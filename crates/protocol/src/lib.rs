@@ -697,6 +697,9 @@ pub struct SearchRequest {
     /// a flat ranking still returns the full page.
     #[serde(default)]
     pub adaptive_limit: bool,
+    /// Include score provenance and per-stage explanations without changing ranking.
+    #[serde(default)]
+    pub explain: bool,
 }
 
 /// Ranking-flatness signal on a `search` page. `High` means the returned
@@ -715,6 +718,42 @@ pub enum SearchConfidence {
     Low,
 }
 
+/// Numeric evidence captured before retrieval or reranking overwrites its inputs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SearchScoreSignals {
+    /// One-based rank in the bounded dense candidate list, after request filters.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dense_rank: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dense_score: Option<f32>,
+    /// One-based rank in the filtered BM25 candidate list.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bm25_rank: Option<usize>,
+    /// SQLite FTS5's raw BM25 value (lower is better).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bm25_score: Option<f32>,
+    /// Reciprocal-rank fusion score before rescaling onto the dense score span.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fused_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reranker_raw: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reranker_normalized: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reranker_weight: Option<f32>,
+}
+
+/// One observed score transition. A missing `before` marks candidate admission.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SearchTrace {
+    pub stage: String,
+    pub before: Option<f32>,
+    pub after: f32,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub signals: Option<SearchScoreSignals>,
+}
+
 /// Wire format is the manual `Serialize` impl below, which adds the computed
 /// `chunk:` `handle`; the derived `Deserialize` ignores it.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -728,6 +767,9 @@ pub struct SearchResult {
     pub score: f32,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub symbols: Vec<SymbolSummary>,
+    /// Present only when search explanation was requested.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trace: Option<Vec<SearchTrace>>,
 }
 
 impl SearchResult {
@@ -741,7 +783,10 @@ impl Serialize for SearchResult {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let emit_symbols = !self.symbols.is_empty();
-        let mut s = serializer.serialize_struct("SearchResult", 7 + usize::from(emit_symbols))?;
+        let mut s = serializer.serialize_struct(
+            "SearchResult",
+            7 + usize::from(emit_symbols) + usize::from(self.trace.is_some()),
+        )?;
         s.serialize_field("handle", &self.handle().to_string())?;
         s.serialize_field("file_path", &self.file_path)?;
         s.serialize_field("language", &self.language)?;
@@ -751,6 +796,9 @@ impl Serialize for SearchResult {
         s.serialize_field("score", &self.score)?;
         if emit_symbols {
             s.serialize_field("symbols", &self.symbols)?;
+        }
+        if let Some(trace) = &self.trace {
+            s.serialize_field("trace", trace)?;
         }
         s.end()
     }
@@ -3485,6 +3533,7 @@ mod tests {
     #[test]
     fn search_result_wire_carries_chunk_handle() {
         let result = SearchResult {
+            trace: None,
             file_path: "src/lib.rs".to_string(),
             language: Language::Rust,
             content: "fn main() {}".to_string(),
@@ -3498,5 +3547,28 @@ mod tests {
         assert!(json.get("symbols").is_none(), "{json}");
         let back: SearchResult = serde_json::from_value(json).unwrap();
         assert_eq!(back.handle().to_string(), "chunk:src/lib.rs:3-9");
+    }
+}
+
+#[cfg(test)]
+mod search_explanation_wire_tests {
+    #[test]
+    fn search_trace_roundtrips_without_changing_legacy_rows() {
+        let legacy = serde_json::json!({
+            "file_path": "src/a.rs", "language": "rust", "content": "fn a() {}",
+            "start_line": 1, "end_line": 1, "score": 0.75
+        });
+        let row: super::SearchResult = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(serde_json::to_value(row).unwrap().get("trace").is_none());
+        let mut explained = legacy;
+        explained["trace"] = serde_json::json!([{
+            "stage": "dense", "before": null, "after": 0.75,
+            "reason": "dense retrieval", "signals": {"dense_rank": 1, "dense_score": 0.75}
+        }]);
+        let row: super::SearchResult = serde_json::from_value(explained.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(row).unwrap()["trace"],
+            explained["trace"]
+        );
     }
 }

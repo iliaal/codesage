@@ -363,6 +363,28 @@ mod tests {
             json!(["boolean", "null"]),
             "search must accept an optional boolean `adaptive_limit`"
         );
+        assert_eq!(
+            input_schema("search")["properties"]["explain"]["type"],
+            json!(["boolean", "null"])
+        );
+        let definitions = search["$defs"].as_object().unwrap();
+        let row = &definitions["SearchResult"];
+        assert!(row["properties"].get("trace").is_some());
+        assert!(
+            !row["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|key| key == "trace")
+        );
+        for field in ["stage", "before", "after", "reason", "signals"] {
+            assert!(
+                definitions["SearchTrace"]["properties"]
+                    .get(field)
+                    .is_some(),
+                "{field}"
+            );
+        }
 
         let symbols = serde_json::to_string(&*schema("find_symbol")).unwrap();
         assert!(!symbols.contains("col_start"), "{symbols}");

@@ -77,6 +77,17 @@ impl CodeSageServer {
         if !has_empty_results(structured) {
             return result;
         }
+        if structured.get("_meta").is_some_and(|meta| {
+            meta.get("truncated").and_then(serde_json::Value::as_bool) == Some(true)
+                && meta.get("field").is_none_or(|field| field == "results")
+                && meta
+                    .get("total_results")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|total| total > 0)
+                && meta.get("returned").and_then(serde_json::Value::as_u64) == Some(0)
+        }) {
+            return result;
+        }
         let counts = match self.with_project_db(project, |db| db.file_counts_by_language()) {
             Ok(c) => c,
             Err(e) => {
@@ -740,7 +751,7 @@ fn truncate_array_reporting(
             if !kept.is_empty() {
                 break;
             }
-            // Keep at least one result, shrinking its content before nested arrays.
+            // Shrink content before nested arrays; search score traces stay atomic.
             let remaining = budget_chars.saturating_sub(used);
             shrink_content_field(&mut item, remaining);
             let shrunk = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0);
@@ -752,6 +763,12 @@ fn truncate_array_reporting(
                     t
                 });
                 shrink_content_field(&mut item, remaining);
+            }
+            if item.as_object().is_some_and(has_search_trace)
+                && serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0) > remaining
+            {
+                nested = None;
+                break;
             }
             kept.push(item);
             break;
@@ -773,13 +790,25 @@ fn nested_element_identifier(entry: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn has_search_trace(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    map.get("file_path")
+        .is_some_and(serde_json::Value::is_string)
+        && map.get("score").is_some_and(serde_json::Value::is_number)
+        && map.get("trace").is_some_and(serde_json::Value::is_array)
+}
+
 /// Trim one nested array, preferring unprotected fields and disclosing protected drops.
 fn shrink_largest_nested_array(
     item: &mut serde_json::Value,
     budget_chars: usize,
 ) -> Option<NestedTrim> {
     let map = item.as_object_mut()?;
-    let (key, key_len, protected) = largest_trimmable_array(map, &[])?;
+    let skip = if has_search_trace(map) {
+        vec!["trace".to_string()]
+    } else {
+        Vec::new()
+    };
+    let (key, key_len, protected) = largest_trimmable_array(map, &skip)?;
     let item_len = serde_json::to_string(&*map).map(|s| s.len()).unwrap_or(0);
     let remaining = budget_chars.saturating_sub(item_len.saturating_sub(key_len));
     let serde_json::Value::Array(entries) = map.remove(&key)? else {
@@ -924,6 +953,121 @@ mod tests {
 
     fn fat_string(n: usize) -> String {
         "x".repeat(n)
+    }
+
+    #[test]
+    fn search_definition_trace_survives_the_mcp_budget_complete() {
+        let names: Vec<String> = (0..149)
+            .map(|i| {
+                format!(
+                    "A{}{}",
+                    char::from(b'a' + i / 26),
+                    char::from(b'A' + i % 26)
+                )
+            })
+            .collect();
+        let source = format!(
+            "trait T{{{}}}",
+            names
+                .iter()
+                .map(|name| format!(" fn {name}();"))
+                .collect::<String>()
+        );
+        assert_eq!(source.len(), 1499);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), &source).unwrap();
+        let db = Database::open_in_memory().unwrap();
+        codesage_graph::full_index(root.path(), &db, &[], false).unwrap();
+        let embedding = vec![0.0; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        db.insert_chunks("src/lib.rs", "rust", &[(&source, 1, 1, &embedding)])
+            .unwrap();
+        let mut request = codesage_protocol::SearchRequest {
+            query: names.join(" "),
+            limit: Some(1),
+            offset: None,
+            languages: None,
+            paths: None,
+            adaptive_limit: false,
+            explain: false,
+        };
+        let plain = codesage_graph::search_page(&db, &embedding, None, &request).unwrap();
+        request.explain = true;
+        let page = codesage_graph::search_page(&db, &embedding, None, &request).unwrap();
+        assert_eq!(page.results[0].score, plain.results[0].score);
+        assert_eq!(f64::from(page.results[0].score), 7139.11328125);
+        let source_trace = page.results[0].trace.as_ref().unwrap();
+        let rendered = render_with_kind(Ok(&page), "search");
+        let payload = rendered.structured_content.unwrap();
+        let row = &payload["results"][0];
+        let trace = row["trace"].as_array().expect("complete explained result");
+        assert_eq!(
+            trace.len(),
+            source_trace.len(),
+            "MCP must not return a trace prefix"
+        );
+        assert_eq!(trace.last().unwrap()["after"], row["score"]);
+        for pair in trace.windows(2) {
+            assert_eq!(pair[1]["before"], pair[0]["after"]);
+        }
+        assert_eq!(
+            source_trace
+                .iter()
+                .filter(|entry| entry.stage == "definition_boost")
+                .count(),
+            1
+        );
+        assert!(source_trace.iter().any(|entry| {
+            entry.stage == "definition_boost"
+                && entry
+                    .reason
+                    .starts_with("149 query symbols matched declarations;")
+        }));
+        assert!(serde_json::to_string(&payload["results"]).unwrap().len() < MCP_BUDGET_CHARS);
+    }
+
+    #[test]
+    fn oversized_search_trace_drops_the_row_instead_of_returning_a_prefix() {
+        let value = json!({ "results": [{
+            "file_path": "src/a.rs", "content": "fn a() {}", "score": 2.0,
+            "trace": [
+                {"stage": "dense", "before": null, "after": 1.0, "reason": fat_string(MCP_BUDGET_CHARS)},
+                {"stage": "definition_boost", "before": 1.0, "after": 2.0, "reason": "matched"}
+            ]
+        }] });
+        let rendered = render_with_kind(Ok(value), "search");
+        let payload = rendered.structured_content.unwrap();
+        assert!(payload["results"].as_array().unwrap().is_empty());
+        assert_eq!(payload["_meta"]["total_results"], 1);
+        assert_eq!(payload["_meta"]["returned"], 0);
+        assert!(payload["_meta"].get("also_truncated_fields").is_none());
+        assert!(serde_json::to_string(&payload).unwrap().len() < MCP_BUDGET_CHARS);
+    }
+
+    #[test]
+    fn search_budget_trims_annotations_while_preserving_every_score_stage() {
+        let trace = json!([
+            {"stage": "dense", "before": null, "after": 1.0, "reason": fat_string(3000)},
+            {"stage": "definition_boost", "before": 1.0, "after": 2.0, "reason": fat_string(3000)}
+        ]);
+        let value = json!({ "results": [{
+            "file_path": "src/a.rs", "content": "fn a() {}", "score": 2.0,
+            "trace": trace,
+            "symbols": (0..100).map(|index| json!({"name": format!("Symbol{index}"), "kind": "function"})).collect::<Vec<_>>()
+        }] });
+        let rendered = render_with_budget(Ok(value), "search", 8000);
+        let payload = rendered.structured_content.unwrap();
+        assert_eq!(payload["results"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["results"][0]["trace"], trace);
+        assert!(payload["results"][0]["symbols"].as_array().unwrap().len() < 100);
+        assert!(
+            payload["_meta"]["also_truncated_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|field| field.as_str().unwrap().starts_with("results[0].symbols"))
+        );
+        assert!(serde_json::to_string(&payload["results"]).unwrap().len() < 8000);
     }
 
     fn truncate_array(items: Vec<Value>, budget_chars: usize) -> Vec<Value> {
@@ -1749,6 +1893,64 @@ mod tests {
             "got {:?}",
             banner.text
         );
+    }
+
+    #[test]
+    fn coverage_distinguishes_budget_dropped_matches_from_real_empty_results() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".codesage")).unwrap();
+        drop(Database::open(&root.path().join(".codesage/index.db")).unwrap());
+        let server = CodeSageServer::with_state(Arc::new(CodeSageServerState::new()));
+        let project = root.path().to_str().unwrap();
+        let path = format!("{}/a.rs", vec!["\u{1}".repeat(200); 15].join("/"));
+        assert_eq!(path.len(), 3019);
+        let row = json!({
+            "file_path": path, "handle": format!("chunk:{path}:1-1"),
+            "content": "fn a() {}", "score": 1.0,
+            "trace": [{"stage": "dense", "before": null, "after": 1.0, "reason": "matched"}]
+        });
+        for payload in [json!({"results": [row.clone()]}), json!([row])] {
+            let rendered = server.render(project, Ok(payload), "search");
+            let value = rendered.structured_content.as_ref().unwrap();
+            assert!(value["results"].as_array().unwrap().is_empty());
+            assert_eq!(value["_meta"]["truncated"], true);
+            assert_eq!(value["_meta"]["total_results"], 1);
+            assert_eq!(value["_meta"]["returned"], 0);
+            assert_eq!(value["_meta"]["approx_tokens_budget"], MCP_TOKEN_BUDGET);
+            assert!(
+                value["_meta"]["hint"]
+                    .as_str()
+                    .unwrap()
+                    .contains("output exceeded budget")
+            );
+            assert!(
+                value["_meta"].get("coverage").is_none(),
+                "matches removed by budgeting are not an empty search"
+            );
+            assert!(
+                rendered
+                    .content
+                    .iter()
+                    .filter_map(|block| block.as_text())
+                    .all(|text| !text.text.contains("No matches"))
+            );
+        }
+        for payload in [
+            json!({"results": []}),
+            json!({"results": [], "_meta": {"truncated": true, "field": "results", "total_results": 0, "returned": 0}}),
+            json!({"results": [], "_meta": {"truncated": true, "field": "warnings", "total_results": 1, "returned": 0}}),
+        ] {
+            let rendered = server.render(project, Ok(payload), "search");
+            let value = rendered.structured_content.as_ref().unwrap();
+            assert_eq!(value["_meta"]["coverage"]["indexed_files"], 0);
+            assert!(
+                rendered
+                    .content
+                    .iter()
+                    .filter_map(|block| block.as_text())
+                    .any(|text| text.text.contains("No matches"))
+            );
+        }
     }
 
     #[test]

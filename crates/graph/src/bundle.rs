@@ -114,6 +114,7 @@ pub fn export_context(
         languages: None,
         paths: None,
         adaptive_limit: false,
+        explain: false,
     };
     let primary = search(db, query_embedding, rerank, &search_req)?;
 
@@ -393,6 +394,7 @@ fn add_chunk_at_line(
         end_line: c.end_line,
         score: 0.0,
         symbols: Vec::new(),
+        trace: None,
     };
     annotate_with_symbols(db, std::slice::from_mut(&mut result))?;
     out.push(result);
@@ -431,6 +433,7 @@ fn add_first_chunk_of_file(
         end_line: c.end_line,
         score: 0.0,
         symbols: Vec::new(),
+        trace: None,
     };
     annotate_with_symbols(db, std::slice::from_mut(&mut result))?;
     out.push(result);
@@ -957,6 +960,7 @@ fn add_related_from_file(
                 end_line: c.end_line,
                 score: 0.0,
                 symbols: Vec::new(),
+                trace: None,
             };
             annotate_with_symbols(db, std::slice::from_mut(&mut result))?;
             out.push(result);

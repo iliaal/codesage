@@ -19,6 +19,8 @@ pub struct RawSearchRow {
     pub start_line: u32,
     pub end_line: u32,
     pub distance: f32,
+    /// Retrieval evidence retained when hybrid fusion replaces `distance`.
+    pub retrieval: codesage_protocol::SearchScoreSignals,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +76,7 @@ fn row_to_raw_search(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSearchRow> 
         start_line: row.get(3)?,
         end_line: row.get(4)?,
         distance: row.get::<_, f64>(5)? as f32,
+        retrieval: Default::default(),
     })
 }
 
@@ -658,6 +661,7 @@ impl Database {
         let rows = stmt
             .query_map(params![file_path], |row| {
                 Ok(RawSearchRow {
+                    retrieval: Default::default(),
                     file_path: row.get(0)?,
                     language: row.get(1)?,
                     content: row.get(2)?,

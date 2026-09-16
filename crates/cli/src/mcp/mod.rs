@@ -507,7 +507,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "search",
-        description = "Semantic code search (embedding-based + cross-encoder reranking). **Prefer this over Grep when you don't know the exact symbol name** — useful for queries like 'where is auth handled', 'error handling in the session pipeline', 'database connection pooling', 'where do we validate inputs'. Grep needs the literal token already; `search` lets the agent ask by intent. For exact identifier lookups with a known name, use `find_symbol` or `find_references` instead. `paths` filters are applied after bounded KNN retrieval so large MCP calls stay responsive; recall is approximate when a filter excludes many near-neighbor chunks. Each page carries `confidence` (`high` / `low`), `margin_pct`, and `cliff_at` describing the largest relative score drop in the returned rows (ranking flatness, not whether the answer exists); pass `adaptive_limit: true` to truncate at that cliff when `confidence` is `high`.",
+        description = "Semantic code search (embedding-based + cross-encoder reranking). **Prefer this over Grep when you don't know the exact symbol name** — useful for queries like 'where is auth handled', 'error handling in the session pipeline', 'database connection pooling', 'where do we validate inputs'. Grep needs the literal token already; `search` lets the agent ask by intent. For exact identifier lookups with a known name, use `find_symbol` or `find_references` instead. `paths` filters are applied after bounded KNN retrieval so large MCP calls stay responsive; recall is approximate when a filter excludes many near-neighbor chunks. Each page carries `confidence` (`high` / `low`), `margin_pct`, and `cliff_at` describing the largest relative score drop in the returned rows (ranking flatness, not whether the answer exists); pass `adaptive_limit: true` to truncate at that cliff when `confidence` is `high`. Pass `explain: true` for each row's score transitions and dense/BM25/reranker signals; ranking stays unchanged.",
         output_schema = schema_for_type::<SearchResults>()
     )]
     async fn search_tool(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
@@ -526,6 +526,7 @@ impl CodeSageServer {
                 languages,
                 paths: params.paths,
                 adaptive_limit: params.adaptive_limit.unwrap_or(false),
+                explain: params.explain.unwrap_or(false),
             };
             let query_for_embed = req.query.clone();
             // Offset and zero-limit requests cannot establish absence from the corpus.

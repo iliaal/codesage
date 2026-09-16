@@ -89,7 +89,7 @@ pub(crate) fn cmd_find_references(name: &str, kind_str: Option<&str>, json: bool
     Ok(())
 }
 
-fn parse_search_language(language: Option<&str>) -> Result<Option<Language>> {
+pub(crate) fn parse_search_language(language: Option<&str>) -> Result<Option<Language>> {
     language
         .map(|l| Language::parse(l).ok_or_else(|| anyhow::anyhow!("unknown language: {l}")))
         .transpose()
@@ -104,28 +104,10 @@ fn normalize_min_jaccard(min_jaccard: f32) -> f32 {
     }
 }
 
-pub(crate) fn cmd_search(
-    query: &str,
-    limit: usize,
-    offset: usize,
-    language: Option<&str>,
-    paths: Option<Vec<String>>,
-    adaptive_limit: bool,
-    json: bool,
-) -> Result<()> {
+pub(crate) fn cmd_search(req: SearchRequest, json: bool) -> Result<()> {
     let root = find_project_root()?;
     let (db, mut embedder, mut reranker) = load_query_stack(&root)?;
-
-    let languages = parse_search_language(language)?.map(|lang| vec![lang]);
-
-    let req = SearchRequest {
-        query: query.to_string(),
-        limit: Some(limit),
-        offset: Some(offset),
-        languages,
-        paths,
-        adaptive_limit,
-    };
+    let query = &req.query;
 
     let query_embedding = embedder.embed_one(&req.query)?;
     let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker.as_mut().map(|r| {
@@ -152,6 +134,20 @@ pub(crate) fn cmd_search(
                 r.language,
                 preview
             );
+            if let Some(trace) = &r.trace {
+                for entry in trace {
+                    let before = entry
+                        .before
+                        .map_or_else(|| "admitted".into(), |score| format!("{score:.6}"));
+                    println!(
+                        "  {}: {} -> {:.6} ({})",
+                        entry.stage, before, entry.after, entry.reason
+                    );
+                    if let Some(signals) = &entry.signals {
+                        println!("    {}", serde_json::to_string(signals)?);
+                    }
+                }
+            }
         }
         // Suppress a natural single-row cliff, but explain rows removed by --adaptive-limit.
         if results.len() < 2 && page.margin_pct == Some(0) {

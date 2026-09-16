@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- `search` accepts `explain: true` (CLI `--explain`) to show each result's score transitions and dense, BM25, and reranker signals without changing ranking; MCP budgeting preserves complete retained traces and distinguishes budget drops from unmatched queries.
+
 ### Fixed
 
 - Python class bases yield inheritance references, and TypeScript annotations and generic type uses yield type-hint references after reindexing.

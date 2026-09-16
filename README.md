@@ -148,6 +148,7 @@ codesage index
 # Search
 codesage search "authentication handler"
 codesage search --json --limit 20 "database connection pooling"
+codesage search --json --explain "database connection pooling"
 
 # Structural queries
 codesage find-symbol MyClass

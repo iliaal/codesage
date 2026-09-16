@@ -131,6 +131,9 @@ enum Commands {
         /// instead of returning exactly --limit rows
         #[arg(long)]
         adaptive_limit: bool,
+        /// Explain the score changes for each returned chunk
+        #[arg(long)]
+        explain: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1027,14 +1030,19 @@ fn run(cli: Cli) -> Result<()> {
             language,
             path,
             adaptive_limit,
+            explain,
             json,
         } => commands::query::cmd_search(
-            &query,
-            limit,
-            offset,
-            language.as_deref(),
-            path,
-            adaptive_limit,
+            codesage_protocol::SearchRequest {
+                query,
+                limit: Some(limit),
+                offset: Some(offset),
+                languages: query::parse_search_language(language.as_deref())?
+                    .map(|lang| vec![lang]),
+                paths: path,
+                adaptive_limit,
+                explain,
+            },
             json,
         ),
         Commands::Brief {
@@ -1187,6 +1195,25 @@ fn run(cli: Cli) -> Result<()> {
 mod tests {
     use super::*;
     use codesage_embed::config::IndexConfig;
+
+    #[test]
+    fn search_explain_is_an_opt_in_cli_flag() {
+        let cli = Cli::try_parse_from(["codesage", "search", "auth"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Search { explain: false, .. }
+        ));
+        let cli =
+            Cli::try_parse_from(["codesage", "search", "auth", "--explain", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Search {
+                explain: true,
+                json: true,
+                ..
+            }
+        ));
+    }
 
     fn attested_root(
         fingerprint: &codesage_graph::SemanticFingerprint,

@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use codesage_parser::detect::detect_language;
 use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
 use codesage_protocol::{
-    Language, SearchConfidence, SearchRequest, SearchResult, SearchResults, Symbol, SymbolSummary,
+    Language, SearchConfidence, SearchRequest, SearchResult, SearchResults, SearchScoreSignals,
+    SearchTrace, Symbol, SymbolSummary,
 };
 use codesage_storage::{Database, RawSearchRow, SemanticValidityToken, embedding_to_bytes};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -406,7 +407,9 @@ fn rrf_merge(
         (sem_min, sem_max)
     };
     let mut scores: HashMap<(String, u32, u32), (f64, RawSearchRow)> = HashMap::new();
-    for (rank, row) in semantic.into_iter().enumerate() {
+    for (rank, mut row) in semantic.into_iter().enumerate() {
+        row.retrieval.dense_rank = Some(rank + 1);
+        row.retrieval.dense_score = Some(l2_to_score(row.distance));
         let contrib = 1.0 / (RRF_K + rank as f64 + 1.0);
         let key = (row.file_path.clone(), row.start_line, row.end_line);
         scores
@@ -414,12 +417,18 @@ fn rrf_merge(
             .and_modify(|(s, _)| *s += contrib)
             .or_insert((contrib, row));
     }
-    for (rank, row) in bm25.into_iter().enumerate() {
+    for (rank, mut row) in bm25.into_iter().enumerate() {
+        row.retrieval.bm25_rank = Some(rank + 1);
+        row.retrieval.bm25_score = Some(row.distance);
         let contrib = BM25_WEIGHT / (RRF_K + rank as f64 + 1.0);
         let key = (row.file_path.clone(), row.start_line, row.end_line);
         scores
             .entry(key)
-            .and_modify(|(s, _)| *s += contrib)
+            .and_modify(|(s, existing)| {
+                *s += contrib;
+                existing.retrieval.bm25_rank = row.retrieval.bm25_rank;
+                existing.retrieval.bm25_score = row.retrieval.bm25_score;
+            })
             .or_insert((contrib, row));
     }
     let mut ranked: Vec<(f64, RawSearchRow)> = scores.into_values().collect();
@@ -443,6 +452,7 @@ fn rrf_merge(
             } else {
                 sem_max
             };
+            row.retrieval.fused_score = Some(score);
             row.distance = (2.0 * (1.0 - rescaled.clamp(0.0, 1.0))).sqrt();
             row
         })
@@ -681,9 +691,11 @@ pub fn search_page(
 
     // A triggered gate can still yield no BM25 hits; reranking depends on actual fusion.
     let mut fused = false;
+    let mut fusion_reason = "Hybrid retrieval gate did not enable lexical lookup".to_string();
     let rows = if hybrid_gate {
         let match_expr = build_fts_match_query(&req.query);
         if match_expr.is_empty() {
+            fusion_reason = "No usable code terms in the lexical MATCH expression".into();
             rows
         } else {
             // Filter before fusion or excluded languages can displace valid candidates.
@@ -718,7 +730,17 @@ pub fn search_page(
                     fused = true;
                     rrf_merge(rows, bm25_rows, semantic_fetch)
                 }
-                _ => rows,
+                Ok(_) => {
+                    fusion_reason = "Lexical lookup returned no candidates".into();
+                    rows
+                }
+                Err(error) => {
+                    if req.explain {
+                        fusion_reason =
+                            format!("Lexical lookup failed; retained dense candidates: {error}");
+                    }
+                    rows
+                }
             }
         }
     } else {
@@ -733,14 +755,54 @@ pub fn search_page(
 
     let semantic_results: Vec<SearchResult> = rows
         .into_iter()
-        .map(|r| SearchResult {
-            file_path: r.file_path,
-            language: parse_db_language(&r.language),
-            content: r.content,
-            start_line: r.start_line,
-            end_line: r.end_line,
-            score: l2_to_score(r.distance),
-            symbols: Vec::new(),
+        .enumerate()
+        .map(|(rank, mut r)| {
+            if !fused {
+                r.retrieval.dense_rank = Some(rank + 1);
+                r.retrieval.dense_score = Some(l2_to_score(r.distance));
+            }
+            let score = l2_to_score(r.distance);
+            let trace = req.explain.then(|| {
+                let dense = r.retrieval.dense_score;
+                vec![
+                    SearchTrace {
+                        stage: "dense".into(),
+                        before: None,
+                        after: dense.unwrap_or(0.0),
+                        reason: if dense.is_some() {
+                            "Cosine-like similarity: max(0, 1 - L2² / 2)".into()
+                        } else {
+                            "Absent from bounded dense candidates; admitted by BM25".into()
+                        },
+                        signals: Some(SearchScoreSignals {
+                            dense_rank: r.retrieval.dense_rank,
+                            dense_score: dense,
+                            ..Default::default()
+                        }),
+                    },
+                    SearchTrace {
+                        stage: "bm25_fusion".into(),
+                        before: Some(dense.unwrap_or(0.0)),
+                        after: score,
+                        reason: if fused {
+                            format!("RRF (k={RRF_K}, BM25 weight={BM25_WEIGHT}), rescaled onto the dense score span")
+                        } else {
+                            fusion_reason.clone()
+                        },
+                        signals: fused.then_some(r.retrieval),
+                    },
+                ]
+            });
+            SearchResult {
+                file_path: r.file_path,
+                language: parse_db_language(&r.language),
+                content: r.content,
+                start_line: r.start_line,
+                end_line: r.end_line,
+                score,
+                symbols: Vec::new(),
+                trace,
+            }
         })
         .collect();
 
@@ -749,20 +811,44 @@ pub fn search_page(
     if has_symbols {
         apply_symbol_boost(&mut results, &known_symbols);
     }
+    finish_trace_stage(
+        &mut results,
+        "symbol_boost",
+        "No matching known query symbol",
+    );
 
     if stem_scan_enabled() {
-        apply_non_candidate_stem_scan(db, &mut results, &req.query)?;
+        apply_non_candidate_stem_scan(db, &mut results, &req.query, req.explain)?;
     }
 
     annotate_with_symbols(db, &mut results)?;
+    for result in &mut results {
+        let count = result.symbols.len();
+        let before = result.score;
+        record_score(result, "symbol_annotation", before, || {
+            format!(
+                "{count} overlapping indexed symbols; feature ownership and graph risk do not affect search scores"
+            )
+        });
+    }
 
     if qualified_name_boost_enabled() && has_symbols {
         apply_qualified_name_boost(&mut results, &known_symbols);
     }
+    finish_trace_stage(
+        &mut results,
+        "qualified_name_boost",
+        "Disabled or no matching qualified name",
+    );
 
     if definition_boost_enabled() {
         apply_definition_boost(&mut results, &req.query);
     }
+    finish_trace_stage(
+        &mut results,
+        "definition_boost",
+        "Disabled or no eligible declaration match",
+    );
 
     // Fused reranking is opt-in; its reduced weight preserves more of BM25's signal.
     // A gated query with no BM25 hits still follows the ordinary reranker path.
@@ -772,28 +858,60 @@ pub fn search_page(
         let weight_override = fused.then_some(RERANK_WEIGHT_SHORT_ID);
         apply_reranking(&mut rerank, &req.query, &mut results, weight_override);
     }
+    finish_trace_stage(
+        &mut results,
+        "rerank_blend",
+        if !has_reranker {
+            "No cross-encoder reranker configured"
+        } else if fused && !fused_rerank_enabled() {
+            "Cross-encoder skipped after BM25 fusion"
+        } else {
+            "Cross-encoder returned no score for this candidate"
+        },
+    );
 
     // Apply penalties after blending; before it, their strength shrinks by 1 - w.
     if path_penalty_enabled() {
         apply_path_penalties(&mut results, &req.query);
     }
+    finish_trace_stage(&mut results, "path_penalty", "Path penalties disabled");
 
     if version_demote_enabled() {
         apply_version_demote(&mut results, &req.query);
     }
+    finish_trace_stage(
+        &mut results,
+        "version_penalty",
+        "Disabled or no competing newer version",
+    );
 
     // The cross-encoder cannot see filenames, so do not dilute the stem boost in its blend.
     if stem_match_boost_enabled() {
         apply_stem_match_boost(&mut results, &req.query);
     }
+    finish_trace_stage(
+        &mut results,
+        "stem_boost",
+        "Disabled or no matching identifier-shaped file stem",
+    );
 
     if file_saturation_enabled() {
         apply_file_saturation(&mut results);
     }
+    finish_trace_stage(
+        &mut results,
+        "file_saturation",
+        "Disabled or file repetition below threshold",
+    );
 
     if dir_saturation_enabled() {
         apply_directory_saturation(&mut results);
     }
+    finish_trace_stage(
+        &mut results,
+        "directory_saturation",
+        "Disabled or directory repetition below threshold",
+    );
 
     // Anchor after saturation so decay cannot undo the lift; first page only.
     apply_mention_anchor(
@@ -802,6 +920,11 @@ pub fn search_page(
         limit.saturating_mul(overfetch),
         offset,
         mention_anchor_enabled(),
+    );
+    finish_trace_stage(
+        &mut results,
+        "mention_anchor",
+        "Disabled, later page, or no eligible unambiguous mention in the anchor window",
     );
 
     apply_offset_and_limit(&mut results, offset, limit);
@@ -817,6 +940,36 @@ pub fn search_page(
         margin_pct: Some(cliff.drop_pct),
         cliff_at: Some(cliff.cut),
     })
+}
+
+fn record_score(
+    result: &mut SearchResult,
+    stage: &str,
+    before: f32,
+    reason: impl FnOnce() -> String,
+) {
+    if let Some(trace) = &mut result.trace {
+        trace.push(SearchTrace {
+            stage: stage.into(),
+            before: Some(before),
+            after: result.score,
+            reason: reason(),
+            signals: None,
+        });
+    }
+}
+
+fn finish_trace_stage(results: &mut [SearchResult], stage: &str, reason: &str) {
+    for result in results {
+        if result
+            .trace
+            .as_ref()
+            .is_some_and(|trace| !trace.iter().any(|entry| entry.stage == stage))
+        {
+            let before = result.score;
+            record_score(result, stage, before, || reason.into());
+        }
+    }
 }
 
 fn extract_known_symbols(db: &Database, query: &str) -> Result<Vec<String>> {
@@ -873,7 +1026,11 @@ fn apply_symbol_boost(results: &mut [SearchResult], known_symbols: &[String]) {
                 boost += 0.1;
             }
         }
+        let before = result.score;
         result.score += boost;
+        record_score(result, "symbol_boost", before, || {
+            format!("Whole-token matches for known query symbols: additive boost {boost}")
+        });
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
@@ -991,7 +1148,13 @@ fn apply_qualified_name_boost(results: &mut [SearchResult], known_symbols: &[Str
                 .any(|k| qualified_name_matches(k, &qn, &name))
         });
         if hit {
+            let before = result.score;
             result.score *= QUALIFIED_NAME_BOOST_FACTOR;
+            record_score(result, "qualified_name_boost", before, || {
+                format!(
+                    "Annotated qualified name matches a known query symbol; factor {QUALIFIED_NAME_BOOST_FACTOR}"
+                )
+            });
         }
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
@@ -1177,13 +1340,19 @@ fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
         EMBEDDED_SYMBOL_BOOST_SCALE
     };
     let boost_unit = max_score * DEFINITION_BOOST_MULTIPLIER * scale;
+    let mut observations = results.iter().any(|r| r.trace.is_some()).then(|| {
+        results
+            .iter()
+            .map(|r| (r.score, 0usize))
+            .collect::<Vec<_>>()
+    });
 
     for symbol_name in &symbols {
         let Some(pattern) = build_definition_pattern(symbol_name) else {
             continue;
         };
         let symbol_lower = symbol_name.to_lowercase();
-        for r in results.iter_mut() {
+        for (index, r) in results.iter_mut().enumerate() {
             if !pattern.is_match(&r.content) {
                 continue;
             }
@@ -1199,6 +1368,21 @@ fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
                 }
             }
             r.score += boost;
+            if let Some(observations) = &mut observations {
+                observations[index].1 += 1;
+            }
+        }
+    }
+    if let Some(observations) = observations {
+        for (r, (before, matches)) in results.iter_mut().zip(observations) {
+            if matches > 0 {
+                let boost = r.score - before;
+                record_score(r, "definition_boost", before, || {
+                    format!(
+                        "{matches} query symbols matched declarations; cumulative additive boost {boost}, including any matching file-stem bonus"
+                    )
+                });
+            }
         }
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
@@ -1397,6 +1581,7 @@ fn apply_non_candidate_stem_scan(
     db: &Database,
     results: &mut Vec<SearchResult>,
     query: &str,
+    explain: bool,
 ) -> Result<()> {
     if results.is_empty() || !is_symbol_query(query) {
         return Ok(());
@@ -1433,6 +1618,13 @@ fn apply_non_candidate_stem_scan(
                     end_line: chunk.end_line,
                     score: 0.0,
                     symbols: Vec::new(),
+                    trace: explain.then(|| vec![SearchTrace {
+                        stage: "stem_scan".into(),
+                        before: None,
+                        after: 0.0,
+                        reason: "Definition admitted by matching file stem outside dense/BM25 candidates".into(),
+                        signals: None,
+                    }]),
                 });
                 break;
             }
@@ -1579,7 +1771,11 @@ fn apply_foreign_platform_penalties(results: &mut [SearchResult], query: &str, w
         return;
     }
     for result in results {
+        let before = result.score;
         result.score *= foreign_platform_penalty(&result.file_path, windows_host);
+        record_score(result, "platform_penalty", before, || {
+            format!("Host-platform preference; windows_host={windows_host}")
+        });
     }
 }
 
@@ -1654,7 +1850,13 @@ fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
         if demote_php_declaration {
             penalty *= php_declaration_penalty(result, query);
         }
+        let before = result.score;
         result.score *= penalty;
+        record_score(result, "path_penalty", before, || {
+            format!(
+                "Combined path/declaration multiplier {penalty}; test-shaped query={is_test_query}"
+            )
+        });
     }
     if cfg!(any(unix, windows)) && platform_demote_enabled() {
         apply_foreign_platform_penalties(results, query, cfg!(windows));
@@ -1707,7 +1909,13 @@ fn apply_stem_match_boost(results: &mut [SearchResult], query: &str) {
         };
         let stem_norm = normalize_stem(stem);
         if tokens.contains(&stem_norm) {
+            let before = result.score;
             result.score *= STEM_MATCH_BOOST;
+            record_score(result, "stem_boost", before, || {
+                format!(
+                    "Identifier-shaped query token matches file stem; factor {STEM_MATCH_BOOST}"
+                )
+            });
             boosted = true;
         }
     }
@@ -1758,7 +1966,11 @@ fn apply_version_demote(results: &mut [SearchResult], query: &str) {
     let mut demoted = false;
     for result in results.iter_mut() {
         if version_dir_of(&result.file_path).is_some_and(|v| v < max_version) {
+            let before = result.score;
             result.score *= SOFT_PENALTY_MILD;
+            record_score(result, "version_penalty", before, || {
+                format!("Candidate is older than v{max_version}; factor {SOFT_PENALTY_MILD}")
+            });
             demoted = true;
         }
     }
@@ -1789,7 +2001,14 @@ fn apply_file_saturation(results: &mut [SearchResult]) {
         let already = per_file.get(&result.file_path).copied().unwrap_or(0);
         if already >= FILE_SATURATION_THRESHOLD {
             let excess = (already - FILE_SATURATION_THRESHOLD + 1) as i32;
+            let before = result.score;
             result.score *= FILE_SATURATION_DECAY.powi(excess);
+            record_score(result, "file_saturation", before, || {
+                format!(
+                    "Repeated file: occurrence {}; factor {FILE_SATURATION_DECAY}^{excess}",
+                    already + 1
+                )
+            });
         }
         *per_file.entry(result.file_path.clone()).or_insert(0) += 1;
     }
@@ -1840,7 +2059,14 @@ fn apply_directory_saturation(results: &mut [SearchResult]) {
         let already = per_dir.get(&dir).copied().unwrap_or(0);
         if already >= threshold {
             let excess = (already - threshold + 1) as i32;
+            let before = result.score;
             result.score *= decay.powi(excess);
+            record_score(result, "directory_saturation", before, || {
+                format!(
+                    "Repeated directory: occurrence {}, threshold {threshold}, factor {decay}^{excess}",
+                    already + 1
+                )
+            });
         }
         *per_dir.entry(dir).or_insert(0) += 1;
     }
@@ -2152,10 +2378,17 @@ fn apply_mention_anchor(
     let mut lifted = false;
     for (slot, &idx) in anchored.iter().enumerate() {
         let target = top * (1.0 - MENTION_TOP_GAP_FRAC).powi(slot as i32 + 1);
+        let before = results[idx].score;
         if results[idx].score < target {
             results[idx].score = target;
             lifted = true;
         }
+        record_score(&mut results[idx], "mention_anchor", before, || {
+            format!(
+                "Explicit query mention, anchor slot {}, minimum score {target}",
+                slot + 1
+            )
+        });
     }
     if lifted {
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
@@ -2223,6 +2456,11 @@ fn apply_reranking(
                 candidates = results.len(),
                 "cross-encoder rerank failed; keeping pre-rerank order"
             );
+            finish_trace_stage(
+                results,
+                "rerank_blend",
+                "Cross-encoder failed; retained pre-rerank score",
+            );
             return false;
         }
     };
@@ -2238,7 +2476,23 @@ fn apply_reranking(
         } else {
             0.5
         };
+        let before = result.score;
         result.score = (1.0 - weight) * result.score + weight * ce_norm;
+        if let Some(trace) = &mut result.trace {
+            trace.push(SearchTrace {
+                stage: "rerank_blend".into(),
+                before: Some(before),
+                after: result.score,
+                reason: "Blend of pre-rerank score and min-max normalized cross-encoder score"
+                    .into(),
+                signals: Some(SearchScoreSignals {
+                    reranker_raw: Some(ce_raw),
+                    reranker_normalized: Some(ce_norm),
+                    reranker_weight: Some(weight),
+                    ..Default::default()
+                }),
+            });
+        }
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
     true
@@ -2417,6 +2671,7 @@ mod hybrid_tests {
     #[test]
     fn rrf_merge_prioritizes_rows_that_appear_in_both_lists() {
         let a = RawSearchRow {
+            retrieval: Default::default(),
             file_path: "a.rs".into(),
             language: "rust".into(),
             content: "a".into(),
@@ -2425,6 +2680,7 @@ mod hybrid_tests {
             distance: 0.0,
         };
         let b = RawSearchRow {
+            retrieval: Default::default(),
             file_path: "b.rs".into(),
             language: "rust".into(),
             content: "b".into(),
@@ -2433,6 +2689,7 @@ mod hybrid_tests {
             distance: 0.0,
         };
         let c = RawSearchRow {
+            retrieval: Default::default(),
             file_path: "c.rs".into(),
             language: "rust".into(),
             content: "c".into(),
@@ -2811,6 +3068,7 @@ mod hybrid_tests {
 
     fn search_req(query: &str) -> SearchRequest {
         SearchRequest {
+            explain: false,
             query: query.to_string(),
             limit: Some(10),
             offset: Some(0),
@@ -2861,6 +3119,7 @@ mod hybrid_tests {
         use super::{RERANK_WEIGHT_NATLANG, RERANK_WEIGHT_SHORT_ID, apply_reranking};
 
         let mk = |file: &str, score: f32| SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language: codesage_protocol::Language::Rust,
             content: file.to_string(),
@@ -2907,6 +3166,7 @@ mod hybrid_tests {
     #[test]
     fn fused_scores_rescale_to_semantic_span_so_flat_boost_cannot_invert() {
         let top = RawSearchRow {
+            retrieval: Default::default(),
             file_path: "top.rs".into(),
             language: "rust".into(),
             content: "fn top() {}".into(),
@@ -2915,6 +3175,7 @@ mod hybrid_tests {
             distance: 0.2, // l2_to_score = 0.98
         };
         let mid = RawSearchRow {
+            retrieval: Default::default(),
             file_path: "mid.rs".into(),
             language: "rust".into(),
             content: "uses known_sym here".into(),
@@ -2927,6 +3188,7 @@ mod hybrid_tests {
         let mut results: Vec<SearchResult> = fused
             .into_iter()
             .map(|r| SearchResult {
+                trace: None,
                 file_path: r.file_path,
                 language: codesage_protocol::Language::Rust,
                 content: r.content,
@@ -2955,6 +3217,7 @@ mod hybrid_tests {
     #[test]
     fn fused_rescale_spreads_rows_when_all_semantic_scores_are_equal() {
         let mk_row = |path: &str, content: &str| RawSearchRow {
+            retrieval: Default::default(),
             file_path: path.into(),
             language: "rust".into(),
             content: content.into(),
@@ -2972,6 +3235,7 @@ mod hybrid_tests {
         let mut results: Vec<SearchResult> = fused
             .into_iter()
             .map(|r| SearchResult {
+                trace: None,
                 file_path: r.file_path,
                 language: codesage_protocol::Language::Rust,
                 content: r.content,
@@ -2996,6 +3260,7 @@ mod hybrid_tests {
     #[test]
     fn fused_rescale_uses_synthetic_span_on_near_tied_semantic_scores() {
         let mk_row = |path: &str, content: &str, distance: f32| RawSearchRow {
+            retrieval: Default::default(),
             file_path: path.into(),
             language: "rust".into(),
             content: content.into(),
@@ -3015,6 +3280,7 @@ mod hybrid_tests {
         let mut results: Vec<SearchResult> = fused
             .into_iter()
             .map(|r| SearchResult {
+                trace: None,
                 file_path: r.file_path,
                 language: codesage_protocol::Language::Rust,
                 content: r.content,
@@ -3131,6 +3397,7 @@ mod test_query_aware_penalty_tests {
 
     fn mk(file: &str, score: f32) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language: codesage_protocol::Language::JavaScript,
             content: String::new(),
@@ -3257,6 +3524,7 @@ mod file_saturation_tests {
 
     fn mk(file: &str, score: f32) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language: codesage_protocol::Language::Rust,
             content: String::new(),
@@ -3339,6 +3607,7 @@ mod symbol_boost_tests {
 
     fn mk(content: &str, score: f32) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: "a.rs".to_string(),
             language: codesage_protocol::Language::Rust,
             content: content.to_string(),
@@ -3382,6 +3651,7 @@ mod definition_boost_tests {
 
     fn mk(file: &str, content: &str, score: f32) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language: codesage_protocol::Language::Rust,
             content: content.to_string(),
@@ -3557,6 +3827,7 @@ mod stem_scan_tests {
 
     fn mk(file: &str, content: &str, score: f32) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language: codesage_protocol::Language::Rust,
             content: content.to_string(),
@@ -3599,7 +3870,7 @@ mod stem_scan_tests {
         let db = Database::open_in_memory().unwrap();
         seed(&db);
         let mut results = vec![mk("src/uses_foo.rs", "let x = FooBar::new();", 0.6)];
-        apply_non_candidate_stem_scan(&db, &mut results, "FooBar").unwrap();
+        apply_non_candidate_stem_scan(&db, &mut results, "FooBar", false).unwrap();
         let injected = results
             .iter()
             .find(|r| r.file_path == "src/foo_bar.rs")
@@ -3614,7 +3885,7 @@ mod stem_scan_tests {
         seed(&db);
         let mut results = vec![mk("src/foo_bar.rs", "pub struct FooBar { x: i32 }", 0.7)];
         let before = results.len();
-        apply_non_candidate_stem_scan(&db, &mut results, "FooBar").unwrap();
+        apply_non_candidate_stem_scan(&db, &mut results, "FooBar", false).unwrap();
         assert_eq!(results.len(), before);
     }
 
@@ -3629,7 +3900,7 @@ mod stem_scan_tests {
         )
         .unwrap();
         let mut results = vec![mk("src/other.rs", "let x = FooBar::new();", 0.6)];
-        apply_non_candidate_stem_scan(&db, &mut results, "FooBar").unwrap();
+        apply_non_candidate_stem_scan(&db, &mut results, "FooBar", false).unwrap();
         assert!(!results.iter().any(|r| r.file_path == "src/foo_bar.rs"));
     }
 
@@ -3639,7 +3910,7 @@ mod stem_scan_tests {
         seed(&db);
         let mut results = vec![mk("src/uses_foo.rs", "let x = FooBar::new();", 0.6)];
         let before = results.len();
-        apply_non_candidate_stem_scan(&db, &mut results, "how does foo work").unwrap();
+        apply_non_candidate_stem_scan(&db, &mut results, "how does foo work", false).unwrap();
         assert_eq!(results.len(), before);
     }
 
@@ -3649,7 +3920,7 @@ mod stem_scan_tests {
         seed(&db);
         let mut results = vec![mk("src/uses_foo.rs", "use Fb;", 0.6)];
         let before = results.len();
-        apply_non_candidate_stem_scan(&db, &mut results, "Fb").unwrap();
+        apply_non_candidate_stem_scan(&db, &mut results, "Fb", false).unwrap();
         assert_eq!(results.len(), before);
     }
 
@@ -3780,6 +4051,7 @@ mod rerank_blend_tests {
 
     fn mk(file: &str, content: &str, score: f32) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language: codesage_protocol::Language::Rust,
             content: content.to_string(),
@@ -3868,6 +4140,7 @@ mod dir_saturation_tests {
 
     fn mk(file: &str, score: f32) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language: codesage_protocol::Language::Rust,
             content: String::new(),
@@ -3929,6 +4202,7 @@ mod dir_saturation_tests {
 
     fn mk_with_symbols(file: &str, score: f32, symbols: Vec<(&str, &str)>) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language: codesage_protocol::Language::Rust,
             content: String::new(),
@@ -4037,6 +4311,7 @@ mod language_and_version_penalty_tests {
 
     fn mk(file: &str, score: f32) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language: Language::TypeScript,
             content: String::new(),
@@ -4280,6 +4555,7 @@ mod header_demote_scope_tests {
 
     fn mk(file: &str, language: Language, score: f32) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language,
             content: String::new(),
@@ -4324,6 +4600,7 @@ mod stem_match_boost_tests {
 
     fn mk(file: &str, score: f32) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language: Language::Rust,
             content: String::new(),
@@ -4673,6 +4950,7 @@ mod mention_anchor_tests {
 
     fn mk(file: &str, score: f32) -> SearchResult {
         SearchResult {
+            trace: None,
             file_path: file.to_string(),
             language: Language::Rust,
             content: String::new(),
@@ -5271,6 +5549,7 @@ mod mention_anchor_pipeline_tests {
 
     fn req(query: &str, limit: usize, offset: usize) -> SearchRequest {
         SearchRequest {
+            explain: false,
             query: query.to_string(),
             limit: Some(limit),
             offset: Some(offset),
@@ -5303,5 +5582,331 @@ mod mention_anchor_pipeline_tests {
         let page2 = search(&db, &emb, None, &req(query, 2, 2)).unwrap();
         let files: Vec<&str> = page2.iter().map(|r| r.file_path.as_str()).collect();
         assert_eq!(files, vec!["src/reg.rs", "src/misc.rs"]);
+    }
+}
+
+#[cfg(test)]
+mod explanation_tests {
+    use super::*;
+
+    fn row(path: &str, content: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: path.into(),
+            language: Language::Rust,
+            content: content.into(),
+            start_line: 1,
+            end_line: 4,
+            score,
+            symbols: Vec::new(),
+            trace: Some(vec![SearchTrace {
+                stage: "dense".into(),
+                before: None,
+                after: score,
+                reason: "Test candidate".into(),
+                signals: None,
+            }]),
+        }
+    }
+
+    fn assert_chain(row: &SearchResult) {
+        let trace = row.trace.as_ref().expect("explain requested");
+        assert!(!trace.is_empty());
+        assert_eq!(trace[0].before, None);
+        for pair in trace.windows(2) {
+            assert_eq!(pair[1].before, Some(pair[0].after), "{trace:?}");
+        }
+        assert_eq!(trace.last().unwrap().after, row.score);
+    }
+
+    fn request(query: &str) -> SearchRequest {
+        SearchRequest {
+            query: query.into(),
+            limit: Some(10),
+            offset: None,
+            languages: None,
+            paths: None,
+            adaptive_limit: false,
+            explain: false,
+        }
+    }
+
+    fn embedding(value: f32) -> Vec<f32> {
+        let mut values = vec![0.0; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        values[0] = value;
+        values
+    }
+
+    fn seed(db: &Database) {
+        for (path, text, start, value) in [
+            ("src/entry.rs", "fn entry() {}", 1, 0.0),
+            ("src/entry.rs", "fn repeated() {}", 8, 0.2),
+            ("src/session.rs", "fn AuthHandler() {}", 1, 0.4),
+            ("src/db.rs", "fn connect() {}", 1, 0.6),
+            ("tests/auth.rs", "fn test_AuthHandler() {}", 1, 0.8),
+        ] {
+            db.insert_chunks(
+                path,
+                "rust",
+                &[(text, start, start + 3, embedding(value).as_slice())],
+            )
+            .unwrap();
+        }
+    }
+
+    fn reranker() -> RerankFn<'static> {
+        Box::new(|_, docs| {
+            Ok(docs
+                .iter()
+                .map(|text| if text.contains("connect") { 3.0 } else { -2.0 })
+                .collect())
+        })
+    }
+
+    #[test]
+    fn explanation_preserves_complete_pages_for_dense_hybrid_paging_and_filters() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        for (query, rerank, offset, paths, adaptive) in [
+            ("where is authentication handled", true, None, None, false),
+            ("use `AuthHandler` here", true, None, None, false),
+            ("panicked at /repo/src/db.rs:3", false, None, None, false),
+            (
+                "where is authentication handled",
+                true,
+                Some(1),
+                Some(vec!["src/*".into()]),
+                true,
+            ),
+        ] {
+            let mut req = request(query);
+            req.offset = offset;
+            req.paths = paths;
+            req.adaptive_limit = adaptive;
+            let plain = search_page(&db, &embedding(0.0), rerank.then(reranker), &req).unwrap();
+            req.explain = true;
+            let explained = search_page(&db, &embedding(0.0), rerank.then(reranker), &req).unwrap();
+            assert!(!explained.results.is_empty(), "{query}");
+            for row in &explained.results {
+                assert_chain(row);
+                assert!(
+                    row.trace
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry.stage == "bm25_fusion")
+                );
+            }
+            let mut stripped = serde_json::to_value(explained).unwrap();
+            for row in stripped["results"].as_array_mut().unwrap() {
+                row.as_object_mut().unwrap().remove("trace");
+            }
+            assert_eq!(stripped, serde_json::to_value(plain).unwrap(), "{query}");
+        }
+    }
+
+    #[test]
+    fn fusion_retains_original_dense_and_lexical_evidence_including_one_leg_rows() {
+        let raw = |path: &str, distance: f32| RawSearchRow {
+            file_path: path.into(),
+            language: "rust".into(),
+            content: path.into(),
+            start_line: 1,
+            end_line: 2,
+            distance,
+            retrieval: Default::default(),
+        };
+        let out = rrf_merge(
+            vec![raw("dense.rs", 0.2), raw("both.rs", 0.8)],
+            vec![raw("both.rs", -7.0), raw("lexical.rs", -2.0)],
+            3,
+        );
+        let both = &out
+            .iter()
+            .find(|row| row.file_path == "both.rs")
+            .unwrap()
+            .retrieval;
+        assert_eq!(both.dense_rank, Some(2));
+        assert_eq!(both.dense_score, Some(l2_to_score(0.8)));
+        assert_eq!(both.bm25_rank, Some(1));
+        assert_eq!(both.bm25_score, Some(-7.0));
+        assert_eq!(both.fused_score, Some(1.0 / 62.0 + BM25_WEIGHT / 61.0));
+        let dense = &out
+            .iter()
+            .find(|row| row.file_path == "dense.rs")
+            .unwrap()
+            .retrieval;
+        assert_eq!(dense.dense_rank, Some(1));
+        assert_eq!(dense.bm25_rank, None);
+        let lexical = &out
+            .iter()
+            .find(|row| row.file_path == "lexical.rs")
+            .unwrap()
+            .retrieval;
+        assert_eq!(lexical.dense_rank, None);
+        assert_eq!(lexical.dense_score, None);
+        assert_eq!(lexical.bm25_rank, Some(2));
+    }
+
+    #[test]
+    fn lexical_only_admission_does_not_claim_a_dense_similarity() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_chunks(
+            "dense.rs",
+            "rust",
+            &[("fn entry() {}", 1, 2, embedding(0.0).as_slice())],
+        )
+        .unwrap();
+        db.insert_chunks(
+            "lexical.rs",
+            "rust",
+            &[("fn NeedleName() {}", 1, 2, embedding(1.0).as_slice())],
+        )
+        .unwrap();
+        let mut req = request("use `NeedleName` here");
+        req.limit = Some(1);
+        req.explain = true;
+        let page = search_page(&db, &embedding(0.0), None, &req).unwrap();
+        assert_eq!(page.results[0].file_path, "lexical.rs");
+        let trace = page.results[0].trace.as_ref().unwrap();
+        assert_eq!(trace[0].signals.as_ref().unwrap().dense_score, None);
+        assert_eq!(trace[1].signals.as_ref().unwrap().bm25_rank, Some(1));
+        assert_chain(&page.results[0]);
+    }
+
+    #[test]
+    fn reranker_trace_keeps_raw_normalized_and_blend_weight() {
+        let mut rows = vec![row("a.rs", "a", 0.8), row("b.rs", "b", 0.4)];
+        let mut rerank: RerankFn<'_> = Box::new(|_, _| Ok(vec![-4.0, 6.0]));
+        apply_reranking(&mut rerank, "auth", &mut rows, Some(0.25));
+        let a = rows.iter().find(|r| r.file_path == "a.rs").unwrap();
+        let trace = a.trace.as_ref().unwrap().last().unwrap();
+        assert_eq!(trace.before, Some(0.8));
+        assert_eq!(trace.after, 0.75 * 0.8);
+        let signals = trace.signals.as_ref().unwrap();
+        assert_eq!(signals.reranker_raw, Some(-4.0));
+        assert_eq!(signals.reranker_normalized, Some(0.0));
+        assert_eq!(signals.reranker_weight, Some(0.25));
+        for row in &rows {
+            assert_chain(row);
+        }
+    }
+
+    #[test]
+    fn reranker_failure_explains_why_scores_are_retained() {
+        let mut rows = vec![row("a.rs", "a", 0.8)];
+        let mut rerank: RerankFn<'_> = Box::new(|_, _| anyhow::bail!("inference unavailable"));
+        assert!(!apply_reranking(&mut rerank, "auth", &mut rows, None));
+        let trace = rows[0].trace.as_ref().unwrap().last().unwrap();
+        assert_eq!(trace.stage, "rerank_blend");
+        assert!(trace.reason.contains("failed"));
+        assert_eq!(rows[0].score, 0.8);
+        assert_chain(&rows[0]);
+    }
+
+    #[test]
+    fn score_mutations_record_boosts_penalties_saturation_and_anchor() {
+        let mut rows = vec![
+            row("src/top.rs", "fn top() {}", 1.0),
+            row("tests/auth.rs", "fn AuthHandler() {}", 0.8),
+            row("tests/auth.rs", "fn AuthHandler() {}", 0.6),
+            row("tests/other.rs", "fn other() {}", 0.5),
+            row("tests/last.rs", "fn last() {}", 0.4),
+        ];
+        rows[2].start_line = 10;
+        apply_symbol_boost(&mut rows, &["authhandler".into()]);
+        apply_definition_boost(&mut rows, "AuthHandler");
+        apply_path_penalties(&mut rows, "auth");
+        apply_file_saturation(&mut rows);
+        apply_directory_saturation(&mut rows);
+        apply_mention_anchor(&mut rows, "panic in /repo/tests/auth.rs:2", 5, 0, true);
+        for stage in [
+            "symbol_boost",
+            "definition_boost",
+            "path_penalty",
+            "file_saturation",
+            "directory_saturation",
+            "mention_anchor",
+        ] {
+            assert!(
+                rows.iter().any(|row| row
+                    .trace
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| { entry.stage == stage && entry.before != Some(entry.after) })),
+                "{stage}"
+            );
+        }
+        for row in &rows {
+            assert_chain(row);
+        }
+    }
+
+    #[test]
+    fn optional_ranking_stages_retain_their_score_changes() {
+        let mut rows = vec![
+            row("src/v1/AuthHandler.rs", "fn AuthHandler() {}", 0.8),
+            row("src/v2/latest.rs", "fn latest() {}", 0.7),
+        ];
+        rows[0].symbols.push(SymbolSummary {
+            name: "AuthHandler".into(),
+            qualified_name: "Session::AuthHandler".into(),
+            kind: codesage_protocol::SymbolKind::Function,
+        });
+        apply_qualified_name_boost(&mut rows, &["session".into()]);
+        apply_stem_match_boost(&mut rows, "AuthHandler");
+        apply_version_demote(&mut rows, "auth");
+        let target = rows
+            .iter()
+            .find(|r| r.file_path.contains("AuthHandler"))
+            .unwrap();
+        for stage in ["qualified_name_boost", "stem_boost", "version_penalty"] {
+            assert!(
+                target
+                    .trace
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.stage == stage && entry.before != Some(entry.after)),
+                "{stage}"
+            );
+        }
+        assert_chain(target);
+        let mut platforms = vec![
+            row("src/win/auth.rs", "a", 0.8),
+            row("src/unix/auth.rs", "b", 0.7),
+        ];
+        apply_foreign_platform_penalties(&mut platforms, "auth", false);
+        let foreign = &platforms[0];
+        assert_eq!(foreign.score, 0.8 * SOFT_PENALTY_MILD);
+        assert_eq!(
+            foreign.trace.as_ref().unwrap().last().unwrap().stage,
+            "platform_penalty"
+        );
+        assert_chain(foreign);
+    }
+
+    #[test]
+    fn stem_injected_rows_start_their_own_trace_without_inventing_dense_evidence() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_chunks(
+            "src/FooBar.rs",
+            "rust",
+            &[("fn FooBar() {}", 1, 2, embedding(1.0).as_slice())],
+        )
+        .unwrap();
+        let mut rows = vec![row("src/entry.rs", "fn entry() {}", 0.8)];
+        apply_non_candidate_stem_scan(&db, &mut rows, "FooBar", true).unwrap();
+        assert_eq!(rows.len(), 2);
+        let admitted = &rows[1];
+        assert_eq!(admitted.file_path, "src/FooBar.rs");
+        assert_eq!(admitted.trace.as_ref().unwrap()[0].stage, "stem_scan");
+        assert_chain(admitted);
+        let mut empty = Vec::new();
+        apply_non_candidate_stem_scan(&db, &mut empty, "FooBar", true).unwrap();
+        assert!(
+            empty.is_empty(),
+            "existing empty-pool behavior is preserved"
+        );
     }
 }

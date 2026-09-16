@@ -322,6 +322,11 @@ pub struct SearchParams {
     )]
     #[serde(default)]
     pub adaptive_limit: Option<bool>,
+    #[schemars(
+        description = "Include per-row score traces and raw retrieval/reranker signals; default false, ranking unchanged."
+    )]
+    #[serde(default)]
+    pub explain: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -543,6 +548,19 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(p.adaptive_limit, Some(true));
+    }
+
+    #[test]
+    fn search_explain_defaults_off_and_requires_a_boolean() {
+        let input = json!({"project": "/p", "query": "auth"});
+        let p: SearchParams = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(p.explain, None);
+        let mut input = input;
+        input["explain"] = json!(true);
+        let p: SearchParams = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(p.explain, Some(true));
+        input["explain"] = json!("true");
+        assert!(serde_json::from_value::<SearchParams>(input).is_err());
     }
 
     #[test]
