@@ -227,7 +227,8 @@ fn mcp_reports_break_before_writing_without_touching_index_or_starting_watcher()
     assert_eq!(missing["error"]["remedy"], Value::Null, "{missing}");
 
     std::fs::write(root.join("dup.rs"), "fn f() {}\nmod inner { fn f() {} }\n").unwrap();
-    run(root, "git", &["add", "dup.rs"]);
+    std::fs::write(root.join("broken.rs"), "fn f( {\n").unwrap();
+    run(root, "git", &["add", "dup.rs", "broken.rs"]);
     run(
         root,
         "git",
@@ -241,6 +242,11 @@ fn mcp_reports_break_before_writing_without_touching_index_or_starting_watcher()
             "duplicate declarations",
         ],
     );
+    let unparsable = failure(&session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"broken.rs", "symbol_name":"f", "replacement":"fn f() {}"}})));
+    assert_eq!(unparsable["error"]["code"], "E_INCOMPLETE", "{unparsable}");
+    assert_eq!(unparsable["status"], "incomplete", "{unparsable}");
+    assert_eq!(unparsable["error"]["remedy"], Value::Null, "{unparsable}");
+
     let ambiguous = failure(&session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"dup.rs", "symbol_name":"f", "replacement":"fn f() {}"}})));
     assert_eq!(ambiguous["error"]["code"], "E_AMBIGUOUS", "{ambiguous}");
     assert_eq!(

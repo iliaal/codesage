@@ -15,7 +15,7 @@
 - Every failed MCP `tools/call` carries one JSON block with `tool`, `error.code`, `error.message`, `error.remedy` (a tool call, a shell command with optional `cwd`, or null), and the legacy `status` / `complete` / `next` fields; parameter validation, project routing, `daemon_stats`, and internal-tool failures included, and the trailing `{"next":null}` block is gone.
 - Error codes: `E_PARAM`, `E_PROJECT_PATH`, `E_NOT_ONBOARDED`, `E_SCHEMA_TOO_NEW`, `E_NOT_FOUND`, `E_AMBIGUOUS`, `E_EMPTY_INPUT`, `E_OVER_CAP`, `E_MODEL`, `E_DB_BUSY`, `E_SATURATED`, `E_TIMEOUT`, `E_CANCELLED`, `E_SHUTDOWN`, `E_INCOMPLETE`, `E_INTERNAL`.
 - `impact_analysis` on an ambiguous symbol returns `E_AMBIGUOUS` with a retry naming the first qualified candidate.
-- `edit_check` refusals carry typed codes: `E_PROJECT_PATH`, `E_PARAM` (traversal or empty `file_path`), `E_OVER_CAP` (1 MiB source or replacement), `E_NOT_FOUND`, and `E_AMBIGUOUS` with a retry naming the first matching `line`; `review_rehearsal` and `edit_check` project preflight failures are `E_PROJECT_PATH`.
+- `edit_check` refusals carry typed codes: `E_PROJECT_PATH`, `E_PARAM` (traversal or empty `file_path`), `E_OVER_CAP` (1 MiB source or replacement), `E_NOT_FOUND`, `E_INCOMPLETE` (HEAD source does not parse), and `E_AMBIGUOUS` with a retry naming the first matching `line`; `review_rehearsal` and `edit_check` project preflight failures are `E_PROJECT_PATH`.
 - Schema migrations `0022_refs_lazy` and `0023_symbols_visibility`; the next `codesage index` reparses existing files under `extraction=2`.
 
 ### Fixed

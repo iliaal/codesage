@@ -28,6 +28,8 @@ pub enum EditCheckRefusal {
     /// Several declarations at HEAD match; `lines` are their one-based start
     /// lines, sorted, so a retry can pass one.
     Ambiguous { message: String, lines: Vec<usize> },
+    /// The pinned source itself cannot be analysed, so no verdict exists.
+    Incomplete(String),
 }
 
 impl EditCheckRefusal {
@@ -37,6 +39,7 @@ impl EditCheckRefusal {
             | Self::Param(message)
             | Self::OverCap(message)
             | Self::NotFound(message)
+            | Self::Incomplete(message)
             | Self::Ambiguous { message, .. } => message,
         }
     }
@@ -435,10 +438,12 @@ fn check_source(
     replacement: &str,
 ) -> Result<EditCheckReport> {
     let tree = parse_file(source.as_bytes(), language)?;
-    ensure!(
-        !tree.root_node().has_error(),
-        "HEAD source has syntax errors; compatibility is unknown"
-    );
+    if tree.root_node().has_error() {
+        return Err(EditCheckRefusal::Incomplete(
+            "HEAD source has syntax errors; compatibility is unknown".into(),
+        )
+        .into());
+    }
     let mut nodes = Vec::new();
     walk(tree.root_node(), &mut nodes);
     let matches: Vec<_> = nodes

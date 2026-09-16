@@ -265,6 +265,10 @@ pub(crate) fn classify(error: &anyhow::Error) -> Classified {
                     code: ErrorCode::NotFound,
                     remedy: None,
                 },
+                EditCheckRefusal::Incomplete(_) => Classified {
+                    code: ErrorCode::Incomplete,
+                    remedy: None,
+                },
                 EditCheckRefusal::Ambiguous { lines, .. } => Classified {
                     code: ErrorCode::Ambiguous,
                     remedy: lines
@@ -623,6 +627,18 @@ mod tests {
             assert_eq!(classified.remedy, remedy, "{refusal:?}");
             assert_eq!(legacy_status(&error), None, "{refusal:?}");
         }
+    }
+
+    #[test]
+    fn edit_check_unparsable_head_source_is_incomplete_not_internal() {
+        let error = anyhow::Error::new(EditCheckRefusal::Incomplete(
+            "HEAD source has syntax errors; compatibility is unknown".into(),
+        ))
+        .context("checking edit");
+        let classified = classify(&error);
+        assert_eq!(classified.code, ErrorCode::Incomplete);
+        assert_eq!(classified.remedy, None);
+        assert_eq!(legacy_status(&error), Some("incomplete"));
     }
 
     #[test]
