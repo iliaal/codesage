@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use codesage_protocol::{
     DependencyEntry, FileInfo, Language, RationaleEntry, Reference, ReferenceKind, Symbol,
-    SymbolKind, TrustBoundary,
+    SymbolKind, TrustBoundary, Visibility,
 };
 use rusqlite::params;
 
@@ -28,11 +28,13 @@ fn deserialize_rationale(s: &str) -> Vec<RationaleEntry> {
 }
 
 /// Map a `(name, qualified_name, kind, path, line_start, line_end, col_start,
-/// col_end, rationale)` row — the column order shared by `find_symbols`,
-/// `symbols_for_files`, and `symbols_for_file` — into a `Symbol`.
+/// col_end, rationale, visibility)` row — the column order shared by
+/// `find_symbols`, `symbols_for_files`, and `symbols_for_file` — into a
+/// `Symbol`. An unrecognized visibility string reads as unknown.
 fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     let kind_str: String = row.get(2)?;
     let rationale_json: String = row.get(8)?;
+    let visibility: Option<String> = row.get(9)?;
     Ok(Symbol {
         name: row.get(0)?,
         qualified_name: row.get(1)?,
@@ -43,6 +45,7 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         col_start: row.get(6)?,
         col_end: row.get(7)?,
         rationale: deserialize_rationale(&rationale_json),
+        visibility: visibility.as_deref().and_then(Visibility::parse),
     })
 }
 
@@ -211,8 +214,8 @@ impl Database {
 
     pub fn insert_symbols(&self, file_id: i64, symbols: &[Symbol]) -> Result<()> {
         let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO symbols (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end, rationale)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end, rationale, visibility)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
 
         for s in symbols {
@@ -228,6 +231,7 @@ impl Database {
                 s.col_start,
                 s.col_end,
                 rationale_json,
+                s.visibility.map(|v| v.as_str()),
             ])?;
         }
         Ok(())
@@ -395,11 +399,11 @@ impl Database {
 
     pub fn find_symbols(&self, name: &str, kind: Option<SymbolKind>) -> Result<Vec<Symbol>> {
         let sql = if name.contains('\\') || name.contains('.') || name.contains("::") {
-            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale
+            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility
               FROM symbols s JOIN files f ON s.file_id = f.id
               WHERE s.qualified_name = ?1"
         } else {
-            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale
+            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility
               FROM symbols s JOIN files f ON s.file_id = f.id
               WHERE s.name = ?1"
         };
@@ -807,7 +811,7 @@ impl Database {
         let placeholders: Vec<String> = (1..=file_paths.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
             "SELECT s.name, s.qualified_name, s.kind, f.path,
-                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale
+                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE f.path IN ({})
              ORDER BY s.line_start",
@@ -829,7 +833,7 @@ impl Database {
     pub fn symbols_for_file(&self, file_path: &str) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.name, s.qualified_name, s.kind, f.path,
-                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale
+                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE f.path = ?1
              ORDER BY s.line_start",

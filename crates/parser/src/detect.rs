@@ -33,6 +33,16 @@ pub fn detect_language_with_dialect(path: &Path, header_is_cpp: bool) -> Option<
     }
 }
 
+/// Every header extension the routing above indexes as C or C++. A `static`
+/// definition in one of these is textually included, so symbol extraction
+/// leaves its visibility unknown instead of file-local.
+pub fn is_c_header_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "h" | "hh" | "hpp" | "hxx" | "h++" | "cuh" | "tpp" | "ipp"
+    )
+}
+
 /// Extensions that switch project-wide `.h` parsing to C++.
 pub fn is_unambiguous_cpp_extension(ext: &str) -> bool {
     matches!(
@@ -55,6 +65,37 @@ pub fn is_unambiguous_cpp_extension(ext: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every extension the router sends to C or C++, so a routing change that
+    /// adds or drops a header shape must revisit the header table.
+    const C_FAMILY_EXTENSIONS: &[&str] = &[
+        "c", "h", "cu", "cuh", "cpp", "cc", "cxx", "c++", "cppm", "ixx", "hpp", "hh", "hxx", "h++",
+        "tpp", "ipp",
+    ];
+    const HEADER_EXTENSIONS: &[&str] = &["h", "cuh", "hpp", "hh", "hxx", "h++", "tpp", "ipp"];
+
+    #[test]
+    fn header_table_matches_c_family_routing() {
+        for ext in C_FAMILY_EXTENSIONS {
+            let lang = detect_language_with_dialect(Path::new(&format!("x.{ext}")), false);
+            assert!(
+                matches!(lang, Some(Language::C | Language::Cpp)),
+                "{ext} routes to {lang:?}"
+            );
+            assert_eq!(
+                is_c_header_extension(ext),
+                HEADER_EXTENSIONS.contains(ext),
+                "{ext}"
+            );
+        }
+        for ext in ["inl", "tcc", "rs", "py", "hs"] {
+            assert!(!is_c_header_extension(ext), "{ext}");
+            assert!(!matches!(
+                detect_language_with_dialect(Path::new(&format!("x.{ext}")), false),
+                Some(Language::C | Language::Cpp)
+            ));
+        }
+    }
 
     #[test]
     fn php_extension() {

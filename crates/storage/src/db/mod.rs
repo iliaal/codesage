@@ -1657,6 +1657,7 @@ mod tests {
             col_start: 0,
             col_end: 0,
             rationale: vec![],
+            visibility: None,
         }
     }
 
@@ -1671,6 +1672,7 @@ mod tests {
             col_start: 0,
             col_end: 0,
             rationale: vec![],
+            visibility: None,
         }
     }
 

@@ -137,14 +137,42 @@ pub struct Symbol {
     /// JSON serialization in that case so existing consumers see no diff.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub rationale: Vec<RationaleEntry>,
+    /// Declared reach of the definition, when the language and extractor
+    /// record one (C/C++ `static`, Rust `pub` levels). `None` means unknown,
+    /// never public; callee resolution admits unknown candidates unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub visibility: Option<Visibility>,
 }
+
+/// Where a definition can be named from. Coarser than any one language's
+/// rules; `Module` covers Rust private items (defining module and its
+/// descendants), `File` covers C/C++ internal linkage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    Public,
+    Crate,
+    Module,
+    File,
+}
+
+str_enum!(Visibility {
+    Public => "public",
+    Crate => "crate",
+    Module => "module",
+    File => "file",
+});
 
 impl Serialize for Symbol {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let emit_qualified = self.qualified_name != self.name;
         let emit_rationale = !self.rationale.is_empty();
-        let len = 5 + usize::from(emit_qualified) + usize::from(emit_rationale);
+        let emit_visibility = self.visibility.is_some();
+        let len = 5
+            + usize::from(emit_qualified)
+            + usize::from(emit_rationale)
+            + usize::from(emit_visibility);
         let mut s = serializer.serialize_struct("Symbol", len)?;
         s.serialize_field("name", &self.name)?;
         if emit_qualified {
@@ -156,6 +184,9 @@ impl Serialize for Symbol {
         s.serialize_field("line_end", &self.line_end)?;
         if emit_rationale {
             s.serialize_field("rationale", &self.rationale)?;
+        }
+        if emit_visibility {
+            s.serialize_field("visibility", &self.visibility)?;
         }
         s.end()
     }
@@ -178,6 +209,8 @@ impl<'de> Deserialize<'de> for Symbol {
             col_end: u32,
             #[serde(default)]
             rationale: Vec<RationaleEntry>,
+            #[serde(default)]
+            visibility: Option<Visibility>,
         }
         let w = Wire::deserialize(deserializer)?;
         Ok(Symbol {
@@ -190,6 +223,7 @@ impl<'de> Deserialize<'de> for Symbol {
             col_start: w.col_start,
             col_end: w.col_end,
             rationale: w.rationale,
+            visibility: w.visibility,
         })
     }
 }
@@ -2964,6 +2998,7 @@ mod tests {
             col_start: 4,
             col_end: 5,
             rationale: Vec::new(),
+            visibility: None,
         }
     }
 

@@ -809,6 +809,7 @@ mod tests {
                             col_start: 0,
                             col_end: 1,
                             rationale: Vec::new(),
+                            visibility: None,
                         }],
                     )
                     .unwrap();
@@ -882,6 +883,7 @@ mod tests {
                     col_start: 0,
                     col_end: 1,
                     rationale: Vec::new(),
+                    visibility: None,
                 }],
             )
             .unwrap();
