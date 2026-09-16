@@ -613,8 +613,8 @@ mod tests {
         let declares_optional = |row: &serde_json::Value, key: &str, what: &str| {
             assert_eq!(
                 row["properties"][key]["type"],
-                json!(["string", "null"]),
-                "{what}: `{key}` is a nullable string: {row}"
+                json!("string"),
+                "{what}: `{key}` is a string, omitted rather than null when unknown: {row}"
             );
             assert!(
                 !row["required"]

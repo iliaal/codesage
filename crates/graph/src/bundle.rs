@@ -604,7 +604,7 @@ pub(crate) fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<V
 
 /// True when `import_ref` (e.g. `crate::helpers_a::helper`) names `sym` in
 /// `sym_file` even if the symbol table only stores the bare tail (`helper`).
-fn import_ref_targets_symbol(
+pub(crate) fn import_ref_targets_symbol(
     import_ref: &str,
     caller_file: &str,
     callee_name: &str,

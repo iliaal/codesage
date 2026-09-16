@@ -340,7 +340,9 @@ fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseReco
                     let span_days =
                         super::risk::days_between(entry.first_observed_at, entry.last_observed_at);
                     coupled.push(CoupledTestEntry {
-                        handle: Handle::file(entry.file.as_str()).to_string(),
+                        handle: Handle::file(entry.file.as_str())
+                            .map(|h| h.to_string())
+                            .unwrap_or_default(),
                         file: entry.file.clone(),
                         weight: entry.weight,
                         count: entry.count,
@@ -626,7 +628,9 @@ fn reachable_test_files(
                 .get(&entry.file_path)
                 .expect("the walk records an edge count for every entry it returns");
             let candidate = ReachableTestEntry {
-                handle: Handle::file(entry.file_path.as_str()).to_string(),
+                handle: Handle::file(entry.file_path.as_str())
+                    .map(|h| h.to_string())
+                    .unwrap_or_default(),
                 path: entry.file_path,
                 distance: entry.distance,
                 edge_count,

@@ -185,7 +185,9 @@ fn span_phrase(max_span: u32) -> String {
 fn to_co_change_entry(r: CoChangeRow, this_commits: u32) -> CoChangeEntry {
     let span_days = days_between(r.first_observed_at, r.last_observed_at);
     CoChangeEntry {
-        handle: Handle::file(r.file.as_str()).to_string(),
+        handle: Handle::file(r.file.as_str())
+            .map(|h| h.to_string())
+            .unwrap_or_default(),
         file: r.file,
         weight: r.weight,
         count: r.count,
@@ -1580,7 +1582,9 @@ fn cluster_by_directory(
         let top_files: Vec<RiskAssessment> = items.iter().take(3).cloned().collect();
         let omitted_files: Vec<String> = items.iter().skip(3).map(|f| f.file.clone()).collect();
         clusters.push(ClusteredDirectory {
-            handle: Handle::dir(dir.as_str()).to_string(),
+            handle: Handle::dir(dir.as_str())
+                .map(|h| h.to_string())
+                .unwrap_or_default(),
             directory: dir,
             count,
             top_files,

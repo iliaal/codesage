@@ -695,7 +695,9 @@ impl Database {
     pub fn list_file_dependencies(&self, file_path: &str) -> Result<DependencyEntry> {
         if self.file_id_for_path(file_path)?.is_none() {
             return Ok(DependencyEntry {
-                handle: Handle::file(file_path).to_string(),
+                handle: Handle::file(file_path)
+                    .map(|h| h.to_string())
+                    .unwrap_or_default(),
                 file_path: file_path.to_string(),
                 found: false,
                 note: Some(
@@ -751,7 +753,9 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(DependencyEntry {
-            handle: Handle::file(file_path).to_string(),
+            handle: Handle::file(file_path)
+                .map(|h| h.to_string())
+                .unwrap_or_default(),
             file_path: file_path.to_string(),
             found: true,
             note: None,

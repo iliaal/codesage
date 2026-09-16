@@ -652,7 +652,9 @@ pub(crate) fn impact_analysis_walk_shared(
         .map(|(path, (distance, reasons, _))| {
             let category = FileCategory::classify(&path);
             ImpactEntry {
-                handle: Handle::file(path.as_str()).to_string(),
+                handle: Handle::file(path.as_str())
+                    .map(|h| h.to_string())
+                    .unwrap_or_default(),
                 file_path: path,
                 distance,
                 category,

@@ -121,12 +121,18 @@ impl Handle {
         }
     }
 
-    pub fn file(path: impl Into<String>) -> Self {
-        Handle::File { path: path.into() }
+    /// `None` when `path` is not a repository-relative path (absolute, `..`
+    /// segment, backslash, control character, empty), so a caller-echoed
+    /// path never becomes a handle that `parse` would reject.
+    pub fn file(path: impl Into<String>) -> Option<Self> {
+        let path = path.into();
+        valid_path(&path).then_some(Handle::File { path })
     }
 
-    pub fn dir(path: impl Into<String>) -> Self {
-        Handle::Dir { path: path.into() }
+    /// Same validation as [`Handle::file`].
+    pub fn dir(path: impl Into<String>) -> Option<Self> {
+        let path = path.into();
+        valid_path(&path).then_some(Handle::Dir { path })
     }
 
     pub fn chunk(path: impl Into<String>, start: u32, end: u32) -> Self {
@@ -258,6 +264,27 @@ mod tests {
         assert_eq!(Handle::parse(&text), Some(handle), "{text}");
     }
 
+    fn round_trip_opt(handle: Option<Handle>) {
+        round_trip(handle.expect("a valid repository-relative path"));
+    }
+
+    #[test]
+    fn file_and_dir_constructors_reject_paths_parse_would_reject() {
+        for hostile in ["../../../etc/passwd", "/etc/passwd", "src\\x.rs"] {
+            assert_eq!(Handle::file(hostile), None, "{hostile}");
+            assert_eq!(Handle::dir(hostile), None, "{hostile}");
+        }
+        assert_eq!(
+            Handle::dir(""),
+            None,
+            "the repository root has no dir handle"
+        );
+        assert_eq!(
+            Handle::file("src/lib.rs").map(|h| h.to_string()),
+            Some("file:src/lib.rs".to_string())
+        );
+    }
+
     #[test]
     fn symbol_handles_round_trip() {
         round_trip(Handle::symbol(
@@ -276,8 +303,8 @@ mod tests {
 
     #[test]
     fn file_dir_chunk_feature_round_trip() {
-        round_trip(Handle::file("src/lib.rs"));
-        round_trip(Handle::dir("crates/graph/src"));
+        round_trip_opt(Handle::file("src/lib.rs"));
+        round_trip_opt(Handle::dir("crates/graph/src"));
         round_trip(Handle::chunk("src/lib.rs", 10, 42));
         round_trip(Handle::Feature {
             id: "feat_0123456789abcdef".to_string(),
@@ -288,7 +315,7 @@ mod tests {
         );
         assert_eq!(
             Handle::parse("dir:crates/graph/"),
-            Some(Handle::dir("crates/graph"))
+            (Handle::dir("crates/graph"))
         );
     }
 
@@ -299,9 +326,9 @@ mod tests {
         assert_eq!(text, "sym:odd/a%23b%40c:d%25e.rs#Ns::f%23g%40h%25@7");
         assert_eq!(Handle::parse(&text), Some(awkward));
 
-        round_trip(Handle::file("with:colon/and#hash@at.rs"));
+        round_trip_opt(Handle::file("with:colon/and#hash@at.rs"));
         round_trip(Handle::chunk("with:colon/and#hash.rs", 1, 3));
-        round_trip(Handle::dir("weird%dir/x@y"));
+        round_trip_opt(Handle::dir("weird%dir/x@y"));
         assert_eq!(
             Handle::parse("chunk:with:colon/a.rs:1-3"),
             Some(Handle::chunk("with:colon/a.rs", 1, 3))
@@ -312,9 +339,9 @@ mod tests {
     fn unknown_percent_sequences_stay_literal() {
         assert_eq!(
             Handle::parse("file:src/100%done.rs"),
-            Some(Handle::file("src/100%done.rs"))
+            (Handle::file("src/100%done.rs"))
         );
-        assert_eq!(Handle::parse("file:a%"), Some(Handle::file("a%")));
+        assert_eq!(Handle::parse("file:a%"), (Handle::file("a%")));
     }
 
     #[test]
@@ -337,7 +364,7 @@ mod tests {
         }
         assert_eq!(
             Handle::parse("file:src/..hidden/x..rs"),
-            Some(Handle::file("src/..hidden/x..rs")),
+            (Handle::file("src/..hidden/x..rs")),
             "`..` is rejected only as a whole segment"
         );
     }

@@ -1042,8 +1042,10 @@ fn apply_qualified(frame: &mut TraceFrame, pool: &NamePool) -> bool {
         [] => false,
         [one] => {
             frame.status = TraceFrameStatus::Resolved;
-            let file = frame.file.get_or_insert_with(|| one.file_path.clone());
-            frame.handle = Some(Handle::file(file.as_str()).to_string());
+            frame.file.get_or_insert_with(|| one.file_path.clone());
+            // The frame's own path may be a vendor call site; the handle names
+            // the indexed file the qualified match lives in.
+            frame.handle = Handle::file(one.file_path.as_str()).map(|h| h.to_string());
             frame.symbol = Some(trace_symbol(one));
             true
         }
@@ -1120,7 +1122,7 @@ fn resolve_frame(
         }
     };
     frame.file = Some(path.clone());
-    frame.handle = Some(Handle::file(path.as_str()).to_string());
+    frame.handle = Handle::file(path.as_str()).map(|h| h.to_string());
     frame.status = TraceFrameStatus::Resolved;
 
     let symbols = db.symbols_for_file(&path)?;

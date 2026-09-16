@@ -394,9 +394,13 @@ fn every_row_emitting_tool_carries_handles() {
     let mut resolved = 0;
     for frame in rows(&trace, "frames", "from_trace") {
         if frame["status"] == "resolved" {
+            let indexed = frame["symbol"]["path"]
+                .as_str()
+                .or_else(|| frame["file"].as_str())
+                .unwrap();
             assert_eq!(
                 assert_handle(frame, "handle", "file:", "from_trace"),
-                format!("file:{}", frame["file"].as_str().unwrap())
+                format!("file:{indexed}")
             );
             resolved += 1;
         } else {

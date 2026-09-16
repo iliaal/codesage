@@ -201,8 +201,8 @@ fn declare_symbol_handle(schema: &mut schemars::Schema) {
     );
 }
 
-/// Declare an optional (nullable, omitted when absent) string property.
-fn declare_optional_string_property(schema: &mut schemars::Schema, name: &str, description: &str) {
+/// Declare a string property that is omitted, never null, when unknown.
+fn declare_omittable_string_property(schema: &mut schemars::Schema, name: &str, description: &str) {
     let Some(object) = schema.as_object_mut() else {
         return;
     };
@@ -212,13 +212,13 @@ fn declare_optional_string_property(schema: &mut schemars::Schema, name: &str, d
     if let Some(properties) = properties.as_object_mut() {
         properties.insert(
             name.to_string(),
-            serde_json::json!({"type": ["string", "null"], "description": description}),
+            serde_json::json!({"type": "string", "description": description}),
         );
     }
 }
 
 fn declare_reference_handles(schema: &mut schemars::Schema) {
-    declare_optional_string_property(
+    declare_omittable_string_property(
         schema,
         "from",
         "`sym:<from_file>#<from_symbol>` handle of the enclosing symbol (`@<line_start>` when \
@@ -477,11 +477,12 @@ pub struct Reference {
     /// JSON; `line` is what agents navigate by.
     #[serde(skip)]
     pub col: u32,
-    /// `sym:` handle of the definition this reference resolves to, when
-    /// exactly one does; `None` (omitted on the wire) when it resolves to
-    /// none or several, or when resolution was capped. Filled by the graph
+    /// `sym:` handle of the definition this reference resolves to with
+    /// qualified, same-file, or import evidence; `None` (omitted on the wire)
+    /// otherwise, including when resolution was capped. Filled by the graph
     /// layer, never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
     pub to: Option<String>,
     /// `line_start` of the enclosing definition when it is one of several
     /// same-named definitions in `from_file`, so `from` carries `@line`.
@@ -549,8 +550,8 @@ pub struct FindReferencesRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DependencyEntry {
-    /// `file:<file_path>`.
-    #[serde(default)]
+    /// `file:<file_path>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub handle: String,
     pub file_path: String,
     #[serde(default)]
@@ -879,8 +880,8 @@ pub struct ImpactReason {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImpactEntry {
-    /// `file:<file_path>`.
-    #[serde(default)]
+    /// `file:<file_path>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub handle: String,
     pub file_path: String,
     pub distance: u32,
@@ -959,8 +960,8 @@ pub struct ContextBundle {
 /// One co-changing file pair, ranked by exponentially-decayed weight.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CoChangeEntry {
-    /// `file:<file>`.
-    #[serde(default)]
+    /// `file:<file>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub handle: String,
     pub file: String,
     /// Raw decayed co-change weight. `find_coupling` ranks by this value
@@ -1220,10 +1221,14 @@ impl Serialize for RiskAssessment {
             + usize::from(emit_trust)
             + usize::from(emit_notes)
             + usize::from(emit_top_symbols);
-        let mut s = serializer.serialize_struct("RiskAssessment", len + 1)?;
+        let handle = Handle::file(self.file.as_str()).map(|h| h.to_string());
+        let mut s =
+            serializer.serialize_struct("RiskAssessment", len + usize::from(handle.is_some()))?;
         s.serialize_field("found", &self.found)?;
         s.serialize_field("file", &self.file)?;
-        s.serialize_field("handle", &Handle::file(self.file.as_str()).to_string())?;
+        if let Some(handle) = &handle {
+            s.serialize_field("handle", handle)?;
+        }
         s.serialize_field("score", &self.score)?;
         if self.unscored {
             s.serialize_field("unscored", &self.unscored)?;
@@ -1434,8 +1439,8 @@ pub struct CycleEntry {
 /// risk score are detailed; the rest are listed by name.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ClusteredDirectory {
-    /// `dir:<directory>`.
-    #[serde(default)]
+    /// `dir:<directory>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub handle: String,
     pub directory: String,
     pub count: u32,
@@ -1449,8 +1454,8 @@ pub struct ClusteredDirectory {
 /// A test file recommended for a change, with the reason it was suggested.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CoupledTestEntry {
-    /// `file:<file>`.
-    #[serde(default)]
+    /// `file:<file>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub handle: String,
     pub file: String,
     /// Raw decayed co-change weight with `source`. The bucket is ordered by
@@ -1483,8 +1488,8 @@ pub struct CoupledTestEntry {
 /// resolved call/import edges.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReachableTestEntry {
-    /// `file:<path>`.
-    #[serde(default)]
+    /// `file:<path>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub handle: String,
     /// Repo-relative path of the test file, as the index stores it.
     pub path: String,
@@ -2225,9 +2230,11 @@ pub struct TraceSymbol {
 /// One frame of a parsed trace, mapped onto the index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraceFrame {
-    /// `file:<file>` once the frame resolves to an indexed file; absent for
+    /// `file:<path>` of the indexed file the frame resolved to (the matched
+    /// symbol's file when resolution came from a qualified name); absent for
     /// ambiguous and unresolved frames.
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schemars(with = "String")]
     pub handle: Option<String>,
     /// Position in `frames`, 0 = innermost frame of stack 0 (see
     /// `FromTraceReport.root_cause_first` for what stack 0 means).
@@ -2904,6 +2911,22 @@ mod tests {
     /// The MCP default hides the decomposition and `top_coupled` but keeps
     /// `cycle_files` (the staleness scan and the cycle notes depend on it);
     /// `verbose` keeps the pre-trim field set and order.
+    /// A caller-echoed path that is not repository-relative gets no handle,
+    /// since `Handle::parse` would reject it.
+    #[test]
+    fn risk_assessment_omits_handle_for_paths_outside_the_repository() {
+        for hostile in ["../../../etc/passwd", "/etc/passwd", "src\\x.rs"] {
+            let mut risk = risk_fixture();
+            risk.file = hostile.to_string();
+            risk.found = false;
+            let json: serde_json::Value = serde_json::to_value(&risk).unwrap();
+            assert!(json.get("handle").is_none(), "{hostile}: {json}");
+            assert_eq!(json["file"], hostile);
+        }
+        let json: serde_json::Value = serde_json::to_value(risk_fixture()).unwrap();
+        assert_eq!(json["handle"], "file:src/lib.rs");
+    }
+
     #[test]
     fn risk_assessment_verbose_switch_gates_wire_fields() {
         let full = risk_fixture();
