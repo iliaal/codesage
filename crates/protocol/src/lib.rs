@@ -2,8 +2,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub mod handle;
 pub mod stat_cache;
 pub mod work;
+
+pub use handle::Handle;
 
 pub const DEFAULT_EMBEDDING_DIM: usize = 384;
 
@@ -99,8 +102,10 @@ pub struct FileInfo {
 /// The `#[serde]` attributes on this struct feed only the `JsonSchema` derive;
 /// the wire format is the manual `Serialize` / `Deserialize` impls below,
 /// which exist because `qualified_name` is dropped whenever it repeats `name`
-/// (a per-field `skip_serializing_if` cannot see a sibling field).
+/// (a per-field `skip_serializing_if` cannot see a sibling field) and because
+/// `handle` is computed rather than stored.
 #[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
+#[schemars(transform = declare_symbol_handle)]
 pub struct Symbol {
     pub name: String,
     /// Fully qualified name (`Class::method`, `Ns\Class`). Omitted from JSON
@@ -142,6 +147,101 @@ pub struct Symbol {
     /// never public; callee resolution admits unknown candidates unchanged.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub visibility: Option<Visibility>,
+    /// True when another definition in `file_path` shares `qualified_name`,
+    /// so the emitted `handle` needs `@line_start` to name this one. Set by
+    /// [`handle::mark_overloads`] at the storage read boundary; never stored.
+    #[serde(skip)]
+    pub overloaded: bool,
+}
+
+impl Symbol {
+    /// `sym:<file_path>#<qualified_name>`, with `@<line_start>` only when
+    /// `overloaded`. Falls back to `name` when `qualified_name` is empty.
+    pub fn handle(&self) -> Handle {
+        let qualified = if self.qualified_name.is_empty() {
+            &self.name
+        } else {
+            &self.qualified_name
+        };
+        Handle::symbol(
+            self.file_path.as_str(),
+            qualified.as_str(),
+            self.overloaded.then_some(self.line_start),
+        )
+    }
+}
+
+/// Declare the computed `handle` field on a schema whose type emits it from
+/// a manual `Serialize` impl, so `outputSchema` matches the wire.
+fn declare_string_property(schema: &mut schemars::Schema, name: &str, description: &str) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    let properties = object
+        .entry("properties")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if let Some(properties) = properties.as_object_mut() {
+        properties.insert(
+            name.to_string(),
+            serde_json::json!({"type": "string", "description": description}),
+        );
+    }
+    let required = object
+        .entry("required")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(required) = required.as_array_mut()
+        && !required.iter().any(|r| r == name)
+    {
+        required.push(serde_json::Value::String(name.to_string()));
+    }
+}
+
+fn declare_symbol_handle(schema: &mut schemars::Schema) {
+    declare_string_property(
+        schema,
+        "handle",
+        "`sym:<file_path>#<qualified_name>`; `@<line_start>` is appended only when several \
+         definitions in the file share the qualified name. Emitted on every symbol row; input \
+         acceptance arrives with the resolver.",
+    );
+}
+
+/// Declare a string property that is omitted, never null, when unknown.
+fn declare_omittable_string_property(schema: &mut schemars::Schema, name: &str, description: &str) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    let properties = object
+        .entry("properties")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if let Some(properties) = properties.as_object_mut() {
+        properties.insert(
+            name.to_string(),
+            serde_json::json!({"type": "string", "description": description}),
+        );
+    }
+}
+
+fn declare_reference_handles(schema: &mut schemars::Schema) {
+    declare_omittable_string_property(
+        schema,
+        "from",
+        "`sym:<from_file>#<from_symbol>` handle of the enclosing symbol (`@<line_start>` when \
+         that symbol is one of several same-named definitions in the file); omitted at file \
+         scope.",
+    );
+}
+
+fn declare_chunk_handle(schema: &mut schemars::Schema) {
+    declare_string_property(
+        schema,
+        "handle",
+        "`chunk:<file_path>:<start_line>-<end_line>` handle of this chunk.",
+    );
+}
+
+fn declare_file_handle(schema: &mut schemars::Schema) {
+    declare_string_property(schema, "handle", "`file:<path>` handle of this file.");
 }
 
 /// Where a definition can be named from. Coarser than any one language's
@@ -169,11 +269,12 @@ impl Serialize for Symbol {
         let emit_qualified = self.qualified_name != self.name;
         let emit_rationale = !self.rationale.is_empty();
         let emit_visibility = self.visibility.is_some();
-        let len = 5
+        let len = 6
             + usize::from(emit_qualified)
             + usize::from(emit_rationale)
             + usize::from(emit_visibility);
         let mut s = serializer.serialize_struct("Symbol", len)?;
+        s.serialize_field("handle", &self.handle().to_string())?;
         s.serialize_field("name", &self.name)?;
         if emit_qualified {
             s.serialize_field("qualified_name", &self.qualified_name)?;
@@ -211,8 +312,12 @@ impl<'de> Deserialize<'de> for Symbol {
             rationale: Vec<RationaleEntry>,
             #[serde(default)]
             visibility: Option<Visibility>,
+            handle: Option<String>,
         }
         let w = Wire::deserialize(deserializer)?;
+        let overloaded = w.handle.as_deref().is_some_and(|h| {
+            matches!(Handle::parse(h), Some(Handle::Symbol { line: Some(_), .. }))
+        });
         Ok(Symbol {
             qualified_name: w.qualified_name.unwrap_or_else(|| w.name.clone()),
             name: w.name,
@@ -224,6 +329,7 @@ impl<'de> Deserialize<'de> for Symbol {
             col_end: w.col_end,
             rationale: w.rationale,
             visibility: w.visibility,
+            overloaded,
         })
     }
 }
@@ -389,7 +495,11 @@ str_enum!(ReferenceKind {
     ImportBinding => "import_binding",
 });
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// Wire format is the manual `Serialize` impl below: it adds `from`, the
+/// handle computed from `from_file` + `from_symbol`, next to the stored
+/// fields; the derived `Deserialize` ignores it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[schemars(transform = declare_reference_handles)]
 pub struct Reference {
     pub from_file: String,
     pub from_symbol: Option<String>,
@@ -412,6 +522,52 @@ pub struct Reference {
     /// PHP, Java, Go).
     #[serde(default, skip_serializing_if = "is_false")]
     pub lazy: bool,
+    /// `sym:` handle of the definition this reference resolves to when the spelling is qualified, the definition is in the same file, or the caller file imports the definition or references its owning type; omitted otherwise, including when resolution was capped. Filled by the graph layer, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub to: Option<String>,
+    /// `line_start` of the enclosing definition when it is one of several
+    /// same-named definitions in `from_file`, so `from` carries `@line`.
+    /// Filled by the graph layer, never stored or sent.
+    #[serde(skip)]
+    pub from_line: Option<u32>,
+}
+
+impl Reference {
+    /// `sym:<from_file>#<from_symbol>`, the enclosing symbol; `None` at file
+    /// scope. Carries `@<line_start>` when `from_line` is set.
+    pub fn from_handle(&self) -> Option<Handle> {
+        self.from_symbol
+            .as_deref()
+            .map(|q| Handle::symbol(self.from_file.as_str(), q, self.from_line))
+    }
+}
+
+impl Serialize for Reference {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let from = self.from_handle().map(|h| h.to_string());
+        let len = 5
+            + usize::from(from.is_some())
+            + usize::from(self.to.is_some())
+            + usize::from(self.lazy);
+        let mut s = serializer.serialize_struct("Reference", len)?;
+        s.serialize_field("from_file", &self.from_file)?;
+        s.serialize_field("from_symbol", &self.from_symbol)?;
+        if let Some(from) = &from {
+            s.serialize_field("from", from)?;
+        }
+        s.serialize_field("to_name", &self.to_name)?;
+        if let Some(to) = &self.to {
+            s.serialize_field("to", to)?;
+        }
+        s.serialize_field("kind", &self.kind)?;
+        s.serialize_field("line", &self.line)?;
+        if self.lazy {
+            s.serialize_field("lazy", &self.lazy)?;
+        }
+        s.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -442,6 +598,9 @@ pub struct FindReferencesRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DependencyEntry {
+    /// `file:<file_path>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handle: String,
     pub file_path: String,
     #[serde(default)]
     pub found: bool,
@@ -556,7 +715,10 @@ pub enum SearchConfidence {
     Low,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+/// Wire format is the manual `Serialize` impl below, which adds the computed
+/// `chunk:` `handle`; the derived `Deserialize` ignores it.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[schemars(transform = declare_chunk_handle)]
 pub struct SearchResult {
     pub file_path: String,
     pub language: Language,
@@ -566,6 +728,32 @@ pub struct SearchResult {
     pub score: f32,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub symbols: Vec<SymbolSummary>,
+}
+
+impl SearchResult {
+    /// `chunk:<file_path>:<start_line>-<end_line>`.
+    pub fn handle(&self) -> Handle {
+        Handle::chunk(self.file_path.as_str(), self.start_line, self.end_line)
+    }
+}
+
+impl Serialize for SearchResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let emit_symbols = !self.symbols.is_empty();
+        let mut s = serializer.serialize_struct("SearchResult", 7 + usize::from(emit_symbols))?;
+        s.serialize_field("handle", &self.handle().to_string())?;
+        s.serialize_field("file_path", &self.file_path)?;
+        s.serialize_field("language", &self.language)?;
+        s.serialize_field("content", &self.content)?;
+        s.serialize_field("start_line", &self.start_line)?;
+        s.serialize_field("end_line", &self.end_line)?;
+        s.serialize_field("score", &self.score)?;
+        if emit_symbols {
+            s.serialize_field("symbols", &self.symbols)?;
+        }
+        s.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -740,6 +928,9 @@ pub struct ImpactReason {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImpactEntry {
+    /// `file:<file_path>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handle: String,
     pub file_path: String,
     pub distance: u32,
     pub category: FileCategory,
@@ -821,6 +1012,9 @@ pub struct ContextBundle {
 /// One co-changing file pair, ranked by exponentially-decayed weight.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CoChangeEntry {
+    /// `file:<file>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handle: String,
     pub file: String,
     /// Raw decayed co-change weight. `find_coupling` ranks by this value
     /// halved when the pair is not `recurring`, so a recurring pair outranks
@@ -952,6 +1146,7 @@ pub struct AuthorConcentration {
 /// below to apply the switch; the `#[serde]` attributes here drive
 /// `Deserialize` and the `JsonSchema` derive.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[schemars(transform = declare_file_handle)]
 pub struct RiskAssessment {
     /// Informational commit-author concentration; does not affect `score`.
     /// Identities are normalized emails, falling back to names, not verified people.
@@ -1087,9 +1282,14 @@ impl Serialize for RiskAssessment {
             + usize::from(emit_trust)
             + usize::from(emit_notes)
             + usize::from(emit_top_symbols);
-        let mut s = serializer.serialize_struct("RiskAssessment", len)?;
+        let handle = Handle::file(self.file.as_str()).map(|h| h.to_string());
+        let mut s =
+            serializer.serialize_struct("RiskAssessment", len + usize::from(handle.is_some()))?;
         s.serialize_field("found", &self.found)?;
         s.serialize_field("file", &self.file)?;
+        if let Some(handle) = &handle {
+            s.serialize_field("handle", handle)?;
+        }
         s.serialize_field("score", &self.score)?;
         if self.unscored {
             s.serialize_field("unscored", &self.unscored)?;
@@ -1308,6 +1508,9 @@ pub struct CycleEntry {
 /// risk score are detailed; the rest are listed by name.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ClusteredDirectory {
+    /// `dir:<directory>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handle: String,
     pub directory: String,
     pub count: u32,
     pub top_files: Vec<RiskAssessment>,
@@ -1320,6 +1523,9 @@ pub struct ClusteredDirectory {
 /// A test file recommended for a change, with the reason it was suggested.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CoupledTestEntry {
+    /// `file:<file>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handle: String,
     pub file: String,
     /// Raw decayed co-change weight with `source`. The bucket is ordered by
     /// this value halved when the pair is not `recurring` (the same key
@@ -1351,6 +1557,9 @@ pub struct CoupledTestEntry {
 /// resolved call/import edges.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReachableTestEntry {
+    /// `file:<path>`. Omitted when the path is not repository-relative.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handle: String,
     /// Repo-relative path of the test file, as the index stores it.
     pub path: String,
     /// Reverse-dependency hops from `via` to this test (1 = the test
@@ -1872,6 +2081,20 @@ pub struct FindReferencesResults {
     /// How to read an ambiguous or definition-less result; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub note: Option<String>,
+    /// Present only when per-row `to` resolution stopped early: rows past
+    /// the cap carry no `to`, which then means "not resolved", not
+    /// "resolves to nothing".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub to_resolution: Option<ToResolution>,
+}
+
+/// Why some `find_references` rows lack `to`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToResolution {
+    /// Distinct (caller file, spelling) pairs that were resolved.
+    pub resolved_pairs: usize,
+    /// True when the pair cap or the time budget stopped resolution.
+    pub capped: bool,
 }
 
 fn default_true() -> bool {
@@ -1938,6 +2161,8 @@ pub struct ImpactOptions {
 /// (name + kind + line, no body) so a dense file collapses to a compact list.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SiblingSymbol {
+    /// `sym:` handle of the sibling's definition.
+    pub handle: String,
     pub name: String,
     pub kind: SymbolKind,
     pub line: u32,
@@ -2037,6 +2262,8 @@ pub struct BranchOverlap {
 /// origin and is not called by anything in the path.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CallPathStep {
+    /// `sym:` handle of this step's definition.
+    pub handle: String,
     pub name: String,
     pub qualified_name: String,
     pub file_path: String,
@@ -2140,6 +2367,10 @@ pub struct TraceSymbol {
 /// One frame of a parsed trace, mapped onto the index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraceFrame {
+    /// `file:<path>` of the indexed file the frame resolved to (the matched symbol's file when resolution came from a qualified name); omitted for ambiguous and unresolved frames.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schemars(with = "String")]
+    pub handle: Option<String>,
     /// Position in `frames`, 0 = innermost frame of stack 0 (see
     /// `FromTraceReport.root_cause_first` for what stack 0 means).
     pub index: usize,
@@ -2714,6 +2945,7 @@ mod tests {
 
         let round_trip: CoChangeEntry = serde_json::from_str(
             &serde_json::to_string(&CoChangeEntry {
+                handle: "file:src/b.rs".to_string(),
                 file: "src/b.rs".to_string(),
                 weight: 2.5,
                 count: 4,
@@ -2758,6 +2990,7 @@ mod tests {
             lazy_edges: 0,
             top_coupled: (0..10)
                 .map(|i| CoChangeEntry {
+                    handle: format!("file:src/coupled_{i}.rs"),
                     file: format!("src/coupled_{i}.rs"),
                     weight: 7.5 - f64::from(i) * 0.4,
                     count: 12 - i,
@@ -2823,6 +3056,7 @@ mod tests {
             [
                 "found",
                 "file",
+                "handle",
                 "score",
                 "churn_score",
                 "churn_percentile",
@@ -2851,6 +3085,7 @@ mod tests {
             [
                 "found",
                 "file",
+                "handle",
                 "score",
                 "cycle_files",
                 "trust_boundaries",
@@ -2896,8 +3131,8 @@ mod tests {
             let json = serde_json::to_string(&unscored).unwrap();
             let keys = json_keys(&json);
             assert_eq!(
-                &keys[..4],
-                ["found", "file", "score", "unscored"],
+                &keys[..5],
+                ["found", "file", "handle", "score", "unscored"],
                 "unscored must sit next to the score it qualifies: {json}"
             );
             let mut back: RiskAssessment = serde_json::from_str(&json).unwrap();
@@ -2907,6 +3142,22 @@ mod tests {
                 assert_eq!(format!("{back:?}"), format!("{unscored:?}"));
             }
         }
+    }
+
+    /// A caller-echoed path that is not repository-relative gets no handle,
+    /// since `Handle::parse` would reject it.
+    #[test]
+    fn risk_assessment_omits_handle_for_paths_outside_the_repository() {
+        for hostile in ["../../../etc/passwd", "/etc/passwd", "src\\x.rs"] {
+            let mut risk = risk_fixture();
+            risk.file = hostile.to_string();
+            risk.found = false;
+            let json: serde_json::Value = serde_json::to_value(&risk).unwrap();
+            assert!(json.get("handle").is_none(), "{hostile}: {json}");
+            assert_eq!(json["file"], hostile);
+        }
+        let json: serde_json::Value = serde_json::to_value(risk_fixture()).unwrap();
+        assert_eq!(json["handle"], "file:src/lib.rs");
     }
 
     /// Guards the hand-written `Serialize`: a field added to the struct but
@@ -2974,6 +3225,7 @@ mod tests {
         let mut diff = RiskDiffAssessment {
             files: vec![risk_fixture()],
             clustered_directories: vec![ClusteredDirectory {
+                handle: "dir:src".to_string(),
                 directory: "src".to_string(),
                 count: 5,
                 top_files: vec![risk_fixture()],
@@ -2999,6 +3251,7 @@ mod tests {
             col_end: 5,
             rationale: Vec::new(),
             visibility: None,
+            overloaded: false,
         }
     }
 
@@ -3010,17 +3263,19 @@ mod tests {
         let json = serde_json::to_string(&bare).unwrap();
         assert_eq!(
             json,
-            r#"{"name":"open","kind":"method","file_path":"src/db.rs","line_start":10,"line_end":20}"#
+            r#"{"handle":"sym:src/db.rs#open","name":"open","kind":"method","file_path":"src/db.rs","line_start":10,"line_end":20}"#
         );
         let back: Symbol = serde_json::from_str(&json).unwrap();
         assert_eq!(back.qualified_name, "open");
         assert_eq!(back.col_start, 0);
+        assert!(!back.overloaded);
 
         let qualified = symbol_fixture("Database::open");
         let json = serde_json::to_string(&qualified).unwrap();
         assert_eq!(
             json_keys(&json),
             [
+                "handle",
                 "name",
                 "qualified_name",
                 "kind",
@@ -3028,6 +3283,10 @@ mod tests {
                 "line_start",
                 "line_end"
             ]
+        );
+        assert!(
+            json.contains(r#""handle":"sym:src/db.rs#Database::open""#),
+            "{json}"
         );
         let back: Symbol = serde_json::from_str(&json).unwrap();
         assert_eq!(back.qualified_name, "Database::open");
@@ -3040,6 +3299,22 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.col_start, 4);
         assert_eq!(legacy.col_end, 5);
+    }
+
+    /// An overloaded definition emits `@line_start` and the flag survives a
+    /// round trip through the wire.
+    #[test]
+    fn symbol_wire_carries_overload_line_in_handle() {
+        let mut sym = symbol_fixture("Database::open");
+        sym.overloaded = true;
+        let json = serde_json::to_string(&sym).unwrap();
+        assert!(
+            json.contains(r#""handle":"sym:src/db.rs#Database::open@10""#),
+            "{json}"
+        );
+        let back: Symbol = serde_json::from_str(&json).unwrap();
+        assert!(back.overloaded);
+        assert_eq!(back.handle().to_string(), "sym:src/db.rs#Database::open@10");
     }
 
     #[test]
@@ -3074,11 +3349,75 @@ mod tests {
             line: 12,
             col: 8,
             lazy: false,
+            to: None,
+            from_line: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains("\"col\""), "{json}");
         let back: Reference = serde_json::from_str(&json).unwrap();
         assert_eq!(back.col, 0);
         assert_eq!(back.line, 12);
+    }
+
+    /// `from` derives from the stored caller (plus `from_line` for an
+    /// overloaded caller); `to` travels only once the graph layer resolves
+    /// it. Both are omitted, not null, when absent.
+    #[test]
+    fn reference_wire_carries_from_and_to_handles() {
+        let mut r = Reference {
+            lazy: false,
+            from_file: "src/a.rs".to_string(),
+            from_symbol: Some("a::run".to_string()),
+            to_name: "open".to_string(),
+            kind: ReferenceKind::Call,
+            line: 12,
+            col: 8,
+            to: None,
+            from_line: None,
+        };
+        let json: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["from"], "sym:src/a.rs#a::run");
+        assert!(json.get("to").is_none(), "{json}");
+        assert_eq!(
+            json_keys(&serde_json::to_string(&r).unwrap()),
+            [
+                "from_file",
+                "from_symbol",
+                "from",
+                "to_name",
+                "kind",
+                "line"
+            ]
+        );
+
+        r.to = Some("sym:src/db.rs#Database::open".to_string());
+        r.from_line = Some(10);
+        let json: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["from"], "sym:src/a.rs#a::run@10");
+        assert_eq!(json["to"], "sym:src/db.rs#Database::open");
+        let back: Reference = serde_json::from_value(json).unwrap();
+        assert_eq!(back.to.as_deref(), Some("sym:src/db.rs#Database::open"));
+
+        r.from_symbol = None;
+        let json: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert!(json.get("from").is_none(), "{json}");
+    }
+
+    #[test]
+    fn search_result_wire_carries_chunk_handle() {
+        let result = SearchResult {
+            file_path: "src/lib.rs".to_string(),
+            language: Language::Rust,
+            content: "fn main() {}".to_string(),
+            start_line: 3,
+            end_line: 9,
+            score: 0.5,
+            symbols: Vec::new(),
+        };
+        let json: serde_json::Value = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["handle"], "chunk:src/lib.rs:3-9");
+        assert!(json.get("symbols").is_none(), "{json}");
+        let back: SearchResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.handle().to_string(), "chunk:src/lib.rs:3-9");
     }
 }

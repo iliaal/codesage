@@ -2402,6 +2402,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
             col_end: 0,
             rationale: Vec::new(),
             visibility: None,
+            overloaded: false,
         }
     }
 

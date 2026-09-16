@@ -622,6 +622,7 @@ mod tests {
                 col_end: 1,
                 rationale: Vec::new(),
                 visibility: None,
+                overloaded: false,
             }],
         )
         .unwrap();
@@ -662,6 +663,8 @@ mod tests {
             line,
             col,
             lazy: false,
+            to: None,
+            from_line: None,
         };
         let mut refs = vec![
             r("foo", ReferenceKind::Call, 3, 4),

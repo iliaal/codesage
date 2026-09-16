@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use codesage_protocol::handle::mark_overloads;
 use codesage_protocol::{
-    DependencyEntry, FileInfo, Language, RationaleEntry, Reference, ReferenceKind, Symbol,
+    DependencyEntry, FileInfo, Handle, Language, RationaleEntry, Reference, ReferenceKind, Symbol,
     SymbolKind, TrustBoundary, Visibility,
 };
 use rusqlite::params;
@@ -46,6 +47,7 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         col_end: row.get(7)?,
         rationale: deserialize_rationale(&rationale_json),
         visibility: visibility.as_deref().and_then(Visibility::parse),
+        overloaded: false,
     })
 }
 
@@ -412,6 +414,8 @@ impl Database {
         let rows = stmt.query_map(params![name], row_to_symbol)?;
 
         let mut symbols: Vec<Symbol> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        // Mark before the kind filter: the sibling set must be complete.
+        mark_overloads(&mut symbols);
         if let Some(k) = kind {
             symbols.retain(|s| s.kind == k);
         }
@@ -497,6 +501,8 @@ impl Database {
                 line: row.get(4)?,
                 col: row.get(5)?,
                 lazy: row.get::<_, i64>(6)? != 0,
+                to: None,
+                from_line: None,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -731,6 +737,9 @@ impl Database {
     pub fn list_file_dependencies(&self, file_path: &str) -> Result<DependencyEntry> {
         if self.file_id_for_path(file_path)?.is_none() {
             return Ok(DependencyEntry {
+                handle: Handle::file(file_path)
+                    .map(|h| h.to_string())
+                    .unwrap_or_default(),
                 file_path: file_path.to_string(),
                 found: false,
                 note: Some(
@@ -786,6 +795,9 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(DependencyEntry {
+            handle: Handle::file(file_path)
+                .map(|h| h.to_string())
+                .unwrap_or_default(),
             file_path: file_path.to_string(),
             found: true,
             note: None,
@@ -827,6 +839,9 @@ impl Database {
             let sym = sym_res?;
             out.entry(sym.file_path.clone()).or_default().push(sym);
         }
+        for symbols in out.values_mut() {
+            mark_overloads(symbols);
+        }
         Ok(out)
     }
 
@@ -838,9 +853,10 @@ impl Database {
              WHERE f.path = ?1
              ORDER BY s.line_start",
         )?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map(params![file_path], row_to_symbol)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        mark_overloads(&mut rows);
         Ok(rows)
     }
 

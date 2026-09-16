@@ -365,6 +365,7 @@ pub fn extract_symbols(
             col_end,
             rationale,
             visibility,
+            overloaded: false,
         };
         if seen_rows.insert(symbol_row_key(&symbol)) {
             symbols.push(symbol);

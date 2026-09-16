@@ -609,6 +609,154 @@ mod tests {
         }
     }
 
+    /// Rows carry legible handles, so the advertised schemas must describe
+    /// them: `handle` on symbol, chunk, sibling, and call-path rows, and
+    /// `from` / `to` on reference rows.
+    #[test]
+    fn row_schemas_declare_handles() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        let schema = |name: &str| -> serde_json::Value {
+            let out = tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .and_then(|t| t.output_schema.clone())
+                .unwrap_or_else(|| panic!("tool `{name}` must advertise an outputSchema"));
+            serde_json::to_value(&*out).unwrap()
+        };
+        let items = |root: &serde_json::Value, path: &[&str]| -> serde_json::Value {
+            let mut node = root.clone();
+            for key in path {
+                let next = resolve(root, &node)["properties"][key].clone();
+                assert!(!next.is_null(), "`{key}` missing under {path:?}: {root}");
+                node = next;
+            }
+            let node = resolve(root, &node).clone();
+            let item = node.get("items").cloned().unwrap_or(node);
+            resolve(root, &item).clone()
+        };
+        let requires = |row: &serde_json::Value, key: &str, what: &str| {
+            assert!(
+                row["properties"].get(key).is_some(),
+                "{what}: row schema must declare `{key}`: {row}"
+            );
+            assert!(
+                row["required"]
+                    .as_array()
+                    .is_some_and(|r| r.iter().any(|k| k == key)),
+                "{what}: `{key}` is always on the wire and must be required: {row}"
+            );
+        };
+
+        let find_symbol = schema("find_symbol");
+        let symbol_row = items(&find_symbol, &["results"]);
+        requires(&symbol_row, "handle", "find_symbol");
+        assert_eq!(symbol_row["properties"]["handle"]["type"], json!("string"));
+        assert!(
+            symbol_row["properties"].get("overloaded").is_none(),
+            "the overload marker is internal: {symbol_row}"
+        );
+
+        let declares_optional = |row: &serde_json::Value, key: &str, what: &str| {
+            assert_eq!(
+                row["properties"][key]["type"],
+                json!("string"),
+                "{what}: `{key}` is a string, omitted rather than null when unknown: {row}"
+            );
+            assert!(
+                !row["required"]
+                    .as_array()
+                    .is_some_and(|r| r.iter().any(|k| k == key)),
+                "{what}: `{key}` is omitted when unknown and must not be required: {row}"
+            );
+        };
+        let find_references = schema("find_references");
+        let reference_row = items(&find_references, &["results"]);
+        declares_optional(&reference_row, "from", "find_references");
+        declares_optional(&reference_row, "to", "find_references");
+        assert!(
+            find_references["properties"].get("to_resolution").is_some(),
+            "find_references must describe `to_resolution`: {find_references}"
+        );
+
+        let search = schema("search");
+        requires(&items(&search, &["results"]), "handle", "search");
+        let export = schema("export_context");
+        requires(
+            &items(&export, &["primary"]),
+            "handle",
+            "export_context primary",
+        );
+        requires(
+            &items(&export, &["symbol_definitions"]),
+            "handle",
+            "export_context symbol_definitions",
+        );
+        let feature = schema("feature_bundle");
+        requires(
+            &items(&feature, &["primary"]),
+            "handle",
+            "feature_bundle primary",
+        );
+
+        let trace = schema("trace_call_path");
+        requires(
+            &items(&trace, &["steps"]),
+            "handle",
+            "trace_call_path steps",
+        );
+        let impact = schema("impact_analysis");
+        requires(
+            &items(&impact, &["sibling_symbols"]),
+            "handle",
+            "impact_analysis sibling_symbols",
+        );
+
+        // File-shaped rows carry `file:` handles (`dir:` for clusters). These
+        // fields default on deserialization for stored snapshots, so they are
+        // declared but not required.
+        let declares = |row: &serde_json::Value, what: &str| {
+            assert_eq!(
+                row["properties"]["handle"]["type"],
+                json!("string"),
+                "{what}: row schema must declare a string `handle`: {row}"
+            );
+        };
+        declares(&items(&impact, &["results"]), "impact_analysis results");
+        declares(&schema("list_dependencies"), "list_dependencies");
+        declares(
+            &items(&schema("find_coupling"), &["coupled"]),
+            "find_coupling coupled",
+        );
+        let risk = schema("assess_risk");
+        requires(&risk, "handle", "assess_risk");
+        declares(&items(&risk, &["top_coupled"]), "assess_risk top_coupled");
+        let diff = schema("assess_risk_diff");
+        requires(
+            &items(&diff, &["files"]),
+            "handle",
+            "assess_risk_diff files",
+        );
+        declares(
+            &items(&diff, &["clustered_directories"]),
+            "assess_risk_diff clustered_directories",
+        );
+        requires(
+            &items(&schema("assess_risk_batch"), &["files"]),
+            "handle",
+            "assess_risk_batch files",
+        );
+        let tests = schema("recommend_tests");
+        declares(&items(&tests, &["coupled"]), "recommend_tests coupled");
+        declares(&items(&tests, &["reachable"]), "recommend_tests reachable");
+        declares_optional(
+            &items(&schema("from_trace"), &["frames"]),
+            "handle",
+            "from_trace frames",
+        );
+    }
+
     #[test]
     fn every_tool_advertises_correct_readonly_annotation() {
         let server = CodeSageServer::new();

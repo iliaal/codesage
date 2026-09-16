@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use codesage_protocol::{
-    CategoryCount, DistanceCount, FileCategory, ImpactEntry, ImpactOptions, ImpactReason,
+    CategoryCount, DistanceCount, FileCategory, Handle, ImpactEntry, ImpactOptions, ImpactReason,
     ImpactReport, ImpactRequest, ImpactSummary, ImpactTarget, Reference, ReferenceKind,
     SiblingSymbol, Symbol,
 };
@@ -677,6 +677,9 @@ pub(crate) fn impact_analysis_walk_shared(
         .map(|(path, (distance, reasons, _))| {
             let category = FileCategory::classify(&path);
             ImpactEntry {
+                handle: Handle::file(path.as_str())
+                    .map(|h| h.to_string())
+                    .unwrap_or_default(),
                 file_path: path,
                 distance,
                 category,
@@ -813,6 +816,7 @@ fn collect_sibling_symbols(
                 continue;
             }
             out.push(SiblingSymbol {
+                handle: s.handle().to_string(),
                 name: s.name,
                 kind: s.kind,
                 line: s.line_start,
@@ -1612,6 +1616,7 @@ mod tests {
                 col_end: 0,
                 rationale: vec![],
                 visibility: None,
+                overloaded: false,
             })
             .collect();
         db.insert_symbols(repo, &syms).unwrap();
@@ -1634,6 +1639,8 @@ mod tests {
                 line: 10 + i as u32,
                 col: 0,
                 lazy: false,
+                to: None,
+                from_line: None,
             })
             .collect();
         // Five repeats of already-recorded (symbol, kind, line) reasons at a
@@ -1647,6 +1654,8 @@ mod tests {
                 line: 10 + i as u32,
                 col: 8,
                 lazy: false,
+                to: None,
+                from_line: None,
             });
         }
         db.insert_references(caller, &refs).unwrap();

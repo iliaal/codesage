@@ -27,6 +27,7 @@ fn symbol(name: &str, file_path: &str) -> Symbol {
         col_end: 0,
         rationale: vec![],
         visibility: None,
+        overloaded: false,
     }
 }
 

@@ -563,6 +563,8 @@ pub fn extract_references(
                     line: row + 1,
                     col,
                     lazy,
+                    to: None,
+                    from_line: None,
                 });
             }
         }
@@ -574,6 +576,8 @@ pub fn extract_references(
             line: row + 1,
             col,
             lazy,
+            to: None,
+            from_line: None,
         });
     }
 

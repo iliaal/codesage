@@ -5,8 +5,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use codesage_protocol::{
-    ClusteredDirectory, CoChangeEntry, CouplingReport, CycleEntry, FileCategory, ImpactRequest,
-    ImpactTarget, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment, TopSymbol,
+    ClusteredDirectory, CoChangeEntry, CouplingReport, CycleEntry, FileCategory, Handle,
+    ImpactRequest, ImpactTarget, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment,
+    TopSymbol,
 };
 use codesage_storage::Database;
 use codesage_storage::db::CoChangeRow;
@@ -300,6 +301,9 @@ fn span_phrase(max_span: u32) -> String {
 fn to_co_change_entry(r: CoChangeRow, this_commits: u32) -> CoChangeEntry {
     let span_days = days_between(r.first_observed_at, r.last_observed_at);
     CoChangeEntry {
+        handle: Handle::file(r.file.as_str())
+            .map(|h| h.to_string())
+            .unwrap_or_default(),
         file: r.file,
         weight: r.weight,
         count: r.count,
@@ -1724,6 +1728,9 @@ fn cluster_by_directory(
         let top_files: Vec<RiskAssessment> = items.iter().take(3).cloned().collect();
         let omitted_files: Vec<String> = items.iter().skip(3).map(|f| f.file.clone()).collect();
         clusters.push(ClusteredDirectory {
+            handle: Handle::dir(dir.as_str())
+                .map(|h| h.to_string())
+                .unwrap_or_default(),
             directory: dir,
             count,
             top_files,
@@ -2239,6 +2246,7 @@ mod tests {
             db.insert_symbols(
                 ids(path),
                 &[Symbol {
+                    overloaded: false,
                     name: name.to_string(),
                     qualified_name: name.to_string(),
                     kind: SymbolKind::Function,
@@ -2254,6 +2262,8 @@ mod tests {
             .unwrap();
         }
         let imp = |from: &str, to: &str, line: u32, lazy: bool| Reference {
+            from_line: None,
+            to: None,
             from_file: from.to_string(),
             from_symbol: None,
             to_name: to.to_string(),
@@ -2352,6 +2362,7 @@ mod tests {
         }
         let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
         let sym = |name: &str, qualified: &str, file: &str| Symbol {
+            overloaded: false,
             name: name.to_string(),
             qualified_name: qualified.to_string(),
             kind: SymbolKind::Class,
@@ -2374,6 +2385,8 @@ mod tests {
         )
         .unwrap();
         let imp = |from: &str, to: &str| Reference {
+            from_line: None,
+            to: None,
             from_file: from.to_string(),
             from_symbol: None,
             to_name: to.to_string(),
@@ -2442,6 +2455,7 @@ mod tests {
             col_end: 0,
             rationale: Vec::new(),
             visibility: None,
+            overloaded: false,
         };
         let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
         db.insert_symbols(
@@ -2464,6 +2478,8 @@ mod tests {
             line: 1,
             col: 0,
             lazy: false,
+            to: None,
+            from_line: None,
         };
         db.insert_references(ids("cyc_a.php"), &[imp("cyc_a.php", "App\\CycleB")])
             .unwrap();

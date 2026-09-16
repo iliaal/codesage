@@ -1658,6 +1658,7 @@ mod tests {
             col_end: 0,
             rationale: vec![],
             visibility: None,
+            overloaded: false,
         }
     }
 
@@ -1673,6 +1674,7 @@ mod tests {
             col_end: 0,
             rationale: vec![],
             visibility: None,
+            overloaded: false,
         }
     }
 
@@ -1685,6 +1687,8 @@ mod tests {
             line: 1,
             col: 0,
             lazy: false,
+            to: None,
+            from_line: None,
         }
     }
 

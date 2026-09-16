@@ -683,7 +683,7 @@ pub(crate) fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<V
 
 /// True when `import_ref` (e.g. `crate::helpers_a::helper`) names `sym` in
 /// `sym_file` even if the symbol table only stores the bare tail (`helper`).
-fn import_ref_targets_symbol(
+pub(crate) fn import_ref_targets_symbol(
     import_ref: &str,
     caller_file: &str,
     callee_name: &str,
@@ -1339,6 +1339,7 @@ mod context_export_tests {
             col_end: 0,
             rationale: vec![],
             visibility: None,
+            overloaded: false,
         }
     }
 
@@ -1351,6 +1352,8 @@ mod context_export_tests {
             line: 5,
             col: 12,
             lazy: false,
+            to: None,
+            from_line: None,
         }
     }
 
@@ -1372,6 +1375,8 @@ mod context_export_tests {
             line: 1,
             col: 0,
             lazy: false,
+            to: None,
+            from_line: None,
         };
         db.insert_references(
             file_id,

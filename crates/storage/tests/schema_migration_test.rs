@@ -652,6 +652,7 @@ fn sample_symbol() -> codesage_protocol::Symbol {
         col_end: 10,
         rationale: Vec::new(),
         visibility: None,
+        overloaded: false,
     }
 }
 
@@ -664,6 +665,8 @@ fn sample_reference(kind: codesage_protocol::ReferenceKind) -> codesage_protocol
         line: 2,
         col: 4,
         lazy: false,
+        to: None,
+        from_line: None,
     }
 }
 

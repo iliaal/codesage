@@ -1426,6 +1426,7 @@ mod tests {
                 col_end: 0,
                 rationale: vec![],
                 visibility: None,
+                overloaded: false,
             }],
         )
         .unwrap();
