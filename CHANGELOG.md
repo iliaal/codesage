@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- Generated indexing hooks pass ShellCheck 0.9 and 0.10 without false unreachable-code warnings for EXIT cleanup.
+
 ## [0.32.0] - 2026-09-16
 
 ### Added

@@ -280,24 +280,25 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
            echo \"[$(date)] $(basename \"$0\") hook skip: another index already running\" >>\"$log\"\n\
            exit 0\n\
          fi\n\
+         # Release only a lock this run still owns: a reaper that took the\n\
+         # lock over must not have its lock removed by the run it displaced.\n\
+         # Define outside the subshell so ShellCheck can follow the EXIT trap.\n\
+         hook_exit() {{\n\
+           rc=$?\n\
+           echo \"[$(date)] $(basename \"$0\") hook exit=$rc pid=$pid\" >>\"$log\"\n\
+           if [ -n \"$pid\" ]; then\n\
+             [ \"$(head -c 32 \"$pidfile\" 2>/dev/null)\" = \"$pid\" ] || return 0\n\
+             rm -f \"$pidfile\"\n\
+           elif [ -e \"$pidfile\" ]; then\n\
+             return 0\n\
+           fi\n\
+           rmdir \"$lockdir\" 2>/dev/null\n\
+         }}\n\
          # `$$` inside `( ... ) &` is still the parent's pid, which exits at\n\
          # once; the subshell learns its own pid from a child's PPID.\n\
          # shellcheck disable=SC2016 # the inner sh expands $PPID itself\n\
          ( pid=\"$(exec sh -c 'echo \"$PPID\"')\"\n\
            case $pid in ''|*[!0-9]*) pid=\"\" ;; esac\n\
-           # Release only a lock this run still owns: a reaper that took the\n\
-           # lock over must not have its lock removed by the run it displaced.\n\
-           hook_exit() {{\n\
-             rc=$?\n\
-             echo \"[$(date)] $(basename \"$0\") hook exit=$rc pid=$pid\" >>\"$log\"\n\
-             if [ -n \"$pid\" ]; then\n\
-               [ \"$(head -c 32 \"$pidfile\" 2>/dev/null)\" = \"$pid\" ] || return 0\n\
-               rm -f \"$pidfile\"\n\
-             elif [ -e \"$pidfile\" ]; then\n\
-               return 0\n\
-             fi\n\
-             rmdir \"$lockdir\" 2>/dev/null\n\
-           }}\n\
            trap hook_exit EXIT\n\
            # sh runs a signal trap only after the foreground child returns, so\n\
            # the exit line for INT/TERM follows the in-flight pass.\n\
@@ -320,7 +321,8 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
            [ -n \"$stamp\" ] && [ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$state\"\n\
            [ \"$index_rc\" -ne 0 ] && exit \"$index_rc\"\n\
            exit \"$rc\" ) >>\"$log\" 2>&1 &\n\
-         exit 0\n",
+         # An explicit parent exit hides the worker's EXIT trap from ShellCheck.\n\
+         :\n",
     )
 }
 
