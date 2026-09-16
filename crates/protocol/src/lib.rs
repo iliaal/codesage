@@ -1978,7 +1978,7 @@ pub struct FeatureFileRef {
 /// fine; the goal is recall, not partition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FeatureRecord {
-    /// Stable blake3-derived id. Format: `feat_<16-hex>`. Computed from
+    /// Stable SHA-256-derived id. Format: `feat_<16-hex>`. Computed from
     /// `(kind, source, entry_path, command|route|symbol)` so renaming an
     /// entry file regenerates the id, but the same file producing the
     /// same feature across re-runs keeps it.
