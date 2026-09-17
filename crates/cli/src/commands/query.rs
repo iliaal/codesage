@@ -12,7 +12,7 @@ use codesage_protocol::{
 };
 
 use crate::{
-    find_project_root, load_query_stack, load_symbol_context_db, open_db, open_db_read_only,
+    find_project_root, load_symbol_context_db, open_db, open_db_read_only, with_query_stack,
 };
 
 pub(crate) fn cmd_find_symbol(name: &str, kind_str: Option<&str>, json: bool) -> Result<()> {
@@ -106,15 +106,15 @@ fn normalize_min_jaccard(min_jaccard: f32) -> f32 {
 
 pub(crate) fn cmd_search(req: SearchRequest, json: bool) -> Result<()> {
     let root = find_project_root()?;
-    let (db, mut embedder, mut reranker) = load_query_stack(&root)?;
     let query = &req.query;
-
-    let query_embedding = embedder.embed_one(&req.query)?;
-    let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker.as_mut().map(|r| {
-        Box::new(move |q: &str, docs: &[&str]| r.score_pairs(q, docs))
-            as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
-    });
-    let page = search_page(&db, &query_embedding, rerank_fn, &req)?;
+    let page = with_query_stack(&root, |db, embedder, reranker| {
+        let query_embedding = embedder.embed_one(&req.query)?;
+        let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker.map(|r| {
+            Box::new(move |q: &str, docs: &[&str]| r.score_pairs(q, docs))
+                as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
+        });
+        search_page(db, &query_embedding, rerank_fn, &req)
+    })?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&page)?);
@@ -511,13 +511,14 @@ pub(crate) fn cmd_export(
         let db = load_symbol_context_db(&root)?;
         export_context_for_symbol(&db, target, &req)?
     } else {
-        let (db, mut embedder, mut reranker) = load_query_stack(&root)?;
-        let query_embedding = embedder.embed_one(req.query.as_deref().unwrap_or_default())?;
-        let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker.as_mut().map(|r| {
-            Box::new(move |q: &str, docs: &[&str]| r.score_pairs(q, docs))
-                as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
-        });
-        export_context(&db, &query_embedding, rerank_fn, &req)?
+        with_query_stack(&root, |db, embedder, reranker| {
+            let query_embedding = embedder.embed_one(req.query.as_deref().unwrap_or_default())?;
+            let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker.map(|r| {
+                Box::new(move |q: &str, docs: &[&str]| r.score_pairs(q, docs))
+                    as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
+            });
+            export_context(db, &query_embedding, rerank_fn, &req)
+        })?
     };
 
     match format {

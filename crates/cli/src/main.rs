@@ -746,21 +746,27 @@ pub(crate) fn get_user_exclude_patterns(config: &ProjectConfig) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Use daemon-pooled embedding and reranking sessions when available, otherwise private ones.
-pub(crate) fn load_query_stack(
+/// Keep semantic validation, query inference, and retrieval on one database snapshot.
+pub(crate) fn with_query_stack<T>(
     root: &Path,
-) -> Result<(
-    Database,
-    Box<dyn codesage_graph::TextEmbedder>,
-    Option<query_reranker::QueryReranker>,
-)> {
-    load_query_stack_with(root, query_embedder, |db, emb_config, dim| {
-        // Reuse artifact attestations to avoid rereading model files.
-        commands::index::resolved_fingerprint(db, emb_config, dim)
-    })
+    consume: impl FnOnce(
+        &Database,
+        &mut dyn codesage_graph::TextEmbedder,
+        Option<&mut query_reranker::QueryReranker>,
+    ) -> Result<T>,
+) -> Result<T> {
+    with_query_stack_with(
+        root,
+        query_embedder,
+        |db, emb_config, dim| {
+            // Reuse artifact attestations to avoid rereading model files.
+            commands::index::resolved_fingerprint(db, emb_config, dim)
+        },
+        consume,
+    )
 }
 
-fn load_query_stack_with(
+fn with_query_stack_with<T>(
     root: &Path,
     embedder_for: impl FnOnce(
         &Path,
@@ -771,27 +777,33 @@ fn load_query_stack_with(
         &EmbeddingConfig,
         usize,
     ) -> Result<codesage_graph::SemanticFingerprint>,
-) -> Result<(
-    Database,
-    Box<dyn codesage_graph::TextEmbedder>,
-    Option<query_reranker::QueryReranker>,
-)> {
+    consume: impl FnOnce(
+        &Database,
+        &mut dyn codesage_graph::TextEmbedder,
+        Option<&mut query_reranker::QueryReranker>,
+    ) -> Result<T>,
+) -> Result<T> {
     codesage_embed::model::ModelAuthorization::for_project(root).scope(|| {
         let config = load_project_config(root)?;
         let emb_config = config.embedding.unwrap_or_default();
         let (mut embedder, dim) = embedder_for(root, &emb_config)?;
         let db = open_db_for_model(root, &emb_config.model, dim)?;
-        // Mismatched or unattested vectors cannot produce trustworthy neighbours.
         let fingerprint = fingerprint_for(&db, &emb_config, dim)?;
-        codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
-        // Query and stored vectors must share the same model and provider identity.
-        embedder.bind_fingerprint(&fingerprint)?;
-        let reranker = emb_config
+        let mut reranker = emb_config
             .reranker
             .as_ref()
             .map(|model| query_reranker::QueryReranker::new(root, model, &emb_config.device))
             .transpose()?;
-        Ok((db, embedder, reranker))
+        if let Some(reranker) = reranker.as_mut() {
+            reranker.prepare()?;
+        }
+        // Model initialization, including private reranker fallback, must precede pinning.
+        let _snapshot = db.read_snapshot()?;
+        // Mismatched or unattested vectors cannot produce trustworthy neighbours.
+        codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
+        // Query and stored vectors must share the same model and provider identity.
+        embedder.bind_fingerprint(&fingerprint)?;
+        consume(&db, embedder.as_mut(), reranker.as_mut())
     })
 }
 
@@ -1242,7 +1254,7 @@ mod tests {
         let (_dir, socket, handle) = spawn_fake(daemon);
         let root = attested_root(&fp_a(), 4);
         {
-            let (_db, mut embedder, reranker) = load_query_stack_with(
+            with_query_stack_with(
                 root.path(),
                 |_root, config| {
                     let daemon =
@@ -1254,13 +1266,16 @@ mod tests {
                     ))
                 },
                 |_db, _config, _dim| Ok(fp_a()),
+                |_db, embedder, reranker| {
+                    assert!(reranker.is_none());
+                    // Unbound daemon sessions reject nonempty requests.
+                    let query = embedder.embed_one("abc")?;
+                    assert_eq!(query[0], 3.0, "the daemon produced the query vector");
+                    assert_eq!(embedded.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    Ok(())
+                },
             )
             .unwrap();
-            assert!(reranker.is_none());
-            // A returned vector proves binding: unbound daemon sessions reject nonempty requests.
-            let query = embedder.embed_one("abc").unwrap();
-            assert_eq!(query[0], 3.0, "the daemon produced the query vector");
-            assert_eq!(embedded.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
         handle.join().unwrap();
     }
@@ -1276,7 +1291,7 @@ mod tests {
         let (_dir, socket, handle) = spawn_fake(daemon);
         let root = attested_root(&fp_a(), 4);
         {
-            let err = load_query_stack_with(
+            let err = with_query_stack_with(
                 root.path(),
                 |_root, config| {
                     let daemon =
@@ -1288,9 +1303,11 @@ mod tests {
                     ))
                 },
                 |_db, _config, _dim| Ok(fp_a()),
+                |_db, _embedder, _reranker| -> Result<()> {
+                    panic!("a mismatched producer must not reach retrieval")
+                },
             )
-            .err()
-            .expect("a daemon on another fingerprint must not serve the query");
+            .expect_err("a daemon on another fingerprint must not serve the query");
             let err = format!("{err:#}");
             assert!(err.contains(mcp::EMBED_TEXTS_FINGERPRINT_MISMATCH), "{err}");
             assert!(
@@ -1324,7 +1341,7 @@ mod tests {
         }
         let bound = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let root = attested_root(&fp_a(), 4);
-        let result = load_query_stack_with(
+        let result = with_query_stack_with(
             root.path(),
             |_root, _config| {
                 Ok((
@@ -1333,15 +1350,17 @@ mod tests {
                 ))
             },
             |_db, _config, _dim| Ok(fp_b()),
-        )
-        .map(|_| ());
+            |_db, _embedder, _reranker| -> Result<()> {
+                panic!("a stale table must not reach retrieval")
+            },
+        );
         assert_eq!(exit_code_for(&result), EXIT_STALE_INDEX);
         let err = result.unwrap_err();
         assert!(err.to_string().contains("codesage index --full"), "{err}");
         assert!(bound.lock().unwrap().is_empty(), "no bind on a stale table");
 
         let root = attested_root(&fp_a(), 4);
-        load_query_stack_with(
+        with_query_stack_with(
             root.path(),
             |_root, _config| {
                 Ok((
@@ -1350,9 +1369,177 @@ mod tests {
                 ))
             },
             |_db, _config, _dim| Ok(fp_a()),
+            |_db, _embedder, _reranker| Ok(()),
         )
         .unwrap();
         assert_eq!(*bound.lock().unwrap(), vec![fp_a().as_str().to_string()]);
+    }
+
+    struct ReindexDuringQueryEmbedding {
+        writer: Option<Database>,
+        producing: codesage_graph::SemanticFingerprint,
+        replacement: codesage_graph::SemanticFingerprint,
+        bound: bool,
+    }
+
+    impl codesage_graph::TextEmbedder for ReindexDuringQueryEmbedding {
+        fn bind_fingerprint(
+            &mut self,
+            expected: &codesage_graph::SemanticFingerprint,
+        ) -> Result<()> {
+            assert_eq!(expected.as_str(), self.producing.as_str());
+            self.bound = true;
+            Ok(())
+        }
+
+        fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            assert!(self.bound, "the producer must be bound before inference");
+            let writer = self.writer.take().expect("one query per request");
+            // Deterministically commit B after the final compatibility check, at inference.
+            writer.execute_batch(|db| {
+                db.clear_semantic_fingerprint()?;
+                db.delete_chunks_for_file("generation.rs")?;
+                db.insert_chunks(
+                    "generation.rs",
+                    "rust",
+                    &[("generation-B", 1, 1, &[0.25; 4])],
+                )?;
+                db.record_semantic_fingerprint(self.replacement.as_str())
+            })?;
+            assert_eq!(
+                writer.semantic_fingerprint()?.as_deref(),
+                Some(self.replacement.as_str()),
+                "B must be committed before retrieval"
+            );
+            Ok(texts.iter().map(|_| vec![0.25; 4]).collect())
+        }
+    }
+
+    fn query_snapshot_schedule(
+        retrieve: impl FnOnce(&Database, &[f32]) -> Result<Vec<codesage_protocol::SearchResult>>,
+    ) {
+        use codesage_embed::config::PoolingStrategy;
+        use codesage_graph::{SemanticFingerprint, StaleSemanticTable};
+
+        let fingerprint = |pooling| {
+            SemanticFingerprint::with_artifact_digest(
+                &EmbeddingConfig {
+                    pooling: Some(pooling),
+                    ..EmbeddingConfig::default()
+                },
+                4,
+                "same-artifact",
+            )
+        };
+        let a = fingerprint(PoolingStrategy::Mean);
+        let b = fingerprint(PoolingStrategy::Cls);
+        assert_ne!(a.as_str(), b.as_str());
+        let root = attested_root(&a, 4);
+        let writer = open_db_for_model(root.path(), &EmbeddingConfig::default().model, 4).unwrap();
+        writer
+            .execute_raw_for_tests(
+                "CREATE TEMP TABLE wal_control(mode TEXT NOT NULL CHECK(mode = 'wal'));
+                 INSERT INTO wal_control SELECT journal_mode FROM pragma_journal_mode;",
+            )
+            .unwrap();
+        writer
+            .insert_chunks(
+                "generation.rs",
+                "rust",
+                &[("generation-A", 1, 1, &[0.25; 4])],
+            )
+            .unwrap();
+        let rows = with_query_stack_with(
+            root.path(),
+            |_root, _config| {
+                Ok((
+                    Box::new(ReindexDuringQueryEmbedding {
+                        writer: Some(writer),
+                        producing: a.clone(),
+                        replacement: b.clone(),
+                        bound: false,
+                    }) as Box<dyn codesage_graph::TextEmbedder>,
+                    4,
+                ))
+            },
+            |_db, _config, _dim| Ok(a.clone()),
+            |db, embedder, _reranker| {
+                let query = embedder.embed_one("generation")?;
+                let rows = retrieve(db, &query)?;
+                assert_eq!(db.semantic_fingerprint()?.as_deref(), Some(a.as_str()));
+                Ok(rows)
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "the request must return the seeded chunk");
+        assert!(
+            rows[0].content.contains("generation-A") && !rows[0].content.contains("generation-B"),
+            "the production request must return generation A, not committed B: {:?}",
+            rows[0].content
+        );
+
+        let outside = open_db_for_model(root.path(), &EmbeddingConfig::default().model, 4).unwrap();
+        assert_eq!(
+            outside.semantic_fingerprint().unwrap().as_deref(),
+            Some(b.as_str())
+        );
+        let err = codesage_graph::require_current_semantic_table(&outside, &a).unwrap_err();
+        assert!(err.downcast_ref::<StaleSemanticTable>().is_some());
+        let fresh = with_query_stack_with(
+            root.path(),
+            |_root, _config| {
+                Ok((
+                    Box::new(ReindexDuringQueryEmbedding {
+                        writer: None,
+                        producing: a.clone(),
+                        replacement: b.clone(),
+                        bound: false,
+                    }) as Box<dyn codesage_graph::TextEmbedder>,
+                    4,
+                ))
+            },
+            |_db, _config, _dim| Ok(a.clone()),
+            |_db, _embedder, _reranker| -> Result<()> {
+                panic!("a fresh A request must refuse generation B before retrieval")
+            },
+        );
+        assert_eq!(exit_code_for(&fresh), EXIT_STALE_INDEX);
+        assert!(
+            fresh
+                .unwrap_err()
+                .downcast_ref::<StaleSemanticTable>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cli_search_snapshot_keeps_generation_a_after_reindex_during_embedding() {
+        query_snapshot_schedule(|db, query| {
+            let request = codesage_protocol::SearchRequest {
+                query: "generation".into(),
+                limit: Some(5),
+                offset: Some(0),
+                languages: None,
+                paths: None,
+                adaptive_limit: false,
+                explain: false,
+            };
+            Ok(codesage_graph::search_page(db, query, None, &request)?.results)
+        });
+    }
+
+    #[test]
+    fn cli_export_snapshot_keeps_generation_a_after_reindex_during_embedding() {
+        query_snapshot_schedule(|db, query| {
+            let request = codesage_protocol::ExportRequest::from_target(
+                "generation".into(),
+                false,
+                5,
+                true,
+                true,
+            );
+            Ok(codesage_graph::export_context(db, query, None, &request)?.primary)
+        });
     }
 
     #[test]

@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- CLI and MCP semantic search and query-based context export keep one database snapshot from the final provenance check through retrieval, preventing concurrent reindexing from mixing embedding generations.
+
 ## [0.33.1] - 2026-09-17
 
 ### Fixed

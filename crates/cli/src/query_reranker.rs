@@ -46,10 +46,29 @@ pub(crate) fn check_scores(scores: &[f32], count: usize) -> Result<()> {
     Ok(())
 }
 
+enum PrivateReranker {
+    Model(Box<Reranker>),
+    #[cfg(test)]
+    Synthetic(fn(&str, &[&str]) -> Result<Vec<f32>>),
+}
+
+impl PrivateReranker {
+    fn score_pairs(&mut self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
+        match self {
+            Self::Model(model) => model.score_pairs(query, documents),
+            #[cfg(test)]
+            Self::Synthetic(score) => score(query, documents),
+        }
+    }
+}
+
 enum Backend {
-    Private(Box<Reranker>),
+    Private(PrivateReranker),
     #[cfg(unix)]
-    Daemon(Box<daemon::Client>),
+    Daemon {
+        client: Box<daemon::Client>,
+        fallback: Option<PrivateReranker>,
+    },
 }
 
 pub(crate) struct QueryReranker {
@@ -80,7 +99,7 @@ impl QueryReranker {
                 root: root.into(),
                 model: model.into(),
                 device: device.into(),
-                backend: Backend::Daemon(Box::new(client)),
+                backend: Backend::Daemon { client: Box::new(client), fallback: None },
             });
         }
         Self::private(root, model, device)
@@ -97,9 +116,38 @@ impl QueryReranker {
                 model: model.into(),
                 #[cfg(unix)]
                 device: device.into(),
-                backend: Backend::Private(Box::new(Reranker::new(model, device)?)),
+                backend: Backend::Private(PrivateReranker::Model(Box::new(Reranker::new(
+                    model, device,
+                )?))),
             })
         })
+    }
+
+    /// Load any private fallback before entering a request's database snapshot.
+    /// Daemon-backed requests retain both the pooled model and this private session.
+    pub(crate) fn prepare(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        self.prepare_with(|root, model, device| {
+            codesage_embed::model::ModelAuthorization::for_project(root).scope(|| {
+                Ok(PrivateReranker::Model(Box::new(Reranker::new(
+                    model, device,
+                )?)))
+            })
+        })?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn prepare_with(
+        &mut self,
+        load: impl FnOnce(&Path, &str, &str) -> Result<PrivateReranker>,
+    ) -> Result<()> {
+        if let Backend::Daemon { fallback, .. } = &mut self.backend
+            && fallback.is_none()
+        {
+            *fallback = Some(load(&self.root, &self.model, &self.device)?);
+        }
+        Ok(())
     }
 
     pub(crate) fn score_pairs(&mut self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
@@ -107,17 +155,26 @@ impl QueryReranker {
             return Ok(Vec::new());
         }
         #[cfg(unix)]
-        if matches!(self.backend, Backend::Daemon(_))
+        if matches!(self.backend, Backend::Daemon { .. })
             && (query.len() > MAX_RERANK_TEXT_BYTES
                 || documents.iter().any(|d| d.len() > MAX_RERANK_TEXT_BYTES))
         {
             tracing::warn!("reranker input exceeds daemon byte caps; reranking privately");
-            *self = Self::private(&self.root, &self.model, &self.device)?;
+            // Standalone callers remain lazy; prepared requests never initialize here.
+            self.prepare()?;
+            if let Backend::Daemon { fallback, .. } = &mut self.backend {
+                let scores = fallback
+                    .as_mut()
+                    .expect("prepared private reranker")
+                    .score_pairs(query, documents)?;
+                check_scores(&scores, documents.len())?;
+                return Ok(scores);
+            }
         }
         let scores = match &mut self.backend {
             Backend::Private(reranker) => reranker.score_pairs(query, documents)?,
             #[cfg(unix)]
-            Backend::Daemon(client) => {
+            Backend::Daemon { client, .. } => {
                 client.score_pairs(query, documents).inspect_err(|error| {
                     tracing::warn!(error = %format!("{error:#}"), "daemon reranking failed");
                 })?
@@ -340,6 +397,63 @@ mod daemon {
                 });
             });
             (dir, socket, task)
+        }
+
+        #[test]
+        fn prepared_daemon_oversized_input_uses_private_fallback_inside_snapshot() {
+            let fake = FakeDaemon::default();
+            let batches = fake.batches.clone();
+            let (_dir, socket, task) = spawn_fake(fake);
+            {
+                let client = Client::connect(&socket, "/project", "reranker", "cpu").unwrap();
+                let mut reranker = QueryReranker {
+                    root: "/project".into(),
+                    // Any attempted real load must fail, rather than downloading a model.
+                    model: "missing-model".into(),
+                    device: "cpu".into(),
+                    backend: Backend::Daemon {
+                        client: Box::new(client),
+                        fallback: None,
+                    },
+                };
+                let database_dir = tempfile::tempdir().unwrap();
+                let db = codesage_storage::Database::open(&database_dir.path().join("index.db"))
+                    .unwrap();
+                let mut loads = 0;
+                reranker
+                    .prepare_with(|_root, _model, _device| {
+                        // A nested transaction would fail if preparation moved inside a snapshot.
+                        let _before_request = db.read_snapshot()?;
+                        loads += 1;
+                        Ok(PrivateReranker::Synthetic(|query, documents| {
+                            Ok(documents
+                                .iter()
+                                .map(|doc| (query.len() + doc.len()) as f32)
+                                .collect())
+                        }))
+                    })
+                    .unwrap();
+                let _snapshot = db.read_snapshot().unwrap();
+                reranker
+                    .prepare_with(|_, _, _| {
+                        panic!("a prepared request must not initialize another private model")
+                    })
+                    .unwrap();
+                let oversized = "x".repeat(MAX_RERANK_TEXT_BYTES + 1);
+                assert_eq!(
+                    reranker.score_pairs("q", &[&oversized]).unwrap(),
+                    vec![(oversized.len() + 1) as f32]
+                );
+                assert_eq!(
+                    reranker.score_pairs(&oversized, &["ab"]).unwrap(),
+                    vec![(oversized.len() + 2) as f32]
+                );
+                assert_eq!(loads, 1);
+                // Normal input continues to use the daemon, not the preloaded fallback.
+                assert_eq!(reranker.score_pairs("q", &["abc"]).unwrap(), vec![3.0]);
+                assert_eq!(*batches.lock().unwrap(), vec![vec!["abc".to_string()]]);
+            }
+            task.join().unwrap();
         }
 
         #[test]

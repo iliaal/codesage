@@ -610,6 +610,19 @@ fn session_fingerprint(
     )
 }
 
+/// Keep the final compatibility check, inference, and every retrieval read on one generation.
+fn with_query_snapshot<R>(
+    db: &Database,
+    produces: &codesage_graph::SemanticFingerprint,
+    embed: impl FnOnce() -> Result<Vec<f32>>,
+    retrieve: impl FnOnce(&Database, &[f32]) -> Result<R>,
+) -> Result<R> {
+    let _snapshot = db.read_snapshot()?;
+    codesage_graph::require_current_semantic_table(db, produces)?;
+    let embedding = embed()?;
+    retrieve(db, &embedding)
+}
+
 /// Non-empty batches must attest this session's fingerprint. Empty probes may omit it.
 /// The mismatch marker tells clients to abort rather than fall back privately.
 fn check_expected_fingerprint(expected: Option<&str>, produces: &str, probe: bool) -> Result<()> {
@@ -1112,13 +1125,15 @@ impl CodeSageServer {
     /// Open an existing debug-fixture table without downloading a model. Require the
     /// recorded dimension; compare fingerprints only when both attestation and local
     /// artifacts exist. Never create a table for an override.
-    fn open_test_override_db(
+    fn with_test_override_db<R>(
         &self,
         state: &ProjectState,
         config: &EmbeddingConfig,
         dim: usize,
-    ) -> Result<Database> {
+        f: impl FnOnce(&Database) -> Result<R>,
+    ) -> Result<R> {
         let db = Database::open_for_existing_model(&state.db_path, &config.model)?;
+        let _snapshot = db.read_snapshot()?;
         let recorded = db.recorded_semantic_dim()?.ok_or_else(|| {
             anyhow::anyhow!(
                 "test query-embedding override is set but model {:?} has no recorded chunk table; run `codesage index`",
@@ -1146,7 +1161,7 @@ impl CodeSageServer {
                 "test query-embedding override proceeds without a fingerprint check: chunk table records no fingerprint"
             );
         }
-        Database::open_for_model_existing(&state.db_path, &config.model, recorded)
+        f(&db)
     }
 
     /// Debug fixtures may lack attestation or cached artifacts; enforce dimension alone
@@ -1311,8 +1326,9 @@ impl CodeSageServer {
             if let Some(query_embedding) = self.test_query_embedding_override()? {
                 // The override skips model loads; table compatibility remains checked and the render layer marks it.
                 let dim = query_embedding.len();
-                let db = self.open_test_override_db(&state, config, dim)?;
-                return f(&db, &query_embedding, None);
+                return self.with_test_override_db(&state, config, dim, |db| {
+                    f(db, &query_embedding, None)
+                });
             }
             let db = self.open_db_for(&state)?;
             let embedder_arc = self.get_or_load_embedder(config)?;
@@ -1322,21 +1338,21 @@ impl CodeSageServer {
                 .map(|m| self.get_or_load_reranker(m, &config.device))
                 .transpose()?;
 
-            let query_embedding = {
-                let mut guard = model_lock(&embedder_arc)?;
-                // Config compatibility is insufficient: verify the resident session's execution provider too.
-                let produces = session_fingerprint(config, &guard)?;
-                codesage_graph::require_current_semantic_table(&db, &produces)?;
-                guard.embed_one(query)?
-            };
-
             let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker_arc.map(|rr| {
                 // Hold the model lock only during inference, not SQL retrieval or post-processing.
                 Box::new(move |q: &str, docs: &[&str]| model_lock(&rr)?.score_pairs(q, docs))
                     as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
             });
 
-            f(&db, &query_embedding, rerank_fn)
+            let mut guard = model_lock(&embedder_arc)?;
+            // Config compatibility is insufficient: verify the resident execution provider too.
+            let produces = session_fingerprint(config, &guard)?;
+            with_query_snapshot(
+                &db,
+                &produces,
+                move || guard.embed_one(query),
+                |db, embedding| f(db, embedding, rerank_fn),
+            )
         })
     }
 }
@@ -1894,6 +1910,91 @@ mod tests {
             err.contains("device=cuda") && err.contains("device=cpu"),
             "{err}"
         );
+    }
+
+    /// Both MCP semantic search and query export execute their retrieval closures through
+    /// `with_project_query` and this production snapshot helper. Only inference is synthetic.
+    #[test]
+    fn query_retrieves_generation_a_after_inference_commits_generation_b() {
+        use codesage_embed::config::PoolingStrategy;
+        use codesage_graph::SemanticFingerprint;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let config = EmbeddingConfig {
+            model: "codesage-test/snapshot".into(),
+            pooling: Some(PoolingStrategy::Mean),
+            ..EmbeddingConfig::default()
+        };
+        let a = SemanticFingerprint::with_artifact_digest(&config, 4, "same-artifact");
+        let b = SemanticFingerprint::with_artifact_digest(
+            &EmbeddingConfig {
+                pooling: Some(PoolingStrategy::Cls),
+                ..config.clone()
+            },
+            4,
+            "same-artifact",
+        );
+        assert_ne!(a.as_str(), b.as_str());
+        let reader = Database::open_for_model(&path, &config.model, 4).unwrap();
+        let writer = Database::open_for_model(&path, &config.model, 4).unwrap();
+        assert_wal(&reader);
+        let vector_a = [0.25; 4];
+        reader
+            .insert_chunks("gen.rs", "rust", &[("generation-A", 1, 1, &vector_a)])
+            .unwrap();
+        reader.record_semantic_fingerprint(a.as_str()).unwrap();
+
+        let rows = with_query_snapshot(
+            &reader,
+            &a,
+            || {
+                writer.clear_semantic_fingerprint()?;
+                writer.execute_batch(|db| {
+                    db.delete_chunks_for_file("gen.rs")?;
+                    db.insert_chunks("gen.rs", "rust", &[("generation-B", 1, 1, &[-0.75; 4])])
+                })?;
+                writer.record_semantic_fingerprint(b.as_str())?;
+                assert_eq!(writer.semantic_fingerprint()?.as_deref(), Some(b.as_str()));
+                Ok(vector_a.to_vec())
+            },
+            |db, embedding| {
+                assert_eq!(db.semantic_fingerprint()?.as_deref(), Some(a.as_str()));
+                db.search_knn(&codesage_storage::embedding_to_bytes(embedding), 1, None)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.content.as_str())
+                .collect::<Vec<_>>(),
+            ["generation-A"]
+        );
+
+        // The next request cannot reuse the old session against the newly committed setup.
+        let err = with_query_snapshot(
+            &reader,
+            &a,
+            || panic!("stale request must fail before inference"),
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<codesage_graph::StaleSemanticTable>()
+                .is_some()
+        );
+        assert_eq!(
+            reader.semantic_fingerprint().unwrap().as_deref(),
+            Some(b.as_str())
+        );
+    }
+
+    fn assert_wal(db: &Database) {
+        db.execute_raw_for_tests(
+            "CREATE TEMP TABLE wal_control(mode TEXT NOT NULL CHECK(mode = 'wal'));
+             INSERT INTO wal_control SELECT journal_mode FROM pragma_journal_mode;",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2936,21 +3037,62 @@ mod tests {
     }
 
     #[test]
+    fn debug_query_retrieves_generation_a_after_writer_commits_generation_b() {
+        let (_dir, _root, server, state) = override_project_with_recorded_dim();
+        let writer =
+            Database::open_for_model(&state.db_path, &state.embedding_config.model, 4).unwrap();
+        assert_wal(&writer);
+        let vector = [0.25; 4];
+        writer
+            .insert_chunks("gen.rs", "rust", &[("generation-A", 1, 1, &vector)])
+            .unwrap();
+        let rows = server
+            .with_test_override_db(&state, &state.embedding_config, 4, |db| {
+                writer.execute_batch(|writer| {
+                    writer.delete_chunks_for_file("gen.rs")?;
+                    writer.insert_chunks("gen.rs", "rust", &[("generation-B", 1, 1, &vector)])
+                })?;
+                db.search_knn(&codesage_storage::embedding_to_bytes(&vector), 1, None)
+            })
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.content.as_str())
+                .collect::<Vec<_>>(),
+            ["generation-A"]
+        );
+
+        // Unattested debug fixtures remain allowed; a fresh request sees the committed data.
+        let rows = server
+            .with_test_override_db(&state, &state.embedding_config, 4, |db| {
+                db.search_knn(&codesage_storage::embedding_to_bytes(&vector), 1, None)
+            })
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.content.as_str())
+                .collect::<Vec<_>>(),
+            ["generation-B"]
+        );
+    }
+
+    #[test]
     fn test_override_open_accepts_recorded_dim() {
         let (_dir, _root, server, state) = override_project_with_recorded_dim();
-        let db = server
-            .open_test_override_db(&state, &state.embedding_config, 4)
+        let recorded = server
+            .with_test_override_db(&state, &state.embedding_config, 4, |db| {
+                db.recorded_semantic_dim()
+            })
             .expect("matching dim must open");
-        assert_eq!(db.recorded_semantic_dim().unwrap(), Some(4));
+        assert_eq!(recorded, Some(4));
     }
 
     #[test]
     fn test_override_open_refuses_dim_mismatch_without_creating_tables() {
         let (_dir, root, server, state) = override_project_with_recorded_dim();
         let err = server
-            .open_test_override_db(&state, &state.embedding_config, 8)
-            .err()
-            .expect("dim mismatch must be refused")
+            .with_test_override_db(&state, &state.embedding_config, 8, |_| Ok(()))
+            .expect_err("dim mismatch must be refused")
             .to_string();
         assert!(
             err.contains("recorded dim 4"),
@@ -2972,9 +3114,8 @@ mod tests {
             "[embedding]\nmodel = \"codesage-test/does-not-exist\"\ndevice = \"cpu\"\n",
         );
         let err = server
-            .open_test_override_db(&state, &state.embedding_config, 4)
-            .err()
-            .expect("unindexed model must be refused")
+            .with_test_override_db(&state, &state.embedding_config, 4, |_| Ok(()))
+            .expect_err("unindexed model must be refused")
             .to_string();
         assert!(
             err.contains("no recorded chunk table"),
