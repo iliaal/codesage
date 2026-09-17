@@ -2,9 +2,22 @@
 
 ## [0.34.0] - 2026-09-17
 
+### Changed
+
+- CMake library and test targets now retain distinct feature IDs when they share an entry file; existing IDs for these targets change after remapping.
+
 ### Fixed
 
 - CLI and MCP semantic search and query-based context export keep one database snapshot from the final provenance check through retrieval, preventing concurrent reindexing from mixing embedding generations.
+- Partial indexing now retains successful writes, returns failure, and retries incomplete structural, semantic, and feature-mapping work without stamping hook success.
+- Read-only database access now preserves SQLite errors and literal filesystem paths instead of falling back to unsafe immutable reads.
+- Runtime loading no longer mutates the process environment from safe library APIs; configured and discovered ONNX Runtime paths load directly.
+- Method fingerprints now match indexed symbol kinds, and generic Go pointer receivers share value-receiver qualification; the next index refreshes unchanged files under `extraction=5`.
+- JavaScript generator creation no longer makes deferred imports eager; direct iterator advancement still counts as execution.
+- Test recommendations and feature associations now preserve dotted basenames, and Go feature mapping excludes ignored and nonregular package members.
+- Benchmark scoring now preserves project identity, literal Git filenames, isolated ranking settings, and declared language limits; query generation rejects assignment-defined constant leaks.
+- Benchmark commands now reject duplicate project names and override inherited permission bypass. Impact-oracle interpolation handles quoted, commented, regex, and nested-template braces.
+- Contributor fixtures now disable inherited Git signing and hooks; release-profile handle tests no longer depend on debug-only embedding overrides.
 
 ## [0.33.1] - 2026-09-17
 
