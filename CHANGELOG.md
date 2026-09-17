@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.34.0] - 2026-09-17
+
 ### Fixed
 
 - CLI and MCP semantic search and query-based context export keep one database snapshot from the final provenance check through retrieval, preventing concurrent reindexing from mixing embedding generations.
@@ -1066,5 +1068,7 @@ Initial public release.
 
 [0.33.0]: https://github.com/iliaal/codesage/releases/tag/v0.33.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.33.1...HEAD
 [0.33.1]: https://github.com/iliaal/codesage/releases/tag/v0.33.1
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.34.0...HEAD
+[0.34.0]: https://github.com/iliaal/codesage/releases/tag/v0.34.0
