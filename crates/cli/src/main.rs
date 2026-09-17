@@ -884,9 +884,7 @@ fn main() {
         std::process::exit(0);
     }
 
-    // Set ORT/CUDA environment paths while single-threaded: set_var races with getenv.
-    // Native libraries load lazily, so no-op indexing avoids CUDA initialization.
-    // Shims and structural commands need no model environment setup.
+    // Cache runtime discovery before worker startup without loading native libraries.
     if !is_shim_invocation() && uses_embedder() {
         codesage_embed::model::init_for_main();
     }

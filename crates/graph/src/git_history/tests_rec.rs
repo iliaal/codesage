@@ -83,12 +83,9 @@ fn test_sibling_paths(
     root: Option<&Path>,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let mut withheld = Vec::new();
-    // First-dot stemming matches dotted names such as `foo.test.ts`.
-    let stem = file_path
-        .rsplit('/')
-        .next()
-        .map(|name| name.split('.').next().unwrap_or(name).to_string())
-        .unwrap_or_default();
+    // Strip only the language extension; interior dots belong to the source name.
+    let basename = file_path.rsplit('/').next().unwrap_or(file_path);
+    let stem = basename.rsplit_once('.').map_or(basename, |(stem, _)| stem);
     if stem.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -114,7 +111,7 @@ fn test_sibling_paths(
     let mut found = Vec::new();
     for c in &candidates {
         let normalized = c.trim_start_matches('/').to_string();
-        // First-dot stemming can regenerate the input test's own path.
+        // Never recommend an input path as its own sibling.
         if normalized == file_path {
             continue;
         }
@@ -1166,6 +1163,27 @@ mod tests {
 
     fn files(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn dotted_source_names_recommend_exact_siblings() {
+        let db = Database::open_in_memory().unwrap();
+        for path in [
+            "src/auth.service.ts",
+            "src/auth.service.spec.ts",
+            "src/auth.spec.ts",
+        ] {
+            add_file(&db, path);
+        }
+        let result = recommend_tests(&db, &files(&["src/auth.service.ts"])).unwrap();
+        assert_eq!(result.primary, files(&["src/auth.service.spec.ts"]));
+        assert!(test_sibling_exists(&db, "src/auth.service.ts").unwrap());
+        assert!(
+            test_sibling_paths(&db, "src/auth.service.spec.ts", None)
+                .unwrap()
+                .0
+                .is_empty()
+        );
     }
 
     fn reach_note(r: &TestRecommendations) -> &str {

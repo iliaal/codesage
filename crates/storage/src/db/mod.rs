@@ -759,20 +759,11 @@ impl Database {
     ///   therefore tolerate whatever schema is on disk rather than assume the
     ///   current one.
     ///
-    /// A WAL database needs a writable `-shm` for ordinary read-only access.
-    /// When that is unavailable the open retries with SQLite's `immutable=1`,
-    /// which is sound precisely in the case that forced it: nothing can be
-    /// writing to a database on a filesystem nobody can write to.
+    /// WAL reads retain SQLite's locking and change detection. If required
+    /// sidecars cannot be opened or initialized, return the original error:
+    /// reader permissions do not guarantee that other processes cannot write.
+    /// This API never opens the database as an immutable snapshot.
     pub fn open_read_only(path: &Path) -> Result<Self> {
-        Self::open_read_only_impl(path, codesage_protocol::work::current().is_none())
-    }
-
-    /// Preserve WAL and locking semantics even when a normal read cannot open.
-    pub fn open_read_only_strict(path: &Path) -> Result<Self> {
-        Self::open_read_only_impl(path, false)
-    }
-
-    fn open_read_only_impl(path: &Path, allow_immutable: bool) -> Result<Self> {
         use rusqlite::OpenFlags;
         init_vec_extension();
         reject_symlinked_db_path(path)?;
@@ -782,53 +773,17 @@ impl Database {
                 path.display()
             );
         }
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_URI
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        // Opening is lazy, so a WAL database that cannot create its `-shm`
-        // sidecar fails on the FIRST QUERY, not here. Probe before handing the
-        // handle back, and only then fall back.
-        let probe = |conn: &Connection| -> rusqlite::Result<()> {
-            conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .map(|_| ())
-        };
-        let conn = match Connection::open_with_flags(path, flags) {
-            Ok(conn) => {
-                install_work_control(&conn)?;
-                match probe(&conn) {
-                    Ok(()) => conn,
-                    Err(error) => {
-                        codesage_protocol::work::checkpoint()?;
-                        if !allow_immutable || !immutable_fallback_allowed(&error) {
-                            return Err(error.into());
-                        }
-                        let uri = format!("file:{}?immutable=1", path.display());
-                        let fallback = Connection::open_with_flags(&uri, flags).map_err(|_| {
-                            anyhow::anyhow!("could not read {} read-only: {error}", path.display())
-                        })?;
-                        install_work_control(&fallback)?;
-                        probe(&fallback)?;
-                        fallback
-                    }
-                }
-            }
-            Err(error) => {
-                if !allow_immutable || !immutable_fallback_allowed(&error) {
-                    return Err(error.into());
-                }
-                let uri = format!("file:{}?immutable=1", path.display());
-                let conn = Connection::open_with_flags(&uri, flags).map_err(|e| {
-                    anyhow::anyhow!("could not open {} read-only: {e}", path.display())
-                })?;
-                install_work_control(&conn)?;
-                probe(&conn).map_err(|e| {
-                    anyhow::anyhow!("could not read {} read-only: {e}", path.display())
-                })?;
-                conn
-            }
-        };
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)?;
+        install_work_control(&conn)?;
+        // Opening is lazy: probe before handing back a handle whose first WAL
+        // read may fail because it cannot initialize the required sidecars.
+        if let Err(error) = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            codesage_protocol::work::checkpoint()?;
+            return Err(error.into());
+        }
         crate::schema::init_db_read_only(&conn)?;
         Ok(Database {
             conn,
@@ -1241,11 +1196,6 @@ impl Database {
     }
 }
 
-fn immutable_fallback_allowed(error: &rusqlite::Error) -> bool {
-    matches!(error, rusqlite::Error::SqliteFailure(code, _)
-        if matches!(code.code, rusqlite::ErrorCode::ReadOnly | rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::PermissionDenied))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1644,11 +1594,10 @@ mod tests {
             let db = Database::open(&db_path).unwrap();
             db.upsert_file(&make_file("app/Svc.php")).unwrap();
         }
-        // Checkpoint so no -wal remains; a writable -shm is otherwise needed.
+        // Rollback-journal reads need no WAL sidecars on a read-only checkout.
         {
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                .unwrap();
+            conn.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
         }
 
         std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o400)).unwrap();
@@ -1665,6 +1614,110 @@ mod tests {
         // Restore so tempdir cleanup can remove the tree.
         std::fs::set_permissions(&cs, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn open_read_only_preserves_sidecar_errors_even_for_a_checkpointed_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let db = Database::open(&path).unwrap();
+            db.upsert_file(&make_file("checkpointed.rs")).unwrap();
+            db.conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+        }
+        // No writer remains and all content is checkpointed. That fact is not
+        // an authorization for this API to bypass SQLite's sidecar failure.
+        std::fs::create_dir(dir.path().join("index.db-wal")).unwrap();
+        let raw =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let original = raw
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_err();
+        let error = Database::open_read_only(&path)
+            .err()
+            .expect("sidecar failure must propagate");
+        let actual = error.downcast_ref::<rusqlite::Error>().unwrap();
+        assert_eq!(actual.sqlite_error_code(), original.sqlite_error_code());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_read_only_does_not_infer_snapshot_authorization_from_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        drop(Database::open(&path).unwrap());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let probe_path = dir.path().join("permission-probe");
+        if std::fs::File::create(&probe_path).is_ok() {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("permission regression requires a user without permission bypass");
+            return;
+        }
+        let raw =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let original = raw
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_err();
+        let result = Database::open_read_only(&path);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result
+            .err()
+            .expect("reader permissions cannot authorize immutable access");
+        assert_eq!(
+            error
+                .downcast_ref::<rusqlite::Error>()
+                .unwrap()
+                .sqlite_error_code(),
+            original.sqlite_error_code(),
+        );
+    }
+
+    #[test]
+    fn open_read_only_observes_later_wal_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let writer = Database::open(&path).unwrap();
+        writer.upsert_file(&make_file("before.rs")).unwrap();
+        let reader = Database::open_read_only(&path).unwrap();
+        assert!(reader.file_id_for_path("before.rs").unwrap().is_some());
+        assert!(reader.file_id_for_path("after.rs").unwrap().is_none());
+        writer.upsert_file(&make_file("after.rs")).unwrap();
+        assert!(reader.file_id_for_path("after.rs").unwrap().is_some());
+        assert!(reader.upsert_file(&make_file("forbidden.rs")).is_err());
+        assert!(writer.file_id_for_path("forbidden.rs").unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_read_only_addresses_the_exact_path_including_percent_query_and_fragment_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let names = [
+            std::ffi::OsString::from("index%252Edb?mode=memory#fragment"),
+            std::ffi::OsString::from_vec(b"index-\xff.db".to_vec()),
+        ];
+        for name in names {
+            let path = dir.path().join(name);
+            {
+                let writer = Database::open(&path).unwrap();
+                writer.upsert_file(&make_file("exact-path.rs")).unwrap();
+                writer
+                    .conn
+                    .execute_batch("PRAGMA journal_mode=DELETE")
+                    .unwrap();
+            }
+            let reader = Database::open_read_only(&path).unwrap();
+            assert!(reader.file_id_for_path("exact-path.rs").unwrap().is_some());
+        }
     }
 
     #[test]

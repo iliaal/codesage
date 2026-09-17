@@ -384,7 +384,13 @@ fn lazy_scope_kinds(language: Language) -> &'static [&'static str] {
 /// `(function () { ... })()` and `(function () { ... }).call(this)` run when
 /// their enclosing scope does, so they defer nothing by themselves; a stored
 /// `.bind(this)` or an unread `.call` only produces another function.
+/// Generator calls only create iterators; a directly chained `.next()` is a
+/// separate execution step. Stored iterators are not followed through bindings.
 fn is_immediately_invoked(function: &Node, source: &[u8]) -> bool {
+    let generator = matches!(
+        function.kind(),
+        "generator_function" | "generator_function_declaration"
+    );
     let mut node = *function;
     loop {
         let mut parent = node.parent();
@@ -403,8 +409,11 @@ fn is_immediately_invoked(function: &Node, source: &[u8]) -> bool {
                 .is_some_and(|child| child.id() == node.id())
         };
         match p.kind() {
-            "call_expression" => return is_field("function"),
-            "new_expression" => return is_field("constructor"),
+            "call_expression" => {
+                return is_field("function")
+                    && (!generator || iterator_is_immediately_advanced(&p, source));
+            }
+            "new_expression" => return !generator && is_field("constructor"),
             "member_expression" if is_field("object") => {
                 let property = p
                     .child_by_field_name("property")
@@ -431,6 +440,32 @@ fn is_immediately_invoked(function: &Node, source: &[u8]) -> bool {
             _ => return false,
         }
     }
+}
+
+/// Recognize the bounded positive case `generator().next()`, including
+/// parentheses around the iterator. This does not infer consumption elsewhere.
+fn iterator_is_immediately_advanced(iterator: &Node, source: &[u8]) -> bool {
+    let mut node = *iterator;
+    while let Some(parent) = node.parent() {
+        if parent.kind() != "parenthesized_expression" {
+            break;
+        }
+        node = parent;
+    }
+    let Some(member) = node.parent() else {
+        return false;
+    };
+    if member.kind() != "member_expression"
+        || member
+            .child_by_field_name("object")
+            .is_none_or(|n| n.id() != node.id())
+        || !member
+            .child_by_field_name("property")
+            .is_some_and(|n| n.utf8_text(source) == Ok("next"))
+    {
+        return false;
+    }
+    is_immediately_invoked(&member, source)
 }
 
 /// True when an import directive sits inside a function, method, closure, or
@@ -855,6 +890,41 @@ mod tests {
         assert_eq!(lazy_flags(&refs, "./bound"), vec![true]);
         // `.call` read but never invoked.
         assert_eq!(lazy_flags(&refs, "./later"), vec![true]);
+    }
+
+    #[test]
+    fn generator_creation_keeps_imports_lazy_until_direct_advancement() {
+        let source = r#"
+(function* () { require('./direct'); })();
+(async function* () { require('./async'); })();
+(function* () { require('./call'); }).call(null);
+(function* () { require('./apply'); }).apply(null, []);
+(function* () { require('./bound'); }).bind(null)();
+(function* () { require('./advanced'); })().next();
+((function* () { require('./advanced-call'); }).call(null)).next();
+(function* () { require('./unread-next'); })().next;
+function later() { (function* () { require('./nested'); })().next(); }
+(function () { require('./ordinary'); })();
+"#;
+        for language in [Language::JavaScript, Language::TypeScript] {
+            let tree = crate::parse::parse_file(source.as_bytes(), language).unwrap();
+            assert!(!tree.root_node().has_error(), "{language:?}");
+            let refs = refs_from_source(source, language);
+            for name in [
+                "./direct",
+                "./async",
+                "./call",
+                "./apply",
+                "./bound",
+                "./unread-next",
+                "./nested",
+            ] {
+                assert_eq!(lazy_flags(&refs, name), vec![true], "{language:?}: {name}");
+            }
+            for name in ["./advanced", "./advanced-call", "./ordinary"] {
+                assert_eq!(lazy_flags(&refs, name), vec![false], "{language:?}: {name}");
+            }
+        }
     }
 
     #[test]

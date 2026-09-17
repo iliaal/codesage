@@ -381,7 +381,7 @@ impl CodeSageServer {
             .parent()
             .and_then(Path::parent)
             .ok_or_else(|| anyhow::anyhow!("could not derive project root from db path"))?;
-        let db = codesage_storage::Database::open_read_only_strict(&state.db_path)?;
+        let db = codesage_storage::Database::open_read_only(&state.db_path)?;
         hooks.reached(SnapshotStage::BeforePin);
         let _snapshot = db.read_snapshot()?;
         hooks.reached(SnapshotStage::AfterPin);
@@ -1011,10 +1011,9 @@ mod tests {
             assert_eq!(ranked, expected_files);
         }
         assert_eq!(swaps.load(Ordering::SeqCst), 1);
-        let current = codesage_storage::Database::open_read_only_strict(
-            &root.path().join(".codesage/index.db"),
-        )
-        .unwrap();
+        let current =
+            codesage_storage::Database::open_read_only(&root.path().join(".codesage/index.db"))
+                .unwrap();
         assert_eq!(
             current.all_file_paths().unwrap(),
             ["new/1.rs", "new/2.rs", "new/3.rs"]

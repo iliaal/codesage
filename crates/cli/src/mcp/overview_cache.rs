@@ -581,7 +581,7 @@ impl OverviewCache {
                     if let Some(hook) = before_open {
                         hook()?;
                     }
-                    let db = Database::open_read_only_strict(&db_path)?;
+                    let db = Database::open_read_only(&db_path)?;
                     let snapshot = db.read_snapshot()?;
                     #[cfg(test)]
                     if let Some(hook) = hook {
@@ -937,7 +937,7 @@ mod tests {
         }
 
         fn recurrence_scores(&self) -> [f64; 2] {
-            let db = Database::open_read_only_strict(&self.path).unwrap();
+            let db = Database::open_read_only(&self.path).unwrap();
             let scores = [false, true].map(|recurrence| {
                 target_score(&top_risk_ranking_with_policy(&db, recurrence).unwrap())
             });

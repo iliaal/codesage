@@ -693,6 +693,54 @@ def check_provenance(header: str, label: str) -> None:
     check("(files=" in header and "symbols=" in header and "refs=" in header, f"{label}: index digest lists row counts")
 
 
+def cochange_path_checks() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = Path(td)
+        project = repo / "sub"
+        project.mkdir()
+        git(repo, "init", "-q")
+        git(repo, "config", "core.quotePath", "true")
+        unusual = ["café.py", " leading.py", "trailing.py ", 'quote"name.py']
+        if os.name == "posix":
+            unusual += ["\nfirst.py", "line\nbreak.py", "carriage\r\nreturn.py",
+                        "tab\tname.py", "back\\slash.py", "\x1eheader\x1fname.py",
+                        os.fsdecode(b"non-utf8-\xff.py")]
+        paths = ["anchor.rs", *unusual]
+        subject = "fix: preserve unusual filenames across updates"
+        commit_files(repo, project, subject, paths)
+        commit_files(repo, project, "fix: update ordinary source files together", ["anchor.rs", "plain.py"])
+        commit_files(repo, repo, "fix: update outside project source files", ["outside.py"])
+
+        walked = se.git_log_commits(project, 3)
+        check(walked is not None, "cochange: unusual path history is readable")
+        if walked is None:
+            return
+        commits, scanned = walked
+        check(scanned == 3 and [row[1] for row in commits] == [
+            "fix: update ordinary source files together", subject,
+        ], "cochange: scoped history preserves order and repository-wide window size")
+        by_subject = {row[1]: row for row in commits}
+        unusual_commit = by_subject.get(subject)
+        check(unusual_commit is not None and set(unusual_commit[2]) == set(paths),
+              "cochange: Git pathnames retain quoting, whitespace, separators, and raw bytes")
+
+        counts = {p: 1 for p in paths}
+        counts["anchor.rs"] = 100
+        cases = se.build_cochange_cases(
+            commits, counts, [], min_files=len(paths), max_files=len(paths),
+            include_tests=True, include_all_types=False, stats=se.CochangeStats(),
+        )
+        check(len(cases) == 1 and cases[0].query == subject
+              and cases[0].expected_files == sorted(unusual),
+              "cochange: lossless indexed path matching retains every gold file at min-files")
+
+        recent = se.git_log_commits(project, 2)
+        check(recent is not None and recent[1] == 2 and [row[1] for row in recent[0]] == [
+            "fix: update ordinary source files together",
+        ] and set(recent[0][0][2]) == {"anchor.rs", "plain.py"},
+              "cochange: path-scoped walk does not admit older commits outside the global window")
+
+
 def unit_checks() -> None:
     for p in ("tests/foo.rs", "src/__tests__/x.ts", "app/FooTest.php", "web/a.test.ts",
               "pkg/test_util.py", "pkg/x_test.go", "ext/a.phpt", "./test/x.c"):
@@ -910,6 +958,7 @@ def main() -> int:
         build_repo(repo, repo)
         out = Path(td) / "out"
         unit_checks()
+        cochange_path_checks()
 
         rc, stdout = run_main(["--mode", "cochange", "--project", str(repo), "--out", str(out), "--commits", "20"])
         check(rc == 0, "cochange: exit 0")

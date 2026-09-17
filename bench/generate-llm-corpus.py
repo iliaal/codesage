@@ -55,6 +55,9 @@ COMMIT_PREFIX = re.compile(
 DECLARED_SYMBOL = re.compile(
     r"\b(?:class|def|enum|fn|function|interface|struct|trait|type)\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
+ASSIGNED_CONSTANT = re.compile(
+    r"^[ \t]*(_*[A-Z][A-Z0-9_]*)[ \t]*(?::[^=\r\n]*)?=(?!=)", re.M
+)
 
 MIN_LINES = 30
 MAX_LINES = 500
@@ -148,10 +151,11 @@ def query_rejection_reason(query: str, rel_path: str, content: str) -> str | Non
         if term and term in q_lower:
             return f"query includes path term {term!r}"
 
-    for match in DECLARED_SYMBOL.finditer(content):
-        symbol = match.group(1).lower()
-        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])", q_lower):
-            return f"query includes symbol {match.group(1)!r}"
+    for pattern in (DECLARED_SYMBOL, ASSIGNED_CONSTANT):
+        for match in pattern.finditer(content):
+            symbol = match.group(1).lower()
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])", q_lower):
+                return f"query includes symbol {match.group(1)!r}"
 
     return None
 

@@ -3,7 +3,9 @@ use std::ffi::OsStr;
 use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-#[cfg(any(feature = "cuda", not(target_vendor = "apple")))]
+#[cfg(not(target_vendor = "apple"))]
+use std::sync::LazyLock;
+#[cfg(feature = "cuda")]
 use std::sync::Once;
 use std::sync::{Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
@@ -18,7 +20,8 @@ use wait_timeout::ChildExt;
 use crate::config::{EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_coreml, wants_cuda};
 
 #[cfg(not(target_vendor = "apple"))]
-static ORT_INIT: Once = Once::new();
+static ORT_DYLIB: LazyLock<Option<PathBuf>> =
+    LazyLock::new(|| ort_dylib_path_from_env().or_else(discover_ort_dylib));
 #[cfg(feature = "cuda")]
 static CUDA_PRELOAD: Once = Once::new();
 
@@ -402,26 +405,15 @@ fn verify_cuda_libs_mapped(maps: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One-shot startup hook: must be called from `main` before any tokio runtime
-/// or background thread is spawned. Resolves the ONNX Runtime + NVIDIA library
-/// locations and writes `LD_LIBRARY_PATH` / `ORT_DYLIB_PATH`. The underlying
-/// `std::env::set_var` calls are `unsafe` under Rust 2024 because concurrent
-/// `getenv` from another thread is UB; pinning the work to single-threaded
-/// startup eliminates the race even though the syntactic `unsafe` remains.
-///
-/// This is the environment-only half of startup and costs microseconds. The
-/// expensive half — dlopen of the CUDA/cuDNN stack — lives in
-/// [`preload_native_libs`], which writes no environment and therefore runs
-/// lazily from the session loader, so a command that never builds a session
-/// never maps those libraries.
-///
-/// `load_onnx_session` still calls `init_ort_dylib` under `Once::call_once` as
-/// a defensive fallback (so direct library users aren't silently broken), but
-/// in the bin path the work has already happened by then and the call is a
-/// cheap no-op.
+/// Resolve native-library locations ahead of the first session, without loading
+/// the runtime or changing the process environment. Safe after threads start.
+/// Session loading and fingerprinting also resolve these locations lazily, so
+/// library consumers do not need to call this startup optimization.
 pub fn init_for_main() {
     #[cfg(not(target_vendor = "apple"))]
-    init_ort_dylib();
+    let _ = selected_ort_dylib();
+    #[cfg(feature = "cuda")]
+    let _ = discover_nvidia_lib_dirs();
 }
 
 /// dlopen the CUDA/cuDNN stack from the discovered NVIDIA library
@@ -431,7 +423,7 @@ pub fn init_for_main() {
 ///
 /// Writes no environment variables: this runs from whatever thread builds the
 /// session, where a `set_var` would race every concurrent `getenv` in the
-/// process. Library-path discovery is the job of [`init_for_main`].
+/// process. Discovery and absolute-path preloading do not require a startup hook.
 #[cfg(feature = "cuda")]
 pub fn preload_native_libs() {
     CUDA_PRELOAD.call_once(|| {
@@ -461,25 +453,7 @@ pub fn preload_native_libs() {
     });
 }
 
-fn prepend_ld_library_path<P: AsRef<Path>>(dirs: &[P]) {
-    if dirs.is_empty() {
-        return;
-    }
-    let current = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    let joined: Vec<String> = dirs
-        .iter()
-        .map(|d| d.as_ref().to_string_lossy().to_string())
-        .collect();
-    let new_val = if current.is_empty() {
-        joined.join(":")
-    } else {
-        format!("{}:{current}", joined.join(":"))
-    };
-    unsafe { std::env::set_var("LD_LIBRARY_PATH", &new_val) };
-}
-
-/// Locate the ONNX Runtime shared library. Order: `ORT_DYLIB_PATH` env var →
-/// site-packages `onnxruntime/capi/libonnxruntime.so*` → standard system locations.
+/// Locate ONNX Runtime in pip site-packages, then standard system locations.
 #[cfg(not(target_vendor = "apple"))]
 fn discover_ort_dylib() -> Option<PathBuf> {
     for base in probe_python_site_packages() {
@@ -532,32 +506,31 @@ fn ort_dylib_path_from_env() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Runtime ONNX Runtime dylib discovery (`ORT_DYLIB_PATH`, pip site-packages).
-/// No-op on Apple targets: macOS builds statically link ORT with the CoreML EP.
+/// Select one runtime path for both fingerprinting and session loading. Keep it
+/// process-local: publishing discovery through `set_var` is unsound once other
+/// threads may be reading the native environment.
 #[cfg(not(target_vendor = "apple"))]
-pub fn init_ort_dylib() {
-    ORT_INIT.call_once(|| {
-        if ort_dylib_path_from_env().is_some() {
-            // Caller took control. Still prepend discovered NVIDIA dirs so CUDA loads.
-            let nvidia = discover_nvidia_lib_dirs();
-            if !nvidia.is_empty() {
-                prepend_ld_library_path(nvidia);
-            }
-            return;
-        }
+fn selected_ort_dylib() -> Option<&'static Path> {
+    ORT_DYLIB.as_deref()
+}
 
-        let Some(ort_path) = discover_ort_dylib() else {
-            return;
-        };
-        unsafe { std::env::set_var("ORT_DYLIB_PATH", &ort_path) };
-
-        let mut extra_dirs: Vec<PathBuf> = Vec::new();
-        if let Some(dir) = ort_path.parent() {
-            extra_dirs.push(dir.to_path_buf());
-        }
-        extra_dirs.extend(discover_nvidia_lib_dirs().iter().cloned());
-        prepend_ld_library_path(&extra_dirs);
-    });
+/// Load the configured or discovered ONNX Runtime without changing environment
+/// variables. Safe to call after other threads have started. If discovery finds
+/// nothing, leave ort's normal platform-soname fallback available to sessions.
+/// Call before using other ort APIs: ort retains the first runtime loaded in the
+/// process, including one loaded by the embedding application's own ort calls.
+#[cfg(not(target_vendor = "apple"))]
+pub fn init_ort_dylib() -> Result<()> {
+    if let Some(path) = selected_ort_dylib() {
+        // rc.13 loads the library inside init_from, not EnvironmentBuilder::commit.
+        // Do not commit default environment options over an application's options.
+        drop(
+            ort::init_from(path).with_context(|| {
+                format!("loading ONNX Runtime shared library {}", path.display())
+            })?,
+        );
+    }
+    Ok(())
 }
 
 /// Repo-local model names are untrusted: require an allowlisted model and
@@ -682,7 +655,7 @@ impl ModelArtifacts {
 }
 
 /// The ONNX Runtime shared library a session built by this process would
-/// load: the `ORT_DYLIB_PATH` the loader honours after discovery. `Ok(None)`
+/// load: the configured or discovered path passed directly to ort. `Ok(None)`
 /// on a target that links the runtime statically. On a dynamic-loading
 /// target an unlocated library is an error, never an absent component: the
 /// loader would resolve a bare soname through the dynamic linker's search
@@ -695,9 +668,8 @@ pub fn ort_runtime_dylib() -> Result<Option<PathBuf>> {
     }
     #[cfg(not(target_vendor = "apple"))]
     {
-        init_ort_dylib();
-        match ort_dylib_path_from_env() {
-            Some(path) => Ok(Some(path)),
+        match selected_ort_dylib() {
+            Some(path) => Ok(Some(path.to_path_buf())),
             _ => anyhow::bail!(
                 "ONNX Runtime shared library not located (no ORT_DYLIB_PATH, no pip \
                  onnxruntime, nothing under /usr/lib or /usr/local/lib); set \
@@ -1504,7 +1476,7 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
     }
 
     #[cfg(not(target_vendor = "apple"))]
-    init_ort_dylib();
+    init_ort_dylib()?;
 
     crate::config::validate_device(device)?;
     let want_cuda = wants_cuda(device);
@@ -3065,9 +3037,8 @@ mod tests {
         );
     }
 
-    /// Serializes the env-seam tests below: `HF_HOME`, `HOME`, and
-    /// `ORT_DYLIB_PATH` are process-global and the harness runs tests on
-    /// threads. Every test below restores what it touches via [`SavedEnv`].
+    /// Serializes the env-seam tests below for `HF_HOME` and `HOME`.
+    /// Every test below restores what it touches via [`SavedEnv`].
     fn env_lock() -> std::sync::LockResult<std::sync::MutexGuard<'static, ()>> {
         static LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
         LOCK.lock()
@@ -3160,28 +3131,6 @@ mod tests {
             hf_cache_from_env().is_none(),
             "an empty HOME resolves nothing either"
         );
-    }
-
-    #[cfg(not(target_vendor = "apple"))]
-    #[test]
-    fn empty_ort_dylib_path_counts_as_unset() {
-        let _lock = env_lock().unwrap_or_else(PoisonError::into_inner);
-        let _empty = SavedEnv::set("ORT_DYLIB_PATH", "");
-        assert_eq!(
-            ort_dylib_path_from_env(),
-            None,
-            "an empty ORT_DYLIB_PATH must fall through to discovery instead of \
-             counting as caller-takes-control and hard-failing inside ORT"
-        );
-        {
-            let _set = SavedEnv::set("ORT_DYLIB_PATH", "/tmp/libonnxruntime.so");
-            assert_eq!(
-                ort_dylib_path_from_env(),
-                Some(PathBuf::from("/tmp/libonnxruntime.so"))
-            );
-        }
-        let _unset = SavedEnv::remove("ORT_DYLIB_PATH");
-        assert_eq!(ort_dylib_path_from_env(), None);
     }
 
     #[test]

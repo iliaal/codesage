@@ -97,6 +97,7 @@ import argparse
 import functools
 import ast
 import hashlib
+import os
 import random
 import re
 import sqlite3
@@ -908,11 +909,12 @@ def referencing_paths(
     ) if v.accepted]
 
 
-def _git(project: Path, args: list[str]) -> subprocess.CompletedProcess | None:
+def _git(project: Path, args: list[str], *, binary: bool = False) -> subprocess.CompletedProcess | None:
     try:
         return subprocess.run(
-            ["git", *args], cwd=project, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=GIT_TIMEOUT_SECS,
+            ["git", *args], cwd=project, capture_output=True, text=not binary,
+            encoding=None if binary else "utf-8", errors=None if binary else "replace",
+            timeout=GIT_TIMEOUT_SECS,
         )
     except subprocess.TimeoutExpired:
         print(f"[self-eval] warn: git timed out after {GIT_TIMEOUT_SECS}s in {project}", file=sys.stderr)
@@ -939,24 +941,34 @@ def git_log_commits(
         return None
     window = set(rev.stdout.split())
     log = _git(project, [
-        "log", "--name-only", "--no-merges", "--relative", f"-n{commits}",
-        "--format=%x1e%H%x1f%s", "--", ".",
-    ])
+        "log", "-z", "--name-only", "--no-merges", "--relative", f"-n{commits}",
+        "--format=%x00%H%x00%s", "--", ".",
+    ], binary=True)
     if log is None or log.returncode != 0:
-        detail = log.stderr.strip() if log is not None else "timeout"
+        detail = log.stderr.decode("utf-8", errors="replace").strip() if log is not None else "timeout"
         print(f"[cochange] warn: git log failed in {project}: {detail}", file=sys.stderr)
         return None
     out: list[tuple[str, str, list[str]]] = []
-    for record in log.stdout.split("\x1e"):
-        if not record.strip():
-            continue
-        head, _, body = record.partition("\n")
-        sha, _, subject = head.partition("\x1f")
-        sha = sha.strip()
-        if sha not in window:
-            continue
-        paths = [line.strip() for line in body.splitlines() if line.strip()]
-        out.append((sha, subject.strip(), paths))
+    # Each header starts with an empty NUL field, followed by SHA and subject.
+    # Git inserts one LF before the first pathname; subsequent fields are raw
+    # pathnames. NUL cannot occur in a pathname, unlike newlines or %x1e/%x1f.
+    fields = iter(log.stdout.split(b"\0"))
+    paths: list[str] = []
+    first_path = False
+    for field in fields:
+        if not field:
+            sha = next(fields, b"").decode("ascii")
+            if not sha:
+                break  # Trailing NUL, or an empty log.
+            subject = next(fields).decode("utf-8", errors="replace")
+            paths = []
+            first_path = True
+            if sha in window:
+                out.append((sha, subject.strip(), paths))
+        else:
+            path = field.removeprefix(b"\n") if first_path else field
+            paths.append(os.fsdecode(path))
+            first_path = False
     return out, len(window)
 
 

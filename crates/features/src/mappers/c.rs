@@ -43,7 +43,7 @@ impl FeatureMapper for CCppMapper {
             .map(|s| s.entry_path.clone())
             .collect();
         seeds.extend(main_function_targets(ctx, &files, &already_seeded_paths)?);
-        Ok(dedup_by_entry(seeds))
+        Ok(dedup_targets(seeds))
     }
 }
 
@@ -421,6 +421,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                     summary: format!("CMake test executable `{name}` declared in {cm}"),
                     source: "cmake-test",
                     confidence: FeatureConfidence::High,
+                    target_name: Some(name.clone()),
                     tags: cmake_target_tags(language, "test", is_cuda),
                     owned_files,
                     context_files,
@@ -510,6 +511,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                 summary: format!("CMake `add_library({name})` declared in {cm}"),
                 source: "cmake-lib",
                 confidence: FeatureConfidence::High,
+                target_name: Some(name.clone()),
                 tags: cmake_target_tags(language, "library", is_cuda),
                 owned_files,
                 context_files,
@@ -1030,15 +1032,13 @@ fn strip_cmake_target_options(words: &mut Vec<String>) {
     });
 }
 
-/// Dedup keyed on `(entry_path, kind)`. First seed wins, so the order
-/// callers extend `seeds` in matters: autotools and CMake run before
-/// main() detection so the higher-confidence build-target seed survives
-/// when both fire on the same file.
-fn dedup_by_entry(seeds: Vec<FeatureSeed>) -> Vec<FeatureSeed> {
-    let mut seen: BTreeSet<(String, FeatureKind)> = BTreeSet::new();
+/// Retain distinct named build targets even when they share an entry file.
+/// Generic main() duplicates are suppressed before their seeds are constructed.
+fn dedup_targets(seeds: Vec<FeatureSeed>) -> Vec<FeatureSeed> {
+    let mut seen = BTreeSet::new();
     let mut out = Vec::with_capacity(seeds.len());
     for s in seeds {
-        let key = (s.entry_path.clone(), s.kind);
+        let key = (s.entry_path.clone(), s.kind, s.source, s.discriminator());
         if seen.insert(key) {
             out.push(s);
         }

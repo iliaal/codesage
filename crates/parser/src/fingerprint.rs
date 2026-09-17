@@ -133,6 +133,7 @@ pub fn file_fingerprints(
             continue;
         };
         let def = def_cap.node;
+        let kind = crate::extract::refine_definition_kind(kind, &def, language);
         // Keep the fingerprinted set equal to the indexed symbol set: a
         // definition in a dead `#if 0` arm is not a symbol either.
         if dead.covers(&def) {
@@ -336,6 +337,46 @@ fn two(x: i32) -> i32 { let mut s = 0; for i in 0..x { s += i; if s > 100 { brea
         let f = fps(&src, Language::C);
         assert_eq!(f.len(), 2, "{f:?}");
         assert_ne!(f[0].line_start, f[1].line_start);
+    }
+
+    #[test]
+    fn fingerprint_kinds_match_methods_and_nested_local_functions() {
+        let cases = [
+            (
+                Language::Python,
+                "class Worker:\n    def run(self, items):\n        def local(items):\n            total = 0\n            for item in items:\n                if item > 0:\n                    total += item * 2\n                else:\n                    total -= 1\n            total += len(items)\n            return total\n        return local(items)\n",
+            ),
+            (
+                Language::Rust,
+                "struct Worker; impl Worker { fn run(&self, items: &[i32]) -> i32 { fn local(items: &[i32]) -> i32 { let mut total = 0; for item in items { if *item > 0 { total += item * 2; } else { total -= 1; } } total } local(items) } }",
+            ),
+            (
+                Language::Rust,
+                "trait Worker { fn run(&self, items: &[i32]) -> i32 { fn local(items: &[i32]) -> i32 { let mut total = 0; for item in items { if *item > 0 { total += item * 2; } else { total -= 1; } } total } local(items) } }",
+            ),
+            (
+                Language::Cpp,
+                "struct Worker { int run(int n) { int total = 0; for (int i = 0; i < n; ++i) { if (i > 2) { total += i * 2; } else { total -= 1; } } return total; } }; int local(int n) { int total = 0; for (int i = 0; i < n; ++i) { if (i > 2) { total += i * 2; } else { total -= 1; } } return total; }",
+            ),
+        ];
+        for (language, source) in cases {
+            let tree = parse_file(source.as_bytes(), language).unwrap();
+            assert!(!tree.root_node().has_error(), "{language:?}");
+            let symbols =
+                crate::extract::extract_symbols(&tree, source.as_bytes(), language, "fixture")
+                    .unwrap();
+            let fingerprints = file_fingerprints(&tree, source.as_bytes(), language);
+            for (name, expected) in [("run", SymbolKind::Method), ("local", SymbolKind::Function)] {
+                let symbol = symbols.iter().find(|s| s.name == name).unwrap();
+                let fingerprint = fingerprints.iter().find(|f| f.name == name).unwrap();
+                assert_eq!(symbol.kind, expected, "{language:?}: {name}");
+                assert_eq!(fingerprint.kind, expected, "{language:?}: {name}");
+                assert_eq!(
+                    (fingerprint.line_start, fingerprint.line_end),
+                    (symbol.line_start, symbol.line_end)
+                );
+            }
+        }
     }
 
     #[test]

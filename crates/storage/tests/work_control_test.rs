@@ -18,13 +18,13 @@ fn opened_connection_detects_replacement_even_when_path_returns_to_original_inod
     }
     std::fs::rename(&path, &saved).unwrap();
     std::fs::rename(&replacement, &path).unwrap();
-    let db = Database::open_read_only_strict(&path).unwrap();
+    let db = Database::open_read_only(&path).unwrap();
     assert!(db.path_still_matches_open_file(&path).unwrap());
     std::fs::rename(&path, &replacement).unwrap();
     std::fs::rename(&saved, &path).unwrap();
     assert!(!db.path_still_matches_open_file(&path).unwrap());
     assert!(
-        Database::open_read_only_strict(&path)
+        Database::open_read_only(&path)
             .unwrap()
             .path_still_matches_open_file(&path)
             .unwrap()
@@ -57,7 +57,7 @@ fn opened_connection_rejects_retargeted_ancestor_symlink() {
     let saved_alias = directory.path().join("saved-alias");
     std::os::unix::fs::symlink(&replacement, &alias).unwrap();
     let expected = alias.join("index.db");
-    let db = Database::open_read_only_strict(&expected).unwrap();
+    let db = Database::open_read_only(&expected).unwrap();
     assert!(db.path_still_matches_open_file(&expected).unwrap());
     std::fs::rename(&alias, &saved_alias).unwrap();
     std::os::unix::fs::symlink(&original, &alias).unwrap();
@@ -105,7 +105,7 @@ fn progress_callback_discovers_deadline_without_timer_thread() {
     drop(Database::open(&path).unwrap());
     let control = WorkControl::new(Some(Instant::now() + Duration::from_millis(250)));
     let _scope = control.enter();
-    let db = Database::open_read_only_strict(&path).unwrap();
+    let db = Database::open_read_only(&path).unwrap();
     let started = Instant::now();
     assert!(db.execute_raw_for_tests(EXPENSIVE_SQL).is_err());
     assert_eq!(control.reason(), Some(StopReason::DeadlineExceeded));
@@ -120,12 +120,12 @@ fn cancellation_leaves_other_connection_usable() {
     let stopped = WorkControl::new(None);
     let first = {
         let _scope = stopped.enter();
-        Database::open_read_only_strict(&path).unwrap()
+        Database::open_read_only(&path).unwrap()
     };
     let unaffected = WorkControl::new(None);
     let second = {
         let _scope = unaffected.enter();
-        Database::open_read_only_strict(&path).unwrap()
+        Database::open_read_only(&path).unwrap()
     };
     stopped.cancel(StopReason::ClientCancelled);
     assert!(first.execute_raw_for_tests(EXPENSIVE_SQL).is_err());
@@ -143,19 +143,12 @@ fn busy_read_only_open_never_falls_back_to_immutable() {
         .unwrap();
     let control = WorkControl::new(None);
     let _scope = control.enter();
-    for strict in [false, true] {
-        let started = Instant::now();
-        let result = if strict {
-            Database::open_read_only_strict(&path)
-        } else {
-            Database::open_read_only(&path)
-        };
-        let error = result
-            .err()
-            .expect("locked database must not open as immutable");
-        assert!(error.chain().any(|cause| matches!(cause.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy)));
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
+    let started = Instant::now();
+    let error = Database::open_read_only(&path)
+        .err()
+        .expect("locked database must not open as immutable");
+    assert!(error.chain().any(|cause| matches!(cause.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy)));
+    assert!(started.elapsed() < Duration::from_secs(1));
     writer.execute_raw_for_tests("ROLLBACK").unwrap();
 }
 

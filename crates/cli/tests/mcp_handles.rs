@@ -27,16 +27,19 @@ impl Drop for Server {
 }
 
 impl Server {
-    fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_codesage"))
+    fn start(query_embedding: Option<&str>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codesage"));
+        command
             .args(["mcp", "--direct"])
             .env("CODESAGE_WATCH", "0")
-            .env("CODESAGE_MCP_TEST_QUERY_EMBEDDING", "0.1,0.2,0.3,0.4")
+            .env_remove("CODESAGE_MCP_TEST_QUERY_EMBEDDING")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::inherit());
+        if let Some(embedding) = query_embedding {
+            command.env("CODESAGE_MCP_TEST_QUERY_EMBEDDING", embedding);
+        }
+        let mut child = command.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, responses) = mpsc::channel();
         std::thread::spawn(move || {
@@ -189,6 +192,8 @@ fn fixture(root: &Path) {
     run(root, &["init"]);
     run(root, &["index", "--no-semantic"]);
     run(root, &["git-index", "--full"]);
+    // Structural bundles read stored chunk text without inference or attestation.
+    // Only the debug-only search test queries these synthetic vectors.
     let db = Database::open_for_model(
         &root.join(".codesage/index.db"),
         "jinaai/jina-embeddings-v2-base-code",
@@ -227,11 +232,11 @@ fn assert_handle(row: &Value, key: &str, prefix: &str, what: &str) -> String {
 }
 
 #[test]
-fn every_row_emitting_tool_carries_handles() {
+fn structural_row_emitting_tools_carry_handles() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     fixture(&root);
-    let mut server = Server::start();
+    let mut server = Server::start(None);
 
     let symbols = server.call(&root, "find_symbol", json!({"name": "inner"}));
     let inner = &rows(&symbols, "results", "find_symbol")[0];
@@ -251,24 +256,6 @@ fn every_row_emitting_tool_carries_handles() {
         }
     }
     assert!(saw_caller, "a call row from `outer`: {references}");
-
-    let search = server.call(
-        &root,
-        "search",
-        json!({"query": "inner helper", "limit": 5}),
-    );
-    for row in rows(&search, "results", "search") {
-        let handle = assert_handle(row, "handle", "chunk:", "search");
-        assert_eq!(
-            handle,
-            format!(
-                "chunk:{}:{}-{}",
-                row["file_path"].as_str().unwrap(),
-                row["start_line"],
-                row["end_line"]
-            )
-        );
-    }
 
     let trace = server.call(
         &root,
@@ -426,5 +413,34 @@ fn every_row_emitting_tool_carries_handles() {
         for row in rows(cluster, "top_files", "assess_risk_diff cluster") {
             assert_handle(row, "handle", "file:", "assess_risk_diff top_files");
         }
+    }
+}
+
+// The production binary honors synthetic query embeddings only in debug builds.
+// Keep semantic search separate so release still exercises all structural tools.
+#[cfg(debug_assertions)]
+#[test]
+fn semantic_search_rows_carry_handles() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fixture(&root);
+    let mut server = Server::start(Some("0.1,0.2,0.3,0.4"));
+
+    let search = server.call(
+        &root,
+        "search",
+        json!({"query": "inner helper", "limit": 5}),
+    );
+    for row in rows(&search, "results", "search") {
+        let handle = assert_handle(row, "handle", "chunk:", "search");
+        assert_eq!(
+            handle,
+            format!(
+                "chunk:{}:{}-{}",
+                row["file_path"].as_str().unwrap(),
+                row["start_line"],
+                row["end_line"]
+            )
+        );
     }
 }

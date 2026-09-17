@@ -1,5 +1,5 @@
 //! Stable feature IDs. `feature_id` shape is `feat_<16-hex>` derived from
-//! the seed's identity tuple (kind, source, entry_path, command|route|symbol).
+//! the seed's identity tuple (kind, source, entry_path, command|route|symbol|target).
 //! Re-running the mapper against the same repo produces the same id so an
 //! agent can quote it across sessions.
 

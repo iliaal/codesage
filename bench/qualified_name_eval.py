@@ -178,7 +178,12 @@ def main():
     if args.explain_parity and not args.pipeline:
         parser.error("--explain-parity requires --pipeline")
     root = Path(__file__).resolve().parents[1]
-    projects = dict(value.split("=", 1) for value in args.project)
+    projects = {}
+    for value in args.project:
+        name, path = value.split("=", 1)
+        if name in projects:
+            parser.error(f"duplicate --project name: {name}")
+        projects[name] = path
     cases = [case for case in json.loads(args.cases.read_text()) if case["split"] == args.split]
     if not cases:
         parser.error("selected split contains no cases")

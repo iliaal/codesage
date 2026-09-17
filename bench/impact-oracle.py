@@ -18,6 +18,10 @@ honoured and the oracle cannot count a file codesage never saw. Precision and
 recall are computed per symbol and micro-averaged (summed hits over summed
 sizes) in the TOTAL row, matching the method recorded on bead cs-z82.
 
+Code-only stripping supports JavaScript/TypeScript-family files and PHP only.
+If the index contains any other file extension, scoring stops with an error
+before emitting results; unsupported files are never treated as stripped code.
+
 Usage:
   impact-oracle.py --repo /tmp/semble-bench-repos/axios \
       --binary target/debug/codesage \
@@ -70,8 +74,14 @@ def strip_js(src: str) -> str:
     """Blank out comments, string literals, template literals, and regex
     literals. Length and line structure are preserved so no other position
     shifts; the blanked regions become spaces."""
+    return _strip_js(src, 0)[0]
+
+
+def _strip_js(src: str, i: int, interpolation: bool = False) -> tuple[str, int]:
+    """Scan code until EOF or an interpolation's closing executable brace."""
     out: list[str] = []
-    i, n = 0, len(src)
+    n = len(src)
+    depth = 1 if interpolation else 0
     while i < n:
         c = src[i]
         two = src[i : i + 2]
@@ -114,20 +124,11 @@ def strip_js(src: str) -> str:
                         i += 1
                     continue
                 if src[i : i + 2] == "${":
-                    # Interpolated expression: keep its code, but strings inside
-                    # it are handled by recursion on the balanced slice.
-                    depth = 1
-                    j = i + 2
-                    while j < n and depth:
-                        if src[j] == "{":
-                            depth += 1
-                        elif src[j] == "}":
-                            depth -= 1
-                        j += 1
-                    out.append("  ")
-                    out.append(strip_js(src[i + 2 : j - 1]))
-                    out.append(" ")
-                    i = j
+                    # The same lexer strips literals and finds the matching
+                    # brace, including recursively nested template expressions.
+                    out.extend("  ")
+                    expression, i = _strip_js(src, i + 2, interpolation=True)
+                    out.extend(expression)
                     continue
                 out.append("\n" if src[i] == "\n" else " ")
                 i += 1
@@ -158,9 +159,17 @@ def strip_js(src: str) -> str:
                     out.append(" ")
                     i += 1
                 continue
+        if interpolation:
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    out.append(" ")
+                    return "".join(out), i + 1
         out.append(c)
         i += 1
-    return "".join(out)
+    return "".join(out), i
 
 
 def strip_php(src: str) -> str:
@@ -218,7 +227,7 @@ def strip_for(path: str, text: str) -> str:
         return strip_js(text)
     if ext in PHP_EXTS:
         return strip_php(text)
-    return text
+    raise ValueError(f"code-only scoring unsupported for indexed file: {path}")
 
 
 def run(binary: str, repo: Path, *args: str) -> str:
@@ -282,6 +291,13 @@ def main() -> None:
         sys.stderr.write(run(binary, repo, "index", "--no-semantic"))
 
     files = indexed_files(repo)
+    supported = JS_EXTS | PHP_EXTS
+    unsupported = sorted(rel for rel in files if Path(rel).suffix not in supported)
+    if unsupported:
+        ap.error(
+            "code-only scoring supports only JavaScript/TypeScript and PHP; "
+            "unsupported indexed files: " + ", ".join(unsupported)
+        )
     raw_text: dict[str, str] = {}
     code_text: dict[str, str] = {}
     for rel in files:

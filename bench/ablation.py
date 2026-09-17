@@ -12,6 +12,10 @@ knobs from env vars on every invocation (the constants are cached per-process
 via OnceLock, and each CLI call is a fresh process). So we sweep arms purely by
 varying the subprocess environment — nothing persistent, nothing to install.
 
+Inherited ranking knobs are removed before each arm's overrides are applied and
+their names are reported on stderr. Operational settings (watcher, runtime paths,
+model caches, and credentials) are preserved.
+
 Arms and the env var each flips (the `ARMS` table below is authoritative):
 
   baseline             (shipped behavior, no overrides)
@@ -68,6 +72,26 @@ ARMS: dict[str, tuple[dict[str, str], bool]] = {
     "qualified_name_boost": ({"CODESAGE_QUALIFIED_NAME_BOOST": "1"}, False),
 }
 
+# Keep in sync with crates/graph/src/search.rs: mod tuning and qualified_groups_enabled.
+# Arm keys also cover optional fusion-weight patches not present in shipped builds.
+RANKING_ENV_KEYS = {key for overrides, _ in ARMS.values() for key in overrides} | {
+    "CODESAGE_STEM_SCAN",
+    "CODESAGE_TEST_QUERY_AWARE",
+    "CODESAGE_FILE_SATURATION",
+    "CODESAGE_DIR_SATURATION",
+    "CODESAGE_DIR_SATURATION_THRESHOLD",
+    "CODESAGE_DIR_SATURATION_DECAY",
+    "CODESAGE_ADAPTIVE_RERANK",
+    "CODESAGE_VERSION_DEMOTE",
+    "CODESAGE_PLATFORM_DEMOTE",
+    "CODESAGE_PHP_DECLARATION_DEMOTE",
+    "CODESAGE_FUSED_RERANK",
+    "CODESAGE_STEM_MATCH_BOOST",
+    "CODESAGE_HYBRID",
+    "CODESAGE_MENTION_ANCHOR",
+    "CODESAGE_QUALIFIED_GROUPS",
+}
+
 METRIC_KEYS = ["miss_rate", "median_first", "r5", "r10", "mean_tokens_to_hit", "search_failures"]
 
 # Search failures invalidate retrieval comparisons.
@@ -105,7 +129,11 @@ def parse_metrics(stdout: str) -> dict[str, str]:
 
 
 def run_arm(runner: Path, corpus: Path, bin_: str, limit: int, env_over: dict[str, str]) -> dict[str, str]:
-    env = {**os.environ, **env_over}
+    env = os.environ.copy()
+    for key in sorted(RANKING_ENV_KEYS & env.keys()):
+        del env[key]
+        print(f"  [env] stripped inherited ranking knob: {key}", file=sys.stderr)
+    env.update(env_over)
     cmd = [sys.executable, str(runner), str(corpus), "--codesage-bin", bin_, "--limit", str(limit)]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=3600)

@@ -179,7 +179,7 @@ fn write_feature_map_state(root: &Path, fingerprint: u64) {
     }
 }
 
-/// Partial mapping skips garbage collection; leave the marker unchanged to force a retry.
+/// A partial map cannot authorize skipping unchanged inputs on the next pass.
 fn record_feature_map_state(
     root: &Path,
     db: &Database,
@@ -191,6 +191,11 @@ fn record_feature_map_state(
             write_feature_map_state(root, fp);
         }
         return;
+    }
+    if let Err(error) = std::fs::remove_file(feature_map_state_path(root))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, "failed to invalidate feature-map marker");
     }
     for err in mapper_errors {
         tracing::warn!(error = %err, "feature mapper failed; skip marker not advanced");
@@ -344,18 +349,49 @@ pub(crate) fn cmd_index(
         );
     }
 
-    let (db, mut embedder) = if no_semantic {
+    let (db, embedder) = if no_semantic {
         (open_db(&root)?, None)
     } else {
         let (db, embedder, fingerprint) = open_index_db_and_embedder(&root, full, &emb_config)?;
         (db, Some((embedder, fingerprint)))
     };
 
+    run_index_passes(
+        root,
+        db,
+        excludes,
+        full,
+        (!no_features).then_some(codesage_features::map_features_detailed),
+        verbose,
+        embedder,
+    )
+}
+
+type FeatureMapper =
+    fn(&Path, &Database, &[String]) -> Result<codesage_features::FeatureMapOutcome>;
+
+#[cfg(test)]
+#[path = "index_completion_tests.rs"]
+mod completion_tests;
+
+fn run_index_passes(
+    root: PathBuf,
+    db: Database,
+    excludes: Vec<String>,
+    full: bool,
+    map_features: Option<FeatureMapper>,
+    verbose: bool,
+    mut embedder: Option<(Box<dyn TextEmbedder>, SemanticFingerprint)>,
+) -> Result<()> {
     let stats = if full {
         full_index(&root, &db, &excludes, verbose)?
     } else {
         incremental_index(&root, &db, &excludes, verbose)?
     };
+    let mut incomplete = Vec::new();
+    if stats.files_failed > 0 {
+        incomplete.push(format!("structural: {} failed files", stats.files_failed));
+    }
 
     if verbose {
         tracing::info!(
@@ -427,13 +463,7 @@ pub(crate) fn cmd_index(
     }
 
     // Mapping needs structural references and boundaries before semantic indexing.
-    if no_features {
-        if verbose {
-            tracing::info!("feature mapping skipped (--no-features)");
-        } else {
-            println!("Features:   skipped (--no-features)");
-        }
-    } else {
+    if let Some(map_features) = map_features {
         let skip = can_skip_feature_mapping(
             full,
             stats.files_indexed,
@@ -452,9 +482,15 @@ pub(crate) fn cmd_index(
             if verbose {
                 tracing::info!("mapping features");
             }
-            match codesage_features::map_features_detailed(&root, &db, &excludes) {
+            match map_features(&root, &db, &excludes) {
                 Ok(outcome) => {
                     record_feature_map_state(&root, &db, &excludes, &outcome.mapper_errors);
+                    if !outcome.mapper_errors.is_empty() {
+                        incomplete.push(format!(
+                            "feature mapping: {} failed mappers",
+                            outcome.mapper_errors.len()
+                        ));
+                    }
                     let map_stats = outcome.stats;
                     if verbose {
                         tracing::info!(
@@ -477,6 +513,10 @@ pub(crate) fn cmd_index(
                 Err(e) => return Err(e.context("feature mapping failed during `codesage index`")),
             }
         }
+    } else if verbose {
+        tracing::info!("feature mapping skipped (--no-features)");
+    } else {
+        println!("Features:   skipped (--no-features)");
     }
 
     if let Some((embedder, fingerprint)) = embedder.as_mut() {
@@ -499,6 +539,9 @@ pub(crate) fn cmd_index(
                 verbose,
             )?
         };
+        if sem_stats.files_failed > 0 {
+            incomplete.push(format!("semantic: {} failed files", sem_stats.files_failed));
+        }
         if verbose {
             tracing::info!(
                 files_processed = sem_stats.files_processed,
@@ -527,12 +570,20 @@ pub(crate) fn cmd_index(
         }
     }
 
-    // Failure only degrades drift telemetry; the index is already durable.
-    if let Some(sha) = codesage_graph::drift::git_head_sha(&root)
+    // Partial structural writes are durable but do not attest the whole tree.
+    // Semantic or mapper failures do not invalidate a complete structural pass.
+    if stats.files_failed == 0
+        && let Some(sha) = codesage_graph::drift::git_head_sha(&root)
         && let Err(e) = db.set_structural_index_state(&sha)
     {
         tracing::warn!(error = %e, "failed to stamp structural_index_state");
     }
+
+    ensure!(
+        incomplete.is_empty(),
+        "index incomplete ({}); successful work retained; retry codesage index",
+        incomplete.join("; ")
+    );
 
     Ok(())
 }

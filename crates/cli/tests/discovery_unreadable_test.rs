@@ -53,8 +53,14 @@ fn discovery_read_failure_preserves_rows_and_reports_failure() {
         if full {
             args.push("--full");
         }
-        let output = run(root, &args);
+        let result = Command::new(env!("CARGO_BIN_EXE_codesage"))
+            .current_dir(root)
+            .args(&args)
+            .output()
+            .unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(result.status.code(), Some(1), "{args:?}: {result:?}");
+        let output = String::from_utf8(result.stdout).unwrap();
         assert!(has_symbol(root, "durable"), "{output}");
         assert!(output.contains("1 failed, 2 removed"), "{output}");
         assert!(

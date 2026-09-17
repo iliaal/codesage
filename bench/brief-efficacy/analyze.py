@@ -297,9 +297,14 @@ def parse_payload(payload: str) -> tuple[list[str], list[str]]:
 
 
 def tool_uses(events: list[dict]):
-    """(event index, tool name, input dict) for every assistant tool_use."""
+    """(event index, tool name, input dict, cwd) for each assistant tool_use."""
+    cwd = None
     for i, ev in enumerate(events):
-        if not isinstance(ev, dict) or ev.get("type") != "assistant":
+        if not isinstance(ev, dict):
+            continue
+        if "cwd" in ev:
+            cwd = file_identity(ev["cwd"])
+        if ev.get("type") != "assistant":
             continue
         msg = ev.get("message")
         if not isinstance(msg, dict):
@@ -312,7 +317,8 @@ def tool_uses(events: list[dict]):
                 name = item.get("name", "")
                 inp = item.get("input", {})
                 if isinstance(inp, dict):
-                    yield i, name, inp
+                    tool_cwd = file_identity(inp["cwd"], cwd) if "cwd" in inp else cwd
+                    yield i, name, inp, tool_cwd
 
 
 def runner_test_paths(runner: str, args: list[str]) -> list[str]:
@@ -375,7 +381,18 @@ def runner_test_paths(runner: str, args: list[str]) -> list[str]:
     return paths
 
 
-def runs_named_test(command: str, tests: list[str]) -> bool:
+def file_identity(path: str, cwd: str | None = None) -> str | None:
+    """Normalize recorded paths, never borrowing the analyzer's cwd or filesystem."""
+    if not isinstance(path, str) or not path:
+        return None
+    if not os.path.isabs(path):
+        if not isinstance(cwd, str) or not os.path.isabs(cwd):
+            return None
+        path = os.path.join(cwd, path)
+    return os.path.normpath(path)
+
+
+def runs_named_test(command: str, tests: list[str], project: str, cwd: str | None) -> bool:
     if any(marker in command for marker in ("<<", "$(", "`")):
         return False
     try:
@@ -386,6 +403,11 @@ def runs_named_test(command: str, tests: list[str]) -> bool:
     except ValueError:
         return False
     if len(tokens) >= 4 and tokens[0] == "cd" and tokens[2] == "&&":
+        directory = tokens[1]
+        # Shell expansions cannot be resolved from a transcript's path context.
+        if directory == "-" or any(c in directory for c in "$~*?{}[]"):
+            return False
+        cwd = file_identity(directory, cwd)
         tokens = tokens[3:]
     if any(token and all(c in ";&|()<>\n" for c in token) for token in tokens):
         return False
@@ -398,27 +420,27 @@ def runs_named_test(command: str, tests: list[str]) -> bool:
         return False
     runner = Path(words[0]).name
     paths = runner_test_paths(runner, words[1:])
-    return any(path.split("::", 1)[0] == test or path.split("::", 1)[0].endswith("/" + test)
-               for path in paths for test in tests)
+    named_tests = {identity for test in tests if (identity := file_identity(test, project)) is not None}
+    return any(not any(c in path for c in "$~*?{}[]")
+               and file_identity(path.split("::", 1)[0], cwd) in named_tests for path in paths)
 
 
-def score_serve(events: list[dict], start: int, tests: list[str], coupled: list[str]) -> str:
+def score_serve(events: list[dict], start: int, tests: list[str], coupled: list[str], project: str) -> str:
     """Strict scoring: see README.md. `acted` needs a Bash run of a served
     test path or a full Read/Edit of a served co-change file after the serve.
-    Ranged reads are ambiguous, never acted."""
+    Ranged reads are ambiguous, never acted. Relative action paths require
+    recorded cwd context; the served project's root only resolves served paths."""
     verdict = "no-op"
-    for i, name, inp in tool_uses(events):
+    named_files = {identity for path in coupled if (identity := file_identity(path, project)) is not None}
+    for i, name, inp, cwd in tool_uses(events):
         if i <= start:
             continue
         if name == "Bash":
             cmd = inp.get("command", "")
-            if isinstance(cmd, str) and runs_named_test(cmd, tests):
+            if isinstance(cmd, str) and runs_named_test(cmd, tests, project, cwd):
                 return "acted"
         elif name in ("Read", "Edit", "Write", "MultiEdit"):
-            fp = inp.get("file_path", "")
-            if not isinstance(fp, str):
-                continue
-            if any(fp == c or fp.endswith("/" + c) for c in coupled):
+            if file_identity(inp.get("file_path"), cwd) in named_files:
                 if name == "Read" and ("offset" in inp or "limit" in inp):
                     verdict = "ambiguous"
                 else:
@@ -447,10 +469,10 @@ def base_rate_for_transcript(events: list[dict]) -> tuple[int, int]:
     uses = list(tool_uses(events))
     edits = [
         (i, inp["file_path"])
-        for i, name, inp in uses
+        for i, name, inp, _ in uses
         if name in ("Edit", "Write", "MultiEdit") and isinstance(inp.get("file_path"), str)
     ]
-    bash = [(i, inp.get("command", "")) for i, name, inp in uses if name == "Bash"]
+    bash = [(i, inp.get("command", "")) for i, name, inp, _ in uses if name == "Bash"]
     total = followed = 0
     seen: set[str] = set()
     for i, fp in edits:
@@ -578,7 +600,7 @@ def main() -> int:
                 row["transcript"] = str(tp)
                 tests, coupled = parse_payload(payload)
                 if tests or coupled:
-                    row["verdict"] = score_serve(events, idx, tests, coupled)
+                    row["verdict"] = score_serve(events, idx, tests, coupled, f["p"])
                 else:
                     # No named action to score; exclude from the denominator.
                     row["verdict"] = "branch-only" if "branch overlap: " in payload else "hotspot-only"

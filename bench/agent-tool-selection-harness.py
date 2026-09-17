@@ -109,6 +109,7 @@ def build_command(
         tools.extend(CODESAGE_RETRIEVAL_TOOLS)
     cmd = [
         "claude", "-p", prompt,
+        "--permission-mode", "default",
         "--allowedTools", ",".join(tools),
         "--disallowedTools", ",".join(DISALLOWED_TOOLS),
         "--setting-sources", "user",

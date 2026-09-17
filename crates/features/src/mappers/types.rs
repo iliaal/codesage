@@ -61,7 +61,7 @@ pub struct SeedTest {
 
 /// Mapper output before the orchestrator resolves nearby tests, trust
 /// boundaries, and assigns a stable `feature_id`. The orchestrator merges
-/// seeds by `(kind, source, entry_path, command|route|symbol)` so two
+/// seeds by `(kind, source, entry_path, command|route|symbol|target)` so two
 /// mappers seeding the same shape deduplicate naturally.
 #[derive(Debug, Clone)]
 pub struct FeatureSeed {
@@ -74,6 +74,9 @@ pub struct FeatureSeed {
     pub entry_symbol: Option<String>,
     pub entry_route: Option<String>,
     pub entry_command: Option<String>,
+    /// Named build target when it has no runnable command, route, or symbol.
+    /// Keeps targets sharing sources distinct without hashing display text.
+    pub target_name: Option<String>,
     /// Test command, or `None` when unknown. Separate from `entry_command`
     /// so test configuration changes do not alter the feature-ID hash.
     pub test_command: Option<String>,
@@ -113,6 +116,7 @@ impl FeatureSeed {
             entry_symbol: None,
             entry_route: None,
             entry_command: None,
+            target_name: None,
             test_command: None,
             language,
             tags: Vec::new(),
@@ -124,13 +128,14 @@ impl FeatureSeed {
     }
 
     /// Discriminator used in both the orchestrator's dedup key and the
-    /// feature-id hash: the entry command, route, or symbol (first present),
-    /// else empty.
+    /// feature-id hash: the entry command, route, symbol, or build target
+    /// (first present), else empty.
     pub fn discriminator(&self) -> String {
         self.entry_command
             .clone()
             .or_else(|| self.entry_route.clone())
             .or_else(|| self.entry_symbol.clone())
+            .or_else(|| self.target_name.clone())
             .unwrap_or_default()
     }
 }

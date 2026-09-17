@@ -15,7 +15,6 @@
 //!
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
@@ -23,7 +22,7 @@ use codesage_protocol::{FeatureKind, Language};
 use regex::Regex;
 
 use crate::mappers::shared::{
-    is_safe_dir, is_safe_file, read_to_string_bounded, should_skip, sorted_read_dir, walk_files,
+    is_safe_file, list_dir_files, read_to_string_bounded, should_skip, walk_files,
 };
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
@@ -102,7 +101,7 @@ fn discover_packages(ctx: &MapperContext, module_path: Option<&str>) -> Result<V
 
     let mut packages: Vec<GoPackage> = Vec::new();
     for dir_rel in by_dir.keys() {
-        let pkg_name = match read_go_package_name(root, dir_rel) {
+        let pkg_name = match read_go_package_name(ctx, dir_rel) {
             Some(name) => name,
             None => continue,
         };
@@ -146,22 +145,14 @@ fn is_skipped_go_dir(root: &Path, dir_rel: &str) -> bool {
     false
 }
 
-fn read_go_package_name(root: &Path, dir_rel: &str) -> Option<String> {
-    let dir = if dir_rel.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(dir_rel)
-    };
-    if !is_safe_dir(root, &dir) {
-        return None;
-    }
+fn read_go_package_name(ctx: &MapperContext, dir_rel: &str) -> Option<String> {
     let pkg_re = Regex::new(r"(?m)^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)").ok()?;
-    // Mixed-package directories use the first file's clause to keep seed kinds stable.
-    for path in sorted_read_dir(&dir) {
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !name.ends_with(".go") || name.ends_with("_test.go") {
+    // Mixed-package directories use the first visible file's clause.
+    for rel in list_dir_files(ctx.root, &ctx.root.join(dir_rel), ctx.excludes, |name| {
+        name.ends_with(".go") && !name.ends_with("_test.go")
+    }) {
+        let path = ctx.root.join(&rel);
+        if !is_safe_file(ctx.root, &path) {
             continue;
         }
         let Ok(Some(raw)) = read_to_string_bounded(&path) else {
@@ -177,40 +168,20 @@ fn read_go_package_name(root: &Path, dir_rel: &str) -> Option<String> {
 }
 
 fn collect_package_files(ctx: &MapperContext, dir_rel: &str) -> Result<GoPackageFiles> {
-    let root = ctx.root;
-    let dir = if dir_rel.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(dir_rel)
-    };
     let mut files = GoPackageFiles::default();
-    if !is_safe_dir(root, &dir) {
-        return Ok(files);
-    }
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Ok(files);
-    };
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
-            continue;
-        };
-        if !name.ends_with(".go") {
+    for rel in list_dir_files(ctx.root, &ctx.root.join(dir_rel), ctx.excludes, |name| {
+        name.ends_with(".go")
+    }) {
+        let path = ctx.root.join(&rel);
+        if !is_safe_file(ctx.root, &path) {
             continue;
         }
-        let rel = if dir_rel.is_empty() {
-            name.clone()
-        } else {
-            format!("{dir_rel}/{name}")
-        };
-        // An excluded entry would cause post-map filtering to drop the whole package.
-        if !ctx.allowed(&rel) {
-            continue;
-        }
+        let name = rel.rsplit('/').next().unwrap_or(&rel);
         if name.ends_with("_test.go") {
             files.tests.push(rel);
             continue;
         }
-        if is_generated_go_file(&entry.path(), &name) {
+        if is_generated_go_file(&path, name) {
             files.generated.push(rel);
             continue;
         }
@@ -564,6 +535,64 @@ mod tests {
             .expect("go-package seed");
         assert_eq!(s.kind, FeatureKind::Library);
         assert_eq!(s.entry_path, "pkg/util/util.go");
+    }
+
+    #[test]
+    fn ignored_package_members_cannot_determine_identity_or_attach() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "go.mod", "module example.com/acme\n");
+        write(
+            root,
+            ".gitignore",
+            "pkg/util/a_ignored.go\npkg/util/main.go\npkg/util/ignored_test.go\npkg/util/ignored.pb.go\n",
+        );
+        write(root, "pkg/util/a_ignored.go", "package main\n");
+        write(root, "pkg/util/main.go", "package main\nfunc main() {}\n");
+        write(root, "pkg/util/ignored_test.go", "package util\n");
+        write(root, "pkg/util/ignored.pb.go", "package util\n");
+        write(root, "pkg/util/util.go", "package util\n");
+        write(root, "pkg/util/visible.go", "package util\n");
+        write(root, "pkg/util/util_test.go", "package util\n");
+        let seeds = GoMapper.map(&MapperContext::for_root(root)).unwrap();
+        assert_eq!(seeds.len(), 1);
+        let seed = &seeds[0];
+        assert_eq!(seed.kind, FeatureKind::Library);
+        assert_eq!(seed.entry_path, "pkg/util/util.go");
+        assert_eq!(
+            seed.owned_files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pkg/util/visible.go"]
+        );
+        assert_eq!(
+            seed.tests
+                .iter()
+                .map(|t| t.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pkg/util/util_test.go"]
+        );
+        assert!(seed.context_files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonregular_go_paths_cannot_name_or_join_package() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "go.mod", "module example.com/acme\n");
+        write(root, "util.go", "package util\n");
+        let _source_socket = UnixListener::bind(root.join("a_socket.go")).unwrap();
+        let _test_socket = UnixListener::bind(root.join("socket_test.go")).unwrap();
+        let seeds = GoMapper.map(&MapperContext::for_root(root)).unwrap();
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].kind, FeatureKind::Library);
+        assert_eq!(seeds[0].entry_path, "util.go");
+        assert!(seeds[0].owned_files.is_empty());
+        assert!(seeds[0].tests.is_empty());
     }
 
     #[test]

@@ -358,7 +358,7 @@ fn parent_dir(rel: &str) -> String {
 
 fn file_stem(rel: &str) -> &str {
     let base = rel.rsplit('/').next().unwrap_or(rel);
-    base.split('.').next().unwrap_or(base)
+    base.rsplit_once('.').map_or(base, |(stem, _)| stem)
 }
 
 #[cfg(test)]
@@ -410,6 +410,26 @@ mod tests {
         ];
         let t = nearby_tests(&s, &all);
         assert!(t.contains(&"tests/integration.rs".to_string()));
+    }
+
+    #[test]
+    fn dotted_source_stem_keeps_matching_test_within_cap() {
+        let s = seed("src/auth.service.ts", Language::TypeScript);
+        // Sorted unrelated dotted names previously consumed all five slots,
+        // excluding the actual test before build_record could attach it.
+        let all = [
+            "tests/auth.a.spec.ts",
+            "tests/auth.b.spec.ts",
+            "tests/auth.c.spec.ts",
+            "tests/auth.d.spec.ts",
+            "tests/auth.e.spec.ts",
+            "tests/auth.service.spec.ts",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            nearby_tests(&s, &all),
+            vec!["tests/auth.service.spec.ts".to_string()]
+        );
     }
 
     #[test]

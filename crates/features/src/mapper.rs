@@ -155,7 +155,7 @@ fn default_mappers() -> Vec<Box<dyn FeatureMapper>> {
 }
 
 /// Collect seeds from every mapper, deduped by `(kind, source, entry_path,
-/// command|route|symbol)`.
+/// command|route|symbol|target)`.
 fn collect_seeds(ctx: &MapperContext) -> Result<CollectedSeeds> {
     collect_seeds_from(default_mappers(), ctx)
 }
@@ -374,6 +374,82 @@ mod tests {
             outcome.mapper_errors
         );
         assert!(outcome.stats.total_features >= 1);
+    }
+
+    #[test]
+    fn named_cmake_targets_sharing_entries_keep_distinct_features() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "CMakeLists.txt",
+            "add_executable(alpha main.c alpha.c)\n\
+             add_executable(beta main.c beta.c)\n\
+             add_library(core_a STATIC shared.c impl_a.c)\n\
+             add_library(core_b STATIC shared.c impl_b.c)\n\
+             add_executable(alpha_tests tests/shared.c tests/alpha.c)\n\
+             add_executable(beta_tests tests/shared.c tests/beta.c)\n",
+        );
+        write(root, "main.c", "int main(void) { return 0; }\n");
+        for path in [
+            "alpha.c",
+            "beta.c",
+            "shared.c",
+            "impl_a.c",
+            "impl_b.c",
+            "tests/shared.c",
+            "tests/alpha.c",
+            "tests/beta.c",
+        ] {
+            write(root, path, "int value;\n");
+        }
+        let db = Database::open_in_memory().unwrap();
+        map_features(root, &db, &[]).unwrap();
+        let features = db.list_features(None, None, None, 100).unwrap();
+        assert_eq!(features.len(), 6, "generic main must not add a feature");
+        for (title, entry, owned, foreign) in [
+            ("CMake binary `alpha`", "main.c", "alpha.c", "beta.c"),
+            ("CMake binary `beta`", "main.c", "beta.c", "alpha.c"),
+            ("CMake library `core_a`", "shared.c", "impl_a.c", "impl_b.c"),
+            ("CMake library `core_b`", "shared.c", "impl_b.c", "impl_a.c"),
+            (
+                "CMake test suite `alpha_tests`",
+                "tests/shared.c",
+                "tests/alpha.c",
+                "tests/beta.c",
+            ),
+            (
+                "CMake test suite `beta_tests`",
+                "tests/shared.c",
+                "tests/beta.c",
+                "tests/alpha.c",
+            ),
+        ] {
+            let feature = features.iter().find(|f| f.title == title).expect(title);
+            assert_eq!(feature.entry_path, entry);
+            assert!(
+                feature
+                    .files
+                    .iter()
+                    .any(|f| f.path == owned && f.role == FeatureFileRole::Owned)
+            );
+            assert!(
+                !feature
+                    .files
+                    .iter()
+                    .any(|f| f.path == foreign && f.role == FeatureFileRole::Owned)
+            );
+        }
+        let ids: BTreeSet<_> = features.iter().map(|f| f.feature_id.clone()).collect();
+        assert_eq!(ids.len(), 6);
+        map_features(root, &db, &[]).unwrap();
+        let repeated_ids: BTreeSet<_> = db
+            .list_features(None, None, None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.feature_id)
+            .collect();
+        assert_eq!(repeated_ids, ids);
     }
 
     #[test]

@@ -24,10 +24,13 @@ def hook_event(payload, tool_id="edit-1", kind="hook_success"):
     }}
 
 
-def tool(name, **kwargs):
-    return {"type": "assistant", "message": {"content": [
+def tool(name, transcript_cwd=None, **kwargs):
+    event = {"type": "assistant", "message": {"content": [
         {"type": "tool_use", "name": name, "input": kwargs},
     ]}}
+    if transcript_cwd is not None:
+        event["cwd"] = transcript_cwd
+    return event
 
 
 BRANCH_PAYLOAD = (
@@ -39,10 +42,9 @@ BRANCH_PAYLOAD = (
 
 
 class ScorerTest(unittest.TestCase):
-    def family_report(self, root, files, rows=1):
+    def family_report(self, root, files, rows=1, payload="tests: tests/test_alpha.py\n"):
         project = root / "projects" / analyze.munge_project("/repo")
         project.mkdir(parents=True, exist_ok=True)
-        payload = "tests: tests/test_alpha.py\n"
         row = {"t": 100, "s": "session", "p": "/repo", "f": "alpha.py",
                "d": "served", "h": analyze.fnv1a64(payload)}
         (root / analyze.FIRE_LOG).write_text((json.dumps(row) + "\n") * rows)
@@ -55,13 +57,89 @@ class ScorerTest(unittest.TestCase):
                                  "--json"], text=True, capture_output=True, check=True)
         return json.loads(result.stdout)
 
+    def test_read_actions_require_served_project_identity(self):
+        payload = "changes with: src/alpha.py\n"
+        cases = [
+            (tool("Read", file_path="/repo-other/src/alpha.py"), "no-op"),
+            (tool("Read", file_path="/repo-other/src/alpha.py", limit=10), "no-op"),
+            (tool("Read", file_path="src/alpha.py"), "no-op"),
+            (tool("Read", file_path="src/alpha.py", transcript_cwd="/repo-other"), "no-op"),
+            (tool("Read", file_path="/repo/src/./alpha.py"), "acted"),
+            (tool("Read", file_path="src/alpha.py", transcript_cwd="/repo"), "acted"),
+            (tool("Read", file_path="../src/alpha.py", transcript_cwd="/repo/tests"), "acted"),
+            (tool("Read", file_path="/repo/src/alpha.py", limit=10), "ambiguous"),
+            (tool("Edit", file_path="src/alpha.py", transcript_cwd="/repo-other"), "no-op"),
+            (tool("Edit", file_path="src/alpha.py", transcript_cwd="/repo"), "acted"),
+        ]
+        for action, verdict in cases:
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temp:
+                report = self.family_report(Path(temp), {
+                    "session.jsonl": [hook_event(payload), action],
+                }, payload=payload)
+                self.assertEqual(report["served_scored"]["verdicts"], {verdict: 1})
+
+    def test_test_actions_resolve_cwd_instead_of_matching_suffixes(self):
+        cases = [
+            ("pytest /repo-other/tests/test_alpha.py", None, "no-op"),
+            ("pytest tests/test_alpha.py", None, "no-op"),
+            ("pytest tests/test_alpha.py", "/repo-other", "no-op"),
+            ("cd /repo-other && pytest tests/test_alpha.py", "/repo", "no-op"),
+            ("cd ../repo-other && pytest tests/test_alpha.py", "/repo", "no-op"),
+            ("cd tests && pytest test_alpha.py", None, "no-op"),
+            ("cd $OTHER/../repo && pytest tests/test_alpha.py", "/repo", "no-op"),
+            ("pytest /repo/tests/test_alpha.py", None, "acted"),
+            ("pytest tests/test_alpha.py", "/repo", "acted"),
+            ("cd /repo && pytest tests/test_alpha.py", "/repo-other", "acted"),
+            ("cd /repo && pytest tests/test_alpha.py", None, "acted"),
+            ("cd ../repo && pytest tests/test_alpha.py", "/repo-other", "acted"),
+            ("cd tests && pytest ./test_alpha.py::test_case", "/repo", "acted"),
+        ]
+        for command, cwd, verdict in cases:
+            with self.subTest(command=command, cwd=cwd), tempfile.TemporaryDirectory() as temp:
+                report = self.family_report(Path(temp), {
+                    "session.jsonl": [hook_event("tests: tests/test_alpha.py\n"),
+                                      tool("Bash", command=command, transcript_cwd=cwd)],
+                })
+                self.assertEqual(report["served_scored"]["verdicts"], {verdict: 1})
+
+    def test_followup_uses_latest_recorded_cwd_without_project_fallback(self):
+        payload = "tests: tests/test_alpha.py\n"
+        for recorded_cwd, verdict in (("/repo", "acted"), ("/repo-other", "no-op"),
+                                      ("relative", "no-op"), (None, "no-op")):
+            with self.subTest(cwd=recorded_cwd), tempfile.TemporaryDirectory() as temp:
+                report = self.family_report(Path(temp), {
+                    "session.jsonl": [{"type": "user", "cwd": "/repo"}, hook_event(payload),
+                                      {"type": "user", "cwd": recorded_cwd},
+                                      tool("Bash", command="pytest tests/test_alpha.py")],
+                })
+                self.assertEqual(report["served_scored"]["verdicts"], {verdict: 1})
+
+    def test_explicit_tool_cwd_overrides_transcript_cwd(self):
+        for cwd, verdict in (("/repo", "acted"), ("/repo-other", "no-op")):
+            with self.subTest(cwd=cwd), tempfile.TemporaryDirectory() as temp:
+                report = self.family_report(Path(temp), {
+                    "session.jsonl": [hook_event("tests: tests/test_alpha.py\n"),
+                                      tool("Bash", command="pytest tests/test_alpha.py",
+                                           transcript_cwd="/repo-other", cwd=cwd)],
+                })
+                self.assertEqual(report["served_scored"]["verdicts"], {verdict: 1})
+
+    def test_later_tool_action_uses_its_own_recorded_project(self):
+        payload = "changes with: src/alpha.py\n"
+        events = [hook_event(payload),
+                  tool("Read", file_path="src/unrelated.py", transcript_cwd="/repo"),
+                  tool("Read", file_path="src/alpha.py", transcript_cwd="/repo-other")]
+        self.assertEqual(analyze.score_serve(events, 0, [], ["src/alpha.py"], "/repo"), "no-op")
+        events.append(tool("Read", file_path="/repo/src/alpha.py"))
+        self.assertEqual(analyze.score_serve(events, 0, [], ["src/alpha.py"], "/repo"), "acted")
+
     def test_nested_native_exposure_uses_only_its_own_actions(self):
         with tempfile.TemporaryDirectory() as temp:
             payload = "tests: tests/test_alpha.py\n"
             report = self.family_report(Path(temp), {
-                "session.jsonl": [tool("Bash", command="pytest tests/test_alpha.py")],
+                "session.jsonl": [tool("Bash", command="pytest tests/test_alpha.py", transcript_cwd="/repo")],
                 "session/subagents/agent-one.jsonl": [hook_event(payload)],
-                "session/subagents/agent-two.jsonl": [tool("Bash", command="pytest tests/test_alpha.py")],
+                "session/subagents/agent-two.jsonl": [tool("Bash", command="pytest tests/test_alpha.py", transcript_cwd="/repo")],
                 "wrong-session/subagents/agent-one.jsonl": [hook_event(payload)],
             })
             self.assertEqual(report["served_scored"]["verdicts"], {"no-op": 1})
@@ -71,7 +149,7 @@ class ScorerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             payload = "tests: tests/test_alpha.py\n"
             report = self.family_report(Path(temp), {
-                "session.jsonl": [hook_event(payload), tool("Bash", command="pytest tests/test_alpha.py")],
+                "session.jsonl": [hook_event(payload), tool("Bash", command="pytest tests/test_alpha.py", transcript_cwd="/repo")],
                 "session/subagents/agent-one.jsonl": [hook_event(payload)],
             }, rows=2)
             self.assertEqual(report["served_scored"]["verdicts"], {"no-op": 1, "unmatched": 1})
@@ -137,14 +215,14 @@ class ScorerTest(unittest.TestCase):
         payload = "tests: tests/test_alpha.py\n" + BRANCH_PAYLOAD
         events = [hook_event(payload.rstrip("\n")),
                   hook_event(payload.rstrip("\n"), kind="hook_additional_context"),
-                  tool("Bash", command="pytest tests/test_alpha.py"),
+                  tool("Bash", command="pytest tests/test_alpha.py", transcript_cwd="/repo"),
                   hook_event(payload, "edit-2")]
         hits = analyze.payload_occurrences(events)[analyze.fnv1a64(payload)]
         self.assertEqual(hits, [(0, payload), (3, payload)])
         tests, coupled = analyze.parse_payload(payload)
         self.assertEqual((tests, coupled), (["tests/test_alpha.py"], []))
-        self.assertEqual(analyze.score_serve(events, hits[0][0], tests, coupled), "acted")
-        self.assertEqual(analyze.score_serve(events, hits[1][0], tests, coupled), "no-op")
+        self.assertEqual(analyze.score_serve(events, hits[0][0], tests, coupled, "/repo"), "acted")
+        self.assertEqual(analyze.score_serve(events, hits[1][0], tests, coupled, "/repo"), "no-op")
 
     def test_branch_render_variants_preserve_full_payload(self):
         branch = BRANCH_PAYLOAD.splitlines()[0]
@@ -213,7 +291,7 @@ class ScorerTest(unittest.TestCase):
                    "d": "served", "h": analyze.fnv1a64(payload)}
             (root / analyze.FIRE_LOG).write_text((json.dumps(row) + "\n") * 51)
             events = [hook_event(payload, f"edit-{i}") for i in range(51)]
-            events.append(tool("Bash", command="pytest tests/test_alpha.py"))
+            events.append(tool("Bash", command="pytest tests/test_alpha.py", transcript_cwd="/repo"))
             (project / "session.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
             result = subprocess.run(["python3", str(Path(__file__).with_name("analyze.py")),
                                      "--ledger-dir", str(root), "--projects-dir", str(root / "projects"),
@@ -337,11 +415,11 @@ class ScorerTest(unittest.TestCase):
     def test_serialized_context_is_one_exposure_per_tool(self):
         payload = "tests: tests/test_alpha.py\n"
         events = [hook_event(payload), hook_event(payload, kind="hook_additional_context"),
-                  tool("Bash", command="pytest tests/test_alpha.py"), hook_event(payload, "edit-2")]
+                  tool("Bash", command="pytest tests/test_alpha.py", transcript_cwd="/repo"), hook_event(payload, "edit-2")]
         hits = analyze.payload_occurrences(events)[analyze.fnv1a64(payload)]
         self.assertEqual([i for i, _ in hits], [0, 3])
-        self.assertEqual(analyze.score_serve(events, 0, ["tests/test_alpha.py"], []), "acted")
-        self.assertEqual(analyze.score_serve(events, 3, ["tests/test_alpha.py"], []), "no-op")
+        self.assertEqual(analyze.score_serve(events, 0, ["tests/test_alpha.py"], [], "/repo"), "acted")
+        self.assertEqual(analyze.score_serve(events, 3, ["tests/test_alpha.py"], [], "/repo"), "no-op")
 
     def test_quoted_or_failed_payload_is_not_exposure(self):
         payload = "tests: tests/test_alpha.py\n"
@@ -358,20 +436,20 @@ class ScorerTest(unittest.TestCase):
         test = "tests/test_alpha.py"
         for command in (f"echo pytest {test}", f"cat {test}", f"pytest {test}.bak", f"printf '{test}'",
                         f"pytest --collect-only {test}", f"pytest --help {test}", f"python3 -V {test}"):
-            self.assertFalse(analyze.runs_named_test(command, [test]), command)
+            self.assertFalse(analyze.runs_named_test(command, [test], "/repo", "/repo"), command)
         for command in (f"false && pytest {test}", f"cat <<EOF\npytest {test}\nEOF"):
-            self.assertFalse(analyze.runs_named_test(command, [test]), command)
+            self.assertFalse(analyze.runs_named_test(command, [test], "/repo", "/repo"), command)
         for command in (f"pytest {test}", f"rtk proxy python3 {test}", f"cd /repo && pytest {test}"):
-            self.assertTrue(analyze.runs_named_test(command, [test]), command)
+            self.assertTrue(analyze.runs_named_test(command, [test], "/repo", "/repo"), command)
 
     def test_redirect_targets_are_not_test_selectors(self):
         test = "tests/test_alpha.py"
         for redirect in (">", ">>", "<", "2>", "2>>", "&>", "<>"):
             command = f"pytest unrelated.py {redirect} {test}"
-            self.assertFalse(analyze.runs_named_test(command, [test]), command)
+            self.assertFalse(analyze.runs_named_test(command, [test], "/repo", "/repo"), command)
         for command in (f"pytest unrelated.py >{test}", f"pytest unrelated.py <{test}",
                         f"pytest {test} > output.log"):
-            self.assertFalse(analyze.runs_named_test(command, [test]), command)
+            self.assertFalse(analyze.runs_named_test(command, [test], "/repo", "/repo"), command)
 
     def test_runner_options_do_not_turn_arguments_into_executed_tests(self):
         test = "tests/test_alpha.py"
@@ -383,19 +461,19 @@ class ScorerTest(unittest.TestCase):
                     f"vitest list {test}", f"node --help {test}",
                     f"cargo test {test}", f"npm test -- {test}", f"go test {test}"]
         for command in rejected:
-            self.assertFalse(analyze.runs_named_test(command, [test]), command)
+            self.assertFalse(analyze.runs_named_test(command, [test], "/repo", "/repo"), command)
         accepted = [f"python3 {test}", f"python3 -B -m pytest -q {test}",
                     f"python3 -m unittest -v {test}", f"pytest -vs {test}::test_case",
                     f"pytest -k alpha --maxfail=1 {test}", f"phpunit --filter alpha {test}",
                     f"jest --runInBand {test}", f"vitest run {test}", f"node --test {test}"]
         for command in accepted:
-            self.assertTrue(analyze.runs_named_test(command, [test]), command)
+            self.assertTrue(analyze.runs_named_test(command, [test], "/repo", "/repo"), command)
 
     def test_ranged_and_suffix_reads_are_not_acted(self):
         events = [hook_event("changes with: src/alpha.py"), tool("Read", file_path="/repo/src/alpha.py", limit=10)]
-        self.assertEqual(analyze.score_serve(events, 0, [], ["src/alpha.py"]), "ambiguous")
+        self.assertEqual(analyze.score_serve(events, 0, [], ["src/alpha.py"], "/repo"), "ambiguous")
         events[1] = tool("Read", file_path="/repo/othersrc/alpha.py")
-        self.assertEqual(analyze.score_serve(events, 0, [], ["src/alpha.py"]), "no-op")
+        self.assertEqual(analyze.score_serve(events, 0, [], ["src/alpha.py"], "/repo"), "no-op")
 
     def test_transcript_in_different_cwd_requires_unique_session(self):
         with tempfile.TemporaryDirectory() as temp:

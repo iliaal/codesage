@@ -300,15 +300,7 @@ pub fn extract_symbols(
             continue;
         }
 
-        let mut kind = kind;
-        if kind == SymbolKind::Function
-            && (language == Language::Python
-                || language == Language::Rust
-                || language == Language::Cpp)
-            && is_inside_impl_or_class(&def_node, language)
-        {
-            kind = SymbolKind::Method;
-        }
+        let kind = refine_definition_kind(kind, &def_node, language);
 
         // C++ captures `Foo::bar` for out-of-line methods; the bare `bar` lives
         // in `name`, the full path in `qualified_name`.
@@ -319,10 +311,6 @@ pub fn extract_symbols(
         };
         if name.is_empty() {
             continue;
-        }
-
-        if language == Language::Go && kind == SymbolKind::Struct {
-            kind = refine_go_type_kind(&def_node);
         }
 
         let qualified_name = if language == Language::Cpp {
@@ -460,6 +448,25 @@ fn find_java_package(root: &Node, source: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+/// Refine query kinds using the enclosing declaration, shared by symbols and
+/// fingerprints so both expose the same definition identity.
+pub(crate) fn refine_definition_kind(
+    kind: SymbolKind,
+    node: &Node,
+    language: Language,
+) -> SymbolKind {
+    if kind == SymbolKind::Function
+        && matches!(language, Language::Python | Language::Rust | Language::Cpp)
+        && is_inside_impl_or_class(node, language)
+    {
+        SymbolKind::Method
+    } else if language == Language::Go && kind == SymbolKind::Struct {
+        refine_go_type_kind(node)
+    } else {
+        kind
+    }
 }
 
 fn is_inside_impl_or_class(node: &Node, language: Language) -> bool {
@@ -807,7 +814,7 @@ fn find_go_receiver_type<'a>(node: &Node, source: &'a [u8]) -> Option<&'a str> {
             if type_node.kind() == "pointer_type" {
                 let mut tc = type_node.walk();
                 for inner in type_node.children(&mut tc) {
-                    if inner.kind() == "type_identifier" {
+                    if matches!(inner.kind(), "type_identifier" | "generic_type") {
                         return inner.utf8_text(source).ok();
                     }
                 }
