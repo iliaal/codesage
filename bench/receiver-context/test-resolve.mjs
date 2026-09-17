@@ -20,6 +20,7 @@ function repo(t, files) {
   execFileSync('git', ['init', '-q', root]);
   execFileSync('git', ['-C', root, 'add', '--', ...Object.keys(files)]);
   execFileSync('git', ['-C', root, '-c', 'user.name=Receiver Test', '-c', 'user.email=receiver@example.invalid',
+    '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null',
     'commit', '-qm', 'fixture']);
   const head = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
   return { root, head };

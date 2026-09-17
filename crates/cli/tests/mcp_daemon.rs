@@ -2364,6 +2364,10 @@ fn onboard_rich_fixture(root: &std::path::Path) {
                 "user.email=fixture@codesage.test",
                 "-c",
                 "user.name=fixture",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
             ])
             .args(args)
             .current_dir(root)
@@ -2418,6 +2422,10 @@ fn run_git(root: &std::path::Path, args: &[&str]) {
             "user.email=fixture@codesage.test",
             "-c",
             "user.name=fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
         ])
         .args(args)
         .current_dir(root)

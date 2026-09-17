@@ -6,6 +6,12 @@ use codesage_graph::edit_check::{EditCheckReport, edit_check};
 fn git(root: &Path, args: &[&str]) -> Vec<u8> {
     let out = Command::new("git")
         .current_dir(root)
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
         .args(args)
         .output()
         .unwrap();
