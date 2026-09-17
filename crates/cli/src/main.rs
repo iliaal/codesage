@@ -776,35 +776,41 @@ fn load_query_stack_with(
     Box<dyn codesage_graph::TextEmbedder>,
     Option<query_reranker::QueryReranker>,
 )> {
-    let config = load_project_config(root)?;
-    let emb_config = config.embedding.unwrap_or_default();
-    let (mut embedder, dim) = embedder_for(root, &emb_config)?;
-    let db = open_db_for_model(root, &emb_config.model, dim)?;
-    // Mismatched or unattested vectors cannot produce trustworthy neighbours.
-    let fingerprint = fingerprint_for(&db, &emb_config, dim)?;
-    codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
-    // Query and stored vectors must share the same model and provider identity.
-    embedder.bind_fingerprint(&fingerprint)?;
-    let reranker = emb_config
-        .reranker
-        .as_ref()
-        .map(|model| query_reranker::QueryReranker::new(root, model, &emb_config.device))
-        .transpose()?;
-    Ok((db, embedder, reranker))
+    codesage_embed::model::ModelAuthorization::for_project(root).scope(|| {
+        let config = load_project_config(root)?;
+        let emb_config = config.embedding.unwrap_or_default();
+        let (mut embedder, dim) = embedder_for(root, &emb_config)?;
+        let db = open_db_for_model(root, &emb_config.model, dim)?;
+        // Mismatched or unattested vectors cannot produce trustworthy neighbours.
+        let fingerprint = fingerprint_for(&db, &emb_config, dim)?;
+        codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
+        // Query and stored vectors must share the same model and provider identity.
+        embedder.bind_fingerprint(&fingerprint)?;
+        let reranker = emb_config
+            .reranker
+            .as_ref()
+            .map(|model| query_reranker::QueryReranker::new(root, model, &emb_config.device))
+            .transpose()?;
+        Ok((db, embedder, reranker))
+    })
 }
 
 pub(crate) fn query_embedder(
     root: &Path,
     emb_config: &EmbeddingConfig,
 ) -> Result<(Box<dyn codesage_graph::TextEmbedder>, usize)> {
-    #[cfg(unix)]
-    if let Some(daemon) = daemon_embed::DaemonEmbedder::connect(root, emb_config) {
-        let dim = daemon.dim();
-        return Ok((Box::new(daemon), dim));
-    }
-    let embedder = Embedder::new(emb_config)?;
-    let dim = embedder.dim();
-    Ok((Box::new(embedder), dim))
+    codesage_embed::model::ModelAuthorization::for_project(root).scope(
+        || -> Result<(Box<dyn codesage_graph::TextEmbedder>, usize)> {
+            #[cfg(unix)]
+            if let Some(daemon) = daemon_embed::DaemonEmbedder::connect(root, emb_config) {
+                let dim = daemon.dim();
+                return Ok((Box::new(daemon), dim));
+            }
+            let embedder = Embedder::new(emb_config)?;
+            let dim = embedder.dim();
+            Ok((Box::new(embedder), dim))
+        },
+    )
 }
 
 pub(crate) fn load_symbol_context_db(root: &Path) -> Result<Database> {

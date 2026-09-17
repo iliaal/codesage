@@ -372,14 +372,7 @@ fn make_seed(
         })
         .collect();
 
-    let mut context_files: Vec<SeedFile> = files
-        .tests
-        .iter()
-        .map(|path| SeedFile {
-            path: path.clone(),
-            reason: "go package test".to_string(),
-        })
-        .collect();
+    let mut context_files = Vec::new();
     for f in files.generated {
         context_files.push(SeedFile {
             path: f,

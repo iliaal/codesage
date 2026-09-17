@@ -140,7 +140,7 @@ fn file_relates_to(seed: &FeatureSeed, stem: &str, dir: &str, candidate: &str) -
         if !path_has_dir_prefix(candidate, default) {
             continue;
         }
-        if always_attach_in_convention_dir {
+        if always_attach_in_convention_dir && same_stem_scope(&seed.entry_path, candidate) {
             return true;
         }
         if stem_match(candidate, stem) && same_stem_scope(seed.entry_path.as_str(), candidate) {

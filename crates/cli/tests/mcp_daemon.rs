@@ -964,10 +964,6 @@ fn tools_call_search_round_trips_tool_error_without_protocol_failure() {
         text.contains("not on CodeSage's validated-model allowlist"),
         "expected allowlist error text, got: {text:?}"
     );
-    assert!(
-        text.contains("resolving model files for \"not-on/allowlist\""),
-        "outer model-resolution context must survive alongside the cause: {text:?}"
-    );
 
     let healthy = session.request(
         3,

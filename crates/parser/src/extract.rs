@@ -417,10 +417,12 @@ fn find_php_namespace(root: &Node, source: &[u8]) -> Option<String> {
 fn find_php_namespace_for_node(node: &Node, root: &Node, source: &[u8]) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if parent.kind() == "namespace_definition"
-            && let Some(name_node) = parent.child_by_field_name("name")
-        {
-            return name_node.utf8_text(source).ok().map(str::to_string);
+        if parent.kind() == "namespace_definition" {
+            // An unnamed enclosing namespace is explicitly global; do not fall back.
+            return parent
+                .child_by_field_name("name")
+                .and_then(|name_node| name_node.utf8_text(source).ok())
+                .map(str::to_string);
         }
         current = parent.parent();
     }
@@ -789,19 +791,11 @@ fn build_qualified_name(
 }
 
 fn refine_go_type_kind(def_node: &Node) -> SymbolKind {
-    let mut cursor = def_node.walk();
-    for child in def_node.children(&mut cursor) {
-        if child.kind() == "type_spec"
-            && let Some(type_child) = child.child_by_field_name("type")
-        {
-            return match type_child.kind() {
-                "struct_type" => SymbolKind::Struct,
-                "interface_type" => SymbolKind::Interface,
-                _ => SymbolKind::Constant,
-            };
-        }
+    match def_node.child_by_field_name("type").map(|node| node.kind()) {
+        Some("struct_type") => SymbolKind::Struct,
+        Some("interface_type") => SymbolKind::Interface,
+        _ => SymbolKind::Constant,
     }
-    SymbolKind::Constant
 }
 
 fn find_go_receiver_type<'a>(node: &Node, source: &'a [u8]) -> Option<&'a str> {

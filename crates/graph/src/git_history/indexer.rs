@@ -662,7 +662,7 @@ pub fn changed_files_since(
     let out = Command::new("git")
         // `--` terminates option parsing so `range` is always read as a
         // revision range, never as flags.
-        .args(["diff", "--name-only", "--relative", &range, "--"])
+        .args(["diff", "--name-only", "-z", "--relative", &range, "--"])
         .current_dir(root)
         .output()
         .with_context(|| format!("git diff --name-only {range} in {}", root.display()))?;
@@ -674,10 +674,9 @@ pub fn changed_files_since(
     }
     let text = String::from_utf8(out.stdout).context("git diff output not UTF-8")?;
     Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(|l| l.replace('\\', "/"))
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
         .collect())
 }
 
@@ -740,7 +739,8 @@ fn run_git_log(root: &Path, range: Option<&str>, since_epoch: i64) -> Result<Str
         "log",
         "--no-merges",
         "--numstat",
-        "--pretty=format:commit\x09%H\x09%ct\x09%ae%x1f%an%x1f%s",
+        "-z",
+        "--pretty=format:commit\x09%H\x09%ct\x09%ae%x1f%an%x1f%s%x00",
         &since_arg,
     ];
     if let Some(r) = range {
@@ -771,7 +771,11 @@ fn parse_log(raw: &str) -> Vec<Commit> {
     // which commits were skipped, not just how many.
     let mut skipped_shas: Vec<String> = Vec::new();
 
-    for line in raw.lines() {
+    let mut records = raw.split('\0');
+    while let Some(record) = records.next() {
+        // Git inserts newlines before numstat records and between commits. Strip
+        // them only at record boundaries, never from the filename field itself.
+        let line = record.trim_start_matches('\n');
         if let Some(rest) = line.strip_prefix("commit\t") {
             if let Some(prev) = current.take() {
                 commits.push(prev);
@@ -807,14 +811,29 @@ fn parse_log(raw: &str) -> Vec<Commit> {
         if line.is_empty() {
             continue;
         }
-        let Some(commit) = current.as_mut() else {
-            continue;
-        };
-        // numstat line: "<added>\t<deleted>\t<path>"; binary files use "-\t-\t<path>"
+        // With -z, ordinary records contain the raw path after two tabs. Rename
+        // records leave that field empty and append old\0new\0 instead. Consume
+        // both paths even for binary files or commits skipped above.
         let mut parts = line.splitn(3, '\t');
         let added_s = parts.next().unwrap_or("-");
         let deleted_s = parts.next().unwrap_or("-");
-        let path = parts.next().unwrap_or("");
+        let Some(path) = parts.next() else {
+            continue;
+        };
+        let path = if path.is_empty() {
+            let Some(_old_path) = records.next() else {
+                break;
+            };
+            let Some(new_path) = records.next() else {
+                break;
+            };
+            new_path
+        } else {
+            path
+        };
+        let Some(commit) = current.as_mut() else {
+            continue;
+        };
         if path.is_empty() || added_s == "-" || deleted_s == "-" {
             continue;
         }
@@ -823,11 +842,8 @@ fn parse_log(raw: &str) -> Vec<Commit> {
             skipped_changes += 1;
             continue;
         };
-        // Rename detection in numstat looks like `path/{old => new}/file`. Normalize
-        // to the destination by stripping `{old => ` and `}`.
-        let normalized = normalize_rename_path(path);
         commit.changes.push(FileChange {
-            path: normalized,
+            path: path.to_owned(),
             added,
             deleted,
         });
@@ -844,33 +860,6 @@ fn parse_log(raw: &str) -> Vec<Commit> {
         );
     }
     commits
-}
-
-fn normalize_rename_path(raw: &str) -> String {
-    // git format examples:
-    //   src/{foo.rs => bar.rs}
-    //   src/{old => new}/inner/file.rs
-    //   {old/dir => new/dir}/file.rs
-    //   src/old.rs => src/new.rs          (braceless: whole-path move)
-    //   src/FOO.rs => src/foo.rs          (braceless: case-only rename)
-    if let (Some(open), Some(close)) = (raw.find('{'), raw.find('}'))
-        && open < close
-        && let Some(arrow) = raw[open..close].find(" => ")
-    {
-        let prefix = &raw[..open];
-        let after_arrow_in_braces = &raw[open + arrow + 4..close];
-        let suffix = &raw[close + 1..];
-        return format!("{prefix}{after_arrow_in_braces}{suffix}");
-    }
-    // Braceless renames carry full paths, including case-only renames.
-    // Empty sides indicate a literal arrow rather than a rename.
-    if let Some((src, dest)) = raw.rsplit_once(" => ")
-        && !src.is_empty()
-        && !dest.is_empty()
-    {
-        return dest.to_string();
-    }
-    raw.to_string()
 }
 
 fn is_fix_commit(subject: &str) -> bool {
@@ -986,37 +975,9 @@ mod tests {
     }
 
     #[test]
-    fn rename_normalization() {
-        assert_eq!(
-            normalize_rename_path("src/{foo.rs => bar.rs}"),
-            "src/bar.rs"
-        );
-        assert_eq!(
-            normalize_rename_path("src/{old => new}/inner.rs"),
-            "src/new/inner.rs"
-        );
-        assert_eq!(
-            normalize_rename_path("{old/dir => new/dir}/file.rs"),
-            "new/dir/file.rs"
-        );
-        assert_eq!(normalize_rename_path("plain/path.rs"), "plain/path.rs");
-        assert_eq!(
-            normalize_rename_path("src/old.rs => src/new.rs"),
-            "src/new.rs"
-        );
-        assert_eq!(
-            normalize_rename_path("src/FOO.rs => src/foo.rs"),
-            "src/foo.rs"
-        );
-        // Degenerate arrows are not renames; leave them untouched.
-        assert_eq!(normalize_rename_path(" => src/new.rs"), " => src/new.rs");
-        assert_eq!(normalize_rename_path("src/old.rs => "), "src/old.rs => ");
-    }
-
-    #[test]
     fn parse_log_handles_basic_format() {
-        let raw = "commit\tabc\t1700000000\tfix: x\n10\t2\tsrc/a.rs\n5\t1\tsrc/b.rs\n\
-                   commit\tdef\t1700001000\tfeat: y\n3\t0\tsrc/c.rs\n-\t-\tbinary.bin\n";
+        let raw = "commit\tabc\t1700000000\tfix: x\0\n10\t2\tsrc/a.rs\x005\t1\tsrc/b.rs\0\
+                   \0commit\tdef\t1700001000\tfeat: y\0\n3\t0\tsrc/c.rs\0-\t-\tbinary.bin\0";
         let commits = parse_log(raw);
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].subject, "fix: x");

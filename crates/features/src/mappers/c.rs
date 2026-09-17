@@ -971,10 +971,11 @@ fn cmake_split_args(args: &str) -> Vec<String> {
             continue;
         }
         let start = i;
+        // Only real bracket openers delimit words; literal '[' bytes must advance.
         while i < bytes.len()
             && !bytes[i].is_ascii_whitespace()
             && bytes[i] != b'"'
-            && bytes[i] != b'['
+            && (bytes[i] != b'[' || cmake_bracket_end(bytes, i).is_none())
         {
             i += 1;
         }

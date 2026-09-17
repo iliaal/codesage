@@ -75,9 +75,13 @@ fn normalize_input_path(root: Option<&Path>, path: &str) -> String {
     parts.join("/")
 }
 
-/// Indexed sibling tests and withheld `.phpt` tests above [`PHPT_LIST_CAP`].
-/// Withheld tests still count as existing for test-gap detection.
-fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Vec<String>)> {
+/// Sibling tests and withheld `.phpt` tests above [`PHPT_LIST_CAP`].
+/// PHPT files are discovered on disk because structural indexing omits them.
+fn test_sibling_paths(
+    db: &Database,
+    file_path: &str,
+    root: Option<&Path>,
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut withheld = Vec::new();
     // First-dot stemming matches dotted names such as `foo.test.ts`.
     let stem = file_path
@@ -141,15 +145,20 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Ve
     }
 
     // PHPT names rarely match source stems. List sibling suites, disclosing withheld large suites.
-    if (file_path.ends_with(".c") || file_path.ends_with(".h"))
-        && let Some((dir, _)) = file_path.rsplit_once('/')
-    {
-        let tests_prefix = format!("{dir}/tests/");
-        let candidates: Vec<String> = db
-            .indexed_files_with_prefix(&tests_prefix)?
-            .into_iter()
-            .filter(|p| p.ends_with(".phpt") && !found.contains(p))
-            .collect();
+    if file_path.ends_with(".c") || file_path.ends_with(".h") {
+        let tests_prefix = if dir.is_empty() {
+            "tests/".to_string()
+        } else {
+            format!("{dir}/tests/")
+        };
+        let candidates = if let Some(root) = root {
+            phpt_siblings(root, &tests_prefix)?
+        } else {
+            db.indexed_files_with_prefix(&tests_prefix)?
+                .into_iter()
+                .filter(|p| p.ends_with(".phpt") && !found.contains(p))
+                .collect()
+        };
         if candidates.len() <= PHPT_LIST_CAP {
             found.extend(candidates);
         } else {
@@ -219,9 +228,60 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Ve
 /// this the directory is named in a note instead of dumped file-by-file.
 const PHPT_LIST_CAP: usize = 50;
 
+/// Only the standard on-disk index layout carries an unambiguous project root.
+fn database_project_root(db: &Database) -> Option<PathBuf> {
+    let path = db.path()?;
+    let dir = path.parent()?;
+    (path.file_name()? == "index.db" && dir.file_name()? == ".codesage")
+        .then(|| dir.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
+fn phpt_siblings(root: &Path, prefix: &str) -> Result<Vec<String>> {
+    // Do not let a supplied path or a repository symlink escape the project.
+    if Path::new(prefix)
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Ok(Vec::new());
+    }
+    let directory = root.join(prefix);
+    let directory = match directory.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if !directory.starts_with(root.canonicalize()?) {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    for (visited, entry) in std::fs::read_dir(directory)?.enumerate() {
+        codesage_protocol::work::checkpoint()?;
+        anyhow::ensure!(
+            visited < 4096,
+            "PHPT sibling discovery exceeded 4096 directory entries"
+        );
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|name| name.ends_with(".phpt")) else {
+            continue;
+        };
+        found.push(format!("{prefix}{name}"));
+        if found.len() > PHPT_LIST_CAP {
+            break;
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 /// Whether any indexed sibling tests exist, including withheld `.phpt` suites.
 pub(super) fn test_sibling_exists(db: &Database, file_path: &str) -> Result<bool> {
-    let (paths, withheld) = test_sibling_paths(db, file_path)?;
+    let root = database_project_root(db);
+    let (paths, withheld) = test_sibling_paths(db, file_path, root.as_deref())?;
     Ok(!paths.is_empty() || !withheld.is_empty())
 }
 
@@ -308,7 +368,11 @@ struct BaseRecommendations {
 /// Fetched with one extra row so an overflow is detected and disclosed.
 const COUPLED_FETCH_CAP: usize = 20;
 
-fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseRecommendations> {
+fn base_recommendations(
+    db: &Database,
+    file_paths: &[String],
+    root: Option<&Path>,
+) -> Result<BaseRecommendations> {
     let mut primary: HashSet<String> = HashSet::new();
     let mut coupled: Vec<CoupledTestEntry> = Vec::new();
     let mut suppressed_sources: Vec<String> = Vec::new();
@@ -321,7 +385,7 @@ fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseReco
     let co_batched = db.co_changes_for_many(&path_refs, COUPLED_FETCH_CAP + 1, multiplier)?;
     for path in file_paths {
         codesage_protocol::work::checkpoint()?;
-        let (siblings, withheld_here) = test_sibling_paths(db, path)?;
+        let (siblings, withheld_here) = test_sibling_paths(db, path, root)?;
         if !withheld_here.is_empty() {
             suppressed_sources.push(path.clone());
             withheld.extend(withheld_here);
@@ -471,7 +535,8 @@ fn base_notes(
 /// hook needs this cheap path; graph reachability is a separate entry point.
 pub fn recommend_tests(db: &Database, file_paths: &[String]) -> Result<TestRecommendations> {
     codesage_protocol::work::checkpoint()?;
-    let base = base_recommendations(db, file_paths)?;
+    let root = database_project_root(db);
+    let base = base_recommendations(db, file_paths, root.as_deref())?;
     let notes = base_notes(&base, base.primary.len(), None);
     Ok(TestRecommendations {
         primary: base.primary,
@@ -772,7 +837,9 @@ pub(crate) fn recommend_tests_with_walk_cache(
             .map(|p| as_given.get(&p).cloned().unwrap_or(p))
             .collect()
     };
-    let mut base = base_recommendations(db, &file_paths)?;
+    let stored_root = database_project_root(db);
+    let root = opts.project_root.as_deref().or(stored_root.as_deref());
+    let mut base = base_recommendations(db, &file_paths, root)?;
     base.coupled_cut_sources = restore(std::mem::take(&mut base.coupled_cut_sources));
     let sibling_count = base.primary.len();
 

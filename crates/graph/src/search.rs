@@ -818,7 +818,14 @@ pub fn search_page(
     );
 
     if stem_scan_enabled() {
-        apply_non_candidate_stem_scan(db, &mut results, &req.query, req.explain)?;
+        apply_non_candidate_stem_scan(
+            db,
+            &mut results,
+            &req.query,
+            req.explain,
+            req.languages.as_deref(),
+            req.paths.as_deref(),
+        )?;
     }
 
     annotate_with_symbols(db, &mut results)?;
@@ -1582,6 +1589,8 @@ fn apply_non_candidate_stem_scan(
     results: &mut Vec<SearchResult>,
     query: &str,
     explain: bool,
+    languages: Option<&[Language]>,
+    paths: Option<&[String]>,
 ) -> Result<()> {
     if results.is_empty() || !is_symbol_query(query) {
         return Ok(());
@@ -1600,14 +1609,28 @@ fn apply_non_candidate_stem_scan(
 
     let candidate_set: HashSet<String> = results.iter().map(|r| r.file_path.clone()).collect();
 
+    let path_filter = paths.map(path_globset).transpose()?;
     let stem_index = stem_index_for(db)?;
     let mut injected: Vec<SearchResult> = Vec::new();
     for file_path in stem_index.matching_paths(&symbol_lower, &symbol_norm) {
-        if candidate_set.contains(&file_path) {
+        if candidate_set.contains(&file_path)
+            || path_filter
+                .as_ref()
+                .is_some_and(|filter| !filter.is_match(&file_path))
+        {
             continue;
         }
         let chunks = db.chunks_for_file(&file_path)?;
         for chunk in chunks {
+            // Compare stored tags before parsing: unknown tags must not inherit
+            // the display fallback language and bypass an explicit restriction.
+            if languages.is_some_and(|allowed| {
+                !allowed
+                    .iter()
+                    .any(|language| language.as_str() == chunk.language)
+            }) {
+                continue;
+            }
             if pattern.is_match(&chunk.content) {
                 // Definition boosting supplies the initial score after injection.
                 injected.push(SearchResult {
@@ -3870,7 +3893,7 @@ mod stem_scan_tests {
         let db = Database::open_in_memory().unwrap();
         seed(&db);
         let mut results = vec![mk("src/uses_foo.rs", "let x = FooBar::new();", 0.6)];
-        apply_non_candidate_stem_scan(&db, &mut results, "FooBar", false).unwrap();
+        apply_non_candidate_stem_scan(&db, &mut results, "FooBar", false, None, None).unwrap();
         let injected = results
             .iter()
             .find(|r| r.file_path == "src/foo_bar.rs")
@@ -3885,7 +3908,7 @@ mod stem_scan_tests {
         seed(&db);
         let mut results = vec![mk("src/foo_bar.rs", "pub struct FooBar { x: i32 }", 0.7)];
         let before = results.len();
-        apply_non_candidate_stem_scan(&db, &mut results, "FooBar", false).unwrap();
+        apply_non_candidate_stem_scan(&db, &mut results, "FooBar", false, None, None).unwrap();
         assert_eq!(results.len(), before);
     }
 
@@ -3900,7 +3923,7 @@ mod stem_scan_tests {
         )
         .unwrap();
         let mut results = vec![mk("src/other.rs", "let x = FooBar::new();", 0.6)];
-        apply_non_candidate_stem_scan(&db, &mut results, "FooBar", false).unwrap();
+        apply_non_candidate_stem_scan(&db, &mut results, "FooBar", false, None, None).unwrap();
         assert!(!results.iter().any(|r| r.file_path == "src/foo_bar.rs"));
     }
 
@@ -3910,7 +3933,8 @@ mod stem_scan_tests {
         seed(&db);
         let mut results = vec![mk("src/uses_foo.rs", "let x = FooBar::new();", 0.6)];
         let before = results.len();
-        apply_non_candidate_stem_scan(&db, &mut results, "how does foo work", false).unwrap();
+        apply_non_candidate_stem_scan(&db, &mut results, "how does foo work", false, None, None)
+            .unwrap();
         assert_eq!(results.len(), before);
     }
 
@@ -3920,7 +3944,7 @@ mod stem_scan_tests {
         seed(&db);
         let mut results = vec![mk("src/uses_foo.rs", "use Fb;", 0.6)];
         let before = results.len();
-        apply_non_candidate_stem_scan(&db, &mut results, "Fb", false).unwrap();
+        apply_non_candidate_stem_scan(&db, &mut results, "Fb", false, None, None).unwrap();
         assert_eq!(results.len(), before);
     }
 
@@ -5896,14 +5920,14 @@ mod explanation_tests {
         )
         .unwrap();
         let mut rows = vec![row("src/entry.rs", "fn entry() {}", 0.8)];
-        apply_non_candidate_stem_scan(&db, &mut rows, "FooBar", true).unwrap();
+        apply_non_candidate_stem_scan(&db, &mut rows, "FooBar", true, None, None).unwrap();
         assert_eq!(rows.len(), 2);
         let admitted = &rows[1];
         assert_eq!(admitted.file_path, "src/FooBar.rs");
         assert_eq!(admitted.trace.as_ref().unwrap()[0].stage, "stem_scan");
         assert_chain(admitted);
         let mut empty = Vec::new();
-        apply_non_candidate_stem_scan(&db, &mut empty, "FooBar", true).unwrap();
+        apply_non_candidate_stem_scan(&db, &mut empty, "FooBar", true, None, None).unwrap();
         assert!(
             empty.is_empty(),
             "existing empty-pool behavior is preserved"

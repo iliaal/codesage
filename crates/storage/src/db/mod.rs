@@ -3,6 +3,7 @@
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use codesage_protocol::{ReferenceKind, SymbolKind};
@@ -94,9 +95,12 @@ pub(super) fn set_index_state(conn: &Connection, table: &str, sha: &str) -> Resu
     Ok(())
 }
 
+static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct Database {
     pub(super) conn: Connection,
     pub(super) chunk_table: String,
+    cache_id: u64,
 }
 
 pub struct ReadSnapshot<'a> {
@@ -656,6 +660,29 @@ fn record_semantic_model_table(
 }
 
 impl Database {
+    /// Filesystem path of this connection; in-memory databases return `None`.
+    pub fn path(&self) -> Option<&Path> {
+        self.conn
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(Path::new)
+    }
+
+    /// Generation for process-local structural caches. Connection identity is
+    /// required because SQLite's data_version is comparable only on one handle.
+    /// total_changes covers local writes; data_version covers other connections.
+    /// Never cache a transaction's view: it may be an old snapshot or roll back.
+    pub fn structural_cache_token(&self) -> Result<Option<(u64, u64, i64)>> {
+        if !self.conn.is_autocommit() {
+            return Ok(None);
+        }
+        Ok(Some((
+            self.cache_id,
+            self.conn.total_changes(),
+            self.data_version()?,
+        )))
+    }
+
     pub fn path_still_matches_open_file(&self, expected_path: &Path) -> Result<bool> {
         connection_path_still_matches_open_file(&self.conn, expected_path)
     }
@@ -686,6 +713,7 @@ impl Database {
         Ok(Database {
             conn,
             chunk_table: String::new(),
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -696,6 +724,7 @@ impl Database {
         Ok(Database {
             conn,
             chunk_table: String::new(),
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -708,6 +737,7 @@ impl Database {
         Ok(Database {
             conn,
             chunk_table: String::new(),
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -803,6 +833,7 @@ impl Database {
         Ok(Database {
             conn,
             chunk_table: String::new(),
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -888,7 +919,11 @@ impl Database {
         }
         record_semantic_model_table(&conn, &chunk_table, model, dim, repair_fts)?;
         harden_db_path_permissions(path)?;
-        Ok(Database { conn, chunk_table })
+        Ok(Database {
+            conn,
+            chunk_table,
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+        })
     }
 
     pub fn open_for_model_rebuild(path: &Path, model: &str, dim: usize) -> Result<Self> {
@@ -922,7 +957,11 @@ impl Database {
         // Interrupted rebuilds must not leave an old attestation over mixed vectors.
         clear_semantic_fingerprint_for(&conn, &chunk_table)?;
         harden_db_path_permissions(path)?;
-        Ok(Database { conn, chunk_table })
+        Ok(Database {
+            conn,
+            chunk_table,
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+        })
     }
 
     /// Open a DB for structural queries plus best-effort chunk reads for an
@@ -977,7 +1016,11 @@ impl Database {
             }
         };
         harden_db_path_permissions(path)?;
-        Ok(Database { conn, chunk_table })
+        Ok(Database {
+            conn,
+            chunk_table,
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -995,7 +1038,11 @@ impl Database {
         )?;
         ensure_chunk_table(&conn, &chunk_table, DEFAULT_EMBEDDING_DIM)?;
         record_semantic_model_table(&conn, &chunk_table, "default", DEFAULT_EMBEDDING_DIM, true)?;
-        Ok(Database { conn, chunk_table })
+        Ok(Database {
+            conn,
+            chunk_table,
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+        })
     }
 
     pub fn chunk_table_name(&self) -> &str {
@@ -2301,6 +2348,7 @@ mod tests {
         let db = Database {
             conn,
             chunk_table: table.clone(),
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         };
         if with_chunk {
             let embedding = make_embedding(0.1);

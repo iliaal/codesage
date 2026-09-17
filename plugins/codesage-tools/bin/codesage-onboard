@@ -73,6 +73,8 @@ if [ ! -x "$codesage_bin" ]; then
     echo "error: $codesage_bin is not executable" >&2
     exit 1
 fi
+# Keep the invocation-directory meaning across registration and project subshells.
+codesage_bin="$(realpath -- "$codesage_bin")"
 
 name="$(basename "$project")"
 

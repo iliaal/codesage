@@ -108,7 +108,7 @@ fn rust_grouped_use_prefix(node: &Node, source: &[u8]) -> Option<String> {
     let mut current = node.parent();
     while let Some(n) = current {
         match n.kind() {
-            "use_list" => {}
+            "use_list" | "use_as_clause" => {}
             "scoped_use_list" => {
                 if let Some(path) = n.child_by_field_name("path")
                     && let Ok(text) = path.utf8_text(source)

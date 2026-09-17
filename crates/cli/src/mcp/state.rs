@@ -35,6 +35,15 @@ pub(super) struct ProjectState {
 }
 
 impl ProjectState {
+    fn model_authorization(&self) -> codesage_embed::model::ModelAuthorization {
+        let root = self
+            .db_path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new(""));
+        codesage_embed::model::ModelAuthorization::for_project(root)
+    }
+
     fn config_path(&self) -> Option<PathBuf> {
         self.db_path.parent().map(|dir| dir.join("config.toml"))
     }
@@ -117,6 +126,17 @@ where
     let arc = Arc::new(Mutex::new(value));
     *slot_guard = Some(arc.clone());
     Ok(arc)
+}
+
+/// Authorization runs before the slot lookup, not merely inside the cold loader.
+fn get_or_load_authorized_slot<T>(
+    map: &ModelMap<T>,
+    model: &str,
+    identity: impl FnOnce() -> Result<String>,
+    load: impl FnOnce() -> Result<T>,
+) -> Result<Arc<Mutex<T>>> {
+    let policy = codesage_embed::model::ModelAuthorization::current().pool_key(model)?;
+    get_or_load_slot(map, format!("{policy}|{}", identity()?), load)
 }
 
 /// Evict idle models only when the pool owns the last reference. Skip busy load
@@ -513,14 +533,22 @@ impl Drop for WatcherReservation<'_> {
 /// stat metadata, not hashing or downloads, on this per-call path. First load replaces
 /// `uncached` and causes one restart.
 fn watcher_config_key(state: &ProjectState) -> String {
-    let embedding =
-        if state.embedding_config.model.is_empty() || state.embedding_config_error.is_some() {
-            "structural-only".to_string()
-        } else {
-            let identity = cached_artifact_identity(&state.embedding_config.model);
-            watcher_key(&state.embedding_config, &identity)
-        };
-    format!("{embedding}|excludes:{:?}", state.exclude_patterns)
+    state.model_authorization().scope(|| {
+        let embedding =
+            if state.embedding_config.model.is_empty() || state.embedding_config_error.is_some() {
+                "structural-only".to_string()
+            } else {
+                let identity = cached_artifact_identity(&state.embedding_config.model);
+                watcher_key(&state.embedding_config, &identity)
+            };
+        let policy = codesage_embed::model::ModelAuthorization::current()
+            .pool_key(&state.embedding_config.model)
+            .unwrap_or_else(|_| "denied".to_string());
+        format!(
+            "{embedding}|policy:{policy}|excludes:{:?}",
+            state.exclude_patterns
+        )
+    })
 }
 
 fn watcher_key(config: &EmbeddingConfig, artifact_identity: &str) -> String {
@@ -896,7 +924,11 @@ impl CodeSageServer {
             } else {
                 let server = self.clone();
                 let cfg = state.embedding_config.clone();
-                Some(Arc::new(move || server.get_or_load_embedder(&cfg)))
+                let root = root.to_path_buf();
+                Some(Arc::new(move || {
+                    codesage_embed::model::ModelAuthorization::for_project(&root)
+                        .scope(|| server.get_or_load_embedder(&cfg))
+                }))
             };
 
         let watcher_config = crate::statewatcher::StateWatcherConfig {
@@ -945,15 +977,19 @@ impl CodeSageServer {
 
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
         let load = || -> Result<Arc<Mutex<Embedder>>> {
-            let key = resolved_embedder_pool_key(config)?;
-            get_or_load_slot(&self.state.embedders, key, || {
-                Embedder::new(config).with_context(|| {
-                    format!(
-                        "loading embedding model '{}' on device '{}'",
-                        config.model, config.device
-                    )
-                })
-            })
+            get_or_load_authorized_slot(
+                &self.state.embedders,
+                &config.model,
+                || resolved_embedder_pool_key(config),
+                || {
+                    Embedder::new(config).with_context(|| {
+                        format!(
+                            "loading embedding model '{}' on device '{}'",
+                            config.model, config.device
+                        )
+                    })
+                },
+            )
         };
         load().map_err(|error| model_error("embedding model unavailable", error))
     }
@@ -963,12 +999,16 @@ impl CodeSageServer {
         reranker_model: &str,
         device: &str,
     ) -> Result<Arc<Mutex<Reranker>>> {
-        let key = format!("{}|{}", reranker_model, device);
-        get_or_load_slot(&self.state.rerankers, key, || {
-            Reranker::new(reranker_model, device).with_context(|| {
-                format!("loading reranker model '{reranker_model}' on device '{device}'")
-            })
-        })
+        get_or_load_authorized_slot(
+            &self.state.rerankers,
+            reranker_model,
+            || Ok(format!("{reranker_model}|{device}")),
+            || {
+                Reranker::new(reranker_model, device).with_context(|| {
+                    format!("loading reranker model '{reranker_model}' on device '{device}'")
+                })
+            },
+        )
         .map_err(|error| model_error("reranker model unavailable", error))
     }
 
@@ -1182,31 +1222,37 @@ impl CodeSageServer {
         texts: &[String],
     ) -> Result<EmbedTextsResult> {
         let state = self.resolve_project(project)?;
-        let config = self.semantic_embedding_config(&state)?;
-        if config.model != model {
-            bail!(
-                "daemon serves model {:?} for this project, caller asked for {:?}; \
+        state.model_authorization().scope(|| {
+            let config = self.semantic_embedding_config(&state)?;
+            if config.model != model {
+                bail!(
+                    "daemon serves model {:?} for this project, caller asked for {:?}; \
                  re-run after the config change settles or embed privately",
-                config.model,
-                model
-            );
-        }
-        let embedder_arc = self.get_or_load_embedder(config)?;
-        let mut embedder = model_lock(&embedder_arc)?;
-        let dim = embedder.dim();
-        let fingerprint = session_fingerprint(config, &embedder)?;
-        check_expected_fingerprint(expected_fingerprint, fingerprint.as_str(), texts.is_empty())?;
-        let embeddings = if texts.is_empty() {
-            Vec::new()
-        } else {
-            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-            embedder.embed_batch(&refs)?
-        };
-        Ok(EmbedTextsResult {
-            model: config.model.clone(),
-            dim,
-            fingerprint: fingerprint.as_str().to_string(),
-            embeddings,
+                    config.model,
+                    model
+                );
+            }
+            let embedder_arc = self.get_or_load_embedder(config)?;
+            let mut embedder = model_lock(&embedder_arc)?;
+            let dim = embedder.dim();
+            let fingerprint = session_fingerprint(config, &embedder)?;
+            check_expected_fingerprint(
+                expected_fingerprint,
+                fingerprint.as_str(),
+                texts.is_empty(),
+            )?;
+            let embeddings = if texts.is_empty() {
+                Vec::new()
+            } else {
+                let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                embedder.embed_batch(&refs)?
+            };
+            Ok(EmbedTextsResult {
+                model: config.model.clone(),
+                dim,
+                fingerprint: fingerprint.as_str().to_string(),
+                embeddings,
+            })
         })
     }
 
@@ -1219,12 +1265,15 @@ impl CodeSageServer {
         crate::query_reranker::check_caps(&params.query, &documents)?;
         anyhow::ensure!(!cancelled(), "rerank_pairs request cancelled");
         let state = self.resolve_project(&params.project)?;
+        state.model_authorization().scope(|| {
         let config = self.semantic_embedding_config(&state)?;
         anyhow::ensure!(
             config.reranker.as_deref() == Some(params.model.as_str())
                 && config.device == params.device,
             "daemon reranker model/device differs from requested configuration; re-run after the config change settles"
         );
+        codesage_embed::model::ModelAuthorization::current().pool_key(&params.model)
+            .map_err(|error| model_error("reranker model unavailable", error))?;
         let scores = if documents.is_empty() {
             Vec::new()
         } else {
@@ -1248,6 +1297,7 @@ impl CodeSageServer {
             device: params.device.clone(),
             scores,
         })
+        })
     }
 
     pub(super) fn with_project_query<F, R>(&self, project: &str, query: &str, f: F) -> Result<R>
@@ -1255,37 +1305,39 @@ impl CodeSageServer {
         F: FnOnce(&Database, &[f32], Option<codesage_graph::RerankFn<'_>>) -> Result<R>,
     {
         let state = self.resolve_project(project)?;
-        self.maybe_start_watcher(&state, true);
-        let config = self.semantic_embedding_config(&state)?;
-        if let Some(query_embedding) = self.test_query_embedding_override()? {
-            // The override skips model loads; table compatibility remains checked and the render layer marks it.
-            let dim = query_embedding.len();
-            let db = self.open_test_override_db(&state, config, dim)?;
-            return f(&db, &query_embedding, None);
-        }
-        let db = self.open_db_for(&state)?;
-        let embedder_arc = self.get_or_load_embedder(config)?;
-        let reranker_arc = config
-            .reranker
-            .as_deref()
-            .map(|m| self.get_or_load_reranker(m, &config.device))
-            .transpose()?;
+        state.model_authorization().scope(|| {
+            self.maybe_start_watcher(&state, true);
+            let config = self.semantic_embedding_config(&state)?;
+            if let Some(query_embedding) = self.test_query_embedding_override()? {
+                // The override skips model loads; table compatibility remains checked and the render layer marks it.
+                let dim = query_embedding.len();
+                let db = self.open_test_override_db(&state, config, dim)?;
+                return f(&db, &query_embedding, None);
+            }
+            let db = self.open_db_for(&state)?;
+            let embedder_arc = self.get_or_load_embedder(config)?;
+            let reranker_arc = config
+                .reranker
+                .as_deref()
+                .map(|m| self.get_or_load_reranker(m, &config.device))
+                .transpose()?;
 
-        let query_embedding = {
-            let mut guard = model_lock(&embedder_arc)?;
-            // Config compatibility is insufficient: verify the resident session's execution provider too.
-            let produces = session_fingerprint(config, &guard)?;
-            codesage_graph::require_current_semantic_table(&db, &produces)?;
-            guard.embed_one(query)?
-        };
+            let query_embedding = {
+                let mut guard = model_lock(&embedder_arc)?;
+                // Config compatibility is insufficient: verify the resident session's execution provider too.
+                let produces = session_fingerprint(config, &guard)?;
+                codesage_graph::require_current_semantic_table(&db, &produces)?;
+                guard.embed_one(query)?
+            };
 
-        let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker_arc.map(|rr| {
-            // Hold the model lock only during inference, not SQL retrieval or post-processing.
-            Box::new(move |q: &str, docs: &[&str]| model_lock(&rr)?.score_pairs(q, docs))
-                as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
-        });
+            let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker_arc.map(|rr| {
+                // Hold the model lock only during inference, not SQL retrieval or post-processing.
+                Box::new(move |q: &str, docs: &[&str]| model_lock(&rr)?.score_pairs(q, docs))
+                    as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
+            });
 
-        f(&db, &query_embedding, rerank_fn)
+            f(&db, &query_embedding, rerank_fn)
+        })
     }
 }
 
@@ -1367,6 +1419,88 @@ fn write_drift_log_for_project(project_root: &Path, db_path: &Path) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_project_authorization_guards_cold_and_warm_pool() {
+        use codesage_embed::model::ModelAuthorization;
+        const CHILD: &str = "CODESAGE_POOL_AUTH_CHILD";
+        const MODEL: &str = "authorization-test/unvalidated";
+        if std::env::var_os(CHILD).is_some() {
+            let listed = PathBuf::from(std::env::var_os("AUTH_LISTED").unwrap());
+            let unlisted = PathBuf::from(std::env::var_os("AUTH_UNLISTED").unwrap());
+            let allowlist = PathBuf::from(std::env::var_os("AUTH_ALLOWLIST").unwrap());
+            let map: ModelMap<u32> = Mutex::new(HashMap::new());
+            let lookup = |root: &Path, model: &str, value| {
+                ModelAuthorization::for_project(root).scope(|| {
+                    get_or_load_authorized_slot(
+                        &map,
+                        model,
+                        || Ok("same-artifacts".into()),
+                        || Ok(value),
+                    )
+                })
+            };
+            assert!(
+                lookup(&unlisted, MODEL, 99).is_err(),
+                "cold unlisted project"
+            );
+            let first = lookup(&listed, MODEL, 7).unwrap();
+            let warm = lookup(&listed, MODEL, 99).unwrap();
+            assert!(Arc::ptr_eq(&first, &warm), "same-policy pool reuse");
+            assert!(
+                lookup(&unlisted, MODEL, 99).is_err(),
+                "warm unlisted project"
+            );
+            let pinned = "sentence-transformers/all-MiniLM-L6-v2";
+            let unpinned = lookup(&listed, pinned, 11).unwrap();
+            std::fs::write(&allowlist, "").unwrap();
+            assert!(lookup(&listed, MODEL, 99).is_err(), "revoked warm project");
+            let verified = lookup(&listed, pinned, 22).unwrap();
+            assert!(
+                !Arc::ptr_eq(&unpinned, &verified),
+                "pin policy changed despite identical artifact identity"
+            );
+            assert_eq!(*verified.lock(), 22);
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let listed = temp.path().join("listed");
+        let unlisted = temp.path().join("unlisted");
+        let config = temp.path().join("config");
+        for root in [&listed, &unlisted] {
+            std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        }
+        std::fs::create_dir_all(config.join("codesage")).unwrap();
+        let allowlist = config.join("codesage/allowed-models");
+        for cwd in [&listed, &unlisted] {
+            std::fs::write(
+                &allowlist,
+                format!("{}\n", listed.canonicalize().unwrap().display()),
+            )
+            .unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mcp::state::tests::requested_project_authorization_guards_cold_and_warm_pool",
+                    "--nocapture",
+                ])
+                .current_dir(cwd)
+                .env(CHILD, "1")
+                .env("CODESAGE_ALLOW_ANY_MODEL", "1")
+                .env("XDG_CONFIG_HOME", &config)
+                .env("AUTH_LISTED", &listed)
+                .env("AUTH_UNLISTED", &unlisted)
+                .env("AUTH_ALLOWLIST", &allowlist)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     fn loaded_entry(value: i32, age: Duration) -> ModelEntry<i32> {
         ModelEntry {
@@ -2586,12 +2720,12 @@ mod tests {
     #[test]
     fn rerank_pairs_validates_caps_cancellation_and_configuration_before_loading() {
         let (_dir, root) = onboarded_project(Some(
-            "[embedding]\nmodel = \"codesage-test/missing\"\nreranker = \"codesage-test/reranker\"\ndevice = \"cpu\"\n[index]\nwatch = false\n",
+            "[embedding]\nmodel = \"codesage-test/missing\"\nreranker = \"cross-encoder/ms-marco-MiniLM-L6-v2\"\ndevice = \"cpu\"\n[index]\nwatch = false\n",
         ));
         let server = CodeSageServer::new();
         let mut params = RerankPairsParams {
             project: root.to_str().unwrap().into(),
-            model: "codesage-test/reranker".into(),
+            model: "cross-encoder/ms-marco-MiniLM-L6-v2".into(),
             device: "cpu".into(),
             query: "query".into(),
             documents: Vec::new(),

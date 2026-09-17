@@ -989,6 +989,34 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(len(merged["feature_files"]), 2)
         self.assertEqual(summary["refuted"][0]["finding_id"], "fnd_55555555")
 
+    def test_merge_counts_uncertain_and_skipped_verification_as_unresolved(self):
+        review_state = load_review_state()
+        feature = {"feature_id": "feat_1111111111111111", "files": []}
+        ids = ["fnd_11111111", "fnd_22222222", "fnd_33333333", "fnd_44444444"]
+        findings = [{"finding_id": identity, "title": identity} for identity in ids]
+        validated = {"feature_id": feature["feature_id"], "findings": findings,
+                     "new_finding_ids": ids}
+        verdicts = {"verdicts": [
+            {"finding_id": ids[0], "verdict": "uncertain", "note": "Needs runtime evidence"},
+            {"finding_id": ids[1], "verdict": "confirmed"},
+            {"finding_id": ids[2], "verdict": "refuted", "refutation": "Guard exists"},
+        ]}
+        with tempfile.TemporaryDirectory() as directory:
+            document, summary = review_state.merge_document(
+                Path(directory), feature, {"findings": []}, validated, verdicts,
+                "run_uncertain", "2026-09-17T00:00:00Z", "review",
+            )
+        by_id = {finding["finding_id"]: finding for finding in document["findings"]}
+        self.assertEqual(set(by_id), {ids[0], ids[1], ids[3]})
+        self.assertEqual(summary["new"], [ids[0], ids[1], ids[3]])
+        self.assertEqual(summary["unverified"], [ids[0], ids[3]])
+        self.assertEqual([item["finding_id"] for item in summary["refuted"]], [ids[2]])
+        self.assertEqual(by_id[ids[0]]["status"], "open")
+        self.assertEqual(by_id[ids[0]]["history"][-1]["result"], "uncertain")
+        self.assertEqual(by_id[ids[0]]["history"][-1]["note"], "Needs runtime evidence")
+        self.assertEqual(by_id[ids[1]]["history"][-1]["result"], "confirmed")
+        self.assertEqual(by_id[ids[3]]["history"][-1]["result"], "unverified")
+
     def test_revalidation_reopens_fixed_only_when_evidence_validated_it_as_present(self):
         review_state = load_review_state()
         prior = self.finding("fnd_66666666", "fixed")

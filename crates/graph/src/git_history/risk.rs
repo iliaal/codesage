@@ -85,7 +85,7 @@ fn test_gap_note(no_symbols: bool, walk_capped: bool) -> String {
     }
 }
 
-type CycleToken = (i64, i64, i64, i64, i64, i64);
+type CycleToken = (u64, u64, i64);
 type CycleComponentCache = HashMap<String, (CycleToken, Arc<ImportCycles>)>;
 
 /// Tarjan SCCs over the load-time import graph plus the lazy-only file pairs
@@ -1644,16 +1644,10 @@ fn cycle_entry_for_file(
 
 fn import_cycle_components(db: &Database) -> Result<Arc<ImportCycles>> {
     codesage_protocol::work::checkpoint()?;
-    // The cross-request token can collide after same-shape reindexing.
-    let cache_key = if COMPLETE_POLICY.get().is_some() {
-        None
-    } else {
-        db.import_cycle_cache_key()
-    };
-    let Some(key) = cache_key else {
+    let (Some(key), Some(token)) = (db.import_cycle_cache_key(), db.structural_cache_token()?)
+    else {
         return Ok(Arc::new(ImportCycles::load(db)?));
     };
-    let token = db.import_cycle_validity_token()?;
     if let Some((_, cached)) = IMPORT_CYCLE_CACHE
         .lock()
         .expect("import cycle cache lock poisoned")

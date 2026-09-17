@@ -1063,7 +1063,7 @@ def merge_document(
         )
         merged_findings.append(current)
         summary["new"].append(finding_id)
-        if verdict.get("verdict") == "unverified":
+        if verdict.get("verdict") in {"unverified", "uncertain"}:
             summary["unverified"].append(finding_id)
 
     if mode == "revalidate":

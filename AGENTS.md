@@ -122,12 +122,11 @@ Write entries in terse style:
 
 ### Cutting a release
 
-1. Move everything under `## [Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD` section. Leave `## [Unreleased]` empty above it.
-2. Append a link reference at the bottom of `CHANGELOG.md`: `[X.Y.Z]: https://github.com/iliaal/codesage/releases/tag/vX.Y.Z` and update the `[Unreleased]` compare URL to `...vX.Y.Z...HEAD`.
-3. Bump `[workspace.package] version` in the root `Cargo.toml`. All seven crates inherit it.
-4. Commit: `git commit -am "release: vX.Y.Z"`.
-5. Tag: `git tag -a vX.Y.Z -m "codesage X.Y.Z"`.
-6. Push: `git push origin master && git push origin vX.Y.Z`.
+Use the repository-owned `/release X.Y.Z` workflow and its canonical implementation, `scripts/release.sh X.Y.Z`, rather than manually bumping Cargo or creating a tag.
+
+The script rolls over the changelog, updates the workspace version, both Codex and Claude plugin manifests, and the marketplace metadata and plugin entry. It runs `scripts/check-changelog.py` and `scripts/check-plugin-versions.py` before mutation, then repeats version alignment validation after mutation and before committing/tagging. Keep that gate in the release path; the tag-triggered workflow is not a substitute.
+
+For a non-publishing alignment check on a synthetic release fixture, run `python3 scripts/check-plugin-versions.py --root /path/to/fixture`; do not invoke the publishing release script for that check.
 
 The `Release` workflow (`.github/workflows/release.yml`) fires on the tag push, extracts the matching `[X.Y.Z]` section from `CHANGELOG.md`, and creates a GitHub Release with those notes plus the auto-attached source tarball. If the section is empty or missing, the workflow fails.
 

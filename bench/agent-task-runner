@@ -277,6 +277,7 @@ def parse_run_output(
     cost_usd = 0.0
     result_text = ""
     is_error = False
+    saw_result = False
     for line in stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -298,6 +299,7 @@ def parse_run_output(
                 + _coerce_int(usage.get("cache_creation_input_tokens"))
             )
         elif obj.get("type") == "result":
+            saw_result = True
             result_text = (obj.get("result") or "").strip()
             cost_usd = _coerce_cost(obj.get("total_cost_usd"))
             is_error = bool(obj.get("is_error")) or obj.get("subtype") not in (None, "success")
@@ -320,6 +322,8 @@ def parse_run_output(
         error = f"rc={returncode}"
     elif is_error:
         error = "result_error"
+    elif not saw_result:
+        error = "missing_result"
     return {
         "error": error,
         "raced": raced,

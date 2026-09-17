@@ -10,7 +10,7 @@ use codesage_protocol::{FileCategory, SimilarSymbol};
 use codesage_storage::Database;
 use codesage_storage::db::StoredFingerprint;
 
-type FingerprintToken = (i64, i64, i64, i64);
+type FingerprintToken = (u64, u64, i64);
 type FingerprintCache = HashMap<String, (FingerprintToken, Arc<Vec<StoredFingerprint>>)>;
 
 static FINGERPRINT_CACHE: LazyLock<Mutex<FingerprintCache>> =
@@ -137,11 +137,11 @@ fn fingerprints_for_language_cached(
     db: &Database,
     language: &str,
 ) -> Result<Arc<Vec<StoredFingerprint>>> {
-    let Some(key) = db.fingerprint_cache_key() else {
+    let (Some(key), Some(token)) = (db.fingerprint_cache_key(), db.structural_cache_token()?)
+    else {
         return Ok(Arc::new(db.fingerprints_for_language(language)?));
     };
     let key = format!("{key}::{language}");
-    let token = db.fingerprint_validity_token()?;
     if let Some((_, cached)) = lock_fingerprint_cache()
         .get(&key)
         .filter(|(cached_token, _)| *cached_token == token)

@@ -1041,19 +1041,76 @@ fn resolve_model_artifacts_at(
     })
 }
 
+/// A request's model policy, resolved from its canonical project rather than the
+/// daemon's working directory. Resolve again for each operation so revocation
+/// also applies to resident sessions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelAuthorization {
+    root: Option<PathBuf>,
+    allow_any: bool,
+}
+
+thread_local! {
+    static MODEL_AUTHORIZATION: std::cell::RefCell<Option<ModelAuthorization>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+impl ModelAuthorization {
+    pub fn for_project(root: &Path) -> Self {
+        let root = std::fs::canonicalize(root).ok();
+        let allow_any = allow_any_eligible_from_env()
+            && root.as_deref().is_some_and(project_allow_any_opted_in);
+        Self { root, allow_any }
+    }
+
+    /// Validate before looking up a resident session, including after revocation.
+    /// Distinguish both project and pin policy even if artifact bytes coincide.
+    pub fn pool_key(&self, model: &str) -> Result<String> {
+        validate_model_allowed(model, self.allow_any)?;
+        Ok(format!("{:?}|unpinned:{}", self.root, self.allow_any))
+    }
+
+    /// Bind all nested synchronous model/artifact/fingerprint operations to this
+    /// request. Never span an async suspension or expect propagation to a spawned
+    /// thread: establish a fresh scope there. Restores the outer scope on unwind.
+    pub fn scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        struct Restore(Option<ModelAuthorization>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MODEL_AUTHORIZATION.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+        let _restore = Restore(MODEL_AUTHORIZATION.with(|slot| slot.replace(Some(self.clone()))));
+        operation()
+    }
+
+    /// Policy of the current synchronous operation; cwd discovery is reserved
+    /// for standalone callers that did not supply a requested project.
+    pub fn current() -> Self {
+        MODEL_AUTHORIZATION
+            .with(|slot| slot.borrow().clone())
+            .unwrap_or_else(|| {
+                current_project_root().map_or(
+                    Self {
+                        root: None,
+                        allow_any: false,
+                    },
+                    |root| Self::for_project(&root),
+                )
+            })
+    }
+}
+
 /// Bypass requires CODESAGE_ALLOW_ANY_MODEL plus the project's canonical root
 /// in the user-owned allowlist (one path per line; blanks and # comments ignored).
 /// Repo-local opt-in would let a cloned repo authorize its own ONNX graph.
-/// The project is the nearest cwd ancestor with .codesage/; none fails closed.
+/// An explicit request scope wins; only standalone callers fall back to cwd.
 /// See [`user_allowlist_path`] for the external configuration location.
 pub fn allow_any_model_from_env() -> bool {
-    if !allow_any_eligible_from_env() {
-        return false;
-    }
-    let Some(root) = current_project_root() else {
-        return false;
-    };
-    project_allow_any_opted_in(&root)
+    ModelAuthorization::current().allow_any
 }
 
 /// Raw eligibility signal behind [`allow_any_model_from_env`]: the env var
@@ -1085,7 +1142,9 @@ fn find_project_root_from(start: &Path) -> Option<PathBuf> {
 /// unresolvable config home (notably HOME-less daemon environments — see
 /// [`hf_cache_from_env`]), is "not listed": fail closed, never panic.
 fn project_allow_any_opted_in(root: &Path) -> bool {
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let Ok(canonical) = std::fs::canonicalize(root) else {
+        return false;
+    };
     let Some(path) = user_allowlist_path() else {
         return false;
     };

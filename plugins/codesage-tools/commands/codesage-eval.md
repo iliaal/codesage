@@ -8,13 +8,13 @@ argument-hint: "<project-path> [--max-cases N] [--min-files N] [--no-extract] [-
 
 Wraps `${CLAUDE_PLUGIN_ROOT}/bin/codesage-eval`. Post-deployment effectiveness check: mine real user queries from this project's Claude Code session history, run them through CodeSage, and report how well retrieval actually performs on queries the user has asked on this codebase.
 
-Use this AFTER `/codesage-onboard` and after the project has accumulated enough Claude Code session history (rule of thumb: at least a dozen sessions with real queries). On a freshly onboarded project with no session history, this command will fail with a clear error.
+Use this AFTER `/codesage-onboard`. Mining requires enough Claude Code session history (rule of thumb: at least a dozen sessions with real queries). With `--no-extract`, an existing corpus replaces that prerequisite; session history and the extractor are not required.
 
 This is separate from `/codesage-bench`, which runs a regression suite across all corpora under `$CODESAGE_BENCH_CORPUS_DIR` (default: `./bench-corpora`). `/codesage-eval` builds a fresh project-specific corpus every run (unless `--no-extract` is passed).
 
 ## Step 1: Validate arguments
 
-`$ARGUMENTS` — first positional arg is the project path. It must be a directory that exists AND has a corresponding `~/.claude/projects/<slug>/` directory with session transcripts. If either is missing, stop and explain why to the user.
+`$ARGUMENTS` — first positional arg is the project path and must be an existing directory. For mining (without `--no-extract`), also require a corresponding `~/.claude/projects/<slug>/` directory with session transcripts and an available extractor. With `--no-extract`, require the existing `<corpus-dir>/<project-name>-session-eval.yaml` instead; do not require session history or the extractor. Both modes require a valid bench runner. Stop and explain any missing prerequisite for the selected mode.
 
 ## Step 2: Run the eval
 

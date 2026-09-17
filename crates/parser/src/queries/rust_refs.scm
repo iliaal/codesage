@@ -31,12 +31,20 @@
 ; Pattern 10: glob use, including nested groups and super::*
 (use_wildcard) @ref
 
-; Pattern 11: grouped use (use a::b::{X, Y}) -- one ref per name;
+; Pattern 11: grouped use (use a::b::{X, Y as Z}) -- one ref per source name;
 ; the enclosing scoped_use_list path is prepended in references.rs.
-(scoped_use_list list: (use_list [(identifier) (scoped_identifier)] @ref))
+(scoped_use_list list: (use_list [
+  (identifier) @ref
+  (scoped_identifier) @ref
+  (use_as_clause path: (_) @ref)
+]))
 
-; Pattern 12: braced use without a leading path (use {a, b}) -- one ref per name
-(use_declaration argument: (use_list [(identifier) (scoped_identifier)] @ref))
+; Pattern 12: braced use without a leading path (use {a, b as c})
+(use_declaration argument: (use_list [
+  (identifier) @ref
+  (scoped_identifier) @ref
+  (use_as_clause path: (_) @ref)
+]))
 
 ; Pattern 13: external module declaration, excluding inline module bodies
 (mod_item name: (identifier) @ref !body)

@@ -385,10 +385,10 @@ impl Database {
 
     /// Count only this model's semantic files; old models remain until cleanup.
     pub fn semantic_file_count_for_model(&self, model: &str) -> Result<usize> {
-        let prefix = crate::schema::model_table_prefix(model);
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT path) FROM semantic_files WHERE chunk_table LIKE ?1 || '%'",
-            [&prefix],
+            "SELECT COUNT(DISTINCT sf.path) FROM semantic_files sf
+             JOIN semantic_models sm ON sm.chunk_table = sf.chunk_table WHERE sm.model = ?1",
+            [model],
             |r| r.get(0),
         )?;
         Ok(n as usize)
@@ -724,6 +724,37 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use crate::Database;
+
+    #[test]
+    fn model_coverage_matches_exact_identity() {
+        let db = Database::open_in_memory().unwrap();
+        for (table, model, path) in [
+            ("chunks_org_model_2", "org/model", "shared.rs"),
+            ("chunks_org_model_3", "org/model", "shared.rs"),
+            ("chunks_org_model_3", "org/model", "own.rs"),
+            ("chunks_org_model_extra_2", "org/model-extra", "longer.rs"),
+            ("chunks_org_model_4", "org-model", "punctuation.rs"),
+            ("chunks_orgXmodel_2", "orgXmodel", "wildcard.rs"),
+        ] {
+            db.conn.execute(
+                "INSERT OR IGNORE INTO semantic_models (chunk_table, model, dim) VALUES (?1, ?2, 2)",
+                rusqlite::params![table, model],
+            ).unwrap();
+            db.conn.execute(
+                "INSERT INTO semantic_files (chunk_table, path, content_hash) VALUES (?1, ?2, 'hash')",
+                rusqlite::params![table, path],
+            ).unwrap();
+        }
+        assert_eq!(db.semantic_file_count_for_model("org/model").unwrap(), 2);
+        assert_eq!(
+            db.semantic_file_count_for_model("org/model-extra").unwrap(),
+            1
+        );
+        assert_eq!(db.semantic_file_count_for_model("org-model").unwrap(), 1);
+        assert_eq!(db.semantic_file_count_for_model("orgXmodel").unwrap(), 1);
+        assert_eq!(db.semantic_file_count_for_model("org").unwrap(), 0);
+        assert_eq!(db.semantic_file_count_for_model("org.model").unwrap(), 0);
+    }
 
     #[test]
     fn search_row_accepts_numeric_distance() {

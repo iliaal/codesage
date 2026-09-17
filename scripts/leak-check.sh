@@ -110,10 +110,10 @@ esac
 list_files() {
 	case "$mode" in
 	staged)
-		git -c core.quotepath=false diff -z --cached --name-only --diff-filter=AM
+		git -c core.quotepath=false diff -z --cached --name-only --no-renames --diff-filter=AMT
 		;;
 	range)
-		git -c core.quotepath=false diff -z --name-only --diff-filter=AM "$range"
+		git -c core.quotepath=false diff -z --name-only --no-renames --diff-filter=AMT "$range"
 		;;
 	all)
 		git -c core.quotepath=false ls-files -z
@@ -146,8 +146,20 @@ is_binary() {
 	fi
 }
 
-content_file="$(mktemp)"
-trap 'rm -f "$content_file"' EXIT
+scan_dir="$(mktemp -d)"
+trap 'rm -rf -- "$scan_dir"' EXIT
+content_file="$scan_dir/content"
+files_file="$scan_dir/files"
+
+# Process substitution hides producer failures. Finish enumeration successfully
+# before scanning any paths, retaining NUL separators in the temporary file.
+if list_files >"$files_file"; then
+	:
+else
+	list_status=$?
+	echo "leak-check: failed to enumerate files (git exit $list_status); refusing to scan an incomplete list" >&2
+	exit 2
+fi
 
 found=0
 while IFS= read -r -d '' file; do
@@ -188,7 +200,7 @@ while IFS= read -r -d '' file; do
 		printf '%s\n' "$matches" | head -5 | sed "s|^|  $file:|" >&2
 		found=1
 	fi
-done < <(list_files)
+done <"$files_file"
 
 if [ "$found" -eq 1 ]; then
 	echo >&2

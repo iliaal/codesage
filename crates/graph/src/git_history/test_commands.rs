@@ -532,21 +532,32 @@ fn rust_integration_target(krate: &RustCrate, path: &str) -> Option<String> {
 }
 
 /// Crate-relative module path of a file under `src/`: `lib.rs`, `main.rs`,
-/// and `bin/<x>.rs` are crate roots (empty path), `a/mod.rs` is `a`,
-/// `a/b.rs` is `a::b`. `None` outside `src/`.
+/// and `bin/<x>.rs` / `bin/<x>/main.rs` are crate roots (empty path),
+/// `a/mod.rs` is `a`, `a/b.rs` is `a::b`. `None` outside `src/`.
 fn rust_module_path(krate: &RustCrate, path: &str) -> Option<String> {
     let rest = krate.rest_under(path, "src")?;
+    let rest = rest.strip_prefix("bin/").map_or(rest, |bin| {
+        bin.split_once('/').map_or(bin, |(_, module)| module)
+    });
     let rest = rest.strip_suffix(".rs")?;
     if rest == "lib" || rest == "main" {
         return Some(String::new());
     }
-    if let Some(bin) = rest.strip_prefix("bin/")
-        && !bin.contains('/')
+    if krate
+        .rest_under(path, "src/bin")
+        .is_some_and(|bin| !bin.contains('/'))
     {
         return Some(String::new());
     }
     let rest = rest.strip_suffix("/mod").unwrap_or(rest);
     Some(rest.replace('/', "::"))
+}
+
+/// Directory binaries may mount descendants with `#[path]`, so recommend the
+/// whole target rather than inventing a substring filter from its disk layout.
+fn rust_directory_binary<'p>(krate: &RustCrate, path: &'p str) -> Option<&'p str> {
+    let rest = krate.rest_under(path, "src/bin")?;
+    rest.split_once('/').map(|(name, _)| name)
 }
 
 fn is_rust_test_module_name(name: &str) -> bool {
@@ -668,6 +679,13 @@ fn inline_commands(
                     continue;
                 };
                 let source = read_source_bounded(ctx.root, path);
+                let directory_binary = rust_directory_binary(&krate, path);
+                if let Some(target) = directory_binary
+                    && !flag_safe(target)
+                {
+                    notes.push(dropped_token_note("cargo binary target", target));
+                    continue;
+                }
                 for (name, count) in rust_inline_modules(&symbols, source.as_deref()) {
                     let module = if module_path.is_empty() {
                         name
@@ -678,12 +696,21 @@ fn inline_commands(
                         notes.push(dropped_token_note("cargo test filter", &module));
                         continue;
                     }
-                    commands.push(command(
+                    let invocation = if let Some(target) = directory_binary {
+                        format!(
+                            "cargo test{} --bin {}",
+                            krate.package_flag(),
+                            shell_quote(target)
+                        )
+                    } else {
                         format!(
                             "cargo test{} {}",
                             krate.package_flag(),
                             shell_quote(&format!("{module}::"))
-                        ),
+                        )
+                    };
+                    commands.push(command(
+                        invocation,
                         vec![module.clone()],
                         "cargo",
                         SOURCE_INLINE,

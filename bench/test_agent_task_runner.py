@@ -4,7 +4,7 @@
 Usage:
   python3 bench/test_agent_task_runner.py
 
-Bare-assert style — no pytest dependency. Exits 0 on success, 1 on failure.
+Existing checks run on import; unittest cases also run through the module runner.
 The runner has a hyphen and no extension, so it's loaded via SourceFileLoader
 (spec_from_file_location returns no loader for extensionless files).
 
@@ -24,6 +24,8 @@ import importlib.machinery
 import importlib.util
 import json
 import sys
+import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -160,9 +162,44 @@ sc_steer = m.render_scorecard(project_root="/repo", corpus_name="x.yaml", rows=r
                               codesage_version="codesage 0.15.0", steer=True)
 check("steering**: **ON**" in sc_steer, "render: steer=True stamps steering ON (value-when-used test)")
 
+
+class MissingResultTests(unittest.TestCase):
+    streams = {
+        "empty": "",
+        "malformed-only": "debug: starting\n{bad\nnot json",
+        "assistant-only": _stream({"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "src/foo.rs"}],
+            "usage": {"input_tokens": 7, "output_tokens": 3},
+        }}),
+    }
+
+    def test_missing_terminal_result_is_an_error(self):
+        for label, stream in self.streams.items():
+            with self.subTest(stream=label):
+                result = m.parse_run_output(stream, "", 0, 0.1, with_codesage=False)
+                self.assertEqual(result["error"], "missing_result")
+
+    def test_incomplete_streams_do_not_affect_arm_medians(self):
+        streams = [*self.streams.values(), good]
+        responses = [m.subprocess.CompletedProcess([], 0, stream, "") for stream in streams]
+        with patch.object(m.subprocess, "run", side_effect=responses):
+            arm = m.run_arm(
+                {"query": "find foo"}, with_codesage=True, mcp_config="{}",
+                project_root=HERE, runs=len(streams), include_raced=True,
+                model="sonnet", effort="high", max_turns=12,
+                max_budget_usd=2.0, timeout_s=240,
+            )
+        self.assertEqual(arm["runs_used"], 1)
+        self.assertEqual(arm["errored"], 3)
+        self.assertEqual(arm["median_cost"], 0.1234)
+        self.assertEqual(arm["median_tokens"], 5160)
+        self.assertEqual(arm["median_tools"], 3)
+        self.assertEqual(arm["result_texts"], ["src/foo.rs"])
+
 if failures:
     print(f"FAIL ({len(failures)}):")
     print("\n".join(failures))
     sys.exit(1)
 print("agent-task-runner: all checks passed")
-sys.exit(0)
+if __name__ == "__main__":
+    unittest.main()

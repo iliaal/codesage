@@ -132,7 +132,7 @@ for root in "${active[@]:-}"; do
 		echo "    [1/3] (skipped per --no-index)"
 	fi
 
-	if [ -d "$root/.git" ]; then
+	if [ -e "$root/.git" ]; then
 		echo "    [2/3] codesage install-hooks"
 		if ! (cd "$root" && "$codesage_bin" install-hooks 2>&1 | sed 's/^/        /'); then
 			failures+=("$root (install-hooks)")

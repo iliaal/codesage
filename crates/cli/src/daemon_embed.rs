@@ -63,10 +63,17 @@ impl DaemonEmbedder {
                     "embedding through the running daemon"
                 );
                 let private_config = config.clone();
+                let private_root = root.to_path_buf();
                 Some(embedder.with_private_fallback(Box::new(move || {
-                    let embedder = codesage_embed::model::Embedder::new(&private_config)
-                        .context("loading a private embedder for texts the daemon refused")?;
-                    Ok(Box::new(embedder) as Box<dyn TextEmbedder>)
+                    codesage_embed::model::ModelAuthorization::for_project(&private_root).scope(
+                        || {
+                            let embedder = codesage_embed::model::Embedder::new(&private_config)
+                                .context(
+                                    "loading a private embedder for texts the daemon refused",
+                                )?;
+                            Ok(Box::new(embedder) as Box<dyn TextEmbedder>)
+                        },
+                    )
                 })))
             }
             Err(e) => {

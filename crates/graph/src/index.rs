@@ -104,7 +104,7 @@ const STRUCTURAL_INDEX_BATCH_SIZE: usize = 50;
 /// Bump the relevant component whenever unchanged bytes can yield different
 /// symbols, references, fingerprints, or trust boundaries. Raw hashes stay separate.
 pub const STRUCTURAL_INTERPRETATION: &str =
-    "codesage/structural/v1;parser-queries=2;extraction=3;trust-boundaries=1";
+    "codesage/structural/v1;parser-queries=3;extraction=4;trust-boundaries=1";
 
 /// Skip and record unreadable or unparseable files; retain degraded parses.
 fn parse_batch(root: &Path, batch: &[&FileInfo], stats: &mut IndexStats) -> Vec<ParsedFile> {
@@ -439,7 +439,7 @@ mod tests {
         let id = db.all_files_with_id_and_language().unwrap()[0].0;
         db.record_file_interpretation(
             id,
-            "codesage/structural/v1;parser-queries=0;extraction=1;trust-boundaries=1",
+            "codesage/structural/v1;parser-queries=2;extraction=3;trust-boundaries=1",
         )
         .unwrap();
         let stats = incremental_index(root.path(), &db, &[], false).unwrap();

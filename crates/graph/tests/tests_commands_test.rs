@@ -10,8 +10,8 @@ use codesage_graph::{
     ReachabilityOptions, build_review_rehearsal, full_index, recommend_tests_with_reachability,
 };
 use codesage_protocol::{
-    FeatureConfidence, FeatureFileRef, FeatureFileRole, FeatureKind, FeatureRecord, FileInfo,
-    Language, TestCommand, TestRecommendations,
+    FeatureConfidence, FeatureFileRef, FeatureFileRole, FeatureKind, FeatureRecord, Language,
+    TestCommand, TestRecommendations,
 };
 use codesage_storage::Database;
 
@@ -21,17 +21,6 @@ fn write(root: &Path, rel: &str, content: &str) {
         std::fs::create_dir_all(parent).unwrap();
     }
     std::fs::write(p, content).unwrap();
-}
-
-/// `.phpt` has no grammar, so `full_index` never stores it; the indexer's
-/// file-discovery path records it the way `index_test_file` does elsewhere.
-fn index_unparsed(db: &Database, path: &str) {
-    db.upsert_file(&FileInfo {
-        path: path.to_string(),
-        language: Language::Php,
-        content_hash: format!("hash-{path}"),
-    })
-    .unwrap();
 }
 
 fn indexed(root: &Path) -> Database {
@@ -487,9 +476,17 @@ fn phpt_suites_map_to_run_tests_per_directory() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "ext/foo/foo.c", "int foo(void) { return 1; }\n");
+    write(
+        root,
+        "ext/foo/tests/001.phpt",
+        "--TEST--\n001\n--FILE--\n<?php ?>\n--EXPECT--\n",
+    );
+    write(
+        root,
+        "ext/foo/tests/002.phpt",
+        "--TEST--\n002\n--FILE--\n<?php ?>\n--EXPECT--\n",
+    );
     let db = indexed(root);
-    index_unparsed(&db, "ext/foo/tests/001.phpt");
-    index_unparsed(&db, "ext/foo/tests/002.phpt");
 
     let r = recs(root, &db, &["ext/foo/foo.c"]);
 
@@ -509,10 +506,14 @@ fn withheld_phpt_directory_is_named_as_a_whole() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "ext/big/big.c", "int big(void) { return 1; }\n");
-    let db = indexed(root);
     for i in 0..51 {
-        index_unparsed(&db, &format!("ext/big/tests/{i:03}.phpt"));
+        write(
+            root,
+            &format!("ext/big/tests/{i:03}.phpt"),
+            "--TEST--\nx\n--FILE--\n<?php ?>\n--EXPECT--\n",
+        );
     }
+    let db = indexed(root);
 
     let r = recs(root, &db, &["ext/big/big.c"]);
 

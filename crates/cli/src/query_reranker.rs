@@ -64,6 +64,7 @@ pub(crate) struct QueryReranker {
 
 impl QueryReranker {
     pub(crate) fn new(root: &Path, model: &str, device: &str) -> Result<Self> {
+        codesage_embed::model::ModelAuthorization::for_project(root).scope(|| {
         #[cfg(unix)]
         if let Some(socket) = crate::daemon::running_daemon_socket()
             && let Some(project) = root.to_str()
@@ -83,18 +84,21 @@ impl QueryReranker {
             });
         }
         Self::private(root, model, device)
+        })
     }
 
     fn private(root: &Path, model: &str, device: &str) -> Result<Self> {
-        tracing::info!(project = %root.display(), "reranking privately");
-        Ok(Self {
-            #[cfg(unix)]
-            root: root.into(),
-            #[cfg(unix)]
-            model: model.into(),
-            #[cfg(unix)]
-            device: device.into(),
-            backend: Backend::Private(Box::new(Reranker::new(model, device)?)),
+        codesage_embed::model::ModelAuthorization::for_project(root).scope(|| {
+            tracing::info!(project = %root.display(), "reranking privately");
+            Ok(Self {
+                #[cfg(unix)]
+                root: root.into(),
+                #[cfg(unix)]
+                model: model.into(),
+                #[cfg(unix)]
+                device: device.into(),
+                backend: Backend::Private(Box::new(Reranker::new(model, device)?)),
+            })
         })
     }
 

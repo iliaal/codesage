@@ -78,14 +78,8 @@ if [ -z "$RUNNER" ]; then
         if [ -x "$cand" ]; then RUNNER="$cand"; break; fi
     done
 fi
-if [ -z "$EXTRACTOR" ]; then
-    for cand in "$plugin_root/bench/extract-eval-cases.py" "$HOME/ai/codesage/bench/extract-eval-cases.py"; do
-        if [ -f "$cand" ]; then EXTRACTOR="$cand"; break; fi
-    done
-fi
 
 [ -x "$RUNNER" ]  || { echo "error: bench runner not found or not executable: $RUNNER" >&2; exit 1; }
-[ -f "$EXTRACTOR" ] || { echo "error: extract-eval-cases.py not found: $EXTRACTOR" >&2; exit 1; }
 
 echo "==> codesage-eval"
 echo "    project:     $project"
@@ -99,6 +93,13 @@ if [ "$NO_EXTRACT" -eq 1 ]; then
     fi
     echo "==> [1/2] reusing existing corpus ($corpus_yaml), skipping mining"
 else
+    if [ -z "$EXTRACTOR" ]; then
+        for cand in "$plugin_root/bench/extract-eval-cases.py" "$HOME/ai/codesage/bench/extract-eval-cases.py"; do
+            if [ -f "$cand" ]; then EXTRACTOR="$cand"; break; fi
+        done
+    fi
+    [ -f "$EXTRACTOR" ] || { echo "error: extract-eval-cases.py not found: $EXTRACTOR" >&2; exit 1; }
+
     # Claude Code slugifies absolute paths by replacing every / with -.
     slug="$(echo "$project" | tr '/' '-')"
     session_dir="$HOME/.claude/projects/$slug"
