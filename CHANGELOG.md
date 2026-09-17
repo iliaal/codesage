@@ -1,5 +1,24 @@
 ## [Unreleased]
 
+## [0.33.1] - 2026-09-17
+
+### Fixed
+
+- `recommend_tests` discovers PHPT siblings on disk, and test-gap reports recognize their coverage; Cargo directory-binary recommendations run the intended target instead of selecting zero tests.
+- Go grouped declarations retain individual kinds and source spans, PHP global namespace blocks no longer inherit preceding namespaces, and Rust grouped aliases produce import references; the next `codesage index` refreshes unchanged files under `parser-queries=3;extraction=4`.
+- The watcher retries failed structural files and failed files within semantic batches without requiring another filesystem event.
+- `search` applies path and language restrictions to symbol-stem candidates, and semantic coverage counts only the requested model.
+- Import-cycle and similarity caches refresh after structural changes, including same-shape function renames and changes committed through another database connection.
+- Git-history indexing preserves Unicode and delimiter-containing filenames and rename destinations.
+- Feature mapping makes progress over literal CMake brackets, records Go test files as tests, and keeps Rust integration tests within their crate scope.
+- Onboarding resolves relative binary overrides before changing directories, and repository refresh recognizes linked Git worktrees.
+- `/codesage-eval --no-extract` no longer requires the extractor executable.
+
+### Security
+
+- Model loading and shared session reuse enforce the requested project's authorization, including revocation, instead of inheriting the daemon's startup directory.
+- Leak-check gates fail when file enumeration fails and scan rename and type-change destinations.
+
 ## [0.33.0] - 2026-09-16
 
 ### Added
@@ -1041,5 +1060,7 @@ Initial public release.
 
 [0.32.0]: https://github.com/iliaal/codesage/releases/tag/v0.32.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.33.0...HEAD
 [0.33.0]: https://github.com/iliaal/codesage/releases/tag/v0.33.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.33.1...HEAD
+[0.33.1]: https://github.com/iliaal/codesage/releases/tag/v0.33.1
