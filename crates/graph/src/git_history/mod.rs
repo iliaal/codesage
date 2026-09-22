@@ -12,7 +12,9 @@ pub use indexer::{
 };
 pub(crate) use risk::CompletePolicy;
 pub(crate) use risk::ImportCycles;
-pub(crate) use risk::assess_risk_diff_with_walk_cache;
+#[cfg(test)]
+pub(crate) use risk::TOP_SYMBOLS_PASSES;
+pub(crate) use risk::{RiskRequestScope, assess_risk_diff_with_walk_cache, assess_risk_with_scope};
 pub use risk::{
     assess_risk, assess_risk_batch, assess_risk_diff, find_coupling, find_coupling_ranked,
 };

@@ -1201,6 +1201,13 @@ pub struct CouplingReport {
 
 /// One symbol inside a file that contributes to its risk score, ranked by
 /// the heuristic `ln(1 + line_count) + ref_count + (in_cycle ? 1.0 : 0.0)`.
+/// `ref_count` is the import-aware resolved product-caller count, not a name
+/// match: a same-named definition in another file no longer lends its callers
+/// here, and test callsites never count. It is a lower bound of the true
+/// caller set: a spelling the resolver cannot tie to this definition is
+/// dropped, and Rust `extern_crate::item` spellings from other workspace
+/// crates do not resolve yet, so a library symbol called mostly from other
+/// crates reads low.
 /// The `why` string is a one-line human-readable explanation the agent can
 /// quote in a PR description (e.g. `"hot: 142 lines, 38 refs, in 7-file cycle"`).
 /// Capped at five entries per file in the producing pipeline so a heavy file
@@ -1214,6 +1221,21 @@ pub struct TopSymbol {
     /// pattern-match on it without depending on the protocol enum.
     pub kind: String,
     pub why: String,
+    /// Several definitions in this same file answer to this short name and at
+    /// least one counted callsite resolves to more than one of them
+    /// (overloads, same-named methods on different impls, a `#[cfg(test)]`
+    /// twin called from product code). The count then covers that set, not
+    /// this definition alone. Cross-file name collisions are resolved away and
+    /// never set this.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared: bool,
+    /// Resolution never reached this row: the per-file cap (symbols, rows, or
+    /// wall clock) or the shared `assess_risk_diff` / `assess_risk_batch`
+    /// request budget ran out first, or this name's own row count exceeded
+    /// what was left of the row budget. The count is then the name-based
+    /// upper bound rather than a resolved caller count.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bounded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -3191,6 +3213,8 @@ mod tests {
                 line: 10,
                 kind: "function".to_string(),
                 why: "hot: 142 lines, 38 refs, in 3-file cycle".to_string(),
+                shared: false,
+                bounded: false,
             }],
         }
     }

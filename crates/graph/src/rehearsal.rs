@@ -1,12 +1,12 @@
 //! Compose risk, test, drift, feature, and branch evidence into review objections.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::git_history::{
-    ReachabilityOptions, assess_risk, assess_risk_diff_with_walk_cache, reach_cap_clause,
+    ReachabilityOptions, assess_risk_diff_with_walk_cache, reach_cap_clause,
     recommend_tests_with_walk_cache,
 };
 use crate::impact::WalkCache;
@@ -80,33 +80,12 @@ pub fn build_review_rehearsal(
     }
 
     let mut walk_cache = WalkCache::default();
-    let risk = assess_risk_diff_with_walk_cache(db, files, Some(&mut walk_cache))?;
-    // Clustering retains scores for only three files per directory. Reassess
-    // omitted files so clustering cannot hide threshold-crossing objections.
-    let mut omitted_detail: Vec<RiskAssessment> = Vec::new();
-    {
-        let mut seen: HashSet<&str> = HashSet::new();
-        for a in risk.files.iter().chain(
-            risk.clustered_directories
-                .iter()
-                .flat_map(|cluster| cluster.top_files.iter()),
-        ) {
-            seen.insert(a.file.as_str());
-        }
-        for cluster in &risk.clustered_directories {
-            codesage_protocol::work::checkpoint()?;
-            for omitted in &cluster.omitted_files {
-                codesage_protocol::work::checkpoint()?;
-                if !seen.insert(omitted.as_str()) {
-                    continue;
-                }
-                omitted_detail.push(
-                    assess_risk(db, omitted)
-                        .with_context(|| format!("scoring clustered-away file {omitted}"))?,
-                );
-            }
-        }
-    }
+    let scored = assess_risk_diff_with_walk_cache(db, files, Some(&mut walk_cache))?;
+    let risk = scored.diff;
+    // Clustering keeps wire detail for only three files per directory; the
+    // omitted rows were scored in the same pass and are read back here so
+    // clustering cannot hide threshold-crossing objections.
+    let mut seen_files = BTreeSet::new();
     let detailed_risk: Vec<&codesage_protocol::RiskAssessment> = risk
         .files
         .iter()
@@ -115,7 +94,8 @@ pub fn build_review_rehearsal(
                 .iter()
                 .flat_map(|cluster| cluster.top_files.iter()),
         )
-        .chain(omitted_detail.iter())
+        .chain(scored.omitted.iter())
+        .filter(|a| seen_files.insert(a.file.as_str()))
         .collect();
     let by_file: HashMap<&str, &codesage_protocol::RiskAssessment> = detailed_risk
         .iter()
@@ -566,6 +546,7 @@ fn test_notes(tests: &codesage_protocol::TestRecommendations) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_history::{TOP_SYMBOLS_PASSES, assess_risk};
     use codesage_protocol::{
         FeatureConfidence, FeatureFileRef, FeatureKind, FeatureRecord, FileInfo, Language,
     };
@@ -1054,7 +1035,15 @@ mod tests {
             "fixture must prove omitted files survive nowhere with detail, got {risk:?}"
         );
 
+        // The omitted rows come out of the diff's own pass; the rehearsal
+        // must not score them a second time.
+        TOP_SYMBOLS_PASSES.with(|passes| passes.set(0));
         let r = build_review_rehearsal(dir.path(), &db, &clustered).unwrap();
+        assert_eq!(
+            TOP_SYMBOLS_PASSES.with(std::cell::Cell::get),
+            clustered.len(),
+            "rehearsal must resolve each patch file exactly once, omitted files included"
+        );
         let obj = r
             .objections
             .iter()

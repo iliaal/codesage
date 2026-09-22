@@ -14,6 +14,7 @@
 - `find_coupling` and `assess_risk` `top_coupled` rows carry `p_cochange` and `p_reverse`.
 - `project_overview` `freshness` and `codesage status --json` report `indexed_files_behind`, the indexed files a reindex would actually change, alongside `commits_behind`.
 - The MCP response envelope carries `index.files_behind` when indexed files differ from HEAD and `index.files_behind_bounded` when that count is a lower bound.
+- `assess_risk` `top_symbols` rows carry `shared: true` when same-named definitions in one file share a count, `bounded: true` when the per-file resolution cap, the 3 s `assess_risk_diff` / `assess_risk_batch` request budget, or a name whose own row count exceeds the row budget left a name-based upper bound.
 
 ### Changed
 
@@ -31,6 +32,7 @@
 - `codesage rehearse` without explicit paths, `codesage features-list --since`, and MCP `list_features` `since` now report both endpoints of a Git rename instead of only the destination.
 - `codesage rehearse` without explicit paths no longer mangles non-ASCII, quoted, or whitespace-padded file names.
 - Drift reporting no longer advises `codesage index` for commits that touched no indexed file, counts supported source files committed since indexing, and treats a comparison that stopped before finding a difference as unmeasured rather than fresh; `codesage status`, `codesage doctor`, `project_overview`, and `review_rehearsal` name the affected indexed files alongside the commit count.
+- `assess_risk` `top_symbols` counts resolved product callers per definition instead of every callsite spelling its short name; same-named definitions in other files contribute nothing and test callsites never count toward `top_symbols`. Resolved counts are lower bounds: Rust `extern_crate::item` spellings from other workspace crates do not resolve yet.
 
 ## [0.34.0] - 2026-09-17
 

@@ -1667,6 +1667,462 @@ fn top_symbols_empty_when_file_has_no_symbols() {
     );
 }
 
+/// Seed a Rust file and its rows directly: resolution reads visibility,
+/// `is_test`, and import edges, and the parser would not let a fixture state
+/// all three independently.
+mod resolution_fixture {
+    use codesage_protocol::{
+        FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind, Visibility,
+    };
+    use codesage_storage::Database;
+
+    pub fn file(db: &Database, path: &str) -> i64 {
+        db.upsert_file(&FileInfo {
+            path: path.into(),
+            language: Language::Rust,
+            content_hash: path.into(),
+            is_test: false,
+        })
+        .unwrap()
+    }
+
+    pub fn func(
+        file_path: &str,
+        name: &str,
+        qualified_name: &str,
+        lines: (u32, u32),
+        visibility: Option<Visibility>,
+        is_test: bool,
+    ) -> Symbol {
+        Symbol {
+            name: name.into(),
+            qualified_name: qualified_name.into(),
+            kind: SymbolKind::Function,
+            file_path: file_path.into(),
+            line_start: lines.0,
+            line_end: lines.1,
+            col_start: 0,
+            col_end: 0,
+            rationale: Vec::new(),
+            visibility,
+            is_test,
+            overloaded: false,
+        }
+    }
+
+    pub fn reference(
+        from_file: &str,
+        from_symbol: Option<&str>,
+        to_name: &str,
+        kind: ReferenceKind,
+        line: u32,
+    ) -> Reference {
+        Reference {
+            from_file: from_file.into(),
+            from_symbol: from_symbol.map(str::to_string),
+            to_name: to_name.into(),
+            kind,
+            line,
+            col: 0,
+            lazy: false,
+            to: None,
+            from_line: None,
+            is_test: false,
+        }
+    }
+
+    pub fn calls(from_file: &str, to_name: &str, lines: &[u32]) -> Vec<Reference> {
+        lines
+            .iter()
+            .map(|&line| reference(from_file, None, to_name, ReferenceKind::Call, line))
+            .collect()
+    }
+}
+
+/// The hotness of a definition is its own callers, not every callsite that
+/// spells its short name. Regression for `top_symbols[0] = path, 1884 refs`
+/// on `crates/graph/src/search.rs`, where a `#[cfg(test)]` helper collected
+/// every `.path()` in the repository.
+#[test]
+fn top_symbols_counts_resolvable_callers_not_same_named_definitions() {
+    use codesage_protocol::{ReferenceKind, Visibility};
+    use resolution_fixture::{calls, file, func, reference};
+
+    let db = Database::open_in_memory().unwrap();
+
+    // The product definition, one test helper of the same name in another
+    // file, and a product neighbour so neither file ranks on `path` alone.
+    let product = file(&db, "src/product.rs");
+    db.insert_symbols(
+        product,
+        &[
+            func(
+                "src/product.rs",
+                "path",
+                "path",
+                (10, 14),
+                Some(Visibility::Public),
+                false,
+            ),
+            func(
+                "src/product.rs",
+                "neighbour",
+                "neighbour",
+                (20, 24),
+                Some(Visibility::Public),
+                false,
+            ),
+        ],
+    )
+    .unwrap();
+    let support = file(&db, "src/support.rs");
+    db.insert_symbols(
+        support,
+        &[
+            func(
+                "src/support.rs",
+                "path",
+                "path",
+                (5, 9),
+                Some(Visibility::Public),
+                true,
+            ),
+            func(
+                "src/support.rs",
+                "helper",
+                "helper",
+                (20, 24),
+                Some(Visibility::Public),
+                false,
+            ),
+        ],
+    )
+    .unwrap();
+
+    // Two files import the product definition and call it three times each.
+    for importer in ["src/importer_a.rs", "src/importer_b.rs"] {
+        let id = file(&db, importer);
+        let mut rows = vec![reference(
+            importer,
+            None,
+            "crate::product::path",
+            ReferenceKind::Import,
+            1,
+        )];
+        rows.extend(calls(importer, "path", &[10, 11, 12]));
+        db.insert_references(id, &rows).unwrap();
+    }
+    // Twelve more call `.path()` while importing neither definition. Under
+    // name counting these landed on whichever `path` ranked first.
+    for i in 0..12u32 {
+        let noise = format!("src/noise_{i:02}.rs");
+        let id = file(&db, &noise);
+        db.insert_references(id, &calls(&noise, "path", &[5, 6]))
+            .unwrap();
+    }
+
+    let name_count = db
+        .reference_counts_for_names(&["path".to_string()])
+        .unwrap()["path"];
+    assert_eq!(
+        name_count, 32,
+        "fixture must keep a name count far above the resolvable callers"
+    );
+
+    let r = assess_risk(&db, "src/product.rs").unwrap();
+    let hot = r
+        .top_symbols
+        .iter()
+        .find(|t| t.name == "path")
+        .unwrap_or_else(|| panic!("product `path` must be ranked, got {:?}", r.top_symbols));
+    // Three call lines in each of the two importing files; the `use` line
+    // names a module path no indexed `mod` declaration resolves, so it is not
+    // a callsite either.
+    assert!(
+        hot.why.contains("6 refs"),
+        "only the importing files' callsites may count, got {:?}",
+        hot.why
+    );
+    assert!(
+        !hot.shared,
+        "one definition per file resolves cleanly, got {hot:?}"
+    );
+    assert!(!hot.bounded, "a two-name file resolves inside the cap");
+
+    // The test helper is not a risk surface for its own file, and the product
+    // neighbour that shares the file still is.
+    let s = assess_risk(&db, "src/support.rs").unwrap();
+    assert!(
+        s.top_symbols.iter().any(|t| t.name == "helper"),
+        "product symbols of the helper file still rank, got {:?}",
+        s.top_symbols
+    );
+    assert!(
+        !s.top_symbols.iter().any(|t| t.name == "path"),
+        "the `#[cfg(test)]` helper must not rank, got {:?}",
+        s.top_symbols
+    );
+}
+
+/// Same-named definitions in ONE file are the residual the resolver cannot
+/// split, so the count covers the set and says so.
+#[test]
+fn top_symbols_discloses_shared_count_for_same_named_definitions_in_one_file() {
+    use resolution_fixture::{calls, file, func};
+
+    let db = Database::open_in_memory().unwrap();
+    let api = file(&db, "src/api.rs");
+    db.insert_symbols(
+        api,
+        &[
+            func("src/api.rs", "run", "Foo::run", (10, 20), None, false),
+            func("src/api.rs", "run", "Bar::run", (30, 40), None, false),
+            func("src/api.rs", "solo", "solo", (50, 55), None, false),
+        ],
+    )
+    .unwrap();
+    // Three bare `run()` callsites below both definitions, plus one `solo()`.
+    let mut rows = calls("src/api.rs", "run", &[60, 61, 62]);
+    rows.extend(calls("src/api.rs", "solo", &[70]));
+    db.insert_references(api, &rows).unwrap();
+
+    let r = assess_risk(&db, "src/api.rs").unwrap();
+    let shared: Vec<_> = r.top_symbols.iter().filter(|t| t.name == "run").collect();
+    assert_eq!(
+        shared.len(),
+        2,
+        "both definitions must rank, got {:?}",
+        r.top_symbols
+    );
+    for t in &shared {
+        assert!(t.shared, "ambiguous count must be disclosed, got {t:?}");
+        assert!(
+            t.why
+                .contains("3 refs (shared across same-named symbols in this file)"),
+            "`why` must carry the disclosure, got {:?}",
+            t.why
+        );
+    }
+    let solo = r
+        .top_symbols
+        .iter()
+        .find(|t| t.name == "solo")
+        .unwrap_or_else(|| panic!("`solo` must rank, got {:?}", r.top_symbols));
+    assert!(!solo.shared, "an unambiguous count is not shared: {solo:?}");
+    assert!(
+        solo.why.contains("1 refs") && !solo.why.contains("shared"),
+        "unexpected why: {:?}",
+        solo.why
+    );
+
+    let json = serde_json::to_string(&r).unwrap();
+    assert!(
+        json.contains("\"shared\":true"),
+        "the disclosure must reach the wire, got {json}"
+    );
+    assert!(
+        !json.contains("\"bounded\""),
+        "nothing was capped here, got {json}"
+    );
+}
+
+/// A `#[cfg(test)]` twin in the same file: its callers are test code, so they
+/// never reach the product definition, and a product callsite that resolves
+/// to both is disclosed instead of silently absorbed.
+#[test]
+fn top_symbols_keeps_test_twin_callers_off_the_product_symbol() {
+    use codesage_protocol::{ReferenceKind, Visibility};
+    use resolution_fixture::{file, func, reference};
+
+    let db = Database::open_in_memory().unwrap();
+    let twin = file(&db, "src/twin.rs");
+    db.insert_symbols(
+        twin,
+        &[
+            func(
+                "src/twin.rs",
+                "setup",
+                "setup",
+                (10, 14),
+                Some(Visibility::Public),
+                false,
+            ),
+            func(
+                "src/twin.rs",
+                "prepare",
+                "prepare",
+                (20, 24),
+                Some(Visibility::Public),
+                false,
+            ),
+            func(
+                "src/twin.rs",
+                "drive",
+                "drive",
+                (30, 40),
+                Some(Visibility::Public),
+                false,
+            ),
+            func(
+                "src/twin.rs",
+                "setup",
+                "tests::setup",
+                (100, 104),
+                None,
+                true,
+            ),
+            func(
+                "src/twin.rs",
+                "prepare",
+                "tests::prepare",
+                (110, 114),
+                None,
+                true,
+            ),
+            func(
+                "src/twin.rs",
+                "case_one",
+                "tests::case_one",
+                (120, 140),
+                None,
+                true,
+            ),
+        ],
+    )
+    .unwrap();
+    let mut rows: Vec<_> = [125u32, 126, 127]
+        .iter()
+        .map(|&line| {
+            reference(
+                "src/twin.rs",
+                Some("tests::case_one"),
+                "setup",
+                ReferenceKind::Call,
+                line,
+            )
+        })
+        .collect();
+    // One product callsite that both `prepare` definitions answer.
+    rows.push(reference(
+        "src/twin.rs",
+        Some("drive"),
+        "prepare",
+        ReferenceKind::Call,
+        35,
+    ));
+    db.insert_references(twin, &rows).unwrap();
+
+    let r = assess_risk(&db, "src/twin.rs").unwrap();
+    assert!(
+        !r.top_symbols.iter().any(|t| t.line >= 100),
+        "no test symbol may rank, got {:?}",
+        r.top_symbols
+    );
+    let setup = r
+        .top_symbols
+        .iter()
+        .find(|t| t.name == "setup")
+        .unwrap_or_else(|| panic!("product `setup` must rank, got {:?}", r.top_symbols));
+    assert!(
+        setup.why.contains("0 refs") && !setup.why.contains("shared"),
+        "the test twin's three callers must not reach the product symbol, got {:?}",
+        setup.why
+    );
+    assert!(!setup.shared, "nothing to share once test callers drop");
+
+    let prepare = r
+        .top_symbols
+        .iter()
+        .find(|t| t.name == "prepare")
+        .unwrap_or_else(|| panic!("product `prepare` must rank, got {:?}", r.top_symbols));
+    assert!(
+        prepare.shared
+            && prepare
+                .why
+                .contains("1 refs (shared across same-named symbols"),
+        "a product callsite answering both definitions must be disclosed, got {prepare:?}"
+    );
+}
+
+/// The row budget is charged from a name's count before its rows are read:
+/// a hub name above the budget is skipped and disclosed `bounded`, and the
+/// next name still resolves. Previously the hub was hydrated in full and the
+/// budget then cut every name after it.
+#[test]
+fn top_symbols_skips_a_group_whose_name_count_alone_exceeds_the_row_budget() {
+    use codesage_protocol::{ReferenceKind, Visibility};
+    use resolution_fixture::{calls, file, func, reference};
+
+    let db = Database::open_in_memory().unwrap();
+    let hub = file(&db, "src/hub.rs");
+    db.insert_symbols(
+        hub,
+        &[
+            func(
+                "src/hub.rs",
+                "hub",
+                "hub",
+                (10, 14),
+                Some(Visibility::Public),
+                false,
+            ),
+            func(
+                "src/hub.rs",
+                "small",
+                "small",
+                (20, 24),
+                Some(Visibility::Public),
+                false,
+            ),
+        ],
+    )
+    .unwrap();
+
+    // One row over the 20,000-row budget, all from a file that imports
+    // nothing, so a full hydration would resolve none of them.
+    let over_budget: Vec<u32> = (1..=20_001).collect();
+    let noise = file(&db, "src/noise.rs");
+    db.insert_references(noise, &calls("src/noise.rs", "hub", &over_budget))
+        .unwrap();
+    let importer = file(&db, "src/importer.rs");
+    let mut rows = vec![reference(
+        "src/importer.rs",
+        None,
+        "crate::hub::small",
+        ReferenceKind::Import,
+        1,
+    )];
+    rows.extend(calls("src/importer.rs", "small", &[10, 11, 12]));
+    db.insert_references(importer, &rows).unwrap();
+
+    let r = assess_risk(&db, "src/hub.rs").unwrap();
+    let hub_row = r
+        .top_symbols
+        .iter()
+        .find(|t| t.name == "hub")
+        .unwrap_or_else(|| panic!("`hub` must rank, got {:?}", r.top_symbols));
+    assert!(
+        hub_row.bounded,
+        "a name above the row budget is never hydrated: {hub_row:?}"
+    );
+    assert!(
+        hub_row
+            .why
+            .contains("20001 refs by name (resolution capped, upper bound)"),
+        "the skipped name keeps its name count, got {:?}",
+        hub_row.why
+    );
+    let small_row = r
+        .top_symbols
+        .iter()
+        .find(|t| t.name == "small")
+        .unwrap_or_else(|| panic!("`small` must rank, got {:?}", r.top_symbols));
+    assert!(
+        !small_row.bounded && small_row.why.contains("3 refs"),
+        "the budget the hub did not spend still resolves the next name: {small_row:?}"
+    );
+}
+
 /// A symbol-less file has no traversal seeds: zero dependents means unmeasured.
 #[test]
 fn zero_dependents_without_symbols_is_flagged_unknown() {

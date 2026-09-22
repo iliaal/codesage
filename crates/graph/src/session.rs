@@ -8,7 +8,8 @@ use codesage_protocol::work::checkpoint;
 use codesage_protocol::{SessionDiff, SessionRiskEntry, SessionRiskRegression, SessionSnapshot};
 use codesage_storage::Database;
 
-use crate::git_history::{assess_risk, assess_risk_batch};
+use crate::git_history::{RiskRequestScope, assess_risk_batch, assess_risk_with_scope};
+use crate::impact::WalkCache;
 
 const SESSIONS_DIR: &str = "sessions";
 
@@ -427,9 +428,13 @@ fn risk_scores(db: &Database, files: &[String]) -> Result<RiskScores> {
             }
             let mut out = Vec::with_capacity(files.len());
             let mut failure = None;
+            // Only `score` is kept, so skip the per-file symbol resolution
+            // pass and share one walk cache across the fallback.
+            let mut cache = WalkCache::default();
+            let mut scope = RiskRequestScope::score_only(&mut cache);
             for f in files {
                 checkpoint()?;
-                match assess_risk(db, f) {
+                match assess_risk_with_scope(db, f, &mut scope) {
                     Ok(r) => out.push((r.file, r.score)),
                     Err(e) => {
                         checkpoint()?;

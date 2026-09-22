@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use codesage_protocol::{
@@ -682,6 +683,64 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
     .0)
 }
 
+/// State one risk request shares across its files. A single-file request
+/// passes `None` and gets its own cache with only the per-file symbol
+/// deadline; `assess_risk_diff` and `assess_risk_batch` build one scope for
+/// the whole file list.
+pub(crate) struct RiskRequestScope<'a> {
+    cache: &'a mut WalkCache,
+    /// Symbol-resolution time left for the request; each file's pass is
+    /// bounded by the smaller of this and [`TOP_SYMBOLS_RESOLVE_DEADLINE`]
+    /// and charges what it spent. Only resolution time counts, so a slow
+    /// dependents walk earlier in the request does not silently zero the
+    /// symbol breakdown of every file after it.
+    top_symbols_budget: Option<Duration>,
+    /// `false` skips the `top_symbols` pass entirely: the composite score
+    /// does not read it, so a caller that keeps only `score` pays nothing
+    /// for symbol resolution.
+    resolve_top_symbols: bool,
+}
+
+impl<'a> RiskRequestScope<'a> {
+    fn multi_file(cache: &'a mut WalkCache) -> Self {
+        Self {
+            cache,
+            top_symbols_budget: Some(TOP_SYMBOLS_REQUEST_BUDGET),
+            resolve_top_symbols: true,
+        }
+    }
+
+    /// Scope for callers that read only `score`; `top_symbols` comes back
+    /// empty without a resolution pass.
+    pub(crate) fn score_only(cache: &'a mut WalkCache) -> Self {
+        Self {
+            cache,
+            top_symbols_budget: None,
+            resolve_top_symbols: false,
+        }
+    }
+}
+
+/// [`assess_risk`] under a caller-owned scope. With
+/// [`RiskRequestScope::score_only`] the assessment carries every signal
+/// except `top_symbols`, which is left empty rather than resolved.
+pub(crate) fn assess_risk_with_scope(
+    db: &Database,
+    file_path: &str,
+    scope: &mut RiskRequestScope<'_>,
+) -> Result<RiskAssessment> {
+    Ok(assess_risk_with_context(
+        db,
+        file_path,
+        None,
+        None,
+        MAX_FRONTIER,
+        IndexWindow::probe(db)?,
+        Some(scope),
+    )?
+    .0)
+}
+
 /// Returns the assessment plus a `gap_check_partial` flag: `true` when
 /// `test_gap` fired but the dependency-hop check either could not run (no
 /// indexed symbols) or was truncated (frontier cap). `assess_risk_diff` reads
@@ -696,9 +755,25 @@ fn assess_risk_with_context(
     precomputed_percentiles: Option<&HashMap<String, f64>>,
     max_frontier: usize,
     window: IndexWindow,
-    cache: Option<&mut WalkCache>,
+    scope: Option<&mut RiskRequestScope<'_>>,
 ) -> Result<(RiskAssessment, bool)> {
     codesage_protocol::work::checkpoint()?;
+    // One cache serves both the dependents walk and the symbol resolution of
+    // this file, so the Rust module table and each (caller, spelling) lookup
+    // load once per request rather than once per pass.
+    let mut local_cache = WalkCache::default();
+    let (cache, top_symbols_budget, resolve_top_symbols): (
+        &mut WalkCache,
+        Option<&mut Duration>,
+        bool,
+    ) = match scope {
+        Some(shared) => (
+            &mut *shared.cache,
+            shared.top_symbols_budget.as_mut(),
+            shared.resolve_top_symbols,
+        ),
+        None => (&mut local_cache, None, true),
+    };
     let git = db.git_file(file_path)?;
     let structural_found = db
         .file_id_for_path(file_path)
@@ -785,7 +860,7 @@ fn assess_risk_with_context(
         },
         max_frontier,
         None,
-        cache,
+        Some(&mut *cache),
     )
     .with_context(|| format!("computing dependent_files for risk({file_path})"))?;
     let dependents = outcome.entries;
@@ -1062,7 +1137,18 @@ fn assess_risk_with_context(
         ));
     }
 
-    let top_symbols = match compute_top_symbols(db, file_path, in_cycle, cycle_size) {
+    let top_symbols = match if resolve_top_symbols {
+        compute_top_symbols(
+            db,
+            file_path,
+            in_cycle,
+            cycle_size,
+            cache,
+            top_symbols_budget,
+        )
+    } else {
+        Ok(Vec::new())
+    } {
         Ok(v) => v,
         Err(e) => {
             codesage_protocol::work::checkpoint()?;
@@ -1141,13 +1227,89 @@ fn cycle_membership(cycles: &[CycleEntry], file_path: &str) -> (bool, u32, Vec<S
 /// Bound the per-file symbol breakdown.
 const TOP_SYMBOLS_CAP: usize = 5;
 
+/// Symbols whose references get import-aware resolution for one file. The
+/// ranking resolves lazily, highest name count first, and stops as soon as the
+/// returned rows are all resolved, so this is reached only when a file's
+/// leading names keep collapsing under resolution. Measured on this repo's
+/// worst file (`crates/graph/src/search.rs`): 3x the returned rows leaves two
+/// of five rows `bounded`, 8x leaves none, and the difference costs nothing
+/// measurable on a multi-file request. A single pathological name is bounded
+/// by [`TOP_SYMBOLS_REF_BUDGET`], which is checked against the name's own
+/// count before any row is read; the pass as a whole is bounded by
+/// [`TOP_SYMBOLS_RESOLVE_DEADLINE`].
+const TOP_SYMBOLS_RESOLVE_CAP: usize = TOP_SYMBOLS_CAP * 8;
+
+/// Reference rows one file's breakdown may resolve. Charged per same-named
+/// group from the name counts, which is what the resolver reads before
+/// filtering, and charged *before* the group is hydrated: a group whose
+/// counts alone exceed what is left is skipped and emitted `bounded`, and
+/// resolution moves on to the next unresolved name.
+const TOP_SYMBOLS_REF_BUDGET: u64 = 20_000;
+
+/// Wall-clock bound on one file's resolution pass, matching the
+/// `to`-resolution deadline `find_references` applies to the same resolver.
+const TOP_SYMBOLS_RESOLVE_DEADLINE: Duration = Duration::from_millis(750);
+
+/// Resolution time the files of one `assess_risk_diff` / `assess_risk_batch`
+/// request share, so N files cost at most this rather than
+/// N x [`TOP_SYMBOLS_RESOLVE_DEADLINE`]: each file gets the smaller of the
+/// per-file deadline and what is left. Files reached after it is spent keep
+/// their name counts and are emitted `bounded`.
+const TOP_SYMBOLS_REQUEST_BUDGET: Duration = Duration::from_secs(3);
+
+#[cfg(test)]
+thread_local! {
+    /// Number of `compute_top_symbols` entries on this thread; tests read it
+    /// to prove a request resolves each file once.
+    pub(crate) static TOP_SYMBOLS_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One file symbol during the [`compute_top_symbols`] ranking.
+struct SymbolRank {
+    line_count: u32,
+    /// Test symbols are never ranked, but stay in the vector: a product
+    /// callsite that also resolves to a same-named test twin here is shared
+    /// evidence, not an attributable count.
+    ranked: bool,
+    /// Name-based count: the upper bound resolution starts from.
+    raw: u32,
+    /// Distinct product callsites that resolve to this definition. `None`
+    /// until resolved, which is also what makes the emitted row `bounded`.
+    resolved: Option<u32>,
+    /// A counted callsite resolves to another same-named definition here too.
+    shared: bool,
+    /// The name's own count outran the remaining row budget, so the group was
+    /// never hydrated and stays unresolved for the rest of the pass.
+    capped: bool,
+}
+
 /// Rank symbols inside `file_path` by the heuristic
 /// `ln(1 + line_count) + ref_count + (in_cycle ? 1.0 : 0.0)` and return the
 /// top [`TOP_SYMBOLS_CAP`] with a one-line `why`. Cycle membership is a
 /// file-level signal: every symbol in a file participating in an import cycle
 /// gets the same +1.0 bump without changing intra-file ordering.
-/// Ref counts use short names, like `find_references`. Same-named symbols share
-/// a count, disclosed as "shared" in `why` rather than as a per-symbol measurement.
+///
+/// `ref_count` is the import-aware resolved *product* caller count, the same
+/// reverse resolution `impact_analysis` and the `find_references` `to` handle
+/// use: a callsite counts only when it resolves to this definition under the
+/// qualified-spelling, same-file, import-evidence, and visibility rules, and
+/// only when the callsite is not itself test code. A same-named definition in
+/// another file therefore lends nothing here, and neither does a `#[cfg(test)]`
+/// twin in this one, whose callers are test code by construction. Several
+/// product definitions of one short name in *this* file can still share a
+/// callsite, which the row discloses as `shared`.
+///
+/// Resolved counts are lower bounds of the true caller set: a spelling the
+/// resolver cannot tie to this definition is dropped, and Rust
+/// `extern_crate::item` paths from another workspace crate are not resolved
+/// yet, so a library symbol called mostly across crates reads low.
+///
+/// Resolution is lazy: name counts are upper bounds, so once the returned rows
+/// are resolved no unresolved symbol can overtake them. A symbol still
+/// unresolved when [`TOP_SYMBOLS_RESOLVE_CAP`], [`TOP_SYMBOLS_REF_BUDGET`],
+/// [`TOP_SYMBOLS_RESOLVE_DEADLINE`], or the caller's `request_budget` runs
+/// out keeps its name count and is emitted `bounded`; the pass charges the
+/// time it spent to that budget.
 ///
 /// Empty when the file has no indexed symbols. Not an error.
 fn compute_top_symbols(
@@ -1155,74 +1317,174 @@ fn compute_top_symbols(
     file_path: &str,
     in_cycle: bool,
     cycle_size: u32,
+    cache: &mut WalkCache,
+    request_budget: Option<&mut Duration>,
 ) -> Result<Vec<TopSymbol>> {
-    let mut symbols = db
+    #[cfg(test)]
+    TOP_SYMBOLS_PASSES.with(|passes| passes.set(passes.get() + 1));
+    let symbols = db
         .symbols_for_file(file_path)
         .with_context(|| format!("loading symbols for top-symbols breakdown of {file_path}"))?;
-    // Test helpers are hot by construction (every test calls them) and would
-    // otherwise name the file's `#[cfg(test)]` module as its risk surface.
-    symbols.retain(|s| !s.is_test);
     if symbols.is_empty() {
         return Ok(Vec::new());
     }
 
-    // One batched ref-count query for every symbol in the file. Refs match by
-    // short name (and tail-name fallback for qualified callsites) — same shape
-    // as `find_references`.
-    let names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
+    // Test helpers are hot by construction (every test calls them) and would
+    // otherwise name the file's `#[cfg(test)]` module as its risk surface.
+    let mut ranks: Vec<SymbolRank> = symbols
+        .iter()
+        .map(|s| SymbolRank {
+            line_count: s.line_end.saturating_sub(s.line_start).saturating_add(1),
+            ranked: !s.is_test,
+            raw: 0,
+            resolved: None,
+            shared: false,
+            capped: false,
+        })
+        .collect();
+    if ranks.iter().all(|r| !r.ranked) {
+        return Ok(Vec::new());
+    }
+
+    // One batched name-count query seeds the ranking. Refs match by short name
+    // (and tail-name fallback for qualified callsites) — same shape as
+    // `find_references`, and an upper bound on what resolution can keep.
+    let mut names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
+    names.sort_unstable();
+    names.dedup();
     let counts = db
         .reference_counts_for_names(&names)
         .with_context(|| format!("counting refs for top-symbols breakdown of {file_path}"))?;
-    // Short-name frequencies in this file: a count is "shared" when more
-    // than one symbol here answers to the same short name.
-    let mut name_freq: HashMap<&str, usize> = HashMap::new();
-    for s in &symbols {
-        *name_freq.entry(s.name.as_str()).or_default() += 1;
+    for (s, r) in symbols.iter().zip(ranks.iter_mut()) {
+        r.raw = counts.get(&s.name).copied().unwrap_or(0);
+        // Nothing spells the name, so nothing can resolve to it.
+        if r.raw == 0 {
+            r.resolved = Some(0);
+        }
     }
 
     let cycle_bonus = if in_cycle { 1.0_f64 } else { 0.0 };
-
-    let mut scored: Vec<(f64, &codesage_protocol::Symbol, u32)> = symbols
-        .iter()
-        .map(|s| {
-            let line_count = s.line_end.saturating_sub(s.line_start).saturating_add(1);
-            let ref_count = counts.get(&s.name).copied().unwrap_or(0);
-            let score = (1.0 + line_count as f64).ln() + ref_count as f64 + cycle_bonus;
-            (score, s, ref_count)
-        })
-        .collect();
-
+    let score = |r: &SymbolRank| {
+        (1.0 + r.line_count as f64).ln() + r.resolved.unwrap_or(r.raw) as f64 + cycle_bonus
+    };
     // Stable sorting preserves source order for equal scores.
-    scored.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.line_start.cmp(&b.1.line_start))
-    });
+    let rank_order = |ranks: &[SymbolRank]| {
+        let mut order: Vec<usize> = (0..ranks.len()).filter(|&i| ranks[i].ranked).collect();
+        order.sort_by(|&a, &b| {
+            score(&ranks[b])
+                .partial_cmp(&score(&ranks[a]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| symbols[a].line_start.cmp(&symbols[b].line_start))
+        });
+        order
+    };
 
-    Ok(scored
+    // A callsite spelled with a short name can resolve to any definition of
+    // that name in this file, so the whole group resolves together and the
+    // overlap between members is what `shared` reports.
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, s) in symbols.iter().enumerate() {
+        groups.entry(s.name.as_str()).or_default().push(i);
+    }
+
+    let started = Instant::now();
+    let allowance = request_budget
+        .as_deref()
+        .copied()
+        .map_or(TOP_SYMBOLS_RESOLVE_DEADLINE, |left| {
+            left.min(TOP_SYMBOLS_RESOLVE_DEADLINE)
+        });
+    let deadline = started + allowance;
+    let mut resolved_symbols = 0usize;
+    let mut rows_spent = 0u64;
+    loop {
+        codesage_protocol::work::checkpoint()?;
+        let order = rank_order(&ranks);
+        let Some(&next) = order
+            .iter()
+            .take(TOP_SYMBOLS_CAP)
+            .find(|&&i| ranks[i].resolved.is_none() && !ranks[i].capped)
+        else {
+            break;
+        };
+        if resolved_symbols >= TOP_SYMBOLS_RESOLVE_CAP || Instant::now() >= deadline {
+            break;
+        }
+        let group = groups
+            .get(symbols[next].name.as_str())
+            .cloned()
+            .unwrap_or_else(|| vec![next]);
+        // The budget is charged from the name counts before any row is read:
+        // a hub name with more rows than remain is never hydrated, and the
+        // pass moves on to names that still fit.
+        let group_rows: u64 = group.iter().map(|&i| u64::from(ranks[i].raw)).sum();
+        if rows_spent.saturating_add(group_rows) > TOP_SYMBOLS_REF_BUDGET {
+            for &i in &group {
+                ranks[i].capped = true;
+            }
+            continue;
+        }
+        rows_spent = rows_spent.saturating_add(group_rows);
+        let mut resolved_rows = Vec::with_capacity(group.len());
+        for &i in &group {
+            resolved_rows.push(cache.references(db, &symbols[i])?);
+            resolved_symbols += 1;
+        }
+        // One callsite is one (file, line) pair, matching how the name counts
+        // collapse an import's module and binding on a single line. Test
+        // callsites are dropped: they are the blast radius of the file's own
+        // `#[cfg(test)]` twin, not of the product definition that shares its
+        // name, and no product change propagates through them.
+        let mut sites: Vec<HashSet<(&str, u32)>> = Vec::with_capacity(group.len());
+        let mut claims: HashMap<(&str, u32), usize> = HashMap::new();
+        for rows in &resolved_rows {
+            let mut member: HashSet<(&str, u32)> = HashSet::new();
+            for r in rows.iter().filter(|r| !r.is_test) {
+                member.insert((r.from_file.as_str(), r.line));
+            }
+            for site in &member {
+                *claims.entry(*site).or_insert(0) += 1;
+            }
+            sites.push(member);
+        }
+        for (&i, member) in group.iter().zip(&sites) {
+            ranks[i].resolved = Some(member.len() as u32);
+            ranks[i].shared = member.iter().any(|site| claims[site] > 1);
+        }
+    }
+    if let Some(left) = request_budget {
+        *left = left.saturating_sub(started.elapsed());
+    }
+
+    Ok(rank_order(&ranks)
         .into_iter()
         .take(TOP_SYMBOLS_CAP)
-        .map(|(_, sym, ref_count)| {
-            let line_count = sym
-                .line_end
-                .saturating_sub(sym.line_start)
-                .saturating_add(1);
+        .map(|i| {
+            let sym = &symbols[i];
+            let rank = &ranks[i];
             let cycle_clause = if in_cycle {
                 format!(", in {cycle_size}-file cycle")
             } else {
                 String::new()
             };
-            let refs_clause = if name_freq.get(sym.name.as_str()).copied().unwrap_or(1) > 1 {
-                format!("{ref_count} refs (shared across same-named symbols in this file)")
-            } else {
-                format!("{ref_count} refs")
+            let refs_clause = match rank.resolved {
+                Some(n) if rank.shared => {
+                    format!("{n} refs (shared across same-named symbols in this file)")
+                }
+                Some(n) => format!("{n} refs"),
+                None => format!("{} refs by name (resolution capped, upper bound)", rank.raw),
             };
-            let why = format!("hot: {line_count} lines, {refs_clause}{cycle_clause}");
+            let why = format!(
+                "hot: {} lines, {refs_clause}{cycle_clause}",
+                rank.line_count
+            );
             TopSymbol {
                 name: sym.name.clone(),
                 line: sym.line_start,
                 kind: sym.kind.as_str().to_string(),
                 why,
+                shared: rank.shared,
+                bounded: rank.resolved.is_none(),
             }
         })
         .collect())
@@ -1237,22 +1499,35 @@ fn compute_top_symbols(
 /// named in `unscored_files`, so the aggregate never averages an unmeasured
 /// zero into a reassuring number.
 pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiffAssessment> {
-    assess_risk_diff_with_walk_cache(db, file_paths, None)
+    Ok(assess_risk_diff_with_walk_cache(db, file_paths, None)?.diff)
+}
+
+/// [`assess_risk_diff`] output plus the assessments directory clustering
+/// dropped from the wire shape. `omitted` holds the full row for every
+/// `ClusteredDirectory::omitted_files` entry, scored under the same request
+/// scope as the retained rows, so `review_rehearsal` reads them instead of
+/// scoring each clustered-away file again.
+pub(crate) struct RiskDiffWithOmitted {
+    pub(crate) diff: RiskDiffAssessment,
+    pub(crate) omitted: Vec<RiskAssessment>,
 }
 
 pub(crate) fn assess_risk_diff_with_walk_cache(
     db: &Database,
     file_paths: &[String],
-    mut cache: Option<&mut WalkCache>,
-) -> Result<RiskDiffAssessment> {
+    cache: Option<&mut WalkCache>,
+) -> Result<RiskDiffWithOmitted> {
     if file_paths.is_empty() {
-        return Ok(RiskDiffAssessment {
-            empty_input: true,
-            summary_notes: vec![
-                "No files supplied — pass the patch's file list (e.g. `git diff --name-only`)."
-                    .to_string(),
-            ],
-            ..RiskDiffAssessment::default()
+        return Ok(RiskDiffWithOmitted {
+            diff: RiskDiffAssessment {
+                empty_input: true,
+                summary_notes: vec![
+                    "No files supplied — pass the patch's file list (e.g. `git diff --name-only`)."
+                        .to_string(),
+                ],
+                ..RiskDiffAssessment::default()
+            },
+            omitted: Vec::new(),
         });
     }
 
@@ -1282,6 +1557,8 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
         .context("bulk churn percentiles for risk diff")?;
 
     let window = IndexWindow::probe(db)?;
+    let mut local_cache = WalkCache::default();
+    let mut scope = RiskRequestScope::multi_file(cache.unwrap_or(&mut local_cache));
     let assessed: Vec<(RiskAssessment, bool)> = file_paths
         .iter()
         .map(|p| {
@@ -1292,7 +1569,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
                 Some(&percentiles),
                 MAX_FRONTIER,
                 window,
-                cache.as_deref_mut(),
+                Some(&mut scope),
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1442,7 +1719,8 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
         ));
     }
 
-    let (mut files, clustered_directories) = cluster_by_directory(files, DIR_CLUSTER_THRESHOLD);
+    let (mut files, clustered_directories, omitted) =
+        cluster_by_directory(files, DIR_CLUSTER_THRESHOLD);
 
     // Omitted cluster members have no notes; alias only the retained detail.
     let mut all_for_alias: Vec<&mut RiskAssessment> = files.iter_mut().collect();
@@ -1454,22 +1732,25 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
     }
     let legend = alias_categorical_notes_in_place(&mut all_for_alias);
 
-    Ok(RiskDiffAssessment {
-        empty_input: false,
-        files,
-        max_score,
-        mean_score,
-        max_risk_file,
-        unscored_files,
-        scored_file_count,
-        test_gap_files,
-        wide_blast_files,
-        fix_heavy_files,
-        hotspot_files,
-        summary_notes,
-        clustered_directories,
-        cycles_touching_patch,
-        legend,
+    Ok(RiskDiffWithOmitted {
+        diff: RiskDiffAssessment {
+            empty_input: false,
+            files,
+            max_score,
+            mean_score,
+            max_risk_file,
+            unscored_files,
+            scored_file_count,
+            test_gap_files,
+            wide_blast_files,
+            fix_heavy_files,
+            hotspot_files,
+            summary_notes,
+            clustered_directories,
+            cycles_touching_patch,
+            legend,
+        },
+        omitted,
     })
 }
 
@@ -1502,6 +1783,7 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
         .context("bulk churn percentiles for risk batch")?;
     let window = IndexWindow::probe(db)?;
     let mut cache = WalkCache::default();
+    let mut scope = RiskRequestScope::multi_file(&mut cache);
     let mut files: Vec<RiskAssessment> = file_paths
         .iter()
         .map(|p| {
@@ -1512,7 +1794,7 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
                 Some(&percentiles),
                 MAX_FRONTIER,
                 window,
-                Some(&mut cache),
+                Some(&mut scope),
             )
             .map(|(a, _)| a)
         })
@@ -1698,11 +1980,17 @@ const DIR_CLUSTER_THRESHOLD: usize = 5;
 /// `>= threshold` entries is collapsed to a `ClusteredDirectory` whose
 /// `top_files` keep full detail for the three highest-scoring files and
 /// whose `omitted_files` lists the rest by name. Directories below the
-/// threshold are returned unchanged in the first tuple element.
+/// threshold are returned unchanged in the first tuple element; the third
+/// element carries the full assessment of every omitted file, in cluster
+/// order, so callers that need per-file detail do not score them again.
 fn cluster_by_directory(
     files: Vec<RiskAssessment>,
     threshold: usize,
-) -> (Vec<RiskAssessment>, Vec<ClusteredDirectory>) {
+) -> (
+    Vec<RiskAssessment>,
+    Vec<ClusteredDirectory>,
+    Vec<RiskAssessment>,
+) {
     use std::collections::BTreeMap;
 
     let mut buckets: BTreeMap<String, Vec<RiskAssessment>> = BTreeMap::new();
@@ -1717,6 +2005,7 @@ fn cluster_by_directory(
 
     let mut kept: Vec<RiskAssessment> = Vec::new();
     let mut clusters: Vec<ClusteredDirectory> = Vec::new();
+    let mut omitted: Vec<RiskAssessment> = Vec::new();
     for (dir, mut items) in buckets {
         if items.len() < threshold {
             kept.extend(items);
@@ -1728,8 +2017,15 @@ fn cluster_by_directory(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         let count = items.len() as u32;
-        let top_files: Vec<RiskAssessment> = items.iter().take(3).cloned().collect();
-        let omitted_files: Vec<String> = items.iter().skip(3).map(|f| f.file.clone()).collect();
+        let mut items = items.into_iter();
+        let top_files: Vec<RiskAssessment> = items.by_ref().take(3).collect();
+        let omitted_files: Vec<String> = items
+            .map(|f| {
+                let file = f.file.clone();
+                omitted.push(f);
+                file
+            })
+            .collect();
         clusters.push(ClusteredDirectory {
             handle: Handle::dir(dir.as_str())
                 .map(|h| h.to_string())
@@ -1740,7 +2036,7 @@ fn cluster_by_directory(
             omitted_files,
         });
     }
-    (kept, clusters)
+    (kept, clusters, omitted)
 }
 
 #[cfg(test)]
@@ -1771,6 +2067,79 @@ mod tests {
     }
 
     const DAY: i64 = 86_400;
+
+    #[test]
+    fn diff_retains_omitted_cluster_assessments_from_the_same_pass() {
+        use codesage_protocol::{FileInfo, Language};
+        let db = Database::open_in_memory().unwrap();
+        let paths: Vec<String> = (0..6).map(|i| format!("app/Hot/File{i}.php")).collect();
+        for (i, path) in paths.iter().enumerate() {
+            db.upsert_file(&FileInfo {
+                path: path.clone(),
+                language: Language::Php,
+                content_hash: format!("hot-{path}"),
+                is_test: false,
+            })
+            .unwrap();
+            db.upsert_git_file(
+                path,
+                10.0 * (i + 1) as f64,
+                i as u32,
+                20,
+                Some(1_700_000_000),
+            )
+            .unwrap();
+        }
+        TOP_SYMBOLS_PASSES.with(|passes| passes.set(0));
+        let mut cache = WalkCache::default();
+        let scored = assess_risk_diff_with_walk_cache(&db, &paths, Some(&mut cache)).unwrap();
+        assert_eq!(TOP_SYMBOLS_PASSES.with(std::cell::Cell::get), paths.len());
+        assert_eq!(scored.diff.clustered_directories.len(), 1);
+        let cluster = &scored.diff.clustered_directories[0];
+        assert_eq!(cluster.omitted_files.len(), 3);
+        assert_eq!(
+            scored
+                .omitted
+                .iter()
+                .map(|a| a.file.as_str())
+                .collect::<Vec<_>>(),
+            cluster
+                .omitted_files
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            "omitted assessments follow omitted_files order"
+        );
+        for a in &scored.omitted {
+            assert!(a.found && !a.unscored, "{a:?}");
+            assert!(
+                cluster.top_files.iter().all(|top| top.score >= a.score),
+                "omitted rows rank below every retained row: {a:?}"
+            );
+            let alone = assess_risk(&db, &a.file).unwrap();
+            assert_eq!(alone.score, a.score);
+        }
+        assert!(scored.diff.files.is_empty());
+    }
+
+    #[test]
+    fn score_only_scope_skips_symbol_resolution() {
+        let (_dir, db) = setup_project();
+        db.upsert_git_file("Repository.php", 5.0, 2, 10, Some(1_700_000_000))
+            .unwrap();
+        let full = assess_risk(&db, "Repository.php").unwrap();
+        assert!(!full.top_symbols.is_empty(), "{full:?}");
+
+        TOP_SYMBOLS_PASSES.with(|passes| passes.set(0));
+        let mut cache = WalkCache::default();
+        let mut scope = RiskRequestScope::score_only(&mut cache);
+        let lean = assess_risk_with_scope(&db, "Repository.php", &mut scope).unwrap();
+        assert_eq!(TOP_SYMBOLS_PASSES.with(std::cell::Cell::get), 0);
+        assert!(lean.top_symbols.is_empty(), "{lean:?}");
+        assert_eq!(lean.score, full.score);
+        assert_eq!(lean.notes, full.notes);
+        assert_eq!(lean.unscored, full.unscored);
+    }
 
     #[test]
     fn utc_date_renders_civil_dates_across_leap_and_century_rules() {
@@ -1863,6 +2232,67 @@ mod tests {
         assert!(
             !no_symbols.contains("within 2 dependency hops"),
             "a walk that never ran must not claim hop coverage: {no_symbols:?}"
+        );
+    }
+
+    /// A spent request budget leaves every referenced symbol on its name
+    /// count and discloses it; the per-file deadline alone resolves them, and
+    /// a live budget is charged only what the pass used.
+    #[test]
+    fn request_budget_bounds_top_symbols_without_hiding_the_cut() {
+        let (_dir, db) = setup_project();
+        let mut cache = WalkCache::default();
+        let resolved =
+            compute_top_symbols(&db, "Repository.php", false, 0, &mut cache, None).unwrap();
+        let find = resolved
+            .iter()
+            .find(|t| t.name == "find")
+            .unwrap_or_else(|| panic!("`find` must rank, got {resolved:?}"));
+        assert!(
+            !find.bounded && find.why.contains("2 refs") && !find.why.contains("by name"),
+            "without a request budget the per-file pass resolves: {find:?}"
+        );
+        let mut live = TOP_SYMBOLS_REQUEST_BUDGET;
+        let charged =
+            compute_top_symbols(&db, "Repository.php", false, 0, &mut cache, Some(&mut live))
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&resolved).unwrap(),
+            serde_json::to_value(&charged).unwrap(),
+            "a live budget changes nothing but the time left"
+        );
+        assert!(
+            live < TOP_SYMBOLS_REQUEST_BUDGET,
+            "the pass charges the time it spent, left {live:?}"
+        );
+
+        let mut spent = Duration::ZERO;
+        let cut = compute_top_symbols(
+            &db,
+            "Repository.php",
+            false,
+            0,
+            &mut cache,
+            Some(&mut spent),
+        )
+        .unwrap();
+        assert_eq!(spent, Duration::ZERO, "a spent budget cannot go negative");
+        let find = cut
+            .iter()
+            .find(|t| t.name == "find")
+            .unwrap_or_else(|| panic!("`find` must still rank, got {cut:?}"));
+        assert!(
+            find.bounded
+                && find
+                    .why
+                    .contains("refs by name (resolution capped, upper bound)"),
+            "a row the request budget cut must say so: {find:?}"
+        );
+        assert!(
+            cut.iter()
+                .filter(|t| !t.bounded)
+                .all(|t| t.why.contains("0 refs")),
+            "only a name nothing spells is resolved without reading rows: {cut:?}"
         );
     }
 
@@ -1966,7 +2396,9 @@ mod tests {
                 .any(|note| note.contains("lower bound"))
         );
         let mut cache = WalkCache::default();
-        let shared = assess_risk_diff_with_walk_cache(&db, &paths, Some(&mut cache)).unwrap();
+        let shared = assess_risk_diff_with_walk_cache(&db, &paths, Some(&mut cache))
+            .unwrap()
+            .diff;
         assert_eq!(
             serde_json::to_value(&plain).unwrap(),
             serde_json::to_value(&shared).unwrap()
@@ -2026,8 +2458,9 @@ mod tests {
             let plain_elapsed = start.elapsed();
             let start = std::time::Instant::now();
             let mut cache = WalkCache::default();
-            let shared_risk =
-                assess_risk_diff_with_walk_cache(&db, &paths, Some(&mut cache)).unwrap();
+            let shared_risk = assess_risk_diff_with_walk_cache(&db, &paths, Some(&mut cache))
+                .unwrap()
+                .diff;
             let shared_risk_elapsed = start.elapsed();
             let shared_tests = super::super::tests_rec::recommend_tests_with_walk_cache(
                 &db,
