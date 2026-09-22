@@ -1151,6 +1151,7 @@ pub(crate) fn laravel_route_handler_refs(root: &Path) -> Result<Vec<Reference>> 
             lazy: false,
             to: None,
             from_line: None,
+            is_test: false,
         });
     }
     Ok(refs)

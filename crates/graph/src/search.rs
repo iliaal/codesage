@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use codesage_parser::detect::detect_language;
-use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
+use codesage_parser::discover::is_test_like_path;
 use codesage_protocol::{
     Language, SearchConfidence, SearchRequest, SearchResult, SearchResults, SearchScoreSignals,
     SearchTrace, Symbol, SymbolSummary,
@@ -879,7 +879,8 @@ pub fn search_page(
 
     // Apply penalties after blending; before it, their strength shrinks by 1 - w.
     if path_penalty_enabled() {
-        apply_path_penalties(&mut results, &req.query);
+        let test_files = TestFileFlags::load(db, &results)?;
+        apply_path_penalties(&mut results, &req.query, &test_files);
     }
     finish_trace_stage(&mut results, "path_penalty", "Path penalties disabled");
 
@@ -1675,24 +1676,60 @@ const COMPAT_DIR_NAMES: &[&str] = &["compat", "_compat", "legacy", "_legacy"];
 const EXAMPLES_DIR_NAMES: &[&str] = &["examples", "_examples"];
 const REEXPORT_BASENAMES: &[&str] = &["__init__.py", "package-info.java"];
 
-static TEST_LIKE_GLOBSET: OnceLock<GlobSet> = OnceLock::new();
+/// Which files on a result page are tests. Loaded from `files.is_test` for
+/// the page's paths; a row indexed under an older structural interpretation
+/// has no trustworthy flag and falls back to the discovery path heuristic,
+/// as does a path the index does not hold.
+pub(crate) struct TestFileFlags(HashMap<String, bool>);
 
-fn test_like_globset() -> &'static GlobSet {
-    TEST_LIKE_GLOBSET.get_or_init(|| {
-        let patterns: Vec<String> = TEST_LIKE_EXCLUDE_PATTERNS
-            .iter()
-            .map(|s| (*s).to_string())
+impl TestFileFlags {
+    pub(crate) fn load(db: &Database, results: &[SearchResult]) -> Result<Self> {
+        let mut paths: Vec<String> = results.iter().map(|r| r.file_path.clone()).collect();
+        paths.sort();
+        paths.dedup();
+        let flags = db
+            .file_test_flags(&paths)
+            .context("loading test flags for search results")?
+            .into_iter()
+            .map(|(path, (stored, interpretation))| {
+                let is_test = crate::index::file_is_test(&path, stored, interpretation.as_deref());
+                (path, is_test)
+            })
             .collect();
-        build_exclude_set(&patterns).expect("TEST_LIKE_EXCLUDE_PATTERNS compile")
-    })
+        Ok(Self(flags))
+    }
+
+    /// The pre-attribute answer: every path through the glob heuristic.
+    #[cfg(test)]
+    pub(crate) fn heuristic(results: &[SearchResult]) -> Self {
+        Self(
+            results
+                .iter()
+                .map(|r| (r.file_path.clone(), is_test_like_path(&r.file_path)))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn is_test(&self, path: &str) -> bool {
+        self.0
+            .get(path)
+            .copied()
+            .unwrap_or_else(|| is_test_like_path(path))
+    }
 }
 
 fn has_dir_segment(path: &str, names: &[&str]) -> bool {
     path.split('/').any(|seg| names.contains(&seg))
 }
 
-// Test intent lifts only the test-path demotion; other path penalties still compose.
+/// Path heuristic form, for callers without an index in hand.
+#[cfg(test)]
 pub(crate) fn path_penalty_for_query(path: &str, query_is_test_shaped: bool) -> f32 {
+    path_penalty(path, is_test_like_path(path), query_is_test_shaped)
+}
+
+// Test intent lifts only the test-path demotion; other path penalties still compose.
+pub(crate) fn path_penalty(path: &str, is_test_file: bool, query_is_test_shaped: bool) -> f32 {
     let normalized = if path.contains('\\') {
         path.replace('\\', "/")
     } else {
@@ -1700,7 +1737,7 @@ pub(crate) fn path_penalty_for_query(path: &str, query_is_test_shaped: bool) -> 
     };
     let mut penalty = 1.0f32;
 
-    if !query_is_test_shaped && test_like_globset().is_match(&normalized) {
+    if !query_is_test_shaped && is_test_file {
         penalty *= SOFT_PENALTY_STRONG * EXTRA_TEST_DEMOTE_NON_TEST_QUERY;
     }
     if has_dir_segment(&normalized, COMPAT_DIR_NAMES) {
@@ -1857,7 +1894,7 @@ fn test_query_aware_enabled() -> bool {
     *TEST_QUERY_AWARE_ENABLED.get_or_init(|| env_default_on(tuning::TEST_QUERY_AWARE))
 }
 
-fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
+fn apply_path_penalties(results: &mut [SearchResult], query: &str, test_files: &TestFileFlags) {
     let is_test_query = query_is_test_shaped(query);
     let demote_php_declaration = php_declaration_demote_enabled();
     // Require a competing .c implementation; otherwise exempt inline headers get
@@ -1866,7 +1903,11 @@ fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
         .iter()
         .any(|r| r.language == Language::C && r.file_path.ends_with(".c"));
     for result in results.iter_mut() {
-        let mut penalty = path_penalty_for_query(&result.file_path, is_test_query);
+        let mut penalty = path_penalty(
+            &result.file_path,
+            test_files.is_test(&result.file_path),
+            is_test_query,
+        );
         if has_c_implementation {
             penalty *= declaration_header_penalty(&result.file_path, result.language);
         }
@@ -3416,7 +3457,10 @@ mod path_penalty_tests {
 
 #[cfg(test)]
 mod test_query_aware_penalty_tests {
-    use super::{SearchResult, apply_path_penalties, path_penalty_for_query, query_is_test_shaped};
+    use super::{
+        SearchResult, TestFileFlags, apply_path_penalties, path_penalty_for_query,
+        query_is_test_shaped,
+    };
 
     fn mk(file: &str, score: f32) -> SearchResult {
         SearchResult {
@@ -3471,6 +3515,93 @@ mod test_query_aware_penalty_tests {
         );
     }
 
+    /// The stored attribute must reproduce the glob heuristic on a freshly
+    /// indexed project, and a row written before the attribute existed must
+    /// still demote through the heuristic.
+    #[test]
+    fn stored_attribute_demotes_exactly_what_the_glob_heuristic_did() {
+        use codesage_protocol::{FileInfo, Language};
+        use codesage_storage::Database;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/__tests__")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::create_dir_all(root.join("compat")).unwrap();
+        let files = [
+            ("src/session.js", "export function validate() {}\n"),
+            ("src/session.test.js", "test('validate', () => {});\n"),
+            ("src/__tests__/login.js", "export function login() {}\n"),
+            ("tests/integration.js", "export function run() {}\n"),
+            ("compat/legacy.js", "export function legacy() {}\n"),
+        ];
+        for (path, source) in files {
+            std::fs::write(root.join(path), source).unwrap();
+        }
+        let db = Database::open_in_memory().unwrap();
+        crate::index::full_index(root, &db, &[], false).unwrap();
+
+        let rows: Vec<SearchResult> = files.iter().map(|(path, _)| mk(path, 0.9)).collect();
+        let stored = TestFileFlags::load(&db, &rows).unwrap();
+        let glob = TestFileFlags::heuristic(&rows);
+        for (path, _) in files {
+            assert_eq!(stored.is_test(path), glob.is_test(path), "{path}");
+        }
+        assert!(stored.is_test("src/session.test.js"));
+        assert!(stored.is_test("src/__tests__/login.js"));
+        assert!(stored.is_test("tests/integration.js"));
+        assert!(!stored.is_test("src/session.js"));
+        assert!(!stored.is_test("compat/legacy.js"));
+
+        let mut by_attribute = rows.clone();
+        let mut by_glob = rows.clone();
+        apply_path_penalties(&mut by_attribute, "validate session token", &stored);
+        apply_path_penalties(&mut by_glob, "validate session token", &glob);
+        let scores = |rows: &[SearchResult]| -> Vec<(String, f32)> {
+            rows.iter()
+                .map(|r| (r.file_path.clone(), r.score))
+                .collect()
+        };
+        assert_eq!(scores(&by_attribute), scores(&by_glob));
+        assert_eq!(by_attribute[0].file_path, "src/session.js");
+
+        // A pre-0024 row: flag 0 under an older interpretation falls back to
+        // the glob; flag 0 under the current interpretation is trusted.
+        let stale_id = db
+            .upsert_file(&FileInfo {
+                path: "tests/integration.js".to_string(),
+                language: Language::JavaScript,
+                content_hash: "stale".to_string(),
+                is_test: false,
+            })
+            .unwrap();
+        db.record_file_interpretation(stale_id, "codesage/structural/v0")
+            .unwrap();
+        let trusted_id = db
+            .upsert_file(&FileInfo {
+                path: "src/__tests__/login.js".to_string(),
+                language: Language::JavaScript,
+                content_hash: "current".to_string(),
+                is_test: false,
+            })
+            .unwrap();
+        db.record_file_interpretation(trusted_id, crate::index::STRUCTURAL_INTERPRETATION)
+            .unwrap();
+        let reloaded = TestFileFlags::load(&db, &rows).unwrap();
+        assert!(
+            reloaded.is_test("tests/integration.js"),
+            "stale row uses the glob"
+        );
+        assert!(
+            !reloaded.is_test("src/__tests__/login.js"),
+            "current row's stored flag wins over the glob"
+        );
+        assert!(
+            reloaded.is_test("unindexed/__tests__/x.js"),
+            "unknown path falls back to the glob"
+        );
+    }
+
     #[test]
     fn axios_interceptor_failure_mode_repro() {
         // Synthetic axios candidates reproduce tests crowding out the implementation.
@@ -3482,7 +3613,9 @@ mod test_query_aware_penalty_tests {
             mk("tests/unit/regression.test.js", 0.60),
         ];
 
-        apply_path_penalties(&mut results, "request and response interceptors");
+        let flags = TestFileFlags::heuristic(&results);
+
+        apply_path_penalties(&mut results, "request and response interceptors", &flags);
 
         assert_eq!(results[0].file_path, "lib/core/InterceptorManager.js");
     }
@@ -3495,7 +3628,9 @@ mod test_query_aware_penalty_tests {
             mk("tests/unit/regression.test.js", 0.60),
         ];
 
-        apply_path_penalties(&mut results, "test for InterceptorManager");
+        let flags = TestFileFlags::heuristic(&results);
+
+        apply_path_penalties(&mut results, "test for InterceptorManager", &flags);
 
         assert_eq!(
             results[0].file_path,
@@ -3524,7 +3659,8 @@ mod test_query_aware_penalty_tests {
             mk("src/auth/session.rs", prod_score),
             mk("tests/auth/session_test.rs", test_score),
         ];
-        apply_path_penalties(&mut results, "validate session token");
+        let flags = TestFileFlags::heuristic(&results);
+        apply_path_penalties(&mut results, "validate session token", &flags);
         let prod_idx = results
             .iter()
             .position(|r| r.file_path == "src/auth/session.rs")
@@ -4574,7 +4710,7 @@ mod language_and_version_penalty_tests {
 
 #[cfg(test)]
 mod header_demote_scope_tests {
-    use super::apply_path_penalties;
+    use super::{TestFileFlags, apply_path_penalties};
     use codesage_protocol::{Language, SearchResult};
 
     fn mk(file: &str, language: Language, score: f32) -> SearchResult {
@@ -4598,7 +4734,8 @@ mod header_demote_scope_tests {
             mk("include/fmt/compile.h", Language::C, 0.90),
             mk("include/fmt/base.h", Language::C, 0.85),
         ];
-        apply_path_penalties(&mut results, "compile-time format string checking");
+        let flags = TestFileFlags::heuristic(&results);
+        apply_path_penalties(&mut results, "compile-time format string checking", &flags);
         assert_eq!(results[0].file_path, "include/fmt/compile.h");
         assert!(
             (results[0].score - 0.90).abs() < 1e-6,
@@ -4612,7 +4749,8 @@ mod header_demote_scope_tests {
             mk("lib/cfilters.h", Language::C, 0.90),
             mk("lib/connect.c", Language::C, 0.85),
         ];
-        apply_path_penalties(&mut results, "connection filter chain setup");
+        let flags = TestFileFlags::heuristic(&results);
+        apply_path_penalties(&mut results, "connection filter chain setup", &flags);
         assert_eq!(results[0].file_path, "lib/connect.c");
     }
 }
@@ -5839,7 +5977,8 @@ mod explanation_tests {
         rows[2].start_line = 10;
         apply_symbol_boost(&mut rows, &["authhandler".into()]);
         apply_definition_boost(&mut rows, "AuthHandler");
-        apply_path_penalties(&mut rows, "auth");
+        let flags = TestFileFlags::heuristic(&rows);
+        apply_path_penalties(&mut rows, "auth", &flags);
         apply_file_saturation(&mut rows);
         apply_directory_saturation(&mut rows);
         apply_mention_anchor(&mut rows, "panic in /repo/tests/auth.rs:2", 5, 0, true);

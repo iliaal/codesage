@@ -12,6 +12,7 @@ fn file_info(path: &str) -> FileInfo {
         path: path.to_string(),
         language: Language::Rust,
         content_hash: "hash".to_string(),
+        is_test: false,
     }
 }
 
@@ -27,6 +28,7 @@ fn symbol(name: &str, file_path: &str) -> Symbol {
         col_end: 0,
         rationale: vec![],
         visibility: None,
+        is_test: false,
         overloaded: false,
     }
 }

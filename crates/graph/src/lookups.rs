@@ -483,6 +483,7 @@ mod tests {
             path: path.to_string(),
             language: Language::Rust,
             content_hash: path.to_string(),
+            is_test: false,
         })
         .unwrap()
     }
@@ -503,6 +504,7 @@ mod tests {
             col_end: 0,
             rationale: vec![],
             visibility: None,
+            is_test: false,
             overloaded: false,
         }
     }
@@ -518,6 +520,7 @@ mod tests {
             lazy: false,
             to: None,
             from_line: None,
+            is_test: false,
         }
     }
 
@@ -538,6 +541,7 @@ mod tests {
             col: 0,
             to: None,
             from_line: None,
+            is_test: false,
         }
     }
 

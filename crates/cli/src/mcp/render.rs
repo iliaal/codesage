@@ -1790,6 +1790,7 @@ mod tests {
                 path: rel.to_string(),
                 language: Language::Rust,
                 content_hash: codesage_parser::discover::content_hash(body),
+                is_test: false,
             })
             .unwrap();
         };
@@ -1853,6 +1854,7 @@ mod tests {
                 path: rel.to_string(),
                 language: lang,
                 content_hash: codesage_parser::discover::content_hash(b"x"),
+                is_test: false,
             })
             .unwrap();
         }
@@ -2051,6 +2053,7 @@ mod tests {
             path: outside_path.clone(),
             language: Language::Rust,
             content_hash: codesage_parser::discover::content_hash(b"fn secret() {}\n"),
+            is_test: false,
         })
         .unwrap();
         drop(db);

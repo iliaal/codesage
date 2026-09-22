@@ -90,6 +90,7 @@ mod tests {
             path: "a.rs".into(),
             language: codesage_protocol::Language::Rust,
             content_hash: "durable".into(),
+            is_test: false,
         })
         .unwrap();
         db.conn.execute_batch("DROP TABLE file_hash_cache; DELETE FROM schema_migrations WHERE name='0019_file_hash_cache';").unwrap();

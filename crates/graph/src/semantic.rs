@@ -914,6 +914,7 @@ mod tests {
             path: path.to_string(),
             language: Language::Rust,
             content_hash: hash.to_string(),
+            is_test: false,
         }
     }
 

@@ -571,6 +571,7 @@ mod tests {
             path: "routes/web.php".to_string(),
             language: Language::Php,
             content_hash: "h".to_string(),
+            is_test: false,
         })
         .unwrap();
 
@@ -739,6 +740,7 @@ mod tests {
                 path: "helper_generated.c".to_string(),
                 language: Language::C,
                 content_hash: "helper".to_string(),
+                is_test: false,
             })
             .unwrap();
         db.replace_file_trust_boundaries(helper_id, &[TrustBoundary::ProcessExec])

@@ -187,6 +187,12 @@ pub(crate) fn cmd_dependencies(file: &str, json: bool) -> Result<()> {
                 println!("  {imp}");
             }
         }
+        if !deps.test_imports.is_empty() {
+            println!("\nTest imports (from test code only):");
+            for imp in &deps.test_imports {
+                println!("  {imp}");
+            }
+        }
         if deps.imported_by.is_empty() {
             println!("\nImported by: (none)");
         } else {

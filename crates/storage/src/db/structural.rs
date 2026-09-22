@@ -12,6 +12,24 @@ use rusqlite::params;
 
 use crate::schema::name_tail;
 
+/// A reference is test code when its enclosing definition is, or when the
+/// whole file is. Derived per row; `refs` stores no flag of its own.
+///
+/// `refs.from_symbol` holds the innermost enclosing definition's qualified
+/// name, which is not unique per file: a Rust `#[cfg(test)] mod tests { fn
+/// setup() }` and a product `fn setup()` in the same file share the bare key.
+/// The reference's own line picks the narrowest definition whose recorded
+/// range contains it; only when no range matches does the name-only aggregate
+/// answer.
+const REF_IS_TEST_SQL: &str = "(f.is_test <> 0 OR COALESCE( \
+     (SELECT s.is_test FROM symbols s \
+        WHERE s.file_id = r.from_file_id AND s.qualified_name = r.from_symbol \
+          AND s.line_start <= r.line AND r.line <= s.line_end \
+        ORDER BY (s.line_end - s.line_start), s.line_start LIMIT 1), \
+     (SELECT MAX(s.is_test) FROM symbols s \
+        WHERE s.file_id = r.from_file_id AND s.qualified_name = r.from_symbol), \
+     0) <> 0)";
+
 /// Cross-file import pairs split by whether any load-time directive joins them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImportPairs {
@@ -29,13 +47,14 @@ fn deserialize_rationale(s: &str) -> Vec<RationaleEntry> {
 }
 
 /// Map a `(name, qualified_name, kind, path, line_start, line_end, col_start,
-/// col_end, rationale, visibility)` row — the column order shared by
+/// col_end, rationale, visibility, is_test)` row — the column order shared by
 /// `find_symbols`, `symbols_for_files`, and `symbols_for_file` — into a
 /// `Symbol`. An unrecognized visibility string reads as unknown.
 fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     let kind_str: String = row.get(2)?;
     let rationale_json: String = row.get(8)?;
     let visibility: Option<String> = row.get(9)?;
+    let is_test: i64 = row.get(10)?;
     Ok(Symbol {
         name: row.get(0)?,
         qualified_name: row.get(1)?,
@@ -47,6 +66,7 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         col_end: row.get(7)?,
         rationale: deserialize_rationale(&rationale_json),
         visibility: visibility.as_deref().and_then(Visibility::parse),
+        is_test: is_test != 0,
         overloaded: false,
     })
 }
@@ -172,18 +192,20 @@ impl Database {
     pub fn upsert_file(&self, file: &FileInfo) -> Result<i64> {
         self.conn
             .prepare_cached(
-                "INSERT INTO files (path, language, content_hash, indexed_at)
-                 VALUES (?1, ?2, ?3, unixepoch())
+                "INSERT INTO files (path, language, content_hash, indexed_at, is_test)
+                 VALUES (?1, ?2, ?3, unixepoch(), ?4)
                  ON CONFLICT(path) DO UPDATE SET
                    language = excluded.language,
                    content_hash = excluded.content_hash,
                    indexed_at = excluded.indexed_at,
-                   interpretation = NULL",
+                   interpretation = NULL,
+                   is_test = excluded.is_test",
             )?
             .execute(params![
                 file.path,
                 file.language.as_str(),
-                file.content_hash
+                file.content_hash,
+                i64::from(file.is_test)
             ])?;
 
         let file_id: i64 = self
@@ -216,8 +238,8 @@ impl Database {
 
     pub fn insert_symbols(&self, file_id: i64, symbols: &[Symbol]) -> Result<()> {
         let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO symbols (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end, rationale, visibility)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end, rationale, visibility, is_test)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
 
         for s in symbols {
@@ -234,6 +256,7 @@ impl Database {
                 s.col_end,
                 rationale_json,
                 s.visibility.map(|v| v.as_str()),
+                i64::from(s.is_test),
             ])?;
         }
         Ok(())
@@ -401,11 +424,11 @@ impl Database {
 
     pub fn find_symbols(&self, name: &str, kind: Option<SymbolKind>) -> Result<Vec<Symbol>> {
         let sql = if name.contains('\\') || name.contains('.') || name.contains("::") {
-            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility
+            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test
               FROM symbols s JOIN files f ON s.file_id = f.id
               WHERE s.qualified_name = ?1"
         } else {
-            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility
+            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test
               FROM symbols s JOIN files f ON s.file_id = f.id
               WHERE s.name = ?1"
         };
@@ -454,16 +477,20 @@ impl Database {
 
         let mut refs = if is_qualified {
             self.query_refs(
-                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy
+                &format!(
+                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
                  FROM refs r JOIN files f ON r.from_file_id = f.id
-                 WHERE r.to_name = ?1",
+                 WHERE r.to_name = ?1"
+            ),
                 params![to_name],
             )?
         } else {
             self.query_refs(
-                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy
+                &format!(
+                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
                  FROM refs r JOIN files f ON r.from_file_id = f.id
-                 WHERE r.to_name_tail = ?1 OR r.to_name = ?1",
+                 WHERE r.to_name_tail = ?1 OR r.to_name = ?1"
+            ),
                 params![to_name],
             )?
         };
@@ -481,10 +508,12 @@ impl Database {
         line_end: u32,
     ) -> Result<Vec<Reference>> {
         self.query_refs(
-            "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy
+            &format!(
+                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
              FROM refs r JOIN files f ON r.from_file_id = f.id
              WHERE f.path = ?1 AND r.line BETWEEN ?2 AND ?3
-             ORDER BY r.line, r.col",
+             ORDER BY r.line, r.col"
+            ),
             params![file_path, line_start, line_end],
         )
     }
@@ -503,6 +532,7 @@ impl Database {
                 lazy: row.get::<_, i64>(6)? != 0,
                 to: None,
                 from_line: None,
+                is_test: row.get::<_, i64>(7)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -646,10 +676,12 @@ impl Database {
 
     pub fn file_import_references(&self) -> Result<Vec<Reference>> {
         self.query_refs(
-            "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy
+            &format!(
+                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
              FROM refs r JOIN files f ON r.from_file_id = f.id
              WHERE r.kind IN ('import', 'include')
-             ORDER BY f.path, r.line, r.col, r.to_name",
+             ORDER BY f.path, r.line, r.col, r.to_name"
+            ),
             [],
         )
     }
@@ -747,19 +779,33 @@ impl Database {
                         .to_string(),
                 ),
                 imports: Vec::new(),
+                test_imports: Vec::new(),
                 imported_by: Vec::new(),
             });
         }
 
-        let mut imports_stmt = self.conn.prepare(
-            "SELECT DISTINCT r.to_name
+        // A target named by any product-scope directive stays in `imports`;
+        // only targets named exclusively from test code move to `test_imports`.
+        let mut imports_stmt = self.conn.prepare(&format!(
+            "SELECT r.to_name, MIN({REF_IS_TEST_SQL})
              FROM refs r JOIN files f ON r.from_file_id = f.id
              WHERE f.path = ?1 AND (r.kind IN ('import', 'include')
-                   OR (r.kind = 'import_binding' AND f.language = 'python'))",
-        )?;
-        let imports: Vec<String> = imports_stmt
-            .query_map(params![file_path], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+                   OR (r.kind = 'import_binding' AND f.language = 'python'))
+             GROUP BY r.to_name
+             ORDER BY MIN(r.id)"
+        ))?;
+        let mut imports = Vec::new();
+        let mut test_imports = Vec::new();
+        for row in imports_stmt.query_map(params![file_path], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+        })? {
+            let (to_name, is_test) = row?;
+            if is_test {
+                test_imports.push(to_name);
+            } else {
+                imports.push(to_name);
+            }
+        }
 
         let mut imported_by_stmt = self.conn.prepare(
             "SELECT DISTINCT f.path
@@ -802,8 +848,65 @@ impl Database {
             found: true,
             note: None,
             imports,
+            test_imports,
             imported_by,
         })
+    }
+
+    /// `(is_test, interpretation)` for each indexed path in `paths`; paths the
+    /// index does not hold are absent. Lets a consumer trust the stored flag
+    /// on rows written under the current interpretation and fall back to a
+    /// path heuristic for older rows.
+    pub fn file_test_flags(
+        &self,
+        paths: &[String],
+    ) -> Result<HashMap<String, (bool, Option<String>)>> {
+        let mut out = HashMap::with_capacity(paths.len());
+        if paths.is_empty() {
+            return Ok(out);
+        }
+        // Bind in chunks so a wide result page stays under SQLite's variable cap.
+        for chunk in paths.chunks(500) {
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT path, is_test, interpretation FROM files WHERE path IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self.conn.prepare_cached(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (path, is_test, interpretation) = row?;
+                out.insert(path, (is_test, interpretation));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `(path, is_test, interpretation)` for every indexed file, path order.
+    pub fn all_file_test_flags(&self) -> Result<Vec<(String, bool, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, is_test, interpretation FROM files ORDER BY path")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Batched lookup: returns a map from file_path → symbols for all distinct
@@ -823,7 +926,7 @@ impl Database {
         let placeholders: Vec<String> = (1..=file_paths.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
             "SELECT s.name, s.qualified_name, s.kind, f.path,
-                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility
+                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE f.path IN ({})
              ORDER BY s.line_start",
@@ -848,7 +951,7 @@ impl Database {
     pub fn symbols_for_file(&self, file_path: &str) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.name, s.qualified_name, s.kind, f.path,
-                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility
+                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE f.path = ?1
              ORDER BY s.line_start",

@@ -1378,6 +1378,7 @@ mod tests {
             path: "src/lib.rs".to_string(),
             language: codesage_protocol::Language::Rust,
             content_hash: "new".to_string(),
+            is_test: false,
         })
         .unwrap();
         db.upsert_semantic_file_hash("src/lib.rs", "old").unwrap();

@@ -200,6 +200,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0021_git_history_anchor",
         "0022_refs_lazy",
         "0023_symbols_visibility",
+        "0024_is_test",
     ];
     for migration in expected_migrations {
         let count: i64 = conn
@@ -211,6 +212,16 @@ fn fresh_db_records_migrations_exactly_once() {
             .unwrap();
         assert_eq!(count, 1, "{migration} recorded on fresh DB");
     }
+
+    let lookup_index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_symbols_file_qualified'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lookup_index, 1, "base schema carries the lookup index");
 
     init_db(&conn).expect("second init_db");
     let count_after: i64 = conn
@@ -242,6 +253,58 @@ fn legacy_interpretation_is_unknown_without_rewriting_raw_hashes() {
         )
         .unwrap();
     assert_eq!(row, ("raw-hash".to_string(), None));
+}
+
+#[test]
+fn legacy_rows_read_as_product_code_until_reparsed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let conn = Connection::open(&path).unwrap();
+    create_old_schema(&conn);
+    conn.execute_batch(
+        "INSERT INTO files (id, path, language, content_hash) VALUES (1, 'tests/old.rs', 'rust', 'h');
+         INSERT INTO symbols (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end)
+         VALUES (1, 'helper', 'tests::helper', 'function', 1, 2, 0, 1);
+         INSERT INTO refs (from_file_id, from_symbol, to_name, kind, line, col)
+         VALUES (1, 'tests::helper', 'target', 'call', 2, 4);",
+    )
+    .unwrap();
+    init_db(&conn).unwrap();
+    let flags: (i64, i64) = conn
+        .query_row(
+            "SELECT f.is_test, s.is_test FROM files f JOIN symbols s ON s.file_id = f.id",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        flags,
+        (0, 0),
+        "0024 must default legacy rows to product code"
+    );
+    let lookup_index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_symbols_file_qualified'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        lookup_index, 1,
+        "0024 adds the (file_id, qualified_name) index the reference is_test lookup rides"
+    );
+    drop(conn);
+
+    let db = codesage_storage::Database::open(&path).unwrap();
+    let symbols = db.find_symbols("helper", None).unwrap();
+    assert_eq!(symbols.len(), 1);
+    assert!(!symbols[0].is_test);
+    let refs = db.find_references("target", None).unwrap();
+    assert_eq!(refs.len(), 1);
+    assert!(!refs[0].is_test);
+    let json = serde_json::to_value(&refs[0]).unwrap();
+    assert!(json.get("is_test").is_none(), "false is omitted: {json}");
 }
 
 #[test]
@@ -637,6 +700,7 @@ fn sample_file_info() -> codesage_protocol::FileInfo {
         path: "src/sample.rs".to_string(),
         language: codesage_protocol::Language::Rust,
         content_hash: "h1".to_string(),
+        is_test: false,
     }
 }
 
@@ -652,6 +716,7 @@ fn sample_symbol() -> codesage_protocol::Symbol {
         col_end: 10,
         rationale: Vec::new(),
         visibility: None,
+        is_test: false,
         overloaded: false,
     }
 }
@@ -667,6 +732,7 @@ fn sample_reference(kind: codesage_protocol::ReferenceKind) -> codesage_protocol
         lazy: false,
         to: None,
         from_line: None,
+        is_test: false,
     }
 }
 

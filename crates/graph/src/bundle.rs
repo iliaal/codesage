@@ -1544,6 +1544,7 @@ mod context_export_tests {
             col_end: 0,
             rationale: vec![],
             visibility: None,
+            is_test: false,
             overloaded: false,
         }
     }
@@ -1559,6 +1560,7 @@ mod context_export_tests {
             lazy: false,
             to: None,
             from_line: None,
+            is_test: false,
         }
     }
 
@@ -1570,6 +1572,7 @@ mod context_export_tests {
                 path: "app/a.php".to_string(),
                 language: Language::Php,
                 content_hash: "a".to_string(),
+                is_test: false,
             })
             .unwrap();
         let mk = |to: &str, kind| Reference {
@@ -1582,6 +1585,7 @@ mod context_export_tests {
             lazy: false,
             to: None,
             from_line: None,
+            is_test: false,
         };
         db.insert_references(
             file_id,
@@ -1639,6 +1643,7 @@ mod context_export_tests {
                 path: "app/repo_controller.py".to_string(),
                 language: Language::Python,
                 content_hash: "repo".to_string(),
+                is_test: false,
             })
             .unwrap();
         let cache_file = db
@@ -1646,6 +1651,7 @@ mod context_export_tests {
                 path: "app/cache_controller.py".to_string(),
                 language: Language::Python,
                 content_hash: "cache".to_string(),
+                is_test: false,
             })
             .unwrap();
         db.insert_references(repo_file, &[reference("find", "app/repo_controller.py")])
@@ -1741,6 +1747,7 @@ mod context_export_tests {
                 path: "helper.rs".to_string(),
                 language: Language::Rust,
                 content_hash: "h".to_string(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(
@@ -1767,6 +1774,7 @@ mod context_export_tests {
                     path: path.to_string(),
                     language: Language::Rust,
                     content_hash: path.to_string(),
+                    is_test: false,
                 })
                 .unwrap();
             db.insert_symbols(id, &[visible("parse", path, visibility)])
@@ -1804,6 +1812,7 @@ mod context_export_tests {
                 path: "util.c".to_string(),
                 language: Language::C,
                 content_hash: "u".to_string(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(util, &[visible("helper", "util.c", Some(Visibility::File))])
@@ -1829,6 +1838,7 @@ mod context_export_tests {
                 path: "a.rs".to_string(),
                 language: Language::Rust,
                 content_hash: "a".to_string(),
+                is_test: false,
             })
             .unwrap();
         let b = db
@@ -1836,6 +1846,7 @@ mod context_export_tests {
                 path: "b.rs".to_string(),
                 language: Language::Rust,
                 content_hash: "b".to_string(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(a, &[symbol("helper", "helper", "a.rs")])
@@ -1862,6 +1873,7 @@ mod context_export_tests {
                 path: "fixtures/sample.cpp".to_string(),
                 language: Language::Cpp,
                 content_hash: "cpp".to_string(),
+                is_test: false,
             })
             .unwrap();
         let rust_file = db
@@ -1869,6 +1881,7 @@ mod context_export_tests {
                 path: "src/db.rs".to_string(),
                 language: Language::Rust,
                 content_hash: "rust".to_string(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(

@@ -11,7 +11,7 @@ use codesage_graph::{index_files, remove_files, semantic_index_files, semantic_r
 use codesage_parser::detect::{
     detect_language, detect_language_with_dialect, is_unambiguous_cpp_extension,
 };
-use codesage_parser::discover::{WatchFilter, content_hash};
+use codesage_parser::discover::{WatchFilter, content_hash, is_test_like_path};
 use codesage_protocol::FileInfo;
 use codesage_storage::Database;
 use notify::event::ModifyKind;
@@ -1083,6 +1083,7 @@ fn reindex_one(
         path: rel_str.clone(),
         language: lang,
         content_hash: hash.clone(),
+        is_test: is_test_like_path(&rel_str),
     };
 
     if semantic_enabled && !semantic_hash_is_fresh(config, &rel_str, &hash) {
@@ -2354,6 +2355,7 @@ mod tests {
                 path: path.into(),
                 language: codesage_protocol::Language::Rust,
                 content_hash: content_hash(source.as_bytes()),
+                is_test: false,
             })
             .collect();
         std::fs::write(root.join("good.rs"), source).unwrap();
@@ -3412,6 +3414,7 @@ mod tests {
             path: "foo.rs".to_string(),
             language: codesage_protocol::Language::Rust,
             content_hash: content_hash(src.as_bytes()),
+            is_test: false,
         };
         index_files(root, &db, std::slice::from_ref(&file_info), false).unwrap();
         assert!(db.get_file_hash("foo.rs").unwrap().is_some());
@@ -3503,6 +3506,7 @@ mod tests {
             path: "foo.rs".to_string(),
             language: codesage_protocol::Language::Rust,
             content_hash: hash.clone(),
+            is_test: false,
         };
         index_files(root, &db, std::slice::from_ref(&file_info), false).unwrap();
         assert!(db.get_file_hash("foo.rs").unwrap().is_some());
@@ -3562,6 +3566,7 @@ mod tests {
                 path: "foo.rs".to_string(),
                 language: codesage_protocol::Language::Rust,
                 content_hash: content_hash(src.as_bytes()),
+                is_test: false,
             }],
             false,
         )
@@ -3605,6 +3610,7 @@ mod tests {
                 path: "foo.rs".to_string(),
                 language: codesage_protocol::Language::Rust,
                 content_hash: hash.clone(),
+                is_test: false,
             }],
             false,
         )
@@ -3682,6 +3688,7 @@ mod tests {
             path: "a.py".to_string(),
             language: codesage_protocol::Language::Python,
             content_hash: hash.clone(),
+            is_test: false,
         })
         .unwrap();
         db.upsert_semantic_file_hash("a.py", &hash).unwrap();
@@ -4332,6 +4339,7 @@ mod tests {
                 path: "foo.rs".to_string(),
                 language: codesage_protocol::Language::Rust,
                 content_hash: content_hash(src.as_bytes()),
+                is_test: false,
             }],
             false,
         )
@@ -4369,6 +4377,7 @@ mod tests {
                 path: "foo.rs".to_string(),
                 language: codesage_protocol::Language::Rust,
                 content_hash: content_hash(src.as_bytes()),
+                is_test: false,
             }],
             false,
         )
@@ -4451,12 +4460,14 @@ mod tests {
             path: "src/main.cpp".to_string(),
             language: codesage_protocol::Language::Cpp,
             content_hash: "x".to_string(),
+            is_test: false,
         })
         .unwrap();
         db.upsert_file(&FileInfo {
             path: "src/util.h".to_string(),
             language: codesage_protocol::Language::Cpp,
             content_hash: "x".to_string(),
+            is_test: false,
         })
         .unwrap();
         drop(db);
@@ -4476,18 +4487,21 @@ mod tests {
             path: "src/main.c".to_string(),
             language: codesage_protocol::Language::C,
             content_hash: "x".to_string(),
+            is_test: false,
         })
         .unwrap();
         db.upsert_file(&FileInfo {
             path: "src/kernel.cu".to_string(),
             language: codesage_protocol::Language::Cpp,
             content_hash: "x".to_string(),
+            is_test: false,
         })
         .unwrap();
         db.upsert_file(&FileInfo {
             path: "src/api.h".to_string(),
             language: codesage_protocol::Language::C,
             content_hash: "x".to_string(),
+            is_test: false,
         })
         .unwrap();
         drop(db);
@@ -4507,12 +4521,14 @@ mod tests {
             path: "src/main.cpp".to_string(),
             language: codesage_protocol::Language::Cpp,
             content_hash: "x".to_string(),
+            is_test: false,
         })
         .unwrap();
         db.upsert_file(&FileInfo {
             path: "src/util.h".to_string(),
             language: codesage_protocol::Language::Cpp,
             content_hash: "x".to_string(),
+            is_test: false,
         })
         .unwrap();
         drop(db);
@@ -4574,6 +4590,7 @@ mod tests {
                 path: "main.cpp".to_string(),
                 language: codesage_protocol::Language::Cpp,
                 content_hash: content_hash(src.as_bytes()),
+                is_test: false,
             }],
             false,
         )
@@ -4905,6 +4922,7 @@ mod tests {
                 path: path.to_string(),
                 language: codesage_protocol::Language::Rust,
                 content_hash: "x".to_string(),
+                is_test: false,
             })
             .unwrap();
         }
@@ -4954,6 +4972,7 @@ mod tests {
                 path: path.to_string(),
                 language: codesage_protocol::Language::Rust,
                 content_hash: "x".to_string(),
+                is_test: false,
             })
             .unwrap();
         }

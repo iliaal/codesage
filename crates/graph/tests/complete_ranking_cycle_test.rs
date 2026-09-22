@@ -20,6 +20,7 @@ fn complete_ranking_observes_same_shape_reindex_after_ordinary_cycle_cache_is_wa
             path: path.into(),
             language: Language::Php,
             content_hash: content_hash(source.as_bytes()),
+            is_test: false,
         });
     }
     index_files(root.path(), &db, &files, false).unwrap();

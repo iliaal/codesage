@@ -56,6 +56,7 @@ fn index_test_file(db: &Database, path: &str) {
         path: path.to_string(),
         language,
         content_hash: format!("test-hash-{path}"),
+        is_test: false,
     })
     .unwrap();
 }
@@ -1441,6 +1442,7 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
             path: "caller.rs".into(),
             language: Language::Rust,
             content_hash: "c".into(),
+            is_test: false,
         })
         .unwrap();
     let target_id = db
@@ -1448,6 +1450,7 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
             path: "target.rs".into(),
             language: Language::Rust,
             content_hash: "t".into(),
+            is_test: false,
         })
         .unwrap();
 
@@ -1462,6 +1465,7 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
         col_end: 0,
         rationale: Vec::new(),
         visibility: None,
+        is_test: false,
         overloaded: false,
     };
 
@@ -1488,6 +1492,7 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
         lazy: false,
         to: None,
         from_line: None,
+        is_test: false,
     };
     let mut refs: Vec<Reference> = (0..20).map(|i| mk_ref("small_hot", 10 + i)).collect();
     refs.push(mk_ref("tiny", 200));
@@ -1538,6 +1543,7 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
             path: "caller.rs".into(),
             language: Language::Rust,
             content_hash: "c".into(),
+            is_test: false,
         })
         .unwrap();
     let hot_id = db
@@ -1545,6 +1551,7 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
             path: "hot.rs".into(),
             language: Language::Rust,
             content_hash: "h".into(),
+            is_test: false,
         })
         .unwrap();
 
@@ -1564,6 +1571,7 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
             col_end: 0,
             rationale: Vec::new(),
             visibility: None,
+            is_test: false,
             overloaded: false,
         });
     }
@@ -1581,6 +1589,7 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
             lazy: false,
             to: None,
             from_line: None,
+            is_test: false,
         })
         .collect();
     db.insert_references(caller_id, &refs).unwrap();

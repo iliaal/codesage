@@ -1150,9 +1150,12 @@ fn compute_top_symbols(
     in_cycle: bool,
     cycle_size: u32,
 ) -> Result<Vec<TopSymbol>> {
-    let symbols = db
+    let mut symbols = db
         .symbols_for_file(file_path)
         .with_context(|| format!("loading symbols for top-symbols breakdown of {file_path}"))?;
+    // Test helpers are hot by construction (every test calls them) and would
+    // otherwise name the file's `#[cfg(test)]` module as its risk surface.
+    symbols.retain(|s| !s.is_test);
     if symbols.is_empty() {
         return Ok(Vec::new());
     }
@@ -2225,6 +2228,7 @@ mod tests {
                 path: path.to_string(),
                 language: Language::Python,
                 content_hash: "hash".to_string(),
+                is_test: false,
             })
             .unwrap();
         }
@@ -2240,6 +2244,7 @@ mod tests {
             db.insert_symbols(
                 ids(path),
                 &[Symbol {
+                    is_test: false,
                     overloaded: false,
                     name: name.to_string(),
                     qualified_name: name.to_string(),
@@ -2257,6 +2262,7 @@ mod tests {
         }
         let imp = |from: &str, to: &str, line: u32, lazy: bool| Reference {
             from_line: None,
+            is_test: false,
             to: None,
             from_file: from.to_string(),
             from_symbol: None,
@@ -2351,11 +2357,13 @@ mod tests {
                 path: path.to_string(),
                 language: Language::Php,
                 content_hash: "hash".to_string(),
+                is_test: false,
             })
             .unwrap();
         }
         let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
         let sym = |name: &str, qualified: &str, file: &str| Symbol {
+            is_test: false,
             overloaded: false,
             name: name.to_string(),
             qualified_name: qualified.to_string(),
@@ -2380,6 +2388,7 @@ mod tests {
         .unwrap();
         let imp = |from: &str, to: &str| Reference {
             from_line: None,
+            is_test: false,
             to: None,
             from_file: from.to_string(),
             from_symbol: None,
@@ -2435,6 +2444,7 @@ mod tests {
                 path: path.to_string(),
                 language: Language::Php,
                 content_hash: "hash".to_string(),
+                is_test: false,
             })
             .unwrap();
         }
@@ -2449,6 +2459,7 @@ mod tests {
             col_end: 0,
             rationale: Vec::new(),
             visibility: None,
+            is_test: false,
             overloaded: false,
         };
         let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
@@ -2474,6 +2485,7 @@ mod tests {
             lazy: false,
             to: None,
             from_line: None,
+            is_test: false,
         };
         db.insert_references(ids("cyc_a.php"), &[imp("cyc_a.php", "App\\CycleB")])
             .unwrap();

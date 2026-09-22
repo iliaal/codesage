@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+### Added
+
+- `find_symbol` and `find_references` rows carry `is_test: true` for test code (omitted when false); a reference is test code when its enclosing definition or its file is.
+- Test-like paths, a JavaScript/TypeScript top-level `describe` / `it` / `test` call, and a Rust `#![cfg(test)]` file header each mark the file and every symbol in it.
+- The parser also marks Rust `#[cfg(test)]` module contents and `#[test]`-family functions, Python `test_*` / `Test*` / `pytest`-decorated definitions, JavaScript/TypeScript `describe` / `it` / `test` bodies, and Java `@Test` / `@ParameterizedTest` methods.
+- `list_dependencies` and `codesage dependencies` report import targets named only from test code under `test_imports` (omitted when empty).
+- `project_overview` accepts `include_tests` (default false) to rank test files in `top_risk_files`.
+- Schema migration `0024_is_test` (`files.is_test`, `symbols.is_test`); the next `codesage index` reparses existing files under `extraction=6`.
+
+### Changed
+
+- `project_overview.top_risk_files` skips test files unless `include_tests: true`, the `session_start` / `session_end` top-50 baseline always skips them, and `assess_risk` `top_symbols` skips test symbols; rows indexed before `0024_is_test` fall back to the test-path heuristic until reindexed.
+- `search` demotes test chunks from the stored `is_test` flag instead of re-matching path globs per query; rows indexed before `0024_is_test` keep the glob result.
+
 ### Fixed
 
 - `codesage rehearse` without explicit paths, `codesage features-list --since`, and MCP `list_features` `since` now report both endpoints of a Git rename instead of only the destination.

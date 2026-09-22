@@ -2402,6 +2402,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
             col_end: 0,
             rationale: Vec::new(),
             visibility: None,
+            is_test: false,
             overloaded: false,
         }
     }
@@ -2440,6 +2441,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
                 path: "src/lib.rs".into(),
                 language: Language::Rust,
                 content_hash: "h1".into(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(
@@ -2518,6 +2520,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
                 path: "src/db/mod.rs".into(),
                 language: Language::Rust,
                 content_hash: "h2".into(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(
@@ -2543,6 +2546,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
                 path: "src/db/net/mux.go".into(),
                 language: Language::Go,
                 content_hash: "h3".into(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(
@@ -2567,6 +2571,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
                 path: "src/retry.cc".into(),
                 language: Language::Cpp,
                 content_hash: "h5".into(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(
@@ -2592,6 +2597,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
                 path: "tests/fixtures/sample.php".into(),
                 language: Language::Php,
                 content_hash: "h4".into(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(
@@ -2660,6 +2666,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
                     path: file.into(),
                     language: Language::Go,
                     content_hash: file.into(),
+                    is_test: false,
                 })
                 .unwrap();
         }
@@ -2711,6 +2718,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
                 path: "src/db/mods/x.rs".into(),
                 language: Language::Rust,
                 content_hash: "m".into(),
+                is_test: false,
             })
             .unwrap();
         let (checked, drifted) = check(&fx, "See `src/db/mods.rs`.\n");
@@ -2758,6 +2766,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
                     path: file.into(),
                     language: lang,
                     content_hash: file.into(),
+                    is_test: false,
                 })
                 .unwrap();
         }
@@ -2896,6 +2905,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
                     path: file.into(),
                     language: lang,
                     content_hash: file.into(),
+                    is_test: false,
                 })
                 .unwrap();
         }

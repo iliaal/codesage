@@ -38,7 +38,10 @@ pub use lookups::{
     find_references, find_references_with_budget, find_symbol, list_dependencies,
     list_dependencies_batch,
 };
-pub use overview::{build_project_overview, build_project_overview_with_top_risk};
+pub use overview::{
+    build_project_overview, build_project_overview_with_options,
+    build_project_overview_with_top_risk,
+};
 pub use rehearsal::{build_branch_only_rehearsal, build_review_rehearsal};
 pub use search::{RerankFn, search, search_page};
 pub use semantic::{
@@ -49,7 +52,8 @@ pub use semantic::{
 };
 pub use session::{
     CompleteRiskRanking, IncompleteRiskRanking, build_session_snapshot_with_top_risk,
-    persist_session_snapshot, session_end, session_start, top_risk_files, top_risk_ranking,
+    persist_session_snapshot, session_end, session_start, top_risk_files,
+    top_risk_files_with_options, top_risk_ranking, top_risk_ranking_with_options,
     top_risk_ranking_with_policy,
 };
 pub use similar::find_similar;

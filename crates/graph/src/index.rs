@@ -9,7 +9,7 @@ use codesage_storage::{Database, is_unique_violation};
 use rayon::prelude::*;
 
 use codesage_parser::discover::{DiscoveryReport, discover_files_report_with_cache};
-use codesage_parser::extract::extract_symbols;
+use codesage_parser::extract::{extract_symbols, file_is_test_by_syntax};
 use codesage_parser::fingerprint::{FunctionFingerprint, file_fingerprints};
 use codesage_parser::parse::{ParsedTree, parse_file_tolerant};
 use codesage_parser::references::extract_references;
@@ -30,15 +30,27 @@ fn parse_one(root: &Path, file_info: &FileInfo) -> Result<ParsedFile> {
     let source = std::fs::read(&abs_path).with_context(|| format!("reading {}", file_info.path))?;
     let ParsedTree { tree, degraded } = parse_file_tolerant(&source, file_info.language)
         .with_context(|| format!("parsing {}", file_info.path))?;
-    let symbols = extract_symbols(&tree, &source, file_info.language, &file_info.path)
-        .with_context(|| format!("extracting symbols from {}", file_info.path))?;
-    let mut refs = extract_references(&tree, &source, file_info.language, &file_info.path)
-        .with_context(|| format!("extracting references from {}", file_info.path))?;
+    // The discovery path heuristic and the parser's file-level verdict answer
+    // the same question; either one makes the whole file test code, so the
+    // stored `files.is_test` carries both rather than the path alone.
+    let mut info = file_info.clone();
+    info.is_test |= file_is_test_by_syntax(&tree, &source, info.language);
+    let mut symbols = extract_symbols(&tree, &source, info.language, &info.path)
+        .with_context(|| format!("extracting symbols from {}", info.path))?;
+    // Every definition in a test file is test code; the parser's own marks
+    // (cfg(test), @Test, describe(...)) add symbol-level detail on top.
+    if info.is_test {
+        for symbol in &mut symbols {
+            symbol.is_test = true;
+        }
+    }
+    let mut refs = extract_references(&tree, &source, info.language, &info.path)
+        .with_context(|| format!("extracting references from {}", info.path))?;
     dedupe_refs(&mut refs);
     populate_from_symbol(&symbols, &mut refs);
-    let fingerprints = file_fingerprints(&tree, &source, file_info.language);
+    let fingerprints = file_fingerprints(&tree, &source, info.language);
     Ok(ParsedFile {
-        info: file_info.clone(),
+        info,
         symbols,
         refs,
         fingerprints,
@@ -104,7 +116,17 @@ const STRUCTURAL_INDEX_BATCH_SIZE: usize = 50;
 /// Bump the relevant component whenever unchanged bytes can yield different
 /// symbols, references, fingerprints, or trust boundaries. Raw hashes stay separate.
 pub const STRUCTURAL_INTERPRETATION: &str =
-    "codesage/structural/v1;parser-queries=3;extraction=5;trust-boundaries=1";
+    "codesage/structural/v1;parser-queries=3;extraction=6;trust-boundaries=1";
+
+/// Whether an indexed file is test code. Rows written under the current
+/// interpretation carry a trustworthy `files.is_test`; a row indexed by an
+/// older binary reads 0 for every file, so it falls back to the discovery
+/// path heuristic until `codesage index` reparses it.
+pub(crate) fn file_is_test(path: &str, stored: bool, interpretation: Option<&str>) -> bool {
+    stored
+        || (interpretation != Some(STRUCTURAL_INTERPRETATION)
+            && codesage_parser::discover::is_test_like_path(path))
+}
 
 /// Skip and record unreadable or unparseable files; retain degraded parses.
 fn parse_batch(root: &Path, batch: &[&FileInfo], stats: &mut IndexStats) -> Vec<ParsedFile> {
@@ -422,6 +444,7 @@ mod tests {
             path: path.to_string(),
             language,
             content_hash: content_hash(source),
+            is_test: false,
         }
     }
 
@@ -604,6 +627,7 @@ mod tests {
             path: path.to_string(),
             language,
             content_hash: "gone".to_string(),
+            is_test: false,
         }
     }
 
@@ -622,6 +646,7 @@ mod tests {
                 col_end: 1,
                 rationale: Vec::new(),
                 visibility: None,
+                is_test: false,
                 overloaded: false,
             }],
         )
@@ -643,6 +668,7 @@ mod tests {
             path: "missing.rs".to_string(),
             language: Language::Rust,
             content_hash: "h".to_string(),
+            is_test: false,
         };
 
         let err = parse_one(root.path(), &file).unwrap_err();
@@ -665,6 +691,7 @@ mod tests {
             lazy: false,
             to: None,
             from_line: None,
+            is_test: false,
         };
         let mut refs = vec![
             r("foo", ReferenceKind::Call, 3, 4),

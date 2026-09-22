@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS files (
     -- set" from "never-derived empty set"; updated by every
     -- `replace_file_trust_boundaries` call.
     boundaries_derived_at INTEGER NOT NULL DEFAULT 0,
-    interpretation TEXT
+    interpretation TEXT,
+    is_test INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS symbols (
@@ -28,12 +29,17 @@ CREATE TABLE IF NOT EXISTS symbols (
     col_start INTEGER NOT NULL,
     col_end INTEGER NOT NULL,
     rationale TEXT NOT NULL DEFAULT '[]',
-    visibility TEXT
+    visibility TEXT,
+    is_test INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
+-- The per-reference `is_test` derivation looks up the enclosing definition by
+-- (file, qualified name); without this pair the whole-index import sweep pays a
+-- scan per row.
+CREATE INDEX IF NOT EXISTS idx_symbols_file_qualified ON symbols(file_id, qualified_name);
 
 -- One MinHash fingerprint per function/method definition, for near-clone
 -- (SIMILAR_TO) detection. `fp` is 64 little-endian u64 (512 bytes). Rebuilt
@@ -499,7 +505,34 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ("0021_git_history_anchor", migrate_0021_git_history_anchor),
     ("0022_refs_lazy", migrate_0022_refs_lazy),
     ("0023_symbols_visibility", migrate_0023_symbols_visibility),
+    ("0024_is_test", migrate_0024_is_test),
 ];
+
+/// Adds `files.is_test` and `symbols.is_test` (1 for test code), plus the
+/// `(file_id, qualified_name)` index the per-reference derivation looks the
+/// enclosing definition up through. Existing rows default to 0 and read as
+/// product code until the bumped structural interpretation reparses them on
+/// the next `codesage index`; consumers that need the old glob answer in the
+/// meantime fall back on stale files.
+fn migrate_0024_is_test(conn: &Connection) -> rusqlite::Result<()> {
+    for table in ["files", "symbols"] {
+        let exists: bool = conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'is_test')"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;"
+            ))?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_symbols_file_qualified ON symbols(file_id, qualified_name);",
+    )
+}
 
 /// Adds `refs.lazy` (1 when the import directive sits inside a function
 /// body). Existing rows default to 0; the bumped structural interpretation

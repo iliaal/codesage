@@ -259,6 +259,30 @@ mod tests {
     }
 
     #[test]
+    fn project_overview_input_schema_declares_optional_include_tests() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        let overview = tools
+            .iter()
+            .find(|t| t.name == "project_overview")
+            .expect("project_overview is listed");
+        let include_tests = &overview.input_schema["properties"]["include_tests"];
+        assert_eq!(
+            include_tests["type"],
+            json!("boolean"),
+            "include_tests is a boolean: {}",
+            serde_json::Value::Object((*overview.input_schema).clone())
+        );
+        assert!(
+            !overview.input_schema["required"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|k| k == "include_tests")),
+            "include_tests defaults to false and must not be required"
+        );
+    }
+
+    #[test]
     fn offset_paged_kinds_match_tools_declaring_offset() {
         let server = CodeSageServer::new();
         let mut tools = server.tool_router.list_all();
@@ -725,6 +749,22 @@ mod tests {
         let reference_row = items(&find_references, &["results"]);
         declares_optional(&reference_row, "from", "find_references");
         declares_optional(&reference_row, "to", "find_references");
+        for (row, what) in [
+            (&symbol_row, "find_symbol"),
+            (&reference_row, "find_references"),
+        ] {
+            assert_eq!(
+                row["properties"]["is_test"]["type"],
+                json!("boolean"),
+                "{what}: rows declare `is_test`: {row}"
+            );
+            assert!(
+                !row["required"]
+                    .as_array()
+                    .is_some_and(|r| r.iter().any(|k| k == "is_test")),
+                "{what}: `is_test` is omitted when false and must not be required: {row}"
+            );
+        }
         assert!(
             find_references["properties"].get("to_resolution").is_some(),
             "find_references must describe `to_resolution`: {find_references}"
@@ -774,7 +814,19 @@ mod tests {
             );
         };
         declares(&items(&impact, &["results"]), "impact_analysis results");
-        declares(&schema("list_dependencies"), "list_dependencies");
+        let dependencies = schema("list_dependencies");
+        declares(&dependencies, "list_dependencies");
+        assert_eq!(
+            dependencies["properties"]["test_imports"]["type"],
+            json!("array"),
+            "list_dependencies must declare `test_imports`: {dependencies}"
+        );
+        assert!(
+            !dependencies["required"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|k| k == "test_imports")),
+            "`test_imports` is omitted when empty and must not be required: {dependencies}"
+        );
         declares(
             &items(&schema("find_coupling"), &["coupled"]),
             "find_coupling coupled",

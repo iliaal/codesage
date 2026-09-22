@@ -247,6 +247,7 @@ mod tests {
                 path: path.to_string(),
                 language: Language::Rust,
                 content_hash: path.to_string(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(
@@ -262,6 +263,7 @@ mod tests {
                 col_end: 0,
                 rationale: vec![],
                 visibility: None,
+                is_test: false,
                 overloaded: false,
             }],
         )

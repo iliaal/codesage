@@ -802,7 +802,10 @@ pub fn impact_analysis_report(
             for f in &target_files {
                 codesage_protocol::work::checkpoint()?;
                 // Avoid the wrapper's imported_by resolution; only imports are needed.
-                for imp in db.list_file_dependencies(f)?.imports {
+                // Test-scope targets sit in `test_imports`, so a test file's
+                // forward deps live entirely in that second list.
+                let deps = db.list_file_dependencies(f)?;
+                for imp in deps.imports.into_iter().chain(deps.test_imports) {
                     fwd.insert(imp);
                 }
             }
@@ -1655,6 +1658,7 @@ mod tests {
                 path: "Repository.php".to_string(),
                 language: Language::Php,
                 content_hash: "r".to_string(),
+                is_test: false,
             })
             .unwrap();
         let names: Vec<String> = (1..=15).map(|i| format!("op{i:02}")).collect();
@@ -1671,6 +1675,7 @@ mod tests {
                 col_end: 0,
                 rationale: vec![],
                 visibility: None,
+                is_test: false,
                 overloaded: false,
             })
             .collect();
@@ -1681,6 +1686,7 @@ mod tests {
                 path: "Caller.php".to_string(),
                 language: Language::Php,
                 content_hash: "c".to_string(),
+                is_test: false,
             })
             .unwrap();
         let mut refs: Vec<Reference> = names
@@ -1696,6 +1702,7 @@ mod tests {
                 lazy: false,
                 to: None,
                 from_line: None,
+                is_test: false,
             })
             .collect();
         // Five repeats of already-recorded (symbol, kind, line) reasons at a
@@ -1711,6 +1718,7 @@ mod tests {
                 lazy: false,
                 to: None,
                 from_line: None,
+                is_test: false,
             });
         }
         db.insert_references(caller, &refs).unwrap();

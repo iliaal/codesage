@@ -1743,6 +1743,7 @@ mod tests {
             path: path.to_string(),
             language: Language::Php,
             content_hash: "abc123".to_string(),
+            is_test: false,
         }
     }
 
@@ -1758,6 +1759,7 @@ mod tests {
             col_end: 0,
             rationale: vec![],
             visibility: None,
+            is_test: false,
             overloaded: false,
         }
     }
@@ -1774,6 +1776,7 @@ mod tests {
             col_end: 0,
             rationale: vec![],
             visibility: None,
+            is_test: false,
             overloaded: false,
         }
     }
@@ -1789,6 +1792,7 @@ mod tests {
             lazy: false,
             to: None,
             from_line: None,
+            is_test: false,
         }
     }
 
@@ -2254,6 +2258,7 @@ mod tests {
                 path: "test.php".to_string(),
                 language: Language::Php,
                 content_hash: "new_hash".to_string(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(file_id2, &[make_symbol("New", SymbolKind::Function)])
@@ -2733,18 +2738,21 @@ mod tests {
             path: "fresh.rs".to_string(),
             language: codesage_protocol::Language::Rust,
             content_hash: "fresh".to_string(),
+            is_test: false,
         })
         .unwrap();
         db.upsert_file(&FileInfo {
             path: "stale.rs".to_string(),
             language: codesage_protocol::Language::Rust,
             content_hash: "new".to_string(),
+            is_test: false,
         })
         .unwrap();
         db.upsert_file(&FileInfo {
             path: "missing.rs".to_string(),
             language: codesage_protocol::Language::Rust,
             content_hash: "missing".to_string(),
+            is_test: false,
         })
         .unwrap();
         db.upsert_semantic_file_hash("fresh.rs", "fresh").unwrap();

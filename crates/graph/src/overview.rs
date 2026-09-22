@@ -16,8 +16,22 @@ const ENTRYPOINT_CAP: usize = 15;
 const TOP_RISK_CAP: usize = 10;
 
 pub fn build_project_overview(root: &Path, db: &Database) -> Result<ProjectOverview> {
+    build_project_overview_with_options(root, db, false)
+}
+
+/// `include_tests` ranks test files alongside product code in
+/// `top_risk_files`; the default ranking excludes them.
+pub fn build_project_overview_with_options(
+    root: &Path,
+    db: &Database,
+    include_tests: bool,
+) -> Result<ProjectOverview> {
     let read = db.read_snapshot()?;
-    let ranking = crate::session::top_risk_ranking(db)?;
+    let ranking = crate::session::top_risk_ranking_with_options(
+        db,
+        crate::search::env_default_on("CODESAGE_COUPLING_RECURRENCE"),
+        include_tests,
+    )?;
     let overview = build_project_overview_with_top_risk(root, db, &ranking)?;
     drop(read);
     Ok(overview)

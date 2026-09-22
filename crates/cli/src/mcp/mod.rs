@@ -339,13 +339,20 @@ impl CodeSageServer {
         Parameters(params): Parameters<ProjectOverviewParams>,
     ) -> CallToolResult {
         if let Ok(request) = dispatch::CURRENT_REQUEST.try_with(Arc::clone) {
+            if params.include_tests {
+                return self.overview_including_tests(request, params.project).await;
+            }
             return self.cached_overview(request, params.project).await;
         }
         self.blocking(move |s| {
             s.render(
                 &params.project,
                 s.with_project_root_db(&params.project, |root, db| {
-                    codesage_graph::build_project_overview(root, db)
+                    codesage_graph::build_project_overview_with_options(
+                        root,
+                        db,
+                        params.include_tests,
+                    )
                 }),
                 "project_overview",
             )
@@ -1412,6 +1419,7 @@ mod tests {
                 path: "src/lib.rs".to_string(),
                 language: codesage_protocol::Language::Rust,
                 content_hash: "h1".to_string(),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(
@@ -1427,6 +1435,7 @@ mod tests {
                 col_end: 0,
                 rationale: vec![],
                 visibility: None,
+                is_test: false,
                 overloaded: false,
             }],
         )

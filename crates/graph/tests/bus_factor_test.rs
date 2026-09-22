@@ -172,6 +172,7 @@ fn filtered_author_history_names_the_actual_anchor_without_changing_risk() {
         path: "untracked.rs".into(),
         language: codesage_protocol::Language::Rust,
         content_hash: "fixture".into(),
+        is_test: false,
     })
     .unwrap();
     let absent = assess_risk(&db, "untracked.rs").unwrap();

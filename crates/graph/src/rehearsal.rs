@@ -655,6 +655,7 @@ mod tests {
             path: path.to_string(),
             language: Language::Rust,
             content_hash: format!("test-hash-{path}"),
+            is_test: false,
         })
         .unwrap();
     }
@@ -811,6 +812,7 @@ mod tests {
                             col_end: 1,
                             rationale: Vec::new(),
                             visibility: None,
+                            is_test: false,
                             overloaded: false,
                         }],
                     )
@@ -886,6 +888,7 @@ mod tests {
                     col_end: 1,
                     rationale: Vec::new(),
                     visibility: None,
+                    is_test: false,
                     overloaded: false,
                 }],
             )
@@ -903,6 +906,7 @@ mod tests {
                         lazy: false,
                         to: None,
                         from_line: None,
+                        is_test: false,
                     }],
                 )
                 .unwrap();
@@ -940,6 +944,7 @@ mod tests {
                 path: "app/Risk/File0.php".to_string(),
                 language: Language::Php,
                 content_hash: "hot".to_string(),
+                is_test: false,
             })
             .unwrap();
         db.replace_file_trust_boundaries(
@@ -1007,6 +1012,7 @@ mod tests {
                     path: path.clone(),
                     language: Language::Php,
                     content_hash: format!("hot-{path}"),
+                    is_test: false,
                 })
                 .unwrap();
             db.replace_file_trust_boundaries(

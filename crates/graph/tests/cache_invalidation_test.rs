@@ -10,6 +10,7 @@ fn index_source(root: &Path, db: &Database, path: &str, language: Language, sour
         path: path.into(),
         language,
         content_hash: content_hash(source.as_bytes()),
+        is_test: false,
     };
     index_files(root, db, &[file], false).unwrap();
 }

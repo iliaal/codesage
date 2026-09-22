@@ -599,6 +599,26 @@ impl CodeSageServer {
         .await
     }
 
+    /// `include_tests: true` ranks test files too; that ranking is not the
+    /// one `session_start` shares, so it never touches the overview cache.
+    pub(super) async fn overview_including_tests(
+        &self,
+        request: Arc<ToolRequest>,
+        project: String,
+    ) -> CallToolResult {
+        let canonical = request.project.to_string_lossy().into_owned();
+        self.controlled_blocking(request, move |server| {
+            server.render(
+                &project,
+                server.with_project_root_db(&canonical, |root, db| {
+                    codesage_graph::build_project_overview_with_options(root, db, true)
+                }),
+                "project_overview",
+            )
+        })
+        .await
+    }
+
     async fn uncached_session_start(
         &self,
         request: Arc<ToolRequest>,

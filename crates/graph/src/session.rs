@@ -79,9 +79,19 @@ pub fn top_risk_ranking_with_policy(
     db: &Database,
     recurrence: bool,
 ) -> Result<CompleteRiskRanking> {
+    top_risk_ranking_with_options(db, recurrence, false)
+}
+
+/// `include_tests` widens the ranking back to test files, which the default
+/// ranking leaves out so hot test modules cannot crowd out product code.
+pub fn top_risk_ranking_with_options(
+    db: &Database,
+    recurrence: bool,
+    include_tests: bool,
+) -> Result<CompleteRiskRanking> {
     let _policy = crate::git_history::CompletePolicy::enter(recurrence);
     Ok(CompleteRiskRanking {
-        rows: top_risk_files(db, TOP_RISK_BASELINE)?,
+        rows: top_risk_files_with_options(db, TOP_RISK_BASELINE, include_tests)?,
     })
 }
 
@@ -328,12 +338,25 @@ fn compute_cycles(db: &Database) -> Result<(Vec<Vec<String>>, u32)> {
 /// Backs `project_overview`. Returns empty when no files are indexed or git
 /// history hasn't been indexed (every file scores ~0 without it).
 pub fn top_risk_files(db: &Database, limit: usize) -> Result<Vec<SessionRiskEntry>> {
+    top_risk_files_with_options(db, limit, false)
+}
+
+/// Test files (`files.is_test`, or the path heuristic for rows indexed
+/// before the flag existed) are excluded unless `include_tests`.
+pub fn top_risk_files_with_options(
+    db: &Database,
+    limit: usize,
+    include_tests: bool,
+) -> Result<Vec<SessionRiskEntry>> {
     checkpoint()?;
     let _policy = crate::git_history::CompletePolicy::enter_current();
     let files: Vec<String> = db
-        .all_files_with_id_and_language()?
+        .all_file_test_flags()?
         .into_iter()
-        .map(|(_, path, _)| path)
+        .filter(|(path, stored, interpretation)| {
+            include_tests || !crate::index::file_is_test(path, *stored, interpretation.as_deref())
+        })
+        .map(|(path, _, _)| path)
         .collect();
     compute_top_risk(db, &files, limit)
 }

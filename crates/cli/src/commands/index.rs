@@ -1244,6 +1244,7 @@ mod tests {
                     path: path.to_string(),
                     language: codesage_protocol::Language::Python,
                     content_hash: "same".to_string(),
+                    is_test: false,
                 })
                 .unwrap();
             if let Some(version) = version {

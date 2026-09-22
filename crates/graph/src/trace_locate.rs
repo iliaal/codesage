@@ -1746,6 +1746,7 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
             col_end: 0,
             rationale: Vec::new(),
             visibility: None,
+            is_test: false,
             overloaded: false,
         }
     }
@@ -1756,6 +1757,7 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
                 path: path.to_string(),
                 language: lang,
                 content_hash: format!("h-{path}"),
+                is_test: false,
             })
             .unwrap();
         db.insert_symbols(id, symbols).unwrap();

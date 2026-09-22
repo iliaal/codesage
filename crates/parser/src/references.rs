@@ -677,6 +677,7 @@ pub fn extract_references(
                     lazy,
                     to: None,
                     from_line: None,
+                    is_test: false,
                 });
             }
         }
@@ -690,6 +691,7 @@ pub fn extract_references(
             lazy,
             to: None,
             from_line: None,
+            is_test: false,
         });
     }
 

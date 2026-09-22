@@ -7,4 +7,5 @@ pub mod position;
 mod preproc;
 pub mod rationale;
 pub mod references;
+mod test_marks;
 pub mod validate;

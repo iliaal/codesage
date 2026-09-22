@@ -1988,6 +1988,7 @@ fn structural_database_write_invalidates_the_cached_ranking() {
         path: "src/inserted.rs".to_string(),
         language: Language::Rust,
         content_hash: codesage_parser::discover::content_hash(body.as_bytes()),
+        is_test: false,
     })
     .unwrap();
     drop(db);

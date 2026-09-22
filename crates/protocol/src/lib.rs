@@ -97,6 +97,12 @@ pub struct FileInfo {
     pub path: String,
     pub language: Language,
     pub content_hash: String,
+    /// True when the discovery path heuristic classifies this file as a test
+    /// (`tests/` directories, `*_test.go`, `*Test.php`, `*.spec.ts`, ...).
+    /// Stored on `files.is_test`; every symbol in the file inherits it.
+    /// Omitted from JSON when false, like `lazy` on references.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_test: bool,
 }
 
 /// The `#[serde]` attributes on this struct feed only the `JsonSchema` derive;
@@ -147,6 +153,13 @@ pub struct Symbol {
     /// never public; callee resolution admits unknown candidates unchanged.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub visibility: Option<Visibility>,
+    /// True when the definition is test code: its file is test-like, or the
+    /// parser marked it (Rust `#[cfg(test)]` module contents and `#[test]`-
+    /// family functions, Python `test_*` / `Test*` / `pytest` decorations,
+    /// JavaScript/TypeScript `describe` / `it` / `test` bodies, Java `@Test`
+    /// / `@ParameterizedTest` methods). Omitted from JSON when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_test: bool,
     /// True when another definition in `file_path` shares `qualified_name`,
     /// so the emitted `handle` needs `@line_start` to name this one. Set by
     /// [`handle::mark_overloads`] at the storage read boundary; never stored.
@@ -272,7 +285,8 @@ impl Serialize for Symbol {
         let len = 6
             + usize::from(emit_qualified)
             + usize::from(emit_rationale)
-            + usize::from(emit_visibility);
+            + usize::from(emit_visibility)
+            + usize::from(self.is_test);
         let mut s = serializer.serialize_struct("Symbol", len)?;
         s.serialize_field("handle", &self.handle().to_string())?;
         s.serialize_field("name", &self.name)?;
@@ -288,6 +302,9 @@ impl Serialize for Symbol {
         }
         if emit_visibility {
             s.serialize_field("visibility", &self.visibility)?;
+        }
+        if self.is_test {
+            s.serialize_field("is_test", &self.is_test)?;
         }
         s.end()
     }
@@ -312,6 +329,8 @@ impl<'de> Deserialize<'de> for Symbol {
             rationale: Vec<RationaleEntry>,
             #[serde(default)]
             visibility: Option<Visibility>,
+            #[serde(default)]
+            is_test: bool,
             handle: Option<String>,
         }
         let w = Wire::deserialize(deserializer)?;
@@ -329,6 +348,7 @@ impl<'de> Deserialize<'de> for Symbol {
             col_end: w.col_end,
             rationale: w.rationale,
             visibility: w.visibility,
+            is_test: w.is_test,
             overloaded,
         })
     }
@@ -522,6 +542,13 @@ pub struct Reference {
     /// PHP, Java, Go).
     #[serde(default, skip_serializing_if = "is_false")]
     pub lazy: bool,
+    /// True when the reference is made from test code: the enclosing
+    /// definition (`from_symbol`) is a test symbol, or `from_file` is a test
+    /// file. Derived at read time from the stored file and symbol flags,
+    /// never stored on the reference row. Omitted from JSON when false, so a
+    /// row without it is a product caller.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_test: bool,
     /// `sym:` handle of the definition this reference resolves to when the spelling is qualified, the definition is in the same file, or the caller file imports the definition or references its owning type; omitted otherwise, including when resolution was capped. Filled by the graph layer, never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String")]
@@ -550,7 +577,8 @@ impl Serialize for Reference {
         let len = 5
             + usize::from(from.is_some())
             + usize::from(self.to.is_some())
-            + usize::from(self.lazy);
+            + usize::from(self.lazy)
+            + usize::from(self.is_test);
         let mut s = serializer.serialize_struct("Reference", len)?;
         s.serialize_field("from_file", &self.from_file)?;
         s.serialize_field("from_symbol", &self.from_symbol)?;
@@ -565,6 +593,9 @@ impl Serialize for Reference {
         s.serialize_field("line", &self.line)?;
         if self.lazy {
             s.serialize_field("lazy", &self.lazy)?;
+        }
+        if self.is_test {
+            s.serialize_field("is_test", &self.is_test)?;
         }
         s.end()
     }
@@ -606,7 +637,13 @@ pub struct DependencyEntry {
     pub found: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Import / include targets written from product code in this file.
     pub imports: Vec<String>,
+    /// Import / include targets written from test code: inside a test symbol
+    /// (a `#[cfg(test)]` module's `use`, a `Test*` class's import) or anywhere
+    /// in a test file. Same row shape as `imports`; omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_imports: Vec<String>,
     pub imported_by: Vec<String>,
 }
 
@@ -3366,6 +3403,7 @@ mod tests {
             col_end: 5,
             rationale: Vec::new(),
             visibility: None,
+            is_test: false,
             overloaded: false,
         }
     }
@@ -3496,6 +3534,7 @@ mod tests {
             lazy: false,
             to: None,
             from_line: None,
+            is_test: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains("\"col\""), "{json}");
@@ -3519,6 +3558,7 @@ mod tests {
             col: 8,
             to: None,
             from_line: None,
+            is_test: false,
         };
         let json: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(json["from"], "sym:src/a.rs#a::run");

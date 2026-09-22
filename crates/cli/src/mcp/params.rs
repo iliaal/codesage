@@ -443,6 +443,11 @@ pub struct RerankPairsResult {
 pub struct ProjectOverviewParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Rank test files in `top_risk_files` too. Default false: files the index marks `is_test` are left out so hot test modules do not crowd out product code. `true` bypasses the shared ranking cache and computes a fresh ranking for this call."
+    )]
+    pub include_tests: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -854,6 +859,22 @@ mod tests {
         check::<ReviewRehearsalParams>(
             "ReviewRehearsalParams",
             json!({"project": "/p", "file_paths": ["a.rs"]}),
+        );
+    }
+
+    #[test]
+    fn project_overview_include_tests_defaults_false_and_accepts_true() {
+        let p: ProjectOverviewParams = serde_json::from_value(json!({"project": "/p"})).unwrap();
+        assert!(!p.include_tests);
+        let p: ProjectOverviewParams =
+            serde_json::from_value(json!({"project": "/p", "include_tests": true})).unwrap();
+        assert!(p.include_tests);
+        assert!(
+            serde_json::from_value::<ProjectOverviewParams>(
+                json!({"project": "/p", "include_tests": "yes"})
+            )
+            .is_err(),
+            "include_tests is a boolean"
         );
     }
 

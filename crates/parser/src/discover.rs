@@ -166,11 +166,13 @@ pub fn discover_files_report_with_cache(
                     }
                 };
             let _ = cache_tx.send((rel_path.clone(), observation, reused, bytes_hashed));
+            let is_test = is_test_like_path(&rel_path);
             if tx
                 .send(FileInfo {
                     path: rel_path,
                     language,
                     content_hash: hash,
+                    is_test,
                 })
                 .is_err()
             {
@@ -440,6 +442,27 @@ pub const TEST_LIKE_EXCLUDE_PATTERNS: &[&str] = &[
     "**/benches/**",
     "**/benchmarks/**",
 ];
+
+static TEST_LIKE_GLOBSET: std::sync::OnceLock<GlobSet> = std::sync::OnceLock::new();
+
+/// The discovery-time test heuristic: does `rel_path` match
+/// [`TEST_LIKE_EXCLUDE_PATTERNS`]? Backslash separators are normalized first.
+/// This is the file-level `is_test` stored on `files` and inherited by every
+/// symbol in the file; the parser adds symbol-level marks on top.
+pub fn is_test_like_path(rel_path: &str) -> bool {
+    let set = TEST_LIKE_GLOBSET.get_or_init(|| {
+        let patterns: Vec<String> = TEST_LIKE_EXCLUDE_PATTERNS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        build_exclude_set(&patterns).expect("TEST_LIKE_EXCLUDE_PATTERNS compile")
+    });
+    if rel_path.contains('\\') {
+        set.is_match(rel_path.replace('\\', "/"))
+    } else {
+        set.is_match(rel_path)
+    }
+}
 
 /// Discovery exclusions that also apply when the checkout has no gitignore rules.
 pub const HARD_EXCLUDE_PATTERNS: &[&str] = &[

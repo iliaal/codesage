@@ -235,6 +235,15 @@ fn ts_kind_map(pattern_index: usize) -> Option<SymbolKind> {
     }
 }
 
+/// Whether the file's own syntax makes every definition in it test code: a
+/// JavaScript/TypeScript program whose top level calls `describe` / `it` /
+/// `test`, or a Rust file headed by `#![cfg(test)]`. The path heuristic in
+/// [`crate::discover::is_test_like_path`] answers the same question from the
+/// name alone; the indexer stores `files.is_test` from either verdict.
+pub fn file_is_test_by_syntax(tree: &Tree, source: &[u8], language: Language) -> bool {
+    crate::test_marks::FileTestContext::scan(&tree.root_node(), source, language).marks_whole_file()
+}
+
 pub fn extract_symbols(
     tree: &Tree,
     source: &[u8],
@@ -258,6 +267,7 @@ pub fn extract_symbols(
         Language::Java => find_java_package(&root, source),
         _ => None,
     };
+    let test_ctx = crate::test_marks::FileTestContext::scan(&root, source, language);
 
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut seen_defs = std::collections::HashSet::new();
@@ -352,6 +362,8 @@ pub fn extract_symbols(
             _ => None,
         };
 
+        let is_test = crate::test_marks::symbol_is_test(&def_node, source, language, test_ctx);
+
         let symbol = Symbol {
             name,
             qualified_name,
@@ -363,6 +375,7 @@ pub fn extract_symbols(
             col_end,
             rationale,
             visibility,
+            is_test,
             overloaded: false,
         };
         if seen_rows.insert(symbol_row_key(&symbol)) {

@@ -276,6 +276,7 @@ fn rust_context_limit_is_disclosed_by_every_public_resolution_report() {
             path: format!("tests/unrelated_{index}.rs"),
             language: Language::Rust,
             content_hash: "empty".into(),
+            is_test: false,
         })
         .unwrap();
     }

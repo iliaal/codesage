@@ -1056,6 +1056,7 @@ mod tests {
             path: path.to_string(),
             language: Language::Php,
             content_hash: format!("hash-{path}"),
+            is_test: false,
         })
         .unwrap()
     }
@@ -1072,6 +1073,7 @@ mod tests {
             col_end: 0,
             rationale: vec![],
             visibility: None,
+            is_test: false,
             overloaded: false,
         }
     }
@@ -1087,6 +1089,7 @@ mod tests {
             lazy: false,
             to: None,
             from_line: None,
+            is_test: false,
         }
     }
 
