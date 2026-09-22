@@ -93,8 +93,11 @@ pub(crate) enum Remedy {
     Retry { overrides: Map<String, Value> },
     /// The failing tool again, with whichever argument carried `input`
     /// replaced by `value`. The tools spell the same target `target`, `name`,
-    /// `symbol_name`, `from`, `to`, and `feature_id`, and only the failing
-    /// input says which one was meant.
+    /// `symbol_name`, `file_path`, `from`, `to`, and `feature_id`, and only
+    /// the failing input says which one was meant. Only string arguments are
+    /// rewritten: an entry of `targets` / `file_paths` would need the list
+    /// rebuilt, which is unimplemented and today unreachable, since the
+    /// file-set tools pass an unmatched path through instead of refusing.
     ReplaceInput { input: String, value: String },
 }
 
@@ -106,8 +109,16 @@ impl Remedy {
     }
 
     pub(crate) fn retry_with(field: &str, value: Value) -> Self {
+        Self::retry_with_all(&[field], value)
+    }
+
+    /// One value written to every field the caller supplied, so a retry that
+    /// rewrites an argument with an accepted alias leaves the two agreeing.
+    pub(crate) fn retry_with_all(fields: &[&str], value: Value) -> Self {
         let mut overrides = Map::new();
-        overrides.insert(field.to_owned(), value);
+        for field in fields {
+            overrides.insert((*field).to_owned(), value.clone());
+        }
         Self::Retry { overrides }
     }
 

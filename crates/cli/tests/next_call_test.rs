@@ -231,9 +231,12 @@ fn assert_followups(server: &mut Server, tools: &BTreeMap<String, Value>, first:
                 value.is_string(),
                 "next arguments are evidence strings: {next}"
             );
-            assert_eq!(
-                input["properties"][key]["type"], "string",
-                "next argument schema drift: {key}"
+            // An argument with a legacy alias is advertised optional, so the
+            // schema says nullable string; anything else is drift.
+            let advertised = &input["properties"][key]["type"];
+            assert!(
+                advertised == "string" || advertised == &json!(["string", "null"]),
+                "next argument schema drift: {key} advertised as {advertised}"
             );
             if key == "project" {
                 assert!(Path::new(value.as_str().unwrap()).is_absolute());
@@ -341,9 +344,15 @@ fn reachable_only_recommendation_emits_an_executable_next() {
     assert_eq!(payload["coupled"], json!([]));
     assert_eq!(payload["reach_walk_capped"], false);
     assert_eq!(payload["reachable"][0]["path"], "tests/test_behavior.py");
+    // The row carries a `file:` handle, so the follow-up names the file by
+    // handle rather than re-spelling its path.
     assert_eq!(
-        payload["next"]["arguments"]["file_path"],
-        "tests/test_behavior.py"
+        payload["reachable"][0]["handle"],
+        "file:tests/test_behavior.py"
+    );
+    assert_eq!(
+        payload["next"]["arguments"]["target"],
+        "file:tests/test_behavior.py"
     );
     assert!(assert_followups(&mut server, &tools, &result) > 0);
 }
@@ -377,7 +386,7 @@ fn clustered_risk_evidence_emits_an_executable_next() {
     );
     let selected = &payload["clustered_directories"][0]["top_files"][0]["file"];
     assert!(selected.is_string());
-    assert_eq!(&payload["next"]["arguments"]["file_path"], selected);
+    assert_eq!(&payload["next"]["arguments"]["target"], selected);
     assert!(assert_followups(&mut server, &tools, &result) > 0);
 }
 

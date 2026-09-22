@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use codesage_protocol::work::{StopReason, WorkControl, WorkStopped};
+use codesage_storage::Database;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock};
 use rmcp::service::RequestContext;
@@ -185,6 +186,142 @@ fn validate_arguments(request: &CallToolRequestParams) -> Result<(), serde_json:
         "feature_bundle" => validate!(FeatureBundleParams),
         _ => Ok(()),
     }
+}
+
+/// Target kinds a file-grained tool has an answer for.
+const FILE_TARGET_KINDS: &str =
+    "a `file:`, `sym:`, or `chunk:` handle, an indexed path, or `path:line`";
+
+/// The file a target names, for the tools whose answer is about one file.
+///
+/// The shared grammar decides what the input names; only the kinds that
+/// carry a file are accepted, and a symbol, `path:line`, or chunk target
+/// contributes the file it lives in.
+///
+/// `nearest` decides what a miss costs. A tool with one target asks for the
+/// scan and refuses with the resolver's leads, so a bare basename or a path
+/// spelled from a subdirectory says where the file actually is instead of
+/// reading as an unindexed file. A tool that takes a set does not: it
+/// reports per-input outcomes (`unscored_files`, `unindexed_files`), so an
+/// unmatched path travels to the tool rather than costing every other input
+/// its answer. Either way a handle, which cannot mean a raw path, always
+/// resolves or fails, and a path the working tree holds is never refused
+/// for leads that name other files.
+fn resolve_file(root: &Path, db: &Database, input: &str, nearest: bool) -> anyhow::Result<String> {
+    use codesage_graph::{ResolveOptions, TargetError, resolve_target};
+    use codesage_protocol::{Handle, TargetKind};
+
+    let trimmed = input.trim();
+    let unsupported = |kind| {
+        Err(TargetError::Unsupported {
+            input: trimmed.to_string(),
+            kind,
+            accepted: FILE_TARGET_KINDS,
+        }
+        .into())
+    };
+    for (prefix, kind) in [("route:", TargetKind::Route), ("cmd:", TargetKind::Command)] {
+        if trimmed.starts_with(prefix) {
+            return unsupported(kind);
+        }
+    }
+    let is_handle = Handle::parse(trimmed).is_some();
+    let resolution = resolve_target(
+        db,
+        trimmed,
+        ResolveOptions::file().with_nearest(nearest || is_handle),
+    )?;
+    match resolution.kind {
+        TargetKind::File | TargetKind::Symbol | TargetKind::Chunk => {}
+        // Nothing indexed carries this spelling. With the scan off that is
+        // all the resolver looked for, so the input stands as written unless
+        // only its spelling (`src/./x.rs`, `src//x.rs`) kept it from matching.
+        TargetKind::Text => {
+            return Ok(working_tree_file(root, db, trimmed)?.unwrap_or_else(|| trimmed.to_string()));
+        }
+        kind => return unsupported(kind),
+    }
+    // Candidates that disagree about the symbol but agree about the file are
+    // not ambiguous at this grain: same-file overloads name one file.
+    let mut paths = resolution
+        .resolved
+        .iter()
+        .filter(|candidate| candidate.confident())
+        .filter_map(|candidate| candidate.path.as_deref());
+    if let Some(first) = paths.next()
+        && paths.all(|path| path == first)
+    {
+        return Ok(first.to_string());
+    }
+    // A path the index does not hold but the working tree does is a file the
+    // caller just wrote, not a misspelling of an indexed one: `src/lib.rs` in
+    // a new crate suffix-matches every other crate's, and answering with
+    // those leads would name the wrong files. Pass it through so the tool
+    // reports it unindexed (`unscored`, `unindexed_files`) as it did before
+    // the grammar gained the scan.
+    if let Some(path) = working_tree_file(root, db, trimmed)? {
+        return Ok(path);
+    }
+    match TargetError::of(&resolution) {
+        Some(error) => Err(error.into()),
+        // A resolution with no refusal and no path has no file to report.
+        None => Err(TargetError::NotFound {
+            input: trimmed.to_string(),
+            nearest: Vec::new(),
+        }
+        .into()),
+    }
+}
+
+/// `input` normalised to the spelling the index stores (`./`, `.` segments,
+/// and repeated separators dropped), when that spelling names an indexed
+/// file or one the working tree holds. The resolver's exact match only drops
+/// a leading `./`, so `src/./x.rs` and `src//x.rs` reach here for an indexed
+/// `src/x.rs`; answering with the indexed spelling keeps the tool from
+/// reporting an indexed file as unindexed. Absolute spellings and `..`
+/// segments name nothing this project can answer for, so they are not paths
+/// here, exactly as `Handle::parse` treats them.
+fn working_tree_file(root: &Path, db: &Database, input: &str) -> anyhow::Result<Option<String>> {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for part in Path::new(input).components() {
+        match part {
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return Ok(None),
+        }
+    }
+    let Some(normalized) = normalized.to_str().filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if db.file_id_for_path(normalized)?.is_some() {
+        return Ok(Some(normalized.to_string()));
+    }
+    Ok(root
+        .join(normalized)
+        .is_file()
+        .then(|| normalized.to_string()))
+}
+
+/// The file one target names; a miss is refused with the resolver's leads.
+pub(super) fn resolve_file_target(
+    root: &Path,
+    db: &Database,
+    input: &str,
+) -> anyhow::Result<String> {
+    resolve_file(root, db, input, true)
+}
+
+/// The files a target set names, in input order; a miss is passed through.
+pub(super) fn resolve_file_targets(
+    root: &Path,
+    db: &Database,
+    inputs: &[String],
+) -> anyhow::Result<Vec<String>> {
+    inputs
+        .iter()
+        .map(|input| resolve_file(root, db, input, false))
+        .collect()
 }
 
 fn class_name(class: WorkClass) -> &'static str {

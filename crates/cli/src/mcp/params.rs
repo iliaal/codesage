@@ -1,7 +1,117 @@
+use anyhow::Result;
 use codesage_protocol::{FeatureKind, Language, ReferenceKind, SymbolKind};
 use rmcp::schemars;
 
+use super::error::{ErrorCode, McpError};
+
 const PROJECT_ARG_DESC: &str = "Absolute path to the project root. Must be an onboarded CodeSage project (contains .codesage/index.db).";
+
+/// Entity-naming argument on the tools whose answer is about a symbol, a
+/// feature, or free text.
+const SYMBOL_TARGET_DESC: &str = "Preferred spelling of what to look up: a `sym:`/`file:` handle, an indexed path, `path:line`, a qualified or bare name, a `feat_` id, `route:METHOD path`, or `cmd:name`. Alias of `name` — pass one, or the same value in both.";
+
+/// Entity-naming argument on the tools whose answer is about one file.
+const FILE_TARGET_DESC: &str = "Preferred spelling of the file: a `file:`, `sym:`, or `chunk:` handle, an indexed path (a leading `./` is ignored), or `path:line`; a symbol target resolves to its file. Alias of `file_path` — pass one, or the same value in both. A spelling that matches no indexed path and no file in the working tree is E_NOT_FOUND with the nearest candidates, so a bare basename or a path spelled from a subdirectory gets told where the file is; a path the working tree holds is taken as written, so a file you just created reads as unindexed rather than as a miss.";
+
+/// Entity-naming argument on the tools whose answer is about a set of files.
+const FILE_TARGETS_DESC: &str = "Preferred spelling of the file set: each entry is a `file:`, `sym:`, or `chunk:` handle, an indexed path (a leading `./` is ignored), or `path:line`; a symbol target resolves to its file. Alias of `file_paths` — pass one, or the same list in both. A path the index does not hold is taken as written, so a new file still appears in this tool's own not-indexed disclosure.";
+
+/// One target from a legacy argument and its `target` alias.
+///
+/// Both spellings are accepted for one minor release. Equal values proceed;
+/// different ones are a parameter error naming both, because picking one
+/// would answer a question the caller did not ask.
+pub(crate) fn one_target(
+    tool: &str,
+    legacy_field: &str,
+    legacy: Option<&str>,
+    target: Option<&str>,
+) -> Result<String> {
+    match (legacy, target) {
+        (Some(legacy_value), Some(target_value)) if legacy_value.trim() != target_value.trim() => {
+            Err(McpError::new(
+                ErrorCode::Param,
+                format!(
+                    "{tool}: `{legacy_field}` ({legacy_value:?}) and `target` ({target_value:?}) name different things; pass one of them"
+                ),
+            )
+            .into())
+        }
+        (Some(value), _) | (None, Some(value)) => Ok(value.to_string()),
+        (None, None) => Err(McpError::new(
+            ErrorCode::Param,
+            format!("{tool}: pass `target` (or the deprecated `{legacy_field}`)"),
+        )
+        .into()),
+    }
+}
+
+/// [`one_target`] for the tools that take a file set.
+pub(crate) fn one_target_list(
+    tool: &str,
+    legacy_field: &str,
+    legacy: Option<&[String]>,
+    targets: Option<&[String]>,
+) -> Result<Vec<String>> {
+    let same = |a: &[String], b: &[String]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.trim() == y.trim())
+    };
+    match (legacy, targets) {
+        (Some(legacy_values), Some(target_values)) if !same(legacy_values, target_values) => {
+            Err(McpError::new(
+                ErrorCode::Param,
+                format!(
+                    "{tool}: {}; pass one of them",
+                    list_conflict(legacy_field, legacy_values, target_values)
+                ),
+            )
+            .into())
+        }
+        (Some(values), _) | (None, Some(values)) => Ok(values.to_vec()),
+        (None, None) => Err(McpError::new(
+            ErrorCode::Param,
+            format!("{tool}: pass `targets` (or the deprecated `{legacy_field}`)"),
+        )
+        .into()),
+    }
+}
+
+/// Where two file lists stop agreeing, with both spellings: lengths alone say
+/// the request is contradictory without saying which entry to fix.
+fn list_conflict(legacy_field: &str, legacy: &[String], targets: &[String]) -> String {
+    let index = legacy
+        .iter()
+        .zip(targets)
+        .position(|(a, b)| a.trim() != b.trim())
+        .unwrap_or_else(|| legacy.len().min(targets.len()));
+    let entry = |values: &[String]| match values.get(index) {
+        Some(value) => format!("{value:?}"),
+        None => format!("nothing ({})", path_count(values.len())),
+    };
+    format!(
+        "`{legacy_field}` and `targets` name different sets, first at index {index}: {} vs {}",
+        entry(legacy),
+        entry(targets)
+    )
+}
+
+fn path_count(paths: usize) -> String {
+    format!("{paths} path{}", if paths == 1 { "" } else { "s" })
+}
+
+/// The argument spellings a file-set request actually used, so an over-cap
+/// retry remedy rewrites every list the caller wrote. Truncating one of two
+/// equal lists would make the retry a conflict, which is not a remedy.
+fn list_fields(
+    file_paths: &Option<Vec<String>>,
+    targets: &Option<Vec<String>>,
+) -> &'static [&'static str] {
+    match (file_paths.is_some(), targets.is_some()) {
+        (true, true) => &["file_paths", "targets"],
+        (false, true) => &["targets"],
+        _ => &["file_paths"],
+    }
+}
 
 /// Agents may encode numeric arguments as strings; accept both forms.
 fn deser_optional_usize<'de, D>(d: D) -> std::result::Result<Option<usize>, D::Error>
@@ -79,12 +189,27 @@ where
 pub struct FindSymbolParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
-    #[schemars(description = "Symbol name or qualified name to search for")]
-    pub name: String,
+    #[schemars(
+        description = "DEPRECATED, removed in the next minor: pass `target`. Symbol name or qualified name to search for."
+    )]
+    pub name: Option<String>,
+    #[schemars(description = SYMBOL_TARGET_DESC)]
+    pub target: Option<String>,
     #[schemars(
         description = "Filter by kind: function, method, class, trait, interface, struct, enum, constant, macro, module, namespace"
     )]
     pub kind: Option<SymbolKind>,
+}
+
+impl FindSymbolParams {
+    pub(crate) fn target_arg(&self) -> Result<String> {
+        one_target(
+            "find_symbol",
+            "name",
+            self.name.as_deref(),
+            self.target.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -92,12 +217,27 @@ pub struct FindSymbolParams {
 pub struct FindReferencesParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
-    #[schemars(description = "Symbol name to find references for")]
-    pub name: String,
+    #[schemars(
+        description = "Symbol name to find references for. The primary spelling here, since the target is a name by nature; `target` is an accepted alias."
+    )]
+    pub name: Option<String>,
+    #[schemars(description = SYMBOL_TARGET_DESC)]
+    pub target: Option<String>,
     #[schemars(
         description = "Filter by reference kind: import, include, call, instantiation, inheritance, trait_use, type_hint, route_handler"
     )]
     pub kind: Option<ReferenceKind>,
+}
+
+impl FindReferencesParams {
+    pub(crate) fn target_arg(&self) -> Result<String> {
+        one_target(
+            "find_references",
+            "name",
+            self.name.as_deref(),
+            self.target.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -105,8 +245,12 @@ pub struct FindReferencesParams {
 pub struct FindSimilarParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
-    #[schemars(description = "Function/method name to find near-clones of")]
-    pub name: String,
+    #[schemars(
+        description = "DEPRECATED, removed in the next minor: pass `target`. Function/method name to find near-clones of."
+    )]
+    pub name: Option<String>,
+    #[schemars(description = SYMBOL_TARGET_DESC)]
+    pub target: Option<String>,
     #[schemars(
         description = "Minimum Jaccard similarity in [0, 1] (default 0.85). Out-of-range values are clamped, and the applied value is reported under `_meta.clamps`."
     )]
@@ -119,13 +263,39 @@ pub struct FindSimilarParams {
     pub limit: Option<usize>,
 }
 
+impl FindSimilarParams {
+    pub(crate) fn target_arg(&self) -> Result<String> {
+        one_target(
+            "find_similar",
+            "name",
+            self.name.as_deref(),
+            self.target.as_deref(),
+        )
+    }
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListDependenciesParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
-    #[schemars(description = "Relative file path from project root")]
-    pub file_path: String,
+    #[schemars(
+        description = "DEPRECATED, removed in the next minor: pass `target`. Relative file path from project root."
+    )]
+    pub file_path: Option<String>,
+    #[schemars(description = FILE_TARGET_DESC)]
+    pub target: Option<String>,
+}
+
+impl ListDependenciesParams {
+    pub(crate) fn target_arg(&self) -> Result<String> {
+        one_target(
+            "list_dependencies",
+            "file_path",
+            self.file_path.as_deref(),
+            self.target.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -133,13 +303,28 @@ pub struct ListDependenciesParams {
 pub struct CouplingParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
-    #[schemars(description = "Repo-relative file path to look up co-change history for")]
-    pub file_path: String,
+    #[schemars(
+        description = "DEPRECATED, removed in the next minor: pass `target`. Repo-relative file path to look up co-change history for."
+    )]
+    pub file_path: Option<String>,
+    #[schemars(description = FILE_TARGET_DESC)]
+    pub target: Option<String>,
     #[schemars(
         description = "Max results (default 10, max 100). Over-max requests are capped and reported under `_meta.clamps`."
     )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
+}
+
+impl CouplingParams {
+    pub(crate) fn target_arg(&self) -> Result<String> {
+        one_target(
+            "find_coupling",
+            "file_path",
+            self.file_path.as_deref(),
+            self.target.as_deref(),
+        )
+    }
 }
 
 const RISK_VERBOSE_DESC: &str = "Include per-signal decomposition (churn_score, churn_percentile, fix_ratio, total_commits, fix_count, dependent_files, coupled_files, test_gap, in_cycle, cycle_size) and coupled files (`top_coupled`) on each RiskAssessment; default false.";
@@ -149,10 +334,25 @@ const RISK_VERBOSE_DESC: &str = "Include per-signal decomposition (churn_score, 
 pub struct RiskParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
-    #[schemars(description = "Repo-relative file path to assess")]
-    pub file_path: String,
+    #[schemars(
+        description = "DEPRECATED, removed in the next minor: pass `target`. Repo-relative file path to assess."
+    )]
+    pub file_path: Option<String>,
+    #[schemars(description = FILE_TARGET_DESC)]
+    pub target: Option<String>,
     #[schemars(description = RISK_VERBOSE_DESC)]
     pub verbose: Option<bool>,
+}
+
+impl RiskParams {
+    pub(crate) fn target_arg(&self) -> Result<String> {
+        one_target(
+            "assess_risk",
+            "file_path",
+            self.file_path.as_deref(),
+            self.target.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -161,11 +361,28 @@ pub struct RiskDiffParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Repo-relative file paths in the patch (typically the output of `git diff --name-only`). Must provide at least one path: an empty list is rejected."
+        description = "DEPRECATED, removed in the next minor: pass `targets`. Repo-relative file paths in the patch (typically the output of `git diff --name-only`). Must provide at least one path: an empty list is rejected."
     )]
-    pub file_paths: Vec<String>,
+    pub file_paths: Option<Vec<String>>,
+    #[schemars(description = FILE_TARGETS_DESC)]
+    pub targets: Option<Vec<String>>,
     #[schemars(description = RISK_VERBOSE_DESC)]
     pub verbose: Option<bool>,
+}
+
+impl RiskDiffParams {
+    pub(crate) fn target_args(&self) -> Result<Vec<String>> {
+        one_target_list(
+            "assess_risk_diff",
+            "file_paths",
+            self.file_paths.as_deref(),
+            self.targets.as_deref(),
+        )
+    }
+
+    pub(crate) fn list_fields(&self) -> &'static [&'static str] {
+        list_fields(&self.file_paths, &self.targets)
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -174,11 +391,28 @@ pub struct RiskBatchParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Repo-relative file paths to score individually. Must provide at least one path: an empty list is rejected. Returns one RiskAssessment per path, in input order. Use when you have a list of files (e.g. from impact analysis or coupling) and want each one's individual score — saves the per-file MCP round-trip overhead vs N separate `assess_risk` calls. For patch-level aggregation (max/mean, summary_notes, cycles), use `assess_risk_diff` instead."
+        description = "DEPRECATED, removed in the next minor: pass `targets`. Repo-relative file paths to score individually. Must provide at least one path: an empty list is rejected. Returns one RiskAssessment per path, in input order. Use when you have a list of files (e.g. from impact analysis or coupling) and want each one's individual score — saves the per-file MCP round-trip overhead vs N separate `assess_risk` calls. For patch-level aggregation (max/mean, summary_notes, cycles), use `assess_risk_diff` instead."
     )]
-    pub file_paths: Vec<String>,
+    pub file_paths: Option<Vec<String>>,
+    #[schemars(description = FILE_TARGETS_DESC)]
+    pub targets: Option<Vec<String>>,
     #[schemars(description = RISK_VERBOSE_DESC)]
     pub verbose: Option<bool>,
+}
+
+impl RiskBatchParams {
+    pub(crate) fn target_args(&self) -> Result<Vec<String>> {
+        one_target_list(
+            "assess_risk_batch",
+            "file_paths",
+            self.file_paths.as_deref(),
+            self.targets.as_deref(),
+        )
+    }
+
+    pub(crate) fn list_fields(&self) -> &'static [&'static str] {
+        list_fields(&self.file_paths, &self.targets)
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -187,9 +421,26 @@ pub struct TestsForParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Repo-relative file paths whose tests should be recommended. Must provide at least one path: an empty list is rejected."
+        description = "DEPRECATED, removed in the next minor: pass `targets`. Repo-relative file paths whose tests should be recommended. Must provide at least one path: an empty list is rejected."
     )]
-    pub file_paths: Vec<String>,
+    pub file_paths: Option<Vec<String>>,
+    #[schemars(description = FILE_TARGETS_DESC)]
+    pub targets: Option<Vec<String>>,
+}
+
+impl TestsForParams {
+    pub(crate) fn target_args(&self) -> Result<Vec<String>> {
+        one_target_list(
+            "recommend_tests",
+            "file_paths",
+            self.file_paths.as_deref(),
+            self.targets.as_deref(),
+        )
+    }
+
+    pub(crate) fn list_fields(&self) -> &'static [&'static str] {
+        list_fields(&self.file_paths, &self.targets)
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -208,9 +459,11 @@ pub struct SessionParams {
 pub struct TracePathParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
-    #[schemars(description = "Origin symbol name (bare or qualified)")]
+    #[schemars(
+        description = "Origin symbol. Takes the shared target grammar: a `sym:` handle, an indexed path, `path:line`, or a qualified or bare name. There is no single `target` here — a chain needs both ends."
+    )]
     pub from: String,
-    #[schemars(description = "Target symbol the chain should reach")]
+    #[schemars(description = "Symbol the chain should reach, in the same grammar as `from`.")]
     pub to: String,
     #[schemars(
         description = "Maximum hops to search before giving up (default 6, and 6 is also the ceiling over MCP — a larger value is capped and reported under `_meta.clamps`, so `bounded: true` at 6 cannot be retried deeper from here; use the `codesage trace` CLI for a longer search)"
@@ -240,10 +493,12 @@ pub struct FromTraceParams {
 pub struct ImpactParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
-    #[schemars(description = "Symbol name or file path to analyze")]
+    #[schemars(
+        description = "What to analyze, in the shared target grammar: a `sym:` or `file:` handle, an indexed path, `path:line`, or a qualified or bare name. `dir:`, `chunk:`, and `feat_` are refused with E_PARAM."
+    )]
     pub target: String,
     #[schemars(
-        description = "Treat target as file path (auto-detected if path-like); pass false to force symbol interpretation"
+        description = "DEPRECATED, removed in the next minor: the grammar disambiguates. Treat target as file path (auto-detected if path-like); pass false to force symbol interpretation. Ignored when `target` is a handle, which names its own kind."
     )]
     pub is_file: Option<bool>,
     #[schemars(
@@ -277,9 +532,13 @@ pub struct ImpactParams {
 pub struct ExportContextParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
-    #[schemars(description = "Natural language query or symbol name")]
+    #[schemars(
+        description = "Natural language query, or an entity in the shared target grammar: a `sym:` handle, an indexed path, `path:line`, or a qualified or bare name. Anything the index does not name is taken as a semantic query."
+    )]
     pub target: String,
-    #[schemars(description = "Treat target as a symbol name instead of a semantic query")]
+    #[schemars(
+        description = "DEPRECATED, removed in the next minor: the grammar disambiguates. Treat target as a symbol name instead of a semantic query. Ignored when `target` is a `sym:` handle, which names its own kind."
+    )]
     pub is_symbol: Option<bool>,
     #[schemars(
         description = "Max primary results to include (default 5, max 20). Over-max requests are capped and reported under `_meta.clamps`."
@@ -360,8 +619,23 @@ pub struct ListFeaturesParams {
 pub struct FindFeatureParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
-    #[schemars(description = "Repo-relative file path to look up")]
-    pub file_path: String,
+    #[schemars(
+        description = "DEPRECATED, removed in the next minor: pass `target`. Repo-relative file path to look up."
+    )]
+    pub file_path: Option<String>,
+    #[schemars(description = FILE_TARGET_DESC)]
+    pub target: Option<String>,
+}
+
+impl FindFeatureParams {
+    pub(crate) fn target_arg(&self) -> Result<String> {
+        one_target(
+            "find_feature",
+            "file_path",
+            self.file_path.as_deref(),
+            self.target.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -370,9 +644,13 @@ pub struct FeatureBundleParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Feature id (e.g. feat_abc123) from `list_features` / `find_feature`"
+        description = "DEPRECATED, removed in the next minor: pass `target`. Feature id (e.g. feat_abc123) from `list_features` / `find_feature`."
     )]
-    pub feature_id: String,
+    pub feature_id: Option<String>,
+    #[schemars(
+        description = "Preferred spelling of the feature, in the feature arm of the shared target grammar: a `feat_` id, `route:METHOD path` (e.g. `route:POST /api/login`), or `cmd:name`. Alias of `feature_id` — pass one, or the same value in both."
+    )]
+    pub target: Option<String>,
     #[schemars(
         description = "Include caller chunks for the feature's entry symbol (default false)"
     )]
@@ -386,6 +664,17 @@ pub struct FeatureBundleParams {
     )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
+}
+
+impl FeatureBundleParams {
+    pub(crate) fn target_arg(&self) -> Result<String> {
+        one_target(
+            "feature_bundle",
+            "feature_id",
+            self.feature_id.as_deref(),
+            self.target.as_deref(),
+        )
+    }
 }
 
 /// Input of the hidden `embed_texts` tool: the CLI's request to embed with
@@ -456,9 +745,26 @@ pub struct ReviewRehearsalParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Repo-relative file paths in the patch / working-tree change set (typically `git diff --name-only`). Must provide at least one path: an empty list is rejected (the CLI's stdin/working-tree fallback does not exist over MCP)."
+        description = "DEPRECATED, removed in the next minor: pass `targets`. Repo-relative file paths in the patch / working-tree change set (typically `git diff --name-only`). Must provide at least one path: an empty list is rejected (the CLI's stdin/working-tree fallback does not exist over MCP)."
     )]
-    pub file_paths: Vec<String>,
+    pub file_paths: Option<Vec<String>>,
+    #[schemars(description = FILE_TARGETS_DESC)]
+    pub targets: Option<Vec<String>>,
+}
+
+impl ReviewRehearsalParams {
+    pub(crate) fn target_args(&self) -> Result<Vec<String>> {
+        one_target_list(
+            "review_rehearsal",
+            "file_paths",
+            self.file_paths.as_deref(),
+            self.targets.as_deref(),
+        )
+    }
+
+    pub(crate) fn list_fields(&self) -> &'static [&'static str] {
+        list_fields(&self.file_paths, &self.targets)
+    }
 }
 
 #[cfg(test)]
@@ -891,6 +1197,130 @@ mod tests {
             err.contains("`limit`"),
             "refusal must list `limit` as a valid field, got: {err}"
         );
+    }
+
+    #[test]
+    fn a_legacy_argument_and_its_target_alias_name_one_entity() {
+        // Either spelling alone.
+        let by_name: FindSymbolParams =
+            serde_json::from_value(json!({"project": "/p", "name": "search"})).unwrap();
+        assert_eq!(by_name.target_arg().unwrap(), "search");
+        let by_target: FindSymbolParams =
+            serde_json::from_value(json!({"project": "/p", "target": "sym:src/a.rs#search"}))
+                .unwrap();
+        assert_eq!(by_target.target_arg().unwrap(), "sym:src/a.rs#search");
+
+        // Both, equal: the caller repeated itself, which is not a conflict.
+        let both: FindSymbolParams = serde_json::from_value(
+            json!({"project": "/p", "name": " search ", "target": "search"}),
+        )
+        .unwrap();
+        assert_eq!(both.target_arg().unwrap(), " search ");
+
+        // Both, different: naming two entities in one call is a param error
+        // quoting both, never a silent pick.
+        let conflict: FindSymbolParams = serde_json::from_value(
+            json!({"project": "/p", "name": "search", "target": "sym:src/a.rs#render"}),
+        )
+        .unwrap();
+        let err = conflict.target_arg().unwrap_err().to_string();
+        assert!(
+            err.contains("find_symbol")
+                && err.contains("`name`")
+                && err.contains("search")
+                && err.contains("sym:src/a.rs#render"),
+            "{err}"
+        );
+
+        // Neither: a param error naming the preferred spelling.
+        let missing: FindSymbolParams = serde_json::from_value(json!({"project": "/p"})).unwrap();
+        let err = missing.target_arg().unwrap_err().to_string();
+        assert!(err.contains("`target`") && err.contains("`name`"), "{err}");
+    }
+
+    #[test]
+    fn file_and_file_set_aliases_follow_the_same_precedence() {
+        let by_path: RiskParams =
+            serde_json::from_value(json!({"project": "/p", "file_path": "src/a.rs"})).unwrap();
+        assert_eq!(by_path.target_arg().unwrap(), "src/a.rs");
+        let by_target: RiskParams =
+            serde_json::from_value(json!({"project": "/p", "target": "file:src/a.rs"})).unwrap();
+        assert_eq!(by_target.target_arg().unwrap(), "file:src/a.rs");
+        let both: RiskParams = serde_json::from_value(
+            json!({"project": "/p", "file_path": "src/a.rs", "target": "src/a.rs"}),
+        )
+        .unwrap();
+        assert_eq!(both.target_arg().unwrap(), "src/a.rs");
+        let conflict: RiskParams = serde_json::from_value(
+            json!({"project": "/p", "file_path": "src/a.rs", "target": "src/b.rs"}),
+        )
+        .unwrap();
+        let err = conflict.target_arg().unwrap_err().to_string();
+        assert!(
+            err.contains("assess_risk")
+                && err.contains("`file_path`")
+                && err.contains("src/a.rs")
+                && err.contains("src/b.rs"),
+            "{err}"
+        );
+        let missing: RiskParams = serde_json::from_value(json!({"project": "/p"})).unwrap();
+        assert!(
+            missing
+                .target_arg()
+                .unwrap_err()
+                .to_string()
+                .contains("`target`")
+        );
+
+        let by_paths: TestsForParams =
+            serde_json::from_value(json!({"project": "/p", "file_paths": ["a.rs", "b.rs"]}))
+                .unwrap();
+        assert_eq!(by_paths.target_args().unwrap(), vec!["a.rs", "b.rs"]);
+        assert_eq!(by_paths.list_fields(), ["file_paths"]);
+        let by_targets: TestsForParams =
+            serde_json::from_value(json!({"project": "/p", "targets": ["file:a.rs"]})).unwrap();
+        assert_eq!(by_targets.target_args().unwrap(), vec!["file:a.rs"]);
+        assert_eq!(by_targets.list_fields(), ["targets"]);
+        let both: TestsForParams = serde_json::from_value(
+            json!({"project": "/p", "file_paths": ["a.rs"], "targets": ["a.rs"]}),
+        )
+        .unwrap();
+        assert_eq!(both.target_args().unwrap(), vec!["a.rs"]);
+        // Both spellings carried the list, so an over-cap remedy has to cut
+        // both: a retry that shortened one would be the conflict above.
+        assert_eq!(both.list_fields(), ["file_paths", "targets"]);
+        // A different set, including one that only adds an entry. The refusal
+        // names where they part and quotes both spellings, since the lengths
+        // alone do not say which entry to fix.
+        for (targets, expected) in [
+            (json!(["b.rs"]), "index 0: \"a.rs\" vs \"b.rs\""),
+            (
+                json!(["a.rs", "b.rs"]),
+                "index 1: nothing (1 path) vs \"b.rs\"",
+            ),
+        ] {
+            let conflict: TestsForParams = serde_json::from_value(
+                json!({"project": "/p", "file_paths": ["a.rs"], "targets": targets}),
+            )
+            .unwrap();
+            let err = conflict.target_args().unwrap_err().to_string();
+            assert!(
+                err.contains("recommend_tests") && err.contains("`file_paths`"),
+                "{err}"
+            );
+            assert!(err.contains(expected), "{err}");
+        }
+        let missing: TestsForParams = serde_json::from_value(json!({"project": "/p"})).unwrap();
+        let err = missing.target_args().unwrap_err().to_string();
+        assert!(
+            err.contains("`targets`") && err.contains("`file_paths`"),
+            "{err}"
+        );
+        // An explicitly empty list is still the empty-input refusal, not a
+        // missing argument: the two say different things to the caller.
+        let empty: TestsForParams =
+            serde_json::from_value(json!({"project": "/p", "file_paths": []})).unwrap();
+        assert!(empty.target_args().unwrap().is_empty());
     }
 
     #[test]

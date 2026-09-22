@@ -319,6 +319,102 @@ mod tests {
         );
     }
 
+    /// One target grammar means one argument name for it. Every tool that
+    /// names an entity advertises `target` (or `targets` for a file set),
+    /// states the grammar in its description, and keeps the legacy spelling
+    /// optional so the alias window is real on the wire.
+    #[test]
+    fn every_entity_naming_tool_advertises_target_and_deprecates_its_legacy_spelling() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        let input = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .map(|t| t.input_schema.clone())
+                .unwrap_or_else(|| panic!("tool `{name}` missing"))
+        };
+        // (tool, target argument, legacy spelling it aliases)
+        let aliased = [
+            ("find_symbol", "target", Some("name")),
+            ("find_references", "target", Some("name")),
+            ("find_similar", "target", Some("name")),
+            ("edit_check", "target", Some("symbol_name")),
+            ("list_dependencies", "target", Some("file_path")),
+            ("find_feature", "target", Some("file_path")),
+            ("find_coupling", "target", Some("file_path")),
+            ("assess_risk", "target", Some("file_path")),
+            ("feature_bundle", "target", Some("feature_id")),
+            ("assess_risk_batch", "targets", Some("file_paths")),
+            ("assess_risk_diff", "targets", Some("file_paths")),
+            ("recommend_tests", "targets", Some("file_paths")),
+            ("review_rehearsal", "targets", Some("file_paths")),
+            // Already spelled `target`; nothing to alias.
+            ("impact_analysis", "target", None),
+            ("export_context", "target", None),
+        ];
+        for (tool, argument, legacy) in aliased {
+            let schema = input(tool);
+            let properties = &schema["properties"];
+            let described = properties[argument]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("`{tool}.{argument}` must carry a description"));
+            assert!(
+                described.contains("handle") || described.contains("grammar"),
+                "`{tool}.{argument}` must state the target grammar: {described}"
+            );
+            let required = schema["required"].as_array().cloned().unwrap_or_default();
+            let Some(legacy) = legacy else {
+                assert!(
+                    required.iter().any(|r| r == argument),
+                    "`{tool}` has no alias, so `{argument}` stays required"
+                );
+                continue;
+            };
+            assert!(
+                properties.get(legacy).is_some(),
+                "`{tool}` must keep accepting `{legacy}` during the alias window"
+            );
+            for name in [argument, legacy] {
+                assert!(
+                    !required.iter().any(|r| r == name),
+                    "`{tool}.{name}` must be optional while both spellings are accepted"
+                );
+            }
+            assert!(
+                properties[legacy]["description"].as_str().is_some_and(|d| d
+                    .contains("DEPRECATED")
+                    || d.contains("`target` is an accepted alias")),
+                "`{tool}.{legacy}` must say it is deprecated or aliased: {}",
+                properties[legacy]["description"]
+            );
+        }
+        // `trace_call_path` needs both ends of a chain, so it has no single
+        // target; each end takes the grammar instead.
+        let trace = input("trace_call_path");
+        assert!(trace["properties"].get("target").is_none());
+        for end in ["from", "to"] {
+            let described = trace["properties"][end]["description"].as_str().unwrap();
+            assert!(
+                described.contains("grammar"),
+                "`trace_call_path.{end}` must state the target grammar: {described}"
+            );
+        }
+        // The flags the grammar replaced are still accepted, and say so.
+        for (tool, flag) in [
+            ("impact_analysis", "is_file"),
+            ("export_context", "is_symbol"),
+        ] {
+            let schema = input(tool);
+            let described = schema["properties"][flag]["description"].as_str().unwrap();
+            assert!(
+                described.starts_with("DEPRECATED"),
+                "`{tool}.{flag}` must be advertised as deprecated: {described}"
+            );
+        }
+    }
+
     #[test]
     fn every_tool_input_schema_closes_additional_properties() {
         let server = CodeSageServer::new();

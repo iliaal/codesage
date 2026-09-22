@@ -242,7 +242,7 @@ A feature slice is a behavior-keyed bundle: entrypoint + owned files + context f
 
 - \`list_features\`: enumerate feature slices, filter by \`kind\` (\`route\`, \`cli-command\`, \`library\`, \`test-suite\`, \`service\`, \`config\`, \`job\`), \`language\`, or \`tag\`. Use to discover the agent-facing surface area before deep-diving.
 - \`find_feature\`: given a file path, return the feature(s) that own it. Answers "what slice owns app/Http/Controllers/UserController.php?" without scanning by hand.
-- \`feature_bundle\`: curated code bundle for one \`feature_id\`. Same shape as \`export_context\` but anchored on the feature's pre-resolved file list (entry + owned + tests + context) — avoids fan-out Read calls per file when reviewing or modifying a whole slice. Optionally expand the entry symbol's callers/callees.
+- \`feature_bundle\`: curated code bundle for one feature (\`target\`: a \`feat_\` id, \`route:METHOD path\`, or \`cmd:name\`). Same shape as \`export_context\` but anchored on the feature's pre-resolved file list (entry + owned + tests + context) — avoids fan-out Read calls per file when reviewing or modifying a whole slice. Optionally expand the entry symbol's callers/callees.
 - Trust-boundary signal: each file in the index carries a derived tag set (\`network\`, \`filesystem\`, \`process-exec\`, \`secrets\`, \`database\`, \`user-input\`, \`external-api\`, \`serialization\`, \`auth\`, \`concurrency\`). The same signal feeds \`assess_risk\` and surfaces a \`"crosses N trust boundaries (X, Y, Z) — security review recommended"\` note when ≥3 are crossed. Quote that note in PR descriptions for security-sensitive patches.
 
 ### Risk and history (V2b)

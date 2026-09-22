@@ -16,7 +16,10 @@
 - The MCP response envelope carries `index.files_behind` when indexed files differ from HEAD and `index.files_behind_bounded` when that count is a lower bound.
 - `assess_risk` `top_symbols` rows carry `shared: true` when same-named definitions in one file share a count, `bounded: true` when the per-file resolution cap, the 3 s `assess_risk_diff` / `assess_risk_batch` request budget, or a name whose own row count exceeds the row budget left a name-based upper bound.
 - `find_symbol`, `find_references`, and `find_similar` carry `target`: one candidate handle per definition, `ambiguous`, `candidates_total`, and `overloads`.
-- `find_symbol`, `impact_analysis`, `trace_call_path`, `export_context`, `feature_bundle`, and `find_similar` accept the shared target grammar: a `sym:` / `file:` / `dir:` / `chunk:` / `feat_` handle, an indexed path (with or without a leading `./`), `path:line`, a qualified or bare name, `route:METHOD path`, or `cmd:name`. `edit_check` accepts a `sym:` handle as `symbol_name`.
+- `find_symbol`, `find_references`, `find_similar`, `impact_analysis`, `trace_call_path`, `export_context`, and `feature_bundle` accept the shared target grammar: a `sym:` / `file:` / `dir:` / `chunk:` / `feat_` handle, an indexed path (with or without a leading `./`), `path:line`, a qualified or bare name, `route:METHOD path`, or `cmd:name`. `edit_check` accepts a `sym:` handle as `target`.
+- Every MCP tool that names an entity takes `target`, or `targets` on the file-set tools, as one argument name for the shared grammar; the legacy spelling stays accepted, and the two naming different things is `E_PARAM` quoting both.
+- The file-taking tools resolve a `file:`, `sym:`, or `chunk:` handle, an indexed path, or `path:line` to the file it names. A single-file tool refuses a spelling that matches no indexed path and no working-tree file with `E_NOT_FOUND` and the nearest candidates; a file-set tool passes it through to its own not-indexed disclosure.
+- MCP `next` follow-ups name their subject with `target`, carrying the row's own handle when it has one.
 - `codesage find-symbol --include-modules` returns module declarations.
 
 ### Changed
@@ -33,6 +36,8 @@
 
 - `_meta` and the per-tool incompleteness fields (`counts_floor`, `bounded`, `truncated`, `callers_truncated`, `reachable_capped`, `reach_walk_capped`, `unmodelled`, `unscored`, `unscored_files`, `unwalked_files`, `partial_files`, `unindexed_files`, `no_symbol_files`) — read `completeness` and `index` instead; removed in the next minor.
 - `find_coupling` `confidence` and `reverse_confidence` — read `p_cochange` and `p_reverse` instead; removed in the next minor.
+- `impact_analysis` `is_file` and `export_context` `is_symbol` — the target grammar names its own kind and a handle already overrides both; removed in the next minor.
+- The legacy entity-naming arguments `name`, `symbol_name`, `file_path`, `file_paths`, and `feature_id` — pass `target` / `targets` instead; removed in the next minor. `find_references` keeps `name` as its primary spelling.
 
 ### Fixed
 

@@ -92,11 +92,11 @@ pub fn find_references_with_budget(
     // every definition behind those bare names, not only the ones the input
     // resolved to; `target` alone keeps the input's own resolution.
     let spelling = req.symbol_name.trim();
-    let mut results = if definitions.is_empty()
+    let as_written = definitions.is_empty()
         || definitions
             .iter()
-            .any(|s| s.name == spelling || s.qualified_name == spelling)
-    {
+            .any(|s| s.name == spelling || s.qualified_name == spelling);
+    let mut results = if as_written {
         db.find_references(spelling, req.kind)?
     } else {
         let names = distinct_sorted(definitions.iter().map(|s| s.name.as_str()));
@@ -113,6 +113,18 @@ pub fn find_references_with_budget(
     let definition_count = definitions.len();
     let to_resolution = attach_handles(db, &mut results, &definitions, to_budget)?;
     let ambiguous = definition_count > 1;
+    // The name the rows are keyed on, which is the spelling itself when the
+    // query used it: a qualified input keeps `Foo::run`, while a `sym:`
+    // handle or `path:line` input is quoted as the bare name its rows share
+    // rather than as a shared name it is not.
+    let shared_name = if as_written {
+        spelling
+    } else {
+        definitions
+            .first()
+            .map(|s| s.name.as_str())
+            .unwrap_or(spelling)
+    };
     let note = if ambiguous {
         // Bare candidates cannot disambiguate impact_analysis; offer files instead.
         let qualified: Vec<&str> =
@@ -136,21 +148,21 @@ pub fn find_references_with_budget(
                 "{definition_count} definitions share the name '{}'; rows are the union across \
                  all of them. Use find_symbol to list them and impact_analysis with one \
                  qualified name ({}) to scope to one.{bare_note}",
-                req.symbol_name,
+                shared_name,
                 sample_list(&qualified, 5)
             ))
         } else {
             let files = distinct_sorted(definitions.iter().map(|s| s.file_path.as_str()));
-            let why = if bare_only == definitions.len() {
+            let why = if bare_only == definitions.len() || bare_only == 0 {
                 "are indistinguishable by qualified name"
             } else {
-                "cannot all be addressed by a qualified name, since at most one carries one"
+                "not every definition carries the one qualified name among them"
             };
             Some(format!(
                 "{definition_count} definitions share the name '{}' and {why}; rows are the \
                  union across all of them. Use find_symbol to list them and scope by file \
                  instead (impact_analysis on the file, or filter rows by from_file): {}.",
-                req.symbol_name,
+                shared_name,
                 sample_list(&files, 5)
             ))
         }
@@ -803,7 +815,10 @@ mod tests {
         assert_eq!(out.definition_count, 2);
         assert!(out.ambiguous);
         let note = out.note.expect("ambiguous lookup must carry a note");
-        assert!(note.contains("at most one carries one"), "{note}");
+        assert!(
+            note.contains("not every definition carries the one qualified name among them"),
+            "{note}"
+        );
         assert!(!note.contains("indistinguishable"), "{note}");
         assert!(note.contains("a.rs, b.rs"), "{note}");
         assert!(!note.contains("qualified name ("), "{note}");

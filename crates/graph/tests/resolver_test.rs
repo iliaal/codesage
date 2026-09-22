@@ -165,7 +165,7 @@ fn find_references_accepts_a_sym_handle() {
         .as_deref()
         .expect("a union of two definitions is disclosed");
     assert!(
-        note.starts_with("2 definitions share the name 'sym:src/search.rs#search'"),
+        note.starts_with("2 definitions share the name 'search'"),
         "{note}"
     );
     assert!(
@@ -194,6 +194,52 @@ fn find_references_accepts_a_sym_handle() {
         refs.target.as_ref().map(|t| t.handles()),
         Some(vec!["sym:src/render.rs#render".to_string()])
     );
+}
+
+/// The disclosure quotes the name the rows are keyed on, which is the
+/// caller's own spelling whenever the query used it: a qualified input keeps
+/// `Foo::run`, and only an input the rows are not keyed on (a handle) is
+/// reduced to the bare name its union shares.
+#[test]
+fn find_references_quotes_the_spelling_its_rows_are_keyed_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+    for module in ["a", "b"] {
+        std::fs::write(
+            root.join(format!("src/{module}.rs")),
+            "pub struct Foo;\n\nimpl Foo {\n    pub fn run(&self) -> u32 {\n        1\n    }\n}\n",
+        )
+        .unwrap();
+    }
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let note = |spelling: &str| {
+        let refs = find_references(
+            &db,
+            &FindReferencesRequest {
+                symbol_name: spelling.to_string(),
+                kind: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(refs.definition_count, 2, "{spelling}");
+        refs.note.expect("two definitions are disclosed")
+    };
+
+    let qualified = note("Foo::run");
+    assert!(
+        qualified.contains("share the name 'Foo::run'"),
+        "{qualified}"
+    );
+    assert!(
+        qualified.contains("indistinguishable by qualified name"),
+        "two `Foo::run` and no bare `run` share one qualified name: {qualified}"
+    );
+    let by_handle = note("sym:src/a.rs#Foo::run");
+    assert!(by_handle.contains("share the name 'run'"), "{by_handle}");
 }
 
 #[test]

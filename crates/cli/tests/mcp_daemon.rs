@@ -2275,7 +2275,7 @@ fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
             "tool": "list_dependencies",
             "arguments": {
                 "project": project.path(),
-                "file_path": mcp_steps[0]["file_path"]
+                "target": mcp_steps[0]["file_path"]
             }
         })
     );

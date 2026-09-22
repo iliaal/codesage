@@ -184,8 +184,10 @@ fn session_start_report(
     }
 }
 
-/// `field` names the argument so the remedy can retry with the list cut to the cap.
-fn validate_file_list_len(paths: &[String], tool: &str, field: &str) -> Result<()> {
+/// `fields` names every list argument the call carried, so the remedy retries
+/// with each of them cut to the cap: rewriting one of an accepted pair would
+/// leave the retry contradicting itself.
+fn validate_file_list_len(paths: &[String], tool: &str, fields: &[&str]) -> Result<()> {
     if paths.len() > MAX_MCP_FILE_PATHS {
         return Err(error::McpError::new(
             error::ErrorCode::OverCap,
@@ -194,8 +196,8 @@ fn validate_file_list_len(paths: &[String], tool: &str, field: &str) -> Result<(
                 paths.len()
             ),
         )
-        .remedy(error::Remedy::retry_with(
-            field,
+        .remedy(error::Remedy::retry_with_all(
+            fields,
             serde_json::json!(paths[..MAX_MCP_FILE_PATHS]),
         ))
         .into());
@@ -203,8 +205,8 @@ fn validate_file_list_len(paths: &[String], tool: &str, field: &str) -> Result<(
     Ok(())
 }
 
-fn validate_non_empty_file_list(paths: &[String], tool: &str) -> Result<()> {
-    validate_file_list_len(paths, tool, "file_paths")?;
+fn validate_non_empty_file_list(paths: &[String], tool: &str, fields: &[&str]) -> Result<()> {
+    validate_file_list_len(paths, tool, fields)?;
     if paths.is_empty() {
         return Err(error::McpError::new(
             error::ErrorCode::EmptyInput,
@@ -371,11 +373,12 @@ impl CodeSageServer {
         Parameters(params): Parameters<ReviewRehearsalParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let file_paths = params.file_paths.clone();
+            let fields = params.list_fields();
             // MCP has no stdin or working-tree fallback for an omitted file set.
             s.render(
                 &params.project,
-                validate_non_empty_file_list(&file_paths, "review_rehearsal").and_then(|()| {
+                params.target_args().and_then(|file_paths| {
+                    validate_non_empty_file_list(&file_paths, "review_rehearsal", fields)?;
                     let root = crate::evidence_root(Path::new(&params.project))?;
                     if !crate::db_path(&root).try_exists()? {
                         return Ok(codesage_graph::build_branch_only_rehearsal(
@@ -384,6 +387,7 @@ impl CodeSageServer {
                         ));
                     }
                     s.with_project_root_db(&params.project, |root, db| {
+                        let file_paths = dispatch::resolve_file_targets(root, db, &file_paths)?;
                         codesage_graph::build_review_rehearsal(root, db, &file_paths)
                     })
                 }),
@@ -403,13 +407,15 @@ impl CodeSageServer {
         Parameters(params): Parameters<edit_check::EditCheckParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let result = codesage_graph::edit_check::edit_check(
-                Path::new(&params.project),
-                &params.file_path,
-                &params.symbol_name,
-                params.line,
-                &params.replacement,
-            );
+            let result = params.target_arg().and_then(|symbol_name| {
+                codesage_graph::edit_check::edit_check(
+                    Path::new(&params.project),
+                    &params.file_path,
+                    &symbol_name,
+                    params.line,
+                    &params.replacement,
+                )
+            });
             // Staleness resolves the project without opening a watcher, so a
             // project with no index still answers; one with an index discloses
             // which of the named files moved on disk.
@@ -428,13 +434,15 @@ impl CodeSageServer {
         Parameters(params): Parameters<FindSymbolParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let req = FindSymbolRequest {
-                name: params.name,
-                kind: params.kind,
-            };
             s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| find_symbol(db, &req)),
+                params.target_arg().and_then(|name| {
+                    let req = FindSymbolRequest {
+                        name,
+                        kind: params.kind,
+                    };
+                    s.with_project_db(&params.project, |db| find_symbol(db, &req))
+                }),
                 "find_symbol",
             )
         })
@@ -451,13 +459,15 @@ impl CodeSageServer {
         Parameters(params): Parameters<FindReferencesParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let req = FindReferencesRequest {
-                symbol_name: params.name,
-                kind: params.kind,
-            };
             s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| find_references(db, &req)),
+                params.target_arg().and_then(|symbol_name| {
+                    let req = FindReferencesRequest {
+                        symbol_name,
+                        kind: params.kind,
+                    };
+                    s.with_project_db(&params.project, |db| find_references(db, &req))
+                }),
                 "find_references",
             )
         })
@@ -481,8 +491,10 @@ impl CodeSageServer {
                 [jaccard_clamp, limit_clamp].into_iter().flatten().collect();
             let result = s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| {
-                    find_similar(db, &params.name, min_jaccard, limit)
+                params.target_arg().and_then(|name| {
+                    s.with_project_db(&params.project, |db| {
+                        find_similar(db, &name, min_jaccard, limit)
+                    })
                 }),
                 "find_similar",
             );
@@ -503,8 +515,11 @@ impl CodeSageServer {
         self.blocking(move |s| {
             s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| {
-                    list_dependencies(db, &params.file_path)
+                params.target_arg().and_then(|target| {
+                    s.with_project_root_db(&params.project, |root, db| {
+                        let file_path = dispatch::resolve_file_target(root, db, &target)?;
+                        list_dependencies(db, &file_path)
+                    })
                 }),
                 "list_dependencies",
             )
@@ -542,7 +557,7 @@ impl CodeSageServer {
                 &params.project,
                 req.paths
                     .as_ref()
-                    .map(|paths| validate_file_list_len(paths, "search.paths", "paths"))
+                    .map(|paths| validate_file_list_len(paths, "search.paths", &["paths"]))
                     .unwrap_or(Ok(()))
                     .and_then(|()| {
                         s.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
@@ -776,10 +791,14 @@ impl CodeSageServer {
         self.blocking(move |s| {
             let (limit, limit_clamp) =
                 capped_limit_tracked(params.limit, 10, MAX_MCP_LIMIT, "limit");
-            let file_path = params.file_path.clone();
             let result = s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| find_coupling(db, &file_path, limit)),
+                params.target_arg().and_then(|target| {
+                    s.with_project_root_db(&params.project, |root, db| {
+                        let file_path = dispatch::resolve_file_target(root, db, &target)?;
+                        find_coupling(db, &file_path, limit)
+                    })
+                }),
                 "find_coupling",
             );
             render::annotate_clamps(result, limit_clamp.as_slice())
@@ -794,11 +813,17 @@ impl CodeSageServer {
     )]
     async fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> CallToolResult {
         self.blocking(move |s| {
-            let file_path = params.file_path.clone();
             let verbose = params.verbose.unwrap_or(false);
             s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| assess_risk(db, &file_path))
+                params
+                    .target_arg()
+                    .and_then(|target| {
+                        s.with_project_root_db(&params.project, |root, db| {
+                            let file_path = dispatch::resolve_file_target(root, db, &target)?;
+                            assess_risk(db, &file_path)
+                        })
+                    })
                     .map(|mut a| {
                         a.set_verbose(verbose);
                         a
@@ -819,13 +844,18 @@ impl CodeSageServer {
         Parameters(params): Parameters<RiskDiffParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let file_paths = params.file_paths.clone();
+            let fields = params.list_fields();
             let verbose = params.verbose.unwrap_or(false);
             s.render(
                 &params.project,
-                validate_non_empty_file_list(&file_paths, "assess_risk_diff")
-                    .and_then(|()| {
-                        s.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths))
+                params
+                    .target_args()
+                    .and_then(|targets| {
+                        validate_non_empty_file_list(&targets, "assess_risk_diff", fields)?;
+                        s.with_project_root_db(&params.project, |root, db| {
+                            let file_paths = dispatch::resolve_file_targets(root, db, &targets)?;
+                            assess_risk_diff(db, &file_paths)
+                        })
                     })
                     .map(|mut a| {
                         a.set_verbose(verbose);
@@ -847,13 +877,18 @@ impl CodeSageServer {
         Parameters(params): Parameters<RiskBatchParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let file_paths = params.file_paths.clone();
+            let fields = params.list_fields();
             let verbose = params.verbose.unwrap_or(false);
             s.render(
                 &params.project,
-                validate_non_empty_file_list(&file_paths, "assess_risk_batch")
-                    .and_then(|()| {
-                        s.with_project_db(&params.project, |db| assess_risk_batch(db, &file_paths))
+                params
+                    .target_args()
+                    .and_then(|targets| {
+                        validate_non_empty_file_list(&targets, "assess_risk_batch", fields)?;
+                        s.with_project_root_db(&params.project, |root, db| {
+                            let file_paths = dispatch::resolve_file_targets(root, db, &targets)?;
+                            assess_risk_batch(db, &file_paths)
+                        })
                     })
                     .map(|mut a| {
                         a.set_verbose(verbose);
@@ -875,12 +910,14 @@ impl CodeSageServer {
         Parameters(params): Parameters<TestsForParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let file_paths = params.file_paths.clone();
+            let fields = params.list_fields();
             s.render(
                 &params.project,
-                validate_non_empty_file_list(&file_paths, "recommend_tests").and_then(|()| {
+                params.target_args().and_then(|targets| {
+                    validate_non_empty_file_list(&targets, "recommend_tests", fields)?;
                     // Relativize absolute inputs against the index root, not a supplied subdirectory.
                     s.with_project_root_db(&params.project, |root, db| {
+                        let file_paths = dispatch::resolve_file_targets(root, db, &targets)?;
                         let opts = codesage_graph::ReachabilityOptions {
                             project_root: Some(root.to_path_buf()),
                             ..codesage_graph::ReachabilityOptions::default()
@@ -986,10 +1023,14 @@ impl CodeSageServer {
         Parameters(params): Parameters<FindFeatureParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let file = params.file_path.clone();
             s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| db.features_for_file(&file)),
+                params.target_arg().and_then(|target| {
+                    s.with_project_root_db(&params.project, |root, db| {
+                        let file = dispatch::resolve_file_target(root, db, &target)?;
+                        db.features_for_file(&file)
+                    })
+                }),
                 "find_feature",
             )
         })
@@ -1006,7 +1047,6 @@ impl CodeSageServer {
         Parameters(params): Parameters<FeatureBundleParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let feature_id = params.feature_id.clone();
             let include_callers = params.include_callers.unwrap_or(false);
             let include_callees = params.include_callees.unwrap_or(false);
             let (limit, limit_clamp) =
@@ -1015,8 +1055,10 @@ impl CodeSageServer {
             let budget = s.bundle_budget_chars(&params.project);
             let result = s.render_budget(
                 &params.project,
-                s.with_project_context_db(&params.project, |db| {
-                    feature_bundle(db, &feature_id, include_callers, include_callees, limit)
+                params.target_arg().and_then(|feature_id| {
+                    s.with_project_context_db(&params.project, |db| {
+                        feature_bundle(db, &feature_id, include_callers, include_callees, limit)
+                    })
                 }),
                 "feature_bundle",
                 budget,
@@ -1281,7 +1323,8 @@ mod tests {
         let result = server
             .review_rehearsal_tool(Parameters(ReviewRehearsalParams {
                 project: dir.path().to_string_lossy().into_owned(),
-                file_paths: vec!["shared.rs".to_string()],
+                file_paths: None,
+                targets: Some(vec!["shared.rs".to_string()]),
             }))
             .await;
         assert_ne!(result.is_error, Some(true), "{result:?}");
@@ -1613,7 +1656,7 @@ mod tests {
             "recommend_tests",
             "review_rehearsal",
         ] {
-            let err = validate_non_empty_file_list(&[], tool)
+            let err = validate_non_empty_file_list(&[], tool, &["targets"])
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -1621,6 +1664,44 @@ mod tests {
                 "{tool}: got: {err}"
             );
         }
-        assert!(validate_non_empty_file_list(&["a.rs".to_string()], "review_rehearsal").is_ok());
+        assert!(
+            validate_non_empty_file_list(&["a.rs".to_string()], "review_rehearsal", &["targets"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_over_cap_retry_cuts_every_list_the_call_carried() {
+        let paths: Vec<String> = (0..=MAX_MCP_FILE_PATHS)
+            .map(|i| format!("f{i}.rs"))
+            .collect();
+        let params: TestsForParams =
+            serde_json::from_value(json!({"project": "/p", "file_paths": paths, "targets": paths}))
+                .unwrap();
+        let error = validate_file_list_len(&paths, "recommend_tests", params.list_fields())
+            .unwrap_err()
+            .downcast::<error::McpError>()
+            .expect("over-cap is an McpError");
+        assert_eq!(error.code, error::ErrorCode::OverCap);
+        let Some(error::Remedy::Retry { overrides }) = error.remedy else {
+            panic!("over-cap must carry a retry remedy");
+        };
+        let cut = json!(paths[..MAX_MCP_FILE_PATHS]);
+        assert_eq!(overrides.get("file_paths"), Some(&cut));
+        assert_eq!(overrides.get("targets"), Some(&cut));
+
+        // The retry the caller would actually make: cutting one of two equal
+        // lists would leave them naming different sets, so the remedy for an
+        // over-cap call would itself be E_PARAM.
+        let mut retried = json!({"project": "/p", "file_paths": paths, "targets": paths});
+        for (field, value) in overrides {
+            retried[field] = value;
+        }
+        let retried: TestsForParams = serde_json::from_value(retried).unwrap();
+        assert_eq!(
+            retried.target_args().unwrap().len(),
+            MAX_MCP_FILE_PATHS,
+            "the remedy must resolve to one list at the cap"
+        );
     }
 }

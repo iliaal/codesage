@@ -25,6 +25,10 @@ Use CodeSage for semantic and code-graph questions: behavior discovery, definiti
 
 Route by intent, regardless of identifier spelling. Use `find_symbol` for a definition and `find_references` for structural uses, including named tests and constants. Use `rg` for literal occurrences, including identifier-shaped configuration keys, test names, error messages, documentation, and generated files. A request for every occurrence of `TIMEOUT` needs `rg`; a request for its definition needs `find_symbol`. Prefer the smallest query that answers the question; do not export a broad context bundle when a symbol or dependency lookup is enough.
 
+## Name the target
+
+Every tool that names an entity takes `target`, or `targets` on the tools that take a file set. It accepts a `sym:` / `file:` / `chunk:` / `feat_` handle, an indexed path, `path:line`, a qualified or bare name, `route:METHOD path`, or `cmd:name`. Prefer the handle a previous response already returned on the row: it names one definition where a bare name names every definition sharing it, and it survives edits that do not rename or move. Pass one spelling per call; `target` and a legacy argument (`name`, `file_path`, `file_paths`, `symbol_name`, `feature_id`) that disagree are rejected.
+
 ## Route MCP calls
 
 - Start unfamiliar-project orientation with `mcp__codesage__project_overview` when its combined language, freshness, feature, risk, and convention summary replaces several narrower calls.
@@ -72,6 +76,6 @@ codesage tests-for -- "${files[@]}"
 codesage rehearse -- "${files[@]}"
 ```
 
-Pass the same set as the MCP tools' `file_paths` arrays, with the absolute `project` path. Keep each path as one argument; do not pipe newline-separated filenames or use unquoted command substitution. If automating collection, use Git's NUL-delimited output and preserve that separation until constructing the argument array. Do not invoke these commands with an empty array.
+Pass the same set as the MCP tools' `targets` arrays, with the absolute `project` path. Keep each path as one argument; do not pipe newline-separated filenames or use unquoted command substitution. If automating collection, use Git's NUL-delimited output and preserve that separation until constructing the argument array. Do not invoke these commands with an empty array.
 
 If daemon startup itself is the suspected failure, run `codesage mcp --direct` to exercise the single-process stdio path. Do not use that diagnostic as a second persistent MCP registration.
