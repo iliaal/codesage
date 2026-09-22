@@ -66,7 +66,9 @@ const NON_READONLY_TOOLS: &[&str] = &["session_start", "session_end"];
 fn meta_property_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "Response envelope annotations, present only when the server \
+        "description": "DEPRECATED, removed in the next minor: read the top-level \
+            `completeness` and `index` keys instead. \
+            Response envelope annotations, present only when the server \
             trimmed, capped, or flagged this response. `_meta.truncated` means the response \
             exceeded the per-call token budget and an array field was trimmed; it is \
             distinct from any same-named field inside a tool's own result (e.g. \
@@ -105,6 +107,9 @@ fn merge_meta_property(schema: &mut serde_json::Map<String, serde_json::Value>) 
     if let serde_json::Value::Object(props) = props {
         props.insert("_meta".to_string(), meta_property_schema());
         props.insert("next".to_string(), super::next::schema());
+        for (name, fragment) in super::envelope::schema_properties() {
+            props.insert(name.to_string(), fragment);
+        }
     }
 }
 
@@ -230,7 +235,36 @@ mod tests {
                     "tool `{}` must not require `_meta`",
                     tool.name
                 );
+                for key in ["tool", "index", "target", "completeness", "cost"] {
+                    assert!(
+                        !required.iter().any(|v| v == key),
+                        "tool `{}` must not require `{key}`",
+                        tool.name
+                    );
+                }
             }
+            for key in ["tool", "index", "target", "completeness", "cost"] {
+                assert!(
+                    out.get("properties")
+                        .and_then(|p| p.get(key))
+                        .is_some_and(|fragment| fragment.get("description").is_some()),
+                    "tool `{}` outputSchema lacks the `{key}` envelope property",
+                    tool.name
+                );
+            }
+            assert_eq!(
+                out["properties"]["completeness"]["properties"]["kind"]["enum"],
+                json!([
+                    "truncated",
+                    "bounded",
+                    "partial",
+                    "clamped",
+                    "unscored",
+                    "floor"
+                ]),
+                "tool `{}` advertises an unexpected completeness vocabulary",
+                tool.name
+            );
             assert_ne!(
                 out.get("additionalProperties"),
                 Some(&json!(false)),

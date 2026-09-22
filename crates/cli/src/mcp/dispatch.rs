@@ -705,6 +705,9 @@ impl CodeSageServer {
             return Ok(result.into());
         }
         let _cancel_on_drop = CancelOnDrop(control.clone());
+        // Request receipt, not handler entry: `cost.ms` therefore covers
+        // project preflight and execution admission wait as well.
+        let started = Instant::now();
         let raw_project = arguments
             .get("project")
             .and_then(|p| p.as_str())
@@ -782,6 +785,9 @@ impl CodeSageServer {
                 if let Ok(CallToolResponse::Complete(response)) = &mut result {
                     normalize_error(response, &tool_name, Some(&arguments), Some(&ticket));
                 }
+                result = self
+                    .enveloped(result, &tool_name, arguments.clone(), started.elapsed())
+                    .await;
                 let outcome = match &result {
                     Ok(CallToolResponse::Complete(result)) => result_outcome(result),
                     _ => "error",
@@ -797,6 +803,34 @@ impl CodeSageServer {
                 ticket.finish(reason.as_str());
                 Ok(stopped_result(reason, &tool_name, Some(&arguments), &ticket).into())
             }
+        }
+    }
+
+    /// Add the response envelope off the async workers: the `index` block
+    /// stats the index and, once per generation or TTL, reads git drift.
+    async fn enveloped(
+        &self,
+        result: Result<CallToolResponse, ErrorData>,
+        tool: &str,
+        arguments: Arc<Map<String, Value>>,
+        elapsed: Duration,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let response = match result {
+            Ok(CallToolResponse::Complete(response)) => response,
+            other => return other,
+        };
+        let server = self.clone();
+        let tool = tool.to_owned();
+        match tokio::task::spawn_blocking(move || {
+            server.annotate_envelope(response, &tool, &arguments, elapsed)
+        })
+        .await
+        {
+            Ok(response) => Ok(CallToolResponse::Complete(response)),
+            Err(error) => Err(ErrorData::internal_error(
+                format!("response envelope worker failed: {error}"),
+                None,
+            )),
         }
     }
 

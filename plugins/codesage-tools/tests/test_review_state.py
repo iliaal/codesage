@@ -2141,10 +2141,28 @@ class InventoryReportTests(unittest.TestCase):
     def test_inventory_rejects_under_cap_and_nested_truncation(self):
         feature = {"feature_id": "feat_1", "files": [{"path": "a.rs", "role": "owned"}]}
         for value in ({"results": [feature], "_meta": {"truncated": True, "total_results": 69}},
+                      {"results": [feature], "completeness": {"kind": "truncated", "kinds": ["truncated"]}},
+                      {"results": [feature], "completeness": {"kind": "bounded", "kinds": ["bounded", "truncated"]}},
                       {"results": [{**feature, "_meta": {"truncated": True}}]},
+                      {"results": [{**feature, "completeness": {"kind": "truncated"}}]},
                       {"results": [{"feature_id": "feat_1"}]}):
             with self.assertRaises(ValueError):
                 self.state.complete_inventory(value)
+
+    def test_inventory_accepts_an_enveloped_response_that_is_not_truncated(self):
+        feature = {"feature_id": "feat_1", "files": [{"path": "a.rs", "role": "owned"}]}
+        value = {"results": [feature], "tool": "list_features", "cost": {"ms": 3, "bytes": 120},
+                 "index": {"generation": 7, "dirty_paths": ["a.rs"]},
+                 "completeness": {"kind": "floor", "kinds": ["floor"]}}
+        self.assertEqual(self.state.complete_inventory(value), [feature])
+
+    def test_response_truncated_reads_both_vocabularies(self):
+        self.assertTrue(self.state.response_truncated({"_meta": {"truncated": True}}))
+        self.assertTrue(self.state.response_truncated({"completeness": {"kind": "truncated"}}))
+        self.assertTrue(self.state.response_truncated({"completeness": {"kinds": ["bounded", "truncated"]}}))
+        self.assertFalse(self.state.response_truncated({"completeness": {"kind": "floor", "kinds": ["floor"]}}))
+        self.assertFalse(self.state.response_truncated({"_meta": {"truncated": False}}))
+        self.assertFalse(self.state.response_truncated([]))
 
     def test_inventory_cli_requests_unlimited_and_retains_all_nested_files(self):
         feature = {"feature_id": "feat_1", "files": [{"path": f"a{i}.rs", "role": "owned"} for i in range(800)]}
@@ -2167,10 +2185,14 @@ class InventoryReportTests(unittest.TestCase):
     def test_risk_coverage_rejects_missing_duplicate_invalid_and_truncated(self):
         row = {"file": "a.rs", "score": 0.2}
         for response in ([row], [row, row], [{**row, "score": float("nan")}],
-                         {"files": [row], "_meta": {"truncated": True}}):
+                         {"files": [row], "_meta": {"truncated": True}},
+                         {"files": [row], "completeness": {"kind": "truncated", "kinds": ["truncated"]}}):
             with self.assertRaises(ValueError):
                 self.state.complete_risk(["a.rs", "b.rs"], response)
         self.assertEqual(self.state.complete_risk(["a.rs"], [row]), {"files": [row]})
+        enveloped = {"files": [row], "tool": "assess_risk_batch", "cost": {"ms": 2, "bytes": 90},
+                     "completeness": {"kind": "unscored", "kinds": ["unscored"]}}
+        self.assertEqual(self.state.complete_risk(["a.rs"], enveloped), {"files": [row]})
 
     def test_strict_plan_refuses_missing_entry_score(self):
         feature = {"feature_id": "feat_1", "entry_path": "a.rs", "files": [{"path": "a.rs", "role": "entry"}]}
@@ -2257,9 +2279,11 @@ class InventoryReportTests(unittest.TestCase):
             with mock.patch.object(self.state, "collect_inventory", side_effect=AssertionError("live lookup")):
                 repeated, _, _ = self.state.render_report(args)
             self.assertEqual(report, repeated)
-            frozen.write_text(json.dumps({**inventory, "_meta": {"truncated": True}}))
-            with self.assertRaisesRegex(ValueError, "truncated"):
-                self.state.render_report(args)
+            for truncated in ({"_meta": {"truncated": True}},
+                              {"completeness": {"kind": "truncated", "kinds": ["truncated"]}}):
+                frozen.write_text(json.dumps({**inventory, **truncated}))
+                with self.assertRaisesRegex(ValueError, "truncated"):
+                    self.state.render_report(args)
 
     def test_report_density_filters_and_boundary_counts(self):
         with tempfile.TemporaryDirectory() as directory:

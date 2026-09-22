@@ -1,6 +1,6 @@
 use std::path::{Component, Path};
 
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::CallToolResult;
 use serde_json::{Value, json};
 
 const MAX_NEXT_BYTES: usize = 2048;
@@ -52,14 +52,7 @@ pub(super) fn annotate(project: &str, kind: &str, mut result: CallToolResult) ->
         object.insert("next".to_owned(), next);
     }
     // Keep annotation banners while replacing the JSON block clients paste.
-    for content in &mut result.content {
-        if let Some(text) = content.as_text()
-            && serde_json::from_str::<Value>(&text.text).is_ok()
-        {
-            *content =
-                ContentBlock::text(serde_json::to_string_pretty(payload).unwrap_or_default());
-        }
-    }
+    super::render::rerender_json_text(&mut result);
     result
 }
 

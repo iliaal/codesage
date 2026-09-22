@@ -112,9 +112,27 @@ def feature_state(project, feature, content_cache=None, params=None):
     return f"sha256:{digest.hexdigest()}"
 
 
+def response_truncated(payload):
+    """True when a CodeSage response dropped rows for budget.
+
+    Reads the response envelope's `completeness` first and falls back to the
+    deprecated `_meta.truncated`, which the next minor removes.
+    """
+    if not isinstance(payload, dict):
+        return False
+    completeness = payload.get("completeness")
+    if isinstance(completeness, dict):
+        kinds = completeness.get("kinds")
+        kinds = kinds if isinstance(kinds, list) else []
+        if completeness.get("kind") == "truncated" or "truncated" in kinds:
+            return True
+    meta = payload.get("_meta")
+    return bool(isinstance(meta, dict) and meta.get("truncated"))
+
+
 def complete_inventory(inventory):
     if isinstance(inventory, dict):
-        if inventory.get("_meta", {}).get("truncated"):
+        if response_truncated(inventory):
             raise ValueError("feature inventory is truncated; use CLI features-list --limit 0")
         features = inventory.get("results")
     else:
@@ -129,7 +147,7 @@ def complete_inventory(inventory):
         if not re.fullmatch(r"feat_[A-Za-z0-9_]+", identity) or identity in seen:
             raise ValueError("invalid or duplicate feature ID")
         seen.add(identity)
-        if feature.get("_meta", {}).get("truncated") or not isinstance(feature.get("files"), list):
+        if response_truncated(feature) or not isinstance(feature.get("files"), list):
             raise ValueError(f"incomplete feature files: {identity}")
         for item in feature["files"]:
             if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not item["path"] or not item.get("role"):
@@ -156,7 +174,7 @@ def collect_inventory(project, feature_id=None, kind=None):
 def complete_risk(paths, risk):
     if not isinstance(paths, list) or any(not isinstance(path, str) or not path for path in paths):
         raise ValueError("requested risk paths must be a string array")
-    if isinstance(risk, dict) and risk.get("_meta", {}).get("truncated"):
+    if response_truncated(risk):
         raise ValueError("risk response is truncated; retry smaller batches")
     records = risk.get("files") if isinstance(risk, dict) else risk
     if not isinstance(records, list):
@@ -299,7 +317,7 @@ def plan_feature_review(feature, risk, changed_files, project=None, strict_risk=
         if isinstance(path, str) and path in all_roles
     }
     scores = {}
-    if isinstance(risk, dict) and risk.get("_meta", {}).get("truncated"):
+    if response_truncated(risk):
         raise ValueError("risk response is truncated")
     for record in records:
         if not isinstance(record, dict):

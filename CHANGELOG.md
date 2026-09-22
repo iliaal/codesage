@@ -8,11 +8,20 @@
 - `list_dependencies` and `codesage dependencies` report import targets named only from test code under `test_imports` (omitted when empty).
 - `project_overview` accepts `include_tests` (default false) to rank test files in `top_risk_files`.
 - Schema migration `0024_is_test` (`files.is_test`, `symbols.is_test`); the next `codesage index` reparses existing files under `extraction=6`.
+- Every successful MCP response carries `tool`, `index`, `cost`, and — when the answer is not exact — `completeness {kind, kinds, recover}` and `target`; `index` reports the index generation, indexed SHA, structural/semantic freshness, and `dirty_paths`.
+- `CODESAGE_ENVELOPE=legacy` in the daemon's environment suppresses every envelope key for that daemon's lifetime.
+- `find_coupling` and `assess_risk` `top_coupled` rows carry `p_cochange` and `p_reverse`.
 
 ### Changed
 
 - `project_overview.top_risk_files` skips test files unless `include_tests: true`, the `session_start` / `session_end` top-50 baseline always skips them, and `assess_risk` `top_symbols` skips test symbols; rows indexed before `0024_is_test` fall back to the test-path heuristic until reindexed.
 - `search` demotes test chunks from the stored `is_test` flag instead of re-matching path globs per query; rows indexed before `0024_is_test` keep the glob result.
+- MCP staleness annotation reads the handles rows already carry, and now also covers `edit_check`, `entry_path`, and reachable-test `via` paths.
+
+### Deprecated
+
+- `_meta` and the per-tool incompleteness fields (`counts_floor`, `bounded`, `truncated`, `callers_truncated`, `reachable_capped`, `reach_walk_capped`, `unmodelled`, `unscored`, `unscored_files`, `unwalked_files`, `partial_files`, `unindexed_files`, `no_symbol_files`) — read `completeness` and `index` instead; removed in the next minor.
+- `find_coupling` `confidence` and `reverse_confidence` — read `p_cochange` and `p_reverse` instead; removed in the next minor.
 
 ### Fixed
 
@@ -726,7 +735,6 @@
 
 ### Added
 
-
 - `assess_risk` (and `assess_risk_batch` / `assess_risk_diff` by extension) now returns an optional `top_symbols` field on each `RiskAssessment`: up to five symbols inside the file ranked by `ln(1 + line_count) + ref_count + (in_cycle ? 1.0 : 0.0)`, each carrying a one-line `why` ("hot: 142 lines, 38 refs, in 7-file cycle"). Closes the agent's natural follow-up to a high score — "which symbols inside the file drive it?" — without a second tool call, so PR descriptions can quote the contributing symbols by name. Empty (and omitted from JSON) when the file has no indexed symbols. CLI `codesage risk <file>` renders a `Top symbols:` block when present. Adopted from repowise's hotspot drill-down via the 2026-05-16 reference-tool sweep.
 - Every MCP tool now advertises an `outputSchema` (MCP spec field). Tool definitions in `crates/cli/src/mcp.rs` pass `output_schema = schema_for_type::<T>()` to the `#[tool(...)]` macro; protocol return types (`Symbol`, `Reference`, `SearchResult`, `DependencyEntry`, `ImpactEntry`, `ContextBundle`, `CouplingReport`, `RiskAssessment`, `RiskDiffAssessment`, `RiskBatchAssessment`, `TestRecommendations`, `SessionSnapshot`, `SessionDiff`, and their nested types) derive `schemars::JsonSchema`. Schema derives respect existing `#[serde(rename_all = "lowercase")]` attributes automatically. Three explicit wrapper structs (`FindSymbolResults`, `FindReferencesResults`, `SearchResults`, `ImpactAnalysisResults`) describe the `{"results": [...]}` envelope that `render_with_kind` produces for the four tools whose graph functions return bare arrays — agents see the wrapped shape, so the schema must too. A new `every_tool_advertises_an_output_schema` test asserts every router tool carries a valid object-shaped schema; catches the regression where a tool ships without one and agents have to guess the response shape.
 - Laravel facade rules added to the PHP trust-boundary table. Real Laravel apps abstract auth/storage/queue/env behind facades rather than calling `getenv` / `exec` / `openssl_*` directly, so the original rule set under-counted boundaries on framework code. New rules cover `Illuminate\Support\Facades\{Hash, Crypt, Config, Session, Auth, Gate, Storage, File, Process, Artisan, Queue, Bus, Http, Mail, Notification, Broadcast, DB, Schema, Cache, Redis, Request, Input, Route}`, `Illuminate\{Auth, Encryption, Hashing, Mail, Notifications, Filesystem, Foundation\Http\FormRequest, Console\Command, Database\Eloquent, Http\UploadedFile}`, `Symfony\Component\{Mailer, Security, HttpFoundation\File}`, plus the bare `env()` / `config()` helpers. Measured on a 1670-file Laravel app: total `file_trust_boundaries` rows grew 977 → 1296 (+33%); the previously-zero `secrets`, `process-exec`, and `auth` categories now register real signal (0 → 76, 0 → 13, 0 → 21 respectively). One concrete catch: a 5-boundary file (filesystem + secrets + database + user-input + auth) that scored 0.92 — `DocumentStorageService.php`, a hotspot + fix-heavy file with 29 dependents in a 142-file import cycle — now flags every facet the security-review note line cares about.
@@ -746,7 +754,6 @@
 
 ### Changed
 
-
 - Rebalanced `assess_risk` weights to make room for the new trust-boundary term: churn 0.35 → 0.32, fix ratio 0.20 → 0.18, dep pressure 0.10 → 0.09, coupled pressure 0.10 → 0.09, test gap 0.15 → 0.13, cycle 0.10 → 0.09, trust boundary +0.10 (new). All seven weights sum to 1.00 so the maximum possible score remains ≤ 1.0. The relative shape of existing signals is preserved; absolute numbers on the same file may shift by up to ±0.12 depending on how many trust boundaries it crosses. The `assess_risk_diff` summary-notes threshold for "max risk score" dropped from 0.60 to 0.50 to track this deflation (a 0.50 max under new weights signals roughly the same calibrated concern as 0.60 did under prior weights). Existing indexes pick up real `trust_boundaries` values on the next `codesage index` pass; until then, the field reports an empty Vec and the term contributes 0, so the score stays defined.
 - README + AGENTS.md now describe the 0.7.0 surface: feature mapping, trust-boundary derivation, `list_features` / `find_feature` / `feature_bundle` MCP tools, and the matching `map` / `features-list` / `feature-show` / `feature-for` / `feature-bundle` / `trust-boundaries` CLI commands. The capability table gains three rows for feature-slice mapping, curated feature bundles, and trust-boundary derivation; new recipes show the `codesage map` → `features-list` → `feature-for` → `feature-bundle` flow.
 - Tightened MCP tool descriptions on `list_dependencies`, `impact_analysis`, and `export_context` so an agent reading the description-only listing can disambiguate adjacent tools without falling back to trial-and-error: `list_dependencies` is now explicit about single-hop scope and points at `impact_analysis` (multi-hop) and `find_references` (per-symbol) as the right neighbors; `impact_analysis` mirrors the bridge in reverse; `export_context` notes that `feature_bundle` is the right call when the anchor is an already-mapped feature, not a free-form query. Pattern adopted from Serena's two-commit description audit this sweep (`5b9600bc` "Make tool descriptions more amenable to tool search mechanisms" + `1767a259` `ReplaceSymbolBodyTool` docstring fix).
@@ -758,7 +765,6 @@
 - **README headline updated to the semble-corpus number** (recall@10 = 0.932, NDCG@10 = 0.788 on 602 queries across 8 supported languages; 0.448 / 0.379 on the full 1,251-query corpus with the parser-coverage gap accounted for honestly). The pre-existing git-mined-corpus benchmark stays as-is.
 
 ### Fixed
-
 
 - **Feature mapper bypassed `.gitignore`.** `crates/features/src/mappers/shared.rs::walk_files` was a hand-rolled walker that ignored gitignore entirely and only matched a small hardcoded directory-name list. `codesage map` against this repo was indexing `.worktrees/<branch>/...` as separate features even though `git check-ignore` reports the directory as ignored. Rewrote to delegate to `ignore::WalkBuilder` (same gitignore-aware walker the structural indexer uses) plus added `.worktrees` / `worktrees` to the belt-and-suspenders hard-exclude list. Two regression tests cover the .gitignore-honored walk and the explicit `should_skip` predicate.
 - **`feature_bundle` returned imports instead of the entrypoint body.** The bundle picked the file's first chunk for entry files; on a Rust binary with 400+ lines of `use` statements before `fn main()`, an agent reviewing the feature got the import preamble, not the function body. `feature_bundle` now looks up the entry symbol's `line_start` in the symbols table and selects the chunk that covers that line, falling back to first-chunk when the symbol can't be located. Regression test seeds an entry file where main sits at line 101 with imports at 1-50.

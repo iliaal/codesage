@@ -1389,7 +1389,8 @@ fn warm_overview_reuses_the_cold_ranking_execution() {
         serde_json::json!({"project": project.path()}),
     );
     assert_eq!(
-        warm, cold,
+        stable(&warm),
+        stable(&cold),
         "cache reuse must preserve every stable overview field and envelope annotation"
     );
     let after_warm = daemon_stats(&mut session, 5, 256);
@@ -1465,19 +1466,11 @@ fn semantic_search_preserves_cached_ranking_until_semantic_index_mutation() {
         .filter_map(|text| serde_json::from_str(text).ok())
         .collect();
     assert_eq!(text_payloads.len(), 1, "{response}");
-    let mut text_payload = text_payloads.pop().unwrap();
-    let text_meta = text_payload
-        .as_object_mut()
-        .unwrap()
-        .entry("_meta")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .unwrap();
-    assert!(!text_meta.contains_key("test_override"), "{response}");
-    text_meta.insert("test_override".to_string(), Value::Bool(true));
+    let text_payload = text_payloads.pop().unwrap();
     assert_eq!(
         &text_payload, search,
-        "debug search payloads may differ only by the structured-only override marker"
+        "the JSON text block must carry the same payload as structuredContent, \
+         debug override marker included"
     );
     assert!(
         search["results"].as_array().unwrap().iter().any(|row| {
@@ -1494,7 +1487,11 @@ fn semantic_search_preserves_cached_ranking_until_semantic_index_mutation() {
         "project_overview",
         serde_json::json!({"project": project.path()}),
     );
-    assert_eq!(warm, cold, "semantic reads must preserve overview output");
+    assert_eq!(
+        stable(&warm),
+        stable(&cold),
+        "semantic reads must preserve overview output"
+    );
     let after_search = daemon_stats(&mut session, 6, 256);
     assert_eq!(
         overview_ranking_executions(&after_search),
@@ -1797,7 +1794,8 @@ fn assert_runtime_toggle_results(diagnostics_enabled: bool, cache_enabled: bool)
             serde_json::json!({"project": project.path()}),
         );
         assert_eq!(
-            overview, reference_overview,
+            stable(&overview),
+            stable(&reference_overview),
             "runtime switches changed overview output"
         );
     }
@@ -1820,7 +1818,9 @@ fn assert_runtime_toggle_results(diagnostics_enabled: bool, cache_enabled: bool)
         started["created_at"].as_i64().unwrap()
             >= reference_session["created_at"].as_i64().unwrap()
     );
-    for field in ["session_id", "snapshot_path", "created_at"] {
+    // The two snapshots carry different session ids, so their payload byte
+    // counts differ by exactly that; `cost` cannot be compared across them.
+    for field in ["session_id", "snapshot_path", "created_at", "cost"] {
         started.as_object_mut().unwrap().remove(field);
         reference_session.as_object_mut().unwrap().remove(field);
     }
@@ -2260,11 +2260,13 @@ fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
         assert_eq!(c, m, "step {i} values diverge");
     }
     let ckeys: Vec<&String> = cli_report.as_object().unwrap().keys().collect();
+    // `_meta`, `next`, and the response envelope are MCP transport contracts
+    // the CLI does not carry; everything else must agree field for field.
     let mkeys: Vec<&String> = mcp_report
         .as_object()
         .unwrap()
         .keys()
-        .filter(|k| *k != "_meta" && *k != "next")
+        .filter(|k| !MCP_ONLY_FIELDS.contains(&k.as_str()))
         .collect();
     assert_eq!(ckeys, mkeys, "top-level field sets diverge");
     assert_eq!(
@@ -2437,6 +2439,27 @@ fn run_git(root: &std::path::Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Response keys the MCP transport adds and the CLI never emits.
+const MCP_ONLY_FIELDS: &[&str] = &[
+    "_meta",
+    "next",
+    "tool",
+    "index",
+    "target",
+    "completeness",
+    "cost",
+];
+
+/// Blank the one envelope field that is wall time, so two responses that
+/// describe the same index state compare equal. `cost.bytes` stays compared.
+fn stable(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Some(ms) = value.pointer_mut("/cost/ms") {
+        *ms = Value::Null;
+    }
+    value
 }
 
 fn call_mcp_tool(session: &mut McpSession, id: u64, tool: &str, arguments: Value) -> Value {

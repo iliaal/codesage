@@ -35,7 +35,8 @@ contribute to search ranking.
 Repeated declaration matches are summarized in one `definition_boost` transition
 with their count and cumulative boost. MCP budgeting keeps each surviving trace
 complete. It can shorten content or symbol annotations, or drop a whole result
-when its complete trace cannot fit; `_meta` discloses those cuts.
+when its complete trace cannot fit; `completeness.kind: truncated` discloses
+those cuts (`_meta` remains a deprecated alias for this release).
 
 Use the evidence to choose the next check. Record your conclusion as a hypothesis
 until the corresponding check distinguishes it from the alternatives:

@@ -290,6 +290,12 @@ pub(crate) struct CodeSageServerState {
     pub(super) work: super::work::WorkCoordinator,
     pub(super) overview_cache: super::overview_cache::OverviewCache,
     pub(super) overview_cache_enabled: bool,
+    /// Per-project drift and semantic coverage behind the response envelope's
+    /// `index` block, recomputed at most once per generation or TTL.
+    pub(super) index_facts: super::envelope::IndexFactsCache,
+    /// `CODESAGE_ENVELOPE=legacy` in the daemon's environment suppresses every
+    /// envelope key for the daemon's whole lifetime, like `RUST_LOG`.
+    pub(super) envelope_enabled: bool,
     project_cache: Mutex<ProjectCache>,
     embedders: ModelMap<Embedder>,
     rerankers: ModelMap<Reranker>,
@@ -650,6 +656,10 @@ impl CodeSageServerState {
                 .expect("built-in work limits are valid"),
             overview_cache: super::overview_cache::OverviewCache::default(),
             overview_cache_enabled: std::env::var("CODESAGE_OVERVIEW_CACHE").as_deref() != Ok("0"),
+            index_facts: super::envelope::IndexFactsCache::default(),
+            envelope_enabled: super::envelope::enabled_from(
+                std::env::var("CODESAGE_ENVELOPE").ok().as_deref(),
+            ),
             project_cache: Mutex::new(ProjectCache::default()),
             embedders: Mutex::new(HashMap::new()),
             rerankers: Mutex::new(HashMap::new()),

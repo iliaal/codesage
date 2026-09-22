@@ -41,7 +41,7 @@ pub(crate) fn is_cache_unavailable(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<CacheUnavailable>())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Generation {
     identity: FileIdentity,
     epoch: u64,
@@ -50,7 +50,24 @@ pub(crate) struct Generation {
     recurrence: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl Generation {
+    /// Identity of one index state, for the response envelope's
+    /// `index.generation`: a 48-bit digest of the index file identity, the
+    /// observer epoch, `data_version`, the config digest, and the coupling
+    /// policy, folded to 48 bits so a JSON client with double-precision
+    /// numbers reproduces the value exactly. Unequal values prove the state
+    /// changed; equal values are only meaningful within one daemon's lifetime,
+    /// since the hasher is deterministic and `NEXT_EPOCH` restarts at 1, so a
+    /// restarted daemon can reproduce an earlier id for a different state.
+    pub(crate) fn id(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish() & 0x0000_FFFF_FFFF_FFFF
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct FileIdentity {
     device: u64,
     inode: u64,

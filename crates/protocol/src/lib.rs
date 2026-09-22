@@ -1131,17 +1131,25 @@ pub struct CoChangeEntry {
     /// which read true.
     #[serde(default = "default_span_known")]
     pub span_known: bool,
+    /// DEPRECATED, removed in the next minor: read `p_cochange`. The name
+    /// collides with `search`'s `confidence`, which reports ranking flatness,
+    /// not a probability.
+    #[serde(default)]
+    pub confidence: f32,
+    /// DEPRECATED, removed in the next minor: read `p_reverse`.
+    #[serde(default)]
+    pub reverse_confidence: f32,
     /// P(`file` changes | the queried file changes): `count` divided by the
     /// queried file's total commits. 0.0 when that total is unknown. A lower
     /// bound: commits touching more than 30 files contribute no pair
     /// evidence but do count in the denominator.
     #[serde(default)]
-    pub confidence: f32,
+    pub p_cochange: f32,
     /// P(the queried file changes | `file` changes): `count` divided by
     /// `file`'s total commits. 0.0 when that total is unknown. Same lower
-    /// bound as `confidence`.
+    /// bound as `p_cochange`.
     #[serde(default)]
-    pub reverse_confidence: f32,
+    pub p_reverse: f32,
     /// `span_days >= 30`: the pair kept co-changing over at least a month
     /// rather than in one commit or a short burst. False on rows indexed
     /// before `span_days` existed.
@@ -3093,6 +3101,8 @@ mod tests {
         );
         assert_eq!(entry.confidence, 0.0);
         assert_eq!(entry.reverse_confidence, 0.0);
+        assert_eq!(entry.p_cochange, 0.0);
+        assert_eq!(entry.p_reverse, 0.0);
         assert!(!entry.recurring);
 
         let round_trip: CoChangeEntry = serde_json::from_str(
@@ -3107,6 +3117,8 @@ mod tests {
                 span_known: true,
                 confidence: 0.4,
                 reverse_confidence: 1.0,
+                p_cochange: 0.4,
+                p_reverse: 1.0,
                 recurring: true,
             })
             .unwrap(),
@@ -3116,6 +3128,8 @@ mod tests {
         assert!(round_trip.recurring);
         assert_eq!(round_trip.confidence, 0.4);
         assert_eq!(round_trip.reverse_confidence, 1.0);
+        assert_eq!(round_trip.p_cochange, 0.4);
+        assert_eq!(round_trip.p_reverse, 1.0);
     }
 
     /// Shaped like a real hotspot: ten coupled files (the `co_changes_for`
@@ -3152,6 +3166,8 @@ mod tests {
                     span_known: true,
                     confidence: 0.5,
                     reverse_confidence: 0.75,
+                    p_cochange: 0.5,
+                    p_reverse: 0.75,
                     recurring: true,
                 })
                 .collect(),

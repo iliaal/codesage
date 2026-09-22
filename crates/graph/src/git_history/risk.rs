@@ -300,6 +300,10 @@ fn span_phrase(max_span: u32) -> String {
 /// denominator of the forward confidence; the row carries the other side's.
 fn to_co_change_entry(r: CoChangeRow, this_commits: u32) -> CoChangeEntry {
     let span_days = days_between(r.first_observed_at, r.last_observed_at);
+    // `confidence` / `reverse_confidence` are the deprecated spellings of
+    // `p_cochange` / `p_reverse`; both carry the same measurement this release.
+    let forward = conditional_probability(r.count, this_commits);
+    let reverse = conditional_probability(r.count, r.other_commits);
     CoChangeEntry {
         handle: Handle::file(r.file.as_str())
             .map(|h| h.to_string())
@@ -311,8 +315,10 @@ fn to_co_change_entry(r: CoChangeRow, this_commits: u32) -> CoChangeEntry {
         recurrence: r.windows,
         span_days,
         span_known: r.first_observed_at.is_some(),
-        confidence: conditional_probability(r.count, this_commits),
-        reverse_confidence: conditional_probability(r.count, r.other_commits),
+        confidence: forward,
+        reverse_confidence: reverse,
+        p_cochange: forward,
+        p_reverse: reverse,
         recurring: is_recurring(span_days),
     }
 }

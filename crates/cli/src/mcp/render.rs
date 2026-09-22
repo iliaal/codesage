@@ -152,7 +152,11 @@ impl CodeSageServer {
     }
 
     /// Best-effort stale-path annotation; unreadable metadata must not fail the tool call.
-    fn annotate_staleness(&self, project: &str, mut result: CallToolResult) -> CallToolResult {
+    pub(super) fn annotate_staleness(
+        &self,
+        project: &str,
+        mut result: CallToolResult,
+    ) -> CallToolResult {
         if result.is_error == Some(true) || !staleness_enabled() {
             return result;
         }
@@ -197,7 +201,9 @@ impl CodeSageServer {
 
     /// Changed, missing, or unreadable indexed paths are stale; unindexed references are skipped.
     fn compute_stale_files(&self, project: &str, rel_paths: &[String]) -> Result<Vec<String>> {
-        let state = self.resolve_project(project)?;
+        // `resolve_project_inner` keeps the check free of watcher side effects,
+        // so `edit_check` can be annotated without starting one.
+        let state = self.resolve_project_inner(project)?;
         let root = state
             .db_path
             .parent()
@@ -310,9 +316,11 @@ fn render_with_budget<T: serde::Serialize>(
 /// Bound per-response disk hashing even for unusually broad results.
 const STALENESS_MAX_FILES: usize = 50;
 
-/// Path-valued fields, including nested arrays. `imports` contains module names,
-/// while `imported_by` contains file paths; `source` is a mapper token.
-/// Omitted files and directory-only fields are not checked.
+/// Path-valued fields that carry no handle, including nested arrays.
+/// `imports` contains module names, while `imported_by` contains file paths;
+/// `source` is a mapper token. Omitted files and directory-only fields are not
+/// checked. Handle-carrying rows are covered by [`envelope::collect_handle_paths`]
+/// instead, which no new field can drift out of.
 const PATH_KEYS: &[&str] = &[
     "file_path",
     "path",
@@ -333,6 +341,10 @@ const PATH_KEYS: &[&str] = &[
     "primary",
     "new_cycles",
     "resolved_cycles",
+    // Entrypoint rows (`project_overview`, `list_features`, `find_feature`) and
+    // the changed file a reachable test resolves to carry no handle.
+    "entry_path",
+    "via",
 ];
 
 /// Staleness checking is on by default; `CODESAGE_STALENESS_CHECK` set to a
@@ -358,22 +370,49 @@ fn push_path_strings(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
+/// Union of the paths named by handles anywhere in the payload and the paths
+/// under the [`PATH_KEYS`] allowlist. The allowlist still carries every
+/// path-valued field emitted as a bare string (`primary`, `test_gap_files`,
+/// `new_files`, `cycle_files`, …), so it cannot be dropped yet.
 fn collect_referenced_paths(value: &serde_json::Value, out: &mut Vec<String>) {
+    super::envelope::collect_handle_paths(value, out);
+    collect_allowlisted_paths(value, out);
+}
+
+fn collect_allowlisted_paths(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(map) => {
             for (k, v) in map {
                 if PATH_KEYS.contains(&k.as_str()) {
                     push_path_strings(v, out);
                 }
-                collect_referenced_paths(v, out);
+                collect_allowlisted_paths(v, out);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_referenced_paths(item, out);
+                collect_allowlisted_paths(item, out);
             }
         }
         _ => {}
+    }
+}
+
+/// Replace the JSON text block clients read with the current structured
+/// payload, keeping any banner block ahead of it. Shared by the `next`
+/// annotation and the response envelope, which both mutate the payload after
+/// the text block was rendered from it.
+pub(super) fn rerender_json_text(result: &mut CallToolResult) {
+    let Some(payload) = result.structured_content.as_ref() else {
+        return;
+    };
+    for content in &mut result.content {
+        if let Some(text) = content.as_text()
+            && serde_json::from_str::<serde_json::Value>(&text.text).is_ok()
+        {
+            *content =
+                ContentBlock::text(serde_json::to_string_pretty(payload).unwrap_or_default());
+        }
     }
 }
 

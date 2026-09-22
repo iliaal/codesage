@@ -1,6 +1,7 @@
 mod diagnostics;
 mod dispatch;
 mod edit_check;
+pub(crate) mod envelope;
 pub(crate) mod error;
 mod next;
 mod overview_cache;
@@ -401,7 +402,7 @@ impl CodeSageServer {
         &self,
         Parameters(params): Parameters<edit_check::EditCheckParams>,
     ) -> CallToolResult {
-        self.blocking(move |_| {
+        self.blocking(move |s| {
             let result = codesage_graph::edit_check::edit_check(
                 Path::new(&params.project),
                 &params.file_path,
@@ -409,11 +410,10 @@ impl CodeSageServer {
                 params.line,
                 &params.replacement,
             );
-            next::annotate(
-                &params.project,
-                "edit_check",
-                render::render_with_kind(result, "edit_check"),
-            )
+            // Staleness resolves the project without opening a watcher, so a
+            // project with no index still answers; one with an index discloses
+            // which of the named files moved on disk.
+            s.render(&params.project, result, "edit_check")
         })
         .await
     }
@@ -766,7 +766,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_coupling",
-        description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d); a pair whose shared commits span under 30 days ranks at half its weight so recurring pairs come first. Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Response is `{found: bool, coupled: [...], file_indexed: bool, file_commits: u32, note?: string}` — check `found` (false when the file has no git-history row), then read `coupled` for the ranked list. Each row carries `recurrence` (distinct 90-day calendar windows the pair co-changed in; informational, a boundary straddle can read 2), `span_days` (oldest to newest shared commit), `recurring` (span_days >= 30), `confidence` = P(row file changes | this file changes) and `reverse_confidence` = P(this file changes | row file changes), both lower bounds (commits touching >30 files add no pair evidence but count in the denominator); a high `confidence` with low `reverse_confidence` means this file depends on the other, not vice versa. Trust `recurring` rows over one-offs (one mass commit). When `coupled` is empty, `note` disambiguates: file never indexed vs. file has history but no pair above the min-count=3 threshold vs. path shape mismatch; when any row has `span_known: false` (indexed before recurrence tracking) `note` says to run `git-index --full`; when no row is recurring, `note` says whether the history is too short to show recurrence or the coupling is short-burst evidence. Index into `.coupled`, not the response directly. For the patch-level question 'which tests should I run after editing these files?' use `recommend_tests` instead (resolves test conventions + co-change in one call). For the single-file risk score that already folds in coupling pressure use `assess_risk`.",
+        description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d); a pair whose shared commits span under 30 days ranks at half its weight so recurring pairs come first. Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Response is `{found: bool, coupled: [...], file_indexed: bool, file_commits: u32, note?: string}` — check `found` (false when the file has no git-history row), then read `coupled` for the ranked list. Each row carries `recurrence` (distinct 90-day calendar windows the pair co-changed in; informational, a boundary straddle can read 2), `span_days` (oldest to newest shared commit), `recurring` (span_days >= 30), `p_cochange` = P(row file changes | this file changes) and `p_reverse` = P(this file changes | row file changes), both lower bounds (commits touching >30 files add no pair evidence but count in the denominator); a high `p_cochange` with low `p_reverse` means this file depends on the other, not vice versa. The older spellings `confidence` / `reverse_confidence` carry the same values and are removed in the next minor. Trust `recurring` rows over one-offs (one mass commit). When `coupled` is empty, `note` disambiguates: file never indexed vs. file has history but no pair above the min-count=3 threshold vs. path shape mismatch; when any row has `span_known: false` (indexed before recurrence tracking) `note` says to run `git-index --full`; when no row is recurring, `note` says whether the history is too short to show recurrence or the coupling is short-burst evidence. Index into `.coupled`, not the response directly. For the patch-level question 'which tests should I run after editing these files?' use `recommend_tests` instead (resolves test conventions + co-change in one call). For the single-file risk score that already folds in coupling pressure use `assess_risk`.",
         output_schema = schema_for_type::<CouplingReport>()
     )]
     async fn find_coupling_tool(
