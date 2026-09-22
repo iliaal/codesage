@@ -151,6 +151,8 @@ fn build_freshness(root: &Path, db: &Database) -> FreshnessInfo {
         structural_kind,
         structural_summary: report.summary(),
         commits_behind: report.commits_between,
+        indexed_files_behind: report.indexed_files_behind,
+        indexed_files_behind_bounded: report.indexed_files_behind_bounded,
         indexed_sha: report.stored_sha,
         head_sha: report.head_sha,
         semantic_indexed_files,
@@ -191,10 +193,14 @@ fn test_conventions_for(languages: &[LanguageStat]) -> Vec<String> {
 
 fn suggested_next_calls(freshness: &FreshnessInfo) -> Vec<SuggestedCall> {
     let mut calls = Vec::new();
+    // A commit range that touched no indexed file is not a reason to reindex;
+    // an unmeasured comparison, or one that stopped before its first record,
+    // still is.
     if matches!(
         freshness.structural_kind.as_str(),
         "behind_head" | "unrelated_ancestor"
-    ) {
+    ) && (freshness.indexed_files_behind != Some(0) || freshness.indexed_files_behind_bounded)
+    {
         calls.push(SuggestedCall {
             intent: "index may be stale".to_string(),
             tool: "codesage index (CLI)".to_string(),
@@ -252,6 +258,8 @@ mod tests {
             structural_kind: kind.to_string(),
             structural_summary: format!("summary for {kind}"),
             commits_behind: None,
+            indexed_files_behind: None,
+            indexed_files_behind_bounded: false,
             indexed_sha: None,
             head_sha: None,
             semantic_indexed_files: 0,
@@ -278,6 +286,34 @@ mod tests {
     fn unrelated_ancestor_prepends_stale_index_nudge() {
         let calls = suggested_next_calls(&freshness("unrelated_ancestor"));
         assert_eq!(calls.first().map(|c| c.tool.as_str()), Some(STALE_TOOL));
+    }
+
+    #[test]
+    fn commits_behind_over_unindexed_paths_do_not_nudge_a_reindex() {
+        for kind in ["behind_head", "unrelated_ancestor"] {
+            let mut state = freshness(kind);
+            state.commits_behind = Some(5);
+            state.indexed_files_behind = Some(0);
+            let calls = suggested_next_calls(&state);
+            assert!(
+                calls.iter().all(|c| c.tool != STALE_TOOL),
+                "{kind}: 5 commits touching no indexed file must not ask for a reindex"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bounded_zero_count_still_nudges_a_reindex() {
+        let mut state = freshness("behind_head");
+        state.commits_behind = Some(5);
+        state.indexed_files_behind = Some(0);
+        state.indexed_files_behind_bounded = true;
+        let calls = suggested_next_calls(&state);
+        assert_eq!(
+            calls.first().map(|c| c.tool.as_str()),
+            Some(STALE_TOOL),
+            "a comparison that stopped before its first record proved nothing"
+        );
     }
 
     #[test]

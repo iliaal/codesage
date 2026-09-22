@@ -29,7 +29,7 @@ use codesage_protocol::{
 };
 use codesage_storage::Database;
 
-use crate::drift::{self, DriftKind};
+use crate::drift;
 
 /// A file crossing at least this many trust boundaries warrants a security note
 /// (matches the `assess_risk` threshold).
@@ -64,10 +64,9 @@ pub fn build_review_rehearsal(
     let mut objections: Vec<ReviewObjection> = Vec::new();
 
     let report = drift::check_drift(root, db);
-    if matches!(
-        report.kind,
-        DriftKind::BehindHead | DriftKind::UnrelatedAncestor
-    ) {
+    // Commits that touched no indexed file leave every structural signal below
+    // intact, so they raise no objection.
+    if report.recommends_reindex() {
         objections.push(ReviewObjection {
             severity: ReviewSeverity::Medium,
             category: "stale-index".to_string(),

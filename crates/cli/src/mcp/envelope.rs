@@ -372,11 +372,34 @@ pub(super) struct IndexFacts {
     generation: Option<u64>,
     /// Short indexed SHA; `None` when the index carries no stamp.
     head: Option<String>,
-    /// The indexed SHA is not HEAD (behind, or an unrelated ancestor).
-    behind: bool,
+    /// How the index stands against HEAD, before this response's own dirty
+    /// paths are considered.
+    structural: Structural,
+    /// Indexed files whose HEAD content differs; `None` when the comparison
+    /// could not run.
+    files_behind: Option<usize>,
+    /// `files_behind` is a lower bound: the comparison stopped at its
+    /// candidate cap or time budget.
+    files_behind_bounded: bool,
     /// `Some("partial" | "none")`; `None` means every indexed file has chunks.
     semantic: Option<&'static str>,
     computed_at: Instant,
+}
+
+/// Where the structural index stands against HEAD.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Structural {
+    /// Every indexed file's content matches HEAD.
+    Fresh,
+    /// At least one indexed file's HEAD content differs from the indexed
+    /// content. When the content comparison could not run, or stopped before
+    /// finding one, this falls back to the SHA-level test: the indexed SHA is
+    /// not HEAD.
+    Behind,
+    /// Drift could not be determined: git failed, the index carries no commit
+    /// stamp, or the index could not be opened. Reported rather than omitted,
+    /// so silence keeps meaning `fresh`.
+    Unknown,
 }
 
 /// Cache key is the canonical project root.
@@ -405,6 +428,21 @@ impl IndexFactsCache {
             }
         }
         entries.insert(root.to_owned(), facts);
+    }
+}
+
+/// Classify drift for the envelope. A complete comparison that found no
+/// differing indexed file is fresh; one that stopped before its first record
+/// proved nothing and falls back to the SHA-level test.
+fn structural_from_drift(drift: &codesage_graph::drift::DriftReport) -> Structural {
+    use codesage_graph::drift::DriftKind;
+    match (drift.kind, drift.indexed_files_behind) {
+        // A project outside Git has no HEAD to fall behind.
+        (DriftKind::NotGit | DriftKind::Fresh, _) => Structural::Fresh,
+        (_, Some(0)) if !drift.indexed_files_behind_bounded => Structural::Fresh,
+        (_, Some(_)) => Structural::Behind,
+        (DriftKind::NeverIndexed | DriftKind::Unknown, None) => Structural::Unknown,
+        (DriftKind::BehindHead | DriftKind::UnrelatedAncestor, None) => Structural::Behind,
     }
 }
 
@@ -437,10 +475,14 @@ impl CodeSageServer {
         if let Some(cached) = self.state.index_facts.get(root, generation) {
             return cached;
         }
+        // An index this call cannot read is an undetermined index, not a
+        // fresh one; the arms below narrow it.
         let mut facts = IndexFacts {
             generation,
             head: None,
-            behind: false,
+            structural: Structural::Unknown,
+            files_behind: None,
+            files_behind_bounded: false,
             semantic: None,
             computed_at: Instant::now(),
         };
@@ -448,11 +490,9 @@ impl CodeSageServer {
             Ok(db) => {
                 let drift = codesage_graph::drift::check_drift(root, &db);
                 facts.head = drift.stored_sha.as_deref().map(short_sha);
-                facts.behind = matches!(
-                    drift.kind,
-                    codesage_graph::drift::DriftKind::BehindHead
-                        | codesage_graph::drift::DriftKind::UnrelatedAncestor
-                );
+                facts.files_behind = drift.indexed_files_behind;
+                facts.files_behind_bounded = drift.indexed_files_behind_bounded;
+                facts.structural = structural_from_drift(&drift);
                 facts.semantic = self.semantic_state(root, db_path, &db);
             }
             Err(error) => {
@@ -534,14 +574,24 @@ impl CodeSageServer {
         if let Some(head) = &facts.head {
             out.insert("head".into(), json!(head));
         }
+        // Silence is the good case: a commit range that changed no indexed
+        // file reports nothing here.
+        if let Some(files_behind) = facts.files_behind.filter(|n| *n > 0) {
+            out.insert("files_behind".into(), json!(files_behind));
+        }
+        if facts.files_behind_bounded {
+            out.insert("files_behind_bounded".into(), json!(true));
+        }
         // `dirty` is the stronger claim about *this* response, so it wins over
-        // a repository-wide `behind`.
+        // a repository-wide `behind` or `unknown`.
         let structural = if !stale.is_empty() {
             Some("dirty")
-        } else if facts.behind {
-            Some("behind")
         } else {
-            None
+            match facts.structural {
+                Structural::Fresh => None,
+                Structural::Behind => Some("behind"),
+                Structural::Unknown => Some("unknown"),
+            }
         };
         if let Some(structural) = structural {
             out.insert("structural".into(), json!(structural));
@@ -636,11 +686,13 @@ pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
             "index",
             json!({
                 "type": "object",
-                "description": "Which index state this answer describes. `structural`, `semantic`, and `dirty_paths` are omitted when everything is fresh. Successor of `_meta.stale_files` / `_meta.stale_warning`.",
+                "description": "Which index state this answer describes. `structural`, `files_behind`, `files_behind_bounded`, `semantic`, and `dirty_paths` are omitted when everything is fresh. Successor of `_meta.stale_files` / `_meta.stale_warning`.",
                 "properties": {
                     "generation": {"type": "integer", "minimum": 0, "description": "48-bit digest of the index state: file identity, observer epoch, `data_version`, config digest, and coupling policy. Unequal values prove the state changed; equal values are only meaningful within one daemon's lifetime, since a restarted daemon can reproduce an earlier value."},
                     "head": {"type": "string", "description": "Short SHA the structural index was built against."},
-                    "structural": {"enum": ["behind", "dirty"], "description": "`behind`: the indexed SHA is not HEAD. `dirty`: a path in this response differs on disk from the index. Absent when fresh."},
+                    "files_behind": {"type": "integer", "minimum": 1, "description": "Indexed files whose content at HEAD differs from the indexed content, plus supported source files committed since indexing. Absent when none do, including when HEAD has moved by commits that touched nothing indexed."},
+                    "files_behind_bounded": {"const": true, "description": "`files_behind` (0 when absent) is a lower bound: the content comparison stopped at its 2,000-path cap or 500 ms budget before checking every candidate. Absent when the comparison completed."},
+                    "structural": {"enum": ["behind", "dirty", "unknown"], "description": "`behind`: at least one indexed file's HEAD content differs from the index (`files_behind` counts them), or, when that comparison could not run or stopped before finding one (`files_behind_bounded`), the indexed SHA is not HEAD. `dirty`: a path in this response differs on disk from the index. `unknown`: drift could not be determined (git failed, the index carries no commit stamp, or it could not be opened). Absent when fresh."},
                     "semantic": {"enum": ["partial", "none"], "description": "Semantic coverage of the indexed file set by the configured embedding model: none when that model has no chunks, partial when some indexed files lack chunks for it or their chunks predate the current content. Absent when the configured model covers every indexed file."},
                     "dirty_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths in this response that changed on disk since indexing."}
                 }
@@ -1141,6 +1193,189 @@ mod tests {
     fn a_model_whose_chunks_cover_the_index_reports_no_semantic_gap() {
         let index = semantic_state_for("chunks/populated");
         assert!(index.get("semantic").is_none(), "{index}");
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// The same project inside a hermetic repository, indexed and stamped at
+    /// HEAD, so drift is measurable rather than `not_git`.
+    fn indexed_git_project(files: &[(&str, &str)]) -> (TempDir, String) {
+        let (dir, project) = indexed_project(files);
+        let root = PathBuf::from(&project);
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "envelope@example.invalid"]);
+        git(&root, &["config", "user.name", "Envelope"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir_all(root.join(".git/disabled-hooks")).unwrap();
+        git(&root, &["config", "core.hooksPath", ".git/disabled-hooks"]);
+        commit(&root, &[], "base");
+        let db = Database::open(&root.join(".codesage/index.db")).unwrap();
+        db.set_structural_index_state(&git(&root, &["rev-parse", "HEAD"]))
+            .unwrap();
+        (dir, project)
+    }
+
+    fn commit(root: &Path, files: &[(&str, &str)], message: &str) {
+        for (rel, body) in files {
+            let abs = root.join(rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(abs, body).unwrap();
+        }
+        git(root, &["add", "-A", "--", ":(exclude).codesage"]);
+        git(root, &["commit", "-q", "-m", message]);
+    }
+
+    #[test]
+    fn commits_over_unindexed_paths_leave_the_index_block_silent() {
+        let (_dir, project) = indexed_git_project(&[("src/a.rs", "fn a() {}")]);
+        commit(
+            Path::new(&project),
+            &[("CHANGELOG.md", "# 0.2.0\n")],
+            "changelog",
+        );
+        let out = enveloped(
+            &server(true),
+            "find_symbol",
+            &project,
+            json!({"results": [{"file_path": "src/a.rs", "line": 1}]}),
+        );
+
+        assert!(
+            out["index"].get("structural").is_none(),
+            "HEAD moved over no indexed file: {out}"
+        );
+        assert!(out["index"].get("files_behind").is_none(), "{out}");
+        assert!(out["index"]["head"].is_string(), "{out}");
+    }
+
+    #[test]
+    fn a_changed_indexed_file_reports_behind_with_a_count() {
+        let (_dir, project) = indexed_git_project(&[("src/a.rs", "fn a() {}")]);
+        commit(
+            Path::new(&project),
+            &[("src/a.rs", "fn edited() {}")],
+            "edit",
+        );
+        let out = enveloped(
+            &server(true),
+            "find_symbol",
+            &project,
+            json!({"results": [{"line": 1}]}),
+        );
+
+        assert_eq!(out["index"]["structural"], "behind", "{out}");
+        assert_eq!(out["index"]["files_behind"], 1, "{out}");
+    }
+
+    #[test]
+    fn an_unstamped_index_reports_unknown_rather_than_silence() {
+        let (_dir, project) = indexed_project(&[("src/a.rs", "fn a() {}")]);
+        let root = PathBuf::from(&project);
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "envelope@example.invalid"]);
+        git(&root, &["config", "user.name", "Envelope"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        std::fs::create_dir_all(root.join(".git/disabled-hooks")).unwrap();
+        git(&root, &["config", "core.hooksPath", ".git/disabled-hooks"]);
+        commit(&root, &[], "base");
+
+        let out = enveloped(
+            &server(true),
+            "find_symbol",
+            &project,
+            json!({"results": [{"line": 1}]}),
+        );
+
+        assert_eq!(
+            out["index"]["structural"], "unknown",
+            "an index with no commit stamp must not read as fresh: {out}"
+        );
+    }
+
+    fn drift_behind(
+        files_behind: Option<usize>,
+        bounded: bool,
+    ) -> codesage_graph::drift::DriftReport {
+        codesage_graph::drift::DriftReport {
+            stored_sha: Some("1111111111111111".to_string()),
+            head_sha: Some("2222222222222222".to_string()),
+            stored_at: Some(0),
+            commits_between: Some(3),
+            indexed_files_behind: files_behind,
+            indexed_files_behind_sample: Vec::new(),
+            indexed_files_behind_bounded: bounded,
+            kind: codesage_graph::drift::DriftKind::BehindHead,
+        }
+    }
+
+    #[test]
+    fn a_bounded_zero_count_is_behind_not_fresh() {
+        assert_eq!(
+            structural_from_drift(&drift_behind(Some(0), false)),
+            Structural::Fresh
+        );
+        assert_eq!(
+            structural_from_drift(&drift_behind(Some(0), true)),
+            Structural::Behind,
+            "a comparison that stopped before its first record proved nothing"
+        );
+        assert_eq!(
+            structural_from_drift(&drift_behind(Some(2), true)),
+            Structural::Behind
+        );
+        assert_eq!(
+            structural_from_drift(&drift_behind(None, false)),
+            Structural::Behind
+        );
+    }
+
+    #[test]
+    fn a_bounded_comparison_discloses_the_lower_bound() {
+        let (_dir, project) = indexed_git_project(&[("src/a.rs", "fn a() {}")]);
+        let server = server(true);
+        let root = crate::evidence_root(Path::new(&project)).unwrap();
+        let db_path = crate::db_path(&root);
+        let generation = server.index_generation(&root, &db_path);
+        let mut drift = drift_behind(Some(0), true);
+        drift.stored_sha = Some(git(&root, &["rev-parse", "HEAD"]));
+        server.state.index_facts.put(
+            &root,
+            IndexFacts {
+                generation,
+                head: drift.stored_sha.as_deref().map(short_sha),
+                structural: structural_from_drift(&drift),
+                files_behind: drift.indexed_files_behind,
+                files_behind_bounded: drift.indexed_files_behind_bounded,
+                semantic: None,
+                computed_at: Instant::now(),
+            },
+        );
+
+        let out = enveloped(
+            &server,
+            "find_symbol",
+            &project,
+            json!({"results": [{"line": 1}]}),
+        );
+
+        assert_eq!(out["index"]["structural"], "behind", "{out}");
+        assert_eq!(out["index"]["files_behind_bounded"], true, "{out}");
+        assert!(
+            out["index"].get("files_behind").is_none(),
+            "a zero count is not emitted: {out}"
+        );
     }
 
     fn server(envelope_enabled: bool) -> CodeSageServer {

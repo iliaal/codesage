@@ -2707,6 +2707,16 @@ pub struct FreshnessInfo {
     /// Commits between the indexed SHA and HEAD when behind on the same line.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub commits_behind: Option<u32>,
+    /// Indexed files whose HEAD content differs from the indexed content.
+    /// `commits_behind` counts commits, most of which may touch nothing the
+    /// index holds; this counts the files a reindex would actually change.
+    /// Absent when the comparison could not run.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub indexed_files_behind: Option<usize>,
+    /// The comparison stopped at its candidate cap or time budget, so
+    /// `indexed_files_behind` is a lower bound.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub indexed_files_behind_bounded: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub indexed_sha: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]

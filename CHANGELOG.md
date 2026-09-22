@@ -9,8 +9,11 @@
 - `project_overview` accepts `include_tests` (default false) to rank test files in `top_risk_files`.
 - Schema migration `0024_is_test` (`files.is_test`, `symbols.is_test`); the next `codesage index` reparses existing files under `extraction=6`.
 - Every successful MCP response carries `tool`, `index`, `cost`, and — when the answer is not exact — `completeness {kind, kinds, recover}` and `target`; `index` reports the index generation, indexed SHA, structural/semantic freshness, and `dirty_paths`.
+- `index.structural` is `behind` when an indexed file's HEAD content differs from the index, `unknown` when drift could not be determined, and omitted when fresh.
 - `CODESAGE_ENVELOPE=legacy` in the daemon's environment suppresses every envelope key for that daemon's lifetime.
 - `find_coupling` and `assess_risk` `top_coupled` rows carry `p_cochange` and `p_reverse`.
+- `project_overview` `freshness` and `codesage status --json` report `indexed_files_behind`, the indexed files a reindex would actually change, alongside `commits_behind`.
+- The MCP response envelope carries `index.files_behind` when indexed files differ from HEAD and `index.files_behind_bounded` when that count is a lower bound.
 
 ### Changed
 
@@ -27,6 +30,7 @@
 
 - `codesage rehearse` without explicit paths, `codesage features-list --since`, and MCP `list_features` `since` now report both endpoints of a Git rename instead of only the destination.
 - `codesage rehearse` without explicit paths no longer mangles non-ASCII, quoted, or whitespace-padded file names.
+- Drift reporting no longer advises `codesage index` for commits that touched no indexed file, counts supported source files committed since indexing, and treats a comparison that stopped before finding a difference as unmeasured rather than fresh; `codesage status`, `codesage doctor`, `project_overview`, and `review_rehearsal` name the affected indexed files alongside the commit count.
 
 ## [0.34.0] - 2026-09-17
 

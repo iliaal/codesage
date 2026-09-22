@@ -665,6 +665,11 @@ fn check_index_drift(root: &Path) -> Check {
     let status = match report.kind {
         DriftKind::Fresh => Status::Pass,
         DriftKind::NotGit | DriftKind::NeverIndexed => Status::Skip,
+        // Commits that changed no indexed file's content leave the index
+        // current; only an actual content difference is worth a warning.
+        DriftKind::BehindHead | DriftKind::UnrelatedAncestor if !report.recommends_reindex() => {
+            Status::Pass
+        }
         DriftKind::BehindHead | DriftKind::UnrelatedAncestor => Status::Warn,
         DriftKind::Unknown => Status::Warn,
     };
