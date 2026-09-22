@@ -96,7 +96,7 @@ fn git_history_preserves_unicode_paths_and_rename_destinations() {
     let changed = changed_files_since(root, "HEAD~1").unwrap();
     assert_eq!(
         changed,
-        HashSet::from([new.to_owned(), "ascii.rs".to_owned()])
+        HashSet::from([old.to_owned(), new.to_owned(), "ascii.rs".to_owned()])
     );
     assert!(feature_touched_since(
         &[FeatureFileRef {

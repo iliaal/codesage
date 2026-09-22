@@ -376,18 +376,20 @@ fn resolve_patch_files(root: &Path, files: Vec<String>) -> Result<Vec<String>> {
     working_tree_changes(root)
 }
 
-/// Tracked changes against HEAD; empty when git exits unsuccessfully.
+/// Tracked changes against HEAD, both endpoints of a rename included;
+/// NUL-delimited so quoted, whitespace-bearing, and non-ASCII paths
+/// survive (a non-UTF-8 byte sequence is replaced, not rejected).
+/// Empty when git exits unsuccessfully.
 fn working_tree_changes(root: &Path) -> Result<Vec<String>> {
     let out = std::process::Command::new("git")
-        .args(["diff", "--name-only", "HEAD"])
+        .args(["diff", "--no-renames", "--name-only", "-z", "HEAD", "--"])
         .current_dir(root)
         .output()?;
     if !out.status.success() {
         return Ok(Vec::new());
     }
     Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|s| s.trim())
+        .split('\0')
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect())
@@ -429,4 +431,56 @@ pub(crate) fn cmd_rehearse(files: Vec<String>, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::working_tree_changes;
+    use std::process::Command;
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn working_tree_changes_keeps_both_endpoints_of_a_staged_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        // Repo-level, not `-c`: working_tree_changes spawns its own git.
+        git(root, &["config", "diff.renames", "true"]);
+        std::fs::write(root.join("old.rs"), "fn same() {}\n").unwrap();
+        git(root, &["add", "old.rs"]);
+        git(root, &["commit", "-qm", "base"]);
+        git(root, &["mv", "old.rs", "new.rs"]);
+        std::fs::write(root.join(" lead space é.rs"), "fn odd() {}\n").unwrap();
+        git(root, &["add", "--", " lead space é.rs"]);
+
+        let mut files = working_tree_changes(root).unwrap();
+        files.sort();
+        assert_eq!(
+            files,
+            [" lead space é.rs", "new.rs", "old.rs"],
+            "R100 rename must list both paths; -z keeps the padded non-ASCII name verbatim"
+        );
+    }
 }

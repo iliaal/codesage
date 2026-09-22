@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use codesage_graph::{
-    IndexMode, changed_files_since, find_coupling, git_history_index,
+    IndexMode, changed_files_since, feature_touched_since, find_coupling, git_history_index,
     git_history_index_with_options,
 };
+use codesage_protocol::{FeatureFileRef, FeatureFileRole};
 use codesage_storage::Database;
 
 fn codesage_repo_root() -> PathBuf {
@@ -252,6 +253,44 @@ fn changed_files_since_returns_only_files_touched_after_ref() {
         "untouched file should not appear: {changed:?}"
     );
     assert_eq!(changed.len(), 2, "exactly two changed files: {changed:?}");
+}
+
+#[test]
+fn changed_files_since_keeps_both_endpoints_of_a_committed_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_hermetic_repo(root);
+    // Pin rename detection so the fixture fails without --no-renames
+    // regardless of the developer's global diff.renames.
+    run_git(root, &["config", "diff.renames", "true"]);
+
+    std::fs::write(root.join("lib.rs"), "fn same() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "first"]);
+
+    run_git(root, &["mv", "lib.rs", "renamed.rs"]);
+    run_git(root, &["commit", "-qm", "rename"]);
+
+    let changed = changed_files_since(root, "HEAD~1").unwrap();
+    assert!(
+        changed.contains("lib.rs"),
+        "rename source missing: {changed:?}"
+    );
+    assert!(
+        changed.contains("renamed.rs"),
+        "rename destination missing: {changed:?}"
+    );
+    assert_eq!(changed.len(), 2, "exactly both endpoints: {changed:?}");
+
+    let files = vec![FeatureFileRef {
+        path: "lib.rs".to_string(),
+        role: FeatureFileRole::Entry,
+        reason: None,
+    }];
+    assert!(
+        feature_touched_since(&files, &changed),
+        "a slice whose entry was renamed away is touched"
+    );
 }
 
 #[test]

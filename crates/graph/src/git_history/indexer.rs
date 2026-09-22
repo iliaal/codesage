@@ -661,8 +661,17 @@ pub fn changed_files_since(
     let range = format!("{git_ref}...HEAD");
     let out = Command::new("git")
         // `--` terminates option parsing so `range` is always read as a
-        // revision range, never as flags.
-        .args(["diff", "--name-only", "-z", "--relative", &range, "--"])
+        // revision range, never as flags. A rename touches both paths, so
+        // rename detection must not collapse the pair to its destination.
+        .args([
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "--relative",
+            &range,
+            "--",
+        ])
         .current_dir(root)
         .output()
         .with_context(|| format!("git diff --name-only {range} in {}", root.display()))?;

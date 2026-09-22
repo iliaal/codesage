@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+### Fixed
+
+- `codesage rehearse` without explicit paths, `codesage features-list --since`, and MCP `list_features` `since` now report both endpoints of a Git rename instead of only the destination.
+- `codesage rehearse` without explicit paths no longer mangles non-ASCII, quoted, or whitespace-padded file names.
+
 ## [0.34.0] - 2026-09-17
 
 ### Changed
