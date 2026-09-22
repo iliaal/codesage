@@ -83,11 +83,14 @@ enum Commands {
     },
     /// Find symbol definitions by name
     FindSymbol {
-        /// Symbol name to search for
+        /// Symbol name, `sym:` handle, or `path:line`
         name: String,
         /// Filter by kind (function, method, class, trait, interface, struct, enum, constant, macro)
         #[arg(long)]
         kind: Option<String>,
+        /// Also return module declarations (`mod x;`), excluded by default
+        #[arg(long)]
+        include_modules: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1032,9 +1035,12 @@ fn run(cli: Cli) -> Result<()> {
             batch_size,
             Duration::from_secs(lock_wait),
         ),
-        Commands::FindSymbol { name, kind, json } => {
-            query::cmd_find_symbol(&name, kind.as_deref(), json)
-        }
+        Commands::FindSymbol {
+            name,
+            kind,
+            include_modules,
+            json,
+        } => query::cmd_find_symbol(&name, kind.as_deref(), include_modules, json),
         Commands::FindReferences { name, kind, json } => {
             query::cmd_find_references(&name, kind.as_deref(), json)
         }

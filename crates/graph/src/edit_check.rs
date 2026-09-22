@@ -5,7 +5,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
 use codesage_parser::{detect::detect_language, parse::parse_file};
-use codesage_protocol::Language;
+use codesage_protocol::{Handle, Language};
 use schemars::JsonSchema;
 use serde::Serialize;
 use tree_sitter::Node;
@@ -26,8 +26,13 @@ pub enum EditCheckRefusal {
     /// No declaration at HEAD matches `symbol` (and `line`, when given).
     NotFound(String),
     /// Several declarations at HEAD match; `lines` are their one-based start
-    /// lines, sorted, so a retry can pass one.
-    Ambiguous { message: String, lines: Vec<usize> },
+    /// lines, sorted, so a retry can pass one, and `handles` name the same
+    /// declarations in the shared target grammar (`sym:<file>#<name>@<line>`).
+    Ambiguous {
+        message: String,
+        lines: Vec<usize>,
+        handles: Vec<String>,
+    },
     /// The pinned source itself cannot be analysed, so no verdict exists.
     Incomplete(String),
 }
@@ -109,6 +114,12 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// Compare a proposed declaration against the one at Git HEAD.
+///
+/// `symbol` takes the shared target grammar's symbol spelling as well as a
+/// bare declaration name: a `sym:<file>#<qualified>[@<line>]` handle from
+/// `find_symbol` names the declaration outright. This path reads Git, never
+/// the index, so the handle is parsed rather than resolved.
 pub fn edit_check(
     project: &Path,
     file: &str,
@@ -129,6 +140,8 @@ pub fn edit_check(
         )
         .into());
     }
+    let (symbol, line) = parse_edit_target(file, symbol, line)?;
+    let symbol = symbol.as_str();
     if replacement.len() > MAX_SOURCE_BYTES {
         return Err(EditCheckRefusal::OverCap("replacement exceeds 1 MiB".into()).into());
     }
@@ -175,6 +188,53 @@ pub fn edit_check(
         report.unknown.push("The working file differs from HEAD or cannot be read as a regular file without following a symlink; findings describe HEAD callers only.".into());
     }
     Ok(report)
+}
+
+/// Read a `sym:` handle as `(declaration name, line)`. A bare name passes
+/// through. The handle's path must be `file`: the check is pinned to one
+/// blob, so a handle naming another file is a mistake, not a redirection.
+fn parse_edit_target(
+    file: &str,
+    symbol: &str,
+    line: Option<usize>,
+) -> Result<(String, Option<usize>)> {
+    let Some(handle) = Handle::parse(symbol) else {
+        return Ok((symbol.to_string(), line));
+    };
+    let Handle::Symbol {
+        path,
+        qualified,
+        line: handle_line,
+    } = handle
+    else {
+        return Err(EditCheckRefusal::Param(
+            "symbol must be a declaration name or a `sym:` handle".into(),
+        )
+        .into());
+    };
+    if path != file {
+        return Err(EditCheckRefusal::Param(format!(
+            "handle names `{path}`, but `file` is `{file}`"
+        ))
+        .into());
+    }
+    let name = declaration_name(&qualified).to_string();
+    Ok((name, line.or(handle_line.map(|l| l as usize))))
+}
+
+/// The unqualified declaration name a qualified name ends in.
+fn declaration_name(qualified: &str) -> &str {
+    ["::", "\\", "."]
+        .iter()
+        .filter_map(|sep| qualified.rfind(sep).map(|pos| pos + sep.len()))
+        .max()
+        .map_or(qualified, |cut| &qualified[cut..])
+}
+
+/// `sym:<file>#<name>@<line>` for one declaration at HEAD. Minted from the
+/// pinned source, since this path never opens an index.
+fn declaration_handle(file: &str, symbol: &str, line: usize) -> String {
+    Handle::symbol(file, symbol, u32::try_from(line).ok()).to_string()
 }
 
 #[cfg(unix)]
@@ -466,17 +526,23 @@ fn check_source(
         }
         several => {
             let lines: Vec<usize> = several.iter().map(|n| n.start_position().row + 1).collect();
+            let handles: Vec<String> = lines
+                .iter()
+                .map(|line| declaration_handle(file, symbol, *line))
+                .collect();
             return Err(EditCheckRefusal::Ambiguous {
                 message: format!(
-                    "expected one declaration named '{symbol}' at HEAD; found {} starting at lines {} (supply `line` to disambiguate)",
+                    "expected one declaration named '{symbol}' at HEAD; found {} starting at lines {} (supply `line` or one of {} to disambiguate)",
                     lines.len(),
                     lines
                         .iter()
                         .map(usize::to_string)
                         .collect::<Vec<_>>()
-                        .join(", ")
+                        .join(", "),
+                    handles.join(", ")
                 ),
                 lines,
+                handles,
             }
             .into());
         }

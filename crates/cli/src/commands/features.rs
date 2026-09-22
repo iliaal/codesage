@@ -127,7 +127,8 @@ pub(crate) fn cmd_feature_bundle(
     let root = find_project_root()?;
     // Context chunks belong to the configured model's table, not the default model.
     let db = load_symbol_context_db(&root)?;
-    let bundle = codesage_graph::feature_bundle(&db, id, include_callers, include_callees, limit)?;
+    let bundle = codesage_graph::feature_bundle(&db, id, include_callers, include_callees, limit)
+        .map_err(|e| super::query::report_target_error(e, json))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&bundle)?);
     } else {

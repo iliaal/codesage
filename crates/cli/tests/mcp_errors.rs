@@ -272,13 +272,58 @@ fn input_failures_on_an_onboarded_project_carry_machine_remedies() {
     let remedy = &ambiguous.block["error"]["remedy"];
     assert_eq!(remedy["tool"], "impact_analysis", "{remedy}");
     assert_eq!(remedy["arguments"]["project"], json!(project.path()));
-    assert_eq!(remedy["arguments"]["is_file"], false);
+    assert_eq!(
+        remedy["arguments"]["is_file"],
+        Value::Null,
+        "a handle names its own kind, so no file/symbol hint is needed: {remedy}"
+    );
     let candidate = remedy["arguments"]["target"].as_str().unwrap();
-    assert_ne!(candidate, "dup", "remedy must qualify the target: {remedy}");
+    assert!(
+        candidate.starts_with("sym:"),
+        "remedy must name one definition by handle: {remedy}"
+    );
     assert!(
         ambiguous.text.contains(candidate),
         "remedy names one of the listed candidates: {} / {candidate}",
         ambiguous.text
+    );
+    let candidates = ambiguous.block["error"]["candidates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("candidates block: {}", ambiguous.block));
+    assert!(
+        candidates.len() >= 2 && candidates.contains(&json!(candidate)),
+        "every candidate is addressable: {candidates:?}"
+    );
+
+    // The handle the refusal offered resolves on retry.
+    let retried = server.call(
+        "impact_analysis",
+        json!({"project": project.path(), "target": candidate}),
+    );
+    assert_ne!(
+        retried["isError"],
+        json!(true),
+        "the offered handle must succeed: {retried}"
+    );
+
+    // A grammar-valid handle of a kind the walk cannot seed from is a
+    // parameter error naming what the tool takes, not a miss to retry.
+    let result = server.call(
+        "impact_analysis",
+        json!({"project": project.path(), "target": "dir:src"}),
+    );
+    let unsupported = failure(&result, "impact_analysis");
+    assert_eq!(unsupported.block["error"]["code"], "E_PARAM");
+    assert_eq!(unsupported.block["error"]["remedy"], Value::Null);
+    assert!(
+        unsupported.block["error"].get("candidates").is_none(),
+        "{}",
+        unsupported.block
+    );
+    assert!(
+        unsupported.text.contains("`sym:`") && unsupported.text.contains("`file:`"),
+        "the refusal names the accepted target kinds: {}",
+        unsupported.text
     );
 
     let result = server.call(

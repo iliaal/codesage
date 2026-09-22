@@ -1,5 +1,5 @@
 use codesage_graph::{
-    ReachabilityOptions, export_context_for_symbol, find_references, full_index,
+    ReachabilityOptions, TargetError, export_context_for_symbol, find_references, full_index,
     impact_analysis_report, list_dependencies, recommend_tests_with_reachability, trace_call_path,
 };
 use codesage_protocol::{
@@ -145,18 +145,35 @@ fn qualified_calls_preserve_the_definitions_owner_scope() {
             .found
         );
         if qualified.is_none() {
-            assert!(
-                !trace_call_path(
-                    &db,
-                    &CallPathRequest {
-                        from: "run".into(),
-                        to: "f".into(),
-                        max_depth: 3,
-                    }
-                )
+            // `f` also names `S::f`, so address the plain definitions by
+            // handle. Two of them share this file, name, and line, so one
+            // handle names both: the trace then refuses as ambiguous rather
+            // than picking one. Either way no chain to a plain `f` exists.
+            let plain: Vec<String> = db
+                .find_symbols("f", None)
                 .unwrap()
-                .found
-            );
+                .iter()
+                .filter(|s| s.file_path == "src/api.rs" && s.qualified_name == "f")
+                .map(|s| s.handle().to_string())
+                .collect();
+            assert!(!plain.is_empty(), "{call}");
+            for handle in plain {
+                let request = CallPathRequest {
+                    from: "run".into(),
+                    to: handle.clone(),
+                    max_depth: 3,
+                };
+                match trace_call_path(&db, &request) {
+                    Ok(report) => assert!(!report.found, "{call}: {handle}"),
+                    Err(error) => assert!(
+                        matches!(
+                            error.downcast_ref::<TargetError>(),
+                            Some(TargetError::Ambiguous { .. })
+                        ),
+                        "{call}: {handle}: {error:#}"
+                    ),
+                }
+            }
         }
     }
 }
@@ -259,7 +276,8 @@ fn rust_context_limit_is_disclosed_by_every_public_resolution_report() {
     ]);
     let call = CallPathRequest {
         from: "run".into(),
-        to: "f".into(),
+        // `src/decoy.rs` defines `f` too; the handle names the imported one.
+        to: "sym:src/api.rs#f".into(),
         max_depth: 3,
     };
     assert!(trace_call_path(&db, &call).unwrap().found);

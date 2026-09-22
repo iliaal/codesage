@@ -33,7 +33,7 @@ fn setup() -> (tempfile::TempDir, Database) {
 fn find_similar_surfaces_clone_not_unrelated() {
     let (_dir, db) = setup();
 
-    let hits = find_similar(&db, "alpha", 0.8, 10).unwrap();
+    let hits = find_similar(&db, "alpha", 0.8, 10).unwrap().results;
     assert!(
         hits.iter()
             .any(|h| h.name == "beta" && h.file_path == "b.rs"),
@@ -51,8 +51,45 @@ fn find_similar_surfaces_clone_not_unrelated() {
     );
 }
 
+/// A `sym:` handle resolves through the shared grammar and keys the
+/// fingerprint lookup on the definition's bare name, so it returns the rows
+/// the bare name does.
+#[test]
+fn find_similar_accepts_a_handle_and_matches_the_bare_name() {
+    let (_dir, db) = setup();
+    let rows = |results: &[codesage_protocol::SimilarSymbol]| -> Vec<(String, String, u32)> {
+        results
+            .iter()
+            .map(|h| (h.name.clone(), h.file_path.clone(), h.line_start))
+            .collect()
+    };
+
+    let by_name = find_similar(&db, "alpha", 0.8, 10).unwrap();
+    assert!(!by_name.results.is_empty(), "fixture must yield a clone");
+
+    let by_handle = find_similar(&db, "sym:a.rs#alpha", 0.8, 10).unwrap();
+    assert_eq!(rows(&by_handle.results), rows(&by_name.results));
+    let target = by_handle
+        .target
+        .expect("every row set carries its resolution");
+    assert_eq!(
+        target.sole().map(|c| c.handle.as_str()),
+        Some("sym:a.rs#alpha"),
+        "{target:?}"
+    );
+
+    // A guessed lead is not a definition: the raw spelling names no
+    // fingerprint, so the rows stay empty while `target` carries the lead.
+    let guessed = find_similar(&db, "Alpha", 0.8, 10).unwrap();
+    assert!(guessed.results.is_empty(), "{:?}", guessed.results);
+    assert!(guessed.target.expect("target").guessed());
+}
+
 #[test]
 fn find_similar_unknown_symbol_is_empty() {
     let (_dir, db) = setup();
-    assert!(find_similar(&db, "no_such_fn", 0.8, 10).unwrap().is_empty());
+    let found = find_similar(&db, "no_such_fn", 0.8, 10).unwrap();
+    assert!(found.results.is_empty());
+    let target = found.target.expect("every row set carries its resolution");
+    assert!(target.resolved.is_empty(), "{target:?}");
 }

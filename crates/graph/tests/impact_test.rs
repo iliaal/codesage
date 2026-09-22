@@ -1,4 +1,4 @@
-use codesage_graph::{full_index, impact_analysis};
+use codesage_graph::{TargetError, full_index, impact_analysis};
 use codesage_protocol::{
     DEFAULT_EMBEDDING_DIM, ExportRequest, FileCategory, ImpactRequest, ImpactTarget,
 };
@@ -327,7 +327,7 @@ fn impact_by_file_excludes_origin() {
 }
 
 #[test]
-fn impact_unknown_symbol_returns_empty() {
+fn impact_unknown_symbol_is_not_found_rather_than_empty() {
     let (_dir, db) = setup_project();
 
     let req = ImpactRequest {
@@ -338,8 +338,44 @@ fn impact_unknown_symbol_returns_empty() {
         source_only: false,
     };
 
-    let entries = impact_analysis(&db, &req).unwrap();
-    assert!(entries.is_empty());
+    let err = impact_analysis(&db, &req).unwrap_err();
+    let target = err
+        .downcast_ref::<TargetError>()
+        .unwrap_or_else(|| panic!("typed target error, got: {err:#}"));
+    assert!(
+        matches!(target, TargetError::NotFound { .. }),
+        "a name nothing carries must not read as zero impact: {target}"
+    );
+}
+
+/// A `dir:`, `chunk:`, or `feat_` handle parses, but the walk has no seed
+/// for it: that is a parameter error naming what the tool takes, not a miss
+/// the agent should retry against a fuller index.
+#[test]
+fn impact_refuses_handle_kinds_it_cannot_seed_from_as_a_parameter_error() {
+    let (_dir, db) = setup_project();
+
+    for input in ["dir:src", "chunk:src/a.rs:1-5", "feat_0123456789abcdef"] {
+        let req = ImpactRequest {
+            target: ImpactTarget::from_hint(input.to_string(), None),
+            depth: 2,
+            source_only: false,
+        };
+        let err = impact_analysis(&db, &req).unwrap_err();
+        let target = err
+            .downcast_ref::<TargetError>()
+            .unwrap_or_else(|| panic!("{input}: typed target error, got: {err:#}"));
+        let TargetError::Unsupported { accepted, .. } = target else {
+            panic!("{input}: expected an unsupported-kind refusal, got {target}");
+        };
+        assert_eq!(target.code(), "E_PARAM", "{input}");
+        assert!(target.handles().is_empty(), "{input}: no blind retry");
+        assert_eq!(target.input(), input);
+        assert!(accepted.contains("`sym:`"), "{input}: {accepted}");
+        assert!(accepted.contains("`file:`"), "{input}: {accepted}");
+        let text = target.to_string();
+        assert!(text.contains(input), "{text}");
+    }
 }
 
 #[test]
@@ -432,14 +468,41 @@ fn impact_by_ambiguous_bare_name_requires_disambiguation() {
     };
 
     let err = impact_analysis(&db, &req).unwrap_err();
-    assert!(
-        err.to_string().contains("ambiguous symbol"),
-        "expected disambiguation error, got: {err:#}"
+    let target = err
+        .downcast_ref::<TargetError>()
+        .unwrap_or_else(|| panic!("typed target error, got: {err:#}"));
+    let TargetError::Ambiguous {
+        candidates_total, ..
+    } = target
+    else {
+        panic!("expected an ambiguous target, got {target}");
+    };
+    assert_eq!(*candidates_total, 2);
+    let handles = target.handles();
+    assert_eq!(
+        handles,
+        ["sym:conn.rs#Connection::open", "sym:db.rs#Database::open"],
+        "each definition must be addressable"
     );
+
+    // The offered handle answers the question the bare name could not.
+    let scoped = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: handles[1].clone(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap();
+    let paths: Vec<&str> = scoped.iter().map(|e| e.file_path.as_str()).collect();
+    assert_eq!(paths, ["db_user.rs"], "handle scopes to one definition");
 }
 
 #[test]
-fn impact_by_bare_name_proceeds_when_definitions_share_a_qualified_name() {
+fn impact_by_bare_name_refuses_when_definitions_share_a_qualified_name() {
     // The declaration and implementation share a bare qualified name.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -478,15 +541,47 @@ fn impact_by_bare_name_proceeds_when_definitions_share_a_qualified_name() {
         source_only: false,
     };
 
-    let report = impact_analysis(&db, &req).expect("identical qualified names are not ambiguous");
+    // A shared qualified name used to fall through to the union. Handles
+    // address each definition, so the same input is now one ambiguity.
+    let err = impact_analysis(&db, &req).unwrap_err();
+    let target = err
+        .downcast_ref::<TargetError>()
+        .unwrap_or_else(|| panic!("typed target error, got: {err:#}"));
+    let handles = target.handles();
+    assert_eq!(
+        handles.len(),
+        2,
+        "one handle per definition, not one per qualified name: {handles:?}"
+    );
+    assert!(
+        handles.iter().any(|h| h.ends_with("index.d.ts#Headers"))
+            && handles.iter().any(|h| h.ends_with("headers.js#Headers")),
+        "{handles:?}"
+    );
+
+    let report = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: handles
+                    .iter()
+                    .find(|h| h.ends_with("headers.js#Headers"))
+                    .unwrap()
+                    .clone(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .expect("a handle names one definition");
     let paths: Vec<&str> = report.iter().map(|e| e.file_path.as_str()).collect();
     assert!(
         paths.iter().any(|p| p.ends_with("client.js")),
         "consumer of the shared-name symbol should be reported, got {paths:?}"
     );
 
-    // Both definitions resolve the same reference row, so the reason arrives
-    // once per seed. Reason count feeds result ranking.
+    // One seed now resolves the reference row, so a reason cannot repeat.
+    // Reason count feeds result ranking.
     let consumer = report
         .iter()
         .find(|e| e.file_path.ends_with("client.js"))
@@ -633,16 +728,44 @@ fn export_context_for_symbol_respects_limit_for_definitions_and_primary() {
 
     let req = ExportRequest {
         query: None,
-        symbol: Some("open".to_string()),
+        symbol: Some("Database::open".to_string()),
         limit: 1,
         include_callers: false,
         include_callees: false,
     };
 
-    let bundle = codesage_graph::export_context_for_symbol(&db, "open", &req).unwrap();
+    let bundle = codesage_graph::export_context_for_symbol(&db, "Database::open", &req).unwrap();
 
     assert_eq!(bundle.symbol_definitions.len(), 1);
     assert_eq!(bundle.primary.len(), 1);
+}
+
+#[test]
+fn export_context_for_an_ambiguous_symbol_refuses_with_candidates() {
+    let (_dir, db) = setup_qualified_rust_project();
+
+    let req = ExportRequest {
+        query: None,
+        symbol: Some("open".to_string()),
+        limit: 5,
+        include_callers: false,
+        include_callees: false,
+    };
+
+    // A bundle welded from both definitions would answer no question.
+    let err = codesage_graph::export_context_for_symbol(&db, "open", &req).unwrap_err();
+    let target = err
+        .downcast_ref::<TargetError>()
+        .unwrap_or_else(|| panic!("typed target error, got: {err:#}"));
+    assert_eq!(
+        target.handles(),
+        ["sym:conn.rs#Connection::open", "sym:db.rs#Database::open"]
+    );
+
+    let bundle =
+        codesage_graph::export_context_for_symbol(&db, "sym:db.rs#Database::open", &req).unwrap();
+    assert_eq!(bundle.symbol_definitions.len(), 1);
+    assert_eq!(bundle.symbol_definitions[0].file_path, "db.rs");
 }
 
 #[test]
@@ -983,11 +1106,30 @@ fn call_path_repeated_callee_names_resolve_consistently() {
     let db = Database::open_in_memory().unwrap();
     full_index(root, &db, &[], false).unwrap();
 
-    let report = codesage_graph::trace_call_path(
+    // `sink` names two definitions; the handle picks the imported one, so a
+    // lost import filter shows up as a chain that is not found.
+    let ambiguous = codesage_graph::trace_call_path(
         &db,
         &CallPathRequest {
             from: "hub".to_string(),
             to: "sink".to_string(),
+            max_depth: 3,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        ambiguous
+            .downcast_ref::<TargetError>()
+            .unwrap_or_else(|| panic!("typed target error, got: {ambiguous:#}"))
+            .handles(),
+        ["sym:other.rs#sink", "sym:sink.rs#sink"]
+    );
+
+    let report = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "hub".to_string(),
+            to: "sym:sink.rs#sink".to_string(),
             max_depth: 3,
         },
     )

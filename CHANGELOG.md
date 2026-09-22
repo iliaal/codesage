@@ -15,12 +15,19 @@
 - `project_overview` `freshness` and `codesage status --json` report `indexed_files_behind`, the indexed files a reindex would actually change, alongside `commits_behind`.
 - The MCP response envelope carries `index.files_behind` when indexed files differ from HEAD and `index.files_behind_bounded` when that count is a lower bound.
 - `assess_risk` `top_symbols` rows carry `shared: true` when same-named definitions in one file share a count, `bounded: true` when the per-file resolution cap, the 3 s `assess_risk_diff` / `assess_risk_batch` request budget, or a name whose own row count exceeds the row budget left a name-based upper bound.
+- `find_symbol`, `find_references`, and `find_similar` carry `target`: one candidate handle per definition, `ambiguous`, `candidates_total`, and `overloads`.
+- `find_symbol`, `impact_analysis`, `trace_call_path`, `export_context`, `feature_bundle`, and `find_similar` accept the shared target grammar: a `sym:` / `file:` / `dir:` / `chunk:` / `feat_` handle, an indexed path (with or without a leading `./`), `path:line`, a qualified or bare name, `route:METHOD path`, or `cmd:name`. `edit_check` accepts a `sym:` handle as `symbol_name`.
+- `codesage find-symbol --include-modules` returns module declarations.
 
 ### Changed
 
 - `project_overview.top_risk_files` skips test files unless `include_tests: true`, the `session_start` / `session_end` top-50 baseline always skips them, and `assess_risk` `top_symbols` skips test symbols; rows indexed before `0024_is_test` fall back to the test-path heuristic until reindexed.
 - `search` demotes test chunks from the stored `is_test` flag instead of re-matching path globs per query; rows indexed before `0024_is_test` keep the glob result.
 - MCP staleness annotation reads the handles rows already carry, and now also covers `edit_check`, `entry_path`, and reachable-test `via` paths.
+- `find_symbol` excludes module declarations (`mod x;`) unless `kind` is `module`/`namespace` or `--include-modules` is passed, adds `target` to its existing `{results}` envelope, and applies `kind` before judging ambiguity.
+- `impact_analysis`, `trace_call_path`, `export_context` on a symbol, `feature_bundle`, and `edit_check` return `E_AMBIGUOUS` with a `candidates` handle list and a retry remedy when a target names several definitions, replacing the prose refusal and the case that silently answered for all of them.
+- `impact_analysis` on a symbol or file target that names nothing returns `E_NOT_FOUND` with the nearest candidates instead of an empty result, and refuses `dir:`, `chunk:`, and `feat_` handles with `E_PARAM` naming the accepted target kinds; `trace_call_path` and the bundles name nearest candidates in their existing not-found reports.
+- CLI `impact`, `trace`, `export --symbol`, and `feature-bundle` print the candidate handles (or the structured error under `--json`) and exit nonzero on an ambiguous target.
 
 ### Deprecated
 

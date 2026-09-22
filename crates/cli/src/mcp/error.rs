@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+use codesage_graph::TargetError;
 use codesage_graph::edit_check::EditCheckRefusal;
 use codesage_protocol::work::{StopReason, WorkStopped};
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -90,6 +91,11 @@ pub(crate) enum Remedy {
     /// The failing tool again, with the original arguments and these
     /// overrides applied. Resolved against the request when rendered.
     Retry { overrides: Map<String, Value> },
+    /// The failing tool again, with whichever argument carried `input`
+    /// replaced by `value`. The tools spell the same target `target`, `name`,
+    /// `symbol_name`, `from`, `to`, and `feature_id`, and only the failing
+    /// input says which one was meant.
+    ReplaceInput { input: String, value: String },
 }
 
 impl Remedy {
@@ -130,6 +136,28 @@ impl Remedy {
             Self::Retry { overrides } => {
                 let mut merged = arguments.cloned().unwrap_or_default();
                 merged.extend(overrides);
+                json!({ "tool": tool, "arguments": Value::Object(merged) })
+            }
+            Self::ReplaceInput { input, value } => {
+                let mut merged = arguments.cloned().unwrap_or_default();
+                let mut replaced = false;
+                // The resolver reports the trimmed input; the argument that
+                // carried it may still have its padding.
+                let input = input.trim();
+                for argument in merged.values_mut() {
+                    if argument
+                        .as_str()
+                        .is_some_and(|carried| carried == input || carried.trim() == input)
+                    {
+                        *argument = json!(value);
+                        replaced = true;
+                    }
+                }
+                if !replaced {
+                    // No argument carried the input, so there is no call to
+                    // rewrite; the candidates block still names the handles.
+                    return Value::Null;
+                }
                 json!({ "tool": tool, "arguments": Value::Object(merged) })
             }
         }
@@ -230,15 +258,29 @@ pub(crate) fn classify(error: &anyhow::Error) -> Classified {
                 remedy: None,
             };
         }
-        if let Some(ambiguous) = cause.downcast_ref::<codesage_graph::AmbiguousSymbol>() {
-            return Classified {
-                code: ErrorCode::Ambiguous,
-                remedy: ambiguous.candidates.first().map(|candidate| {
-                    let mut overrides = Map::new();
-                    overrides.insert("target".to_owned(), json!(candidate));
-                    overrides.insert("is_file".to_owned(), json!(false));
-                    Remedy::Retry { overrides }
-                }),
+        if let Some(target) = cause.downcast_ref::<TargetError>() {
+            return match target {
+                TargetError::Ambiguous {
+                    input, candidates, ..
+                } => Classified {
+                    code: ErrorCode::Ambiguous,
+                    remedy: candidates.first().map(|candidate| Remedy::ReplaceInput {
+                        input: input.clone(),
+                        value: candidate.handle.clone(),
+                    }),
+                },
+                // Nearest candidates ride in the `candidates` block; none of
+                // them is a retry the agent should make blind.
+                TargetError::NotFound { .. } => Classified {
+                    code: ErrorCode::NotFound,
+                    remedy: None,
+                },
+                // The message names the kinds the tool takes; no index state
+                // would make the same call succeed.
+                TargetError::Unsupported { .. } => Classified {
+                    code: ErrorCode::Param,
+                    remedy: None,
+                },
             };
         }
         if cause.is::<codesage_graph::StaleSemanticTable>() {
@@ -360,13 +402,20 @@ pub(crate) fn render_error(
 ) -> CallToolResult {
     let Classified { code, remedy } = classify(error);
     let message = format!("{error:#}");
+    let mut failure = json!({
+        "code": code.as_str(),
+        "message": message,
+        "remedy": remedy.map_or(Value::Null, |remedy| remedy.resolve(tool, arguments)),
+    });
+    let candidates = target_candidates(error);
+    if !candidates.is_empty()
+        && let Some(failure) = failure.as_object_mut()
+    {
+        failure.insert("candidates".to_owned(), json!(candidates));
+    }
     let block = json!({
         "tool": tool,
-        "error": {
-            "code": code.as_str(),
-            "message": message,
-            "remedy": remedy.map_or(Value::Null, |remedy| remedy.resolve(tool, arguments)),
-        },
+        "error": failure,
         "status": code.status(),
         "complete": false,
         "next": null,
@@ -375,6 +424,24 @@ pub(crate) fn render_error(
         ContentBlock::text(message),
         ContentBlock::text(block.to_string()),
     ])
+}
+
+/// Handles for every entity an ambiguous target named, or the nearest
+/// candidates a missing one left behind. Empty for every other failure.
+fn target_candidates(error: &anyhow::Error) -> Vec<String> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TargetError>())
+        .map(TargetError::handles)
+        .or_else(|| {
+            error
+                .chain()
+                .find_map(|cause| match cause.downcast_ref::<EditCheckRefusal>() {
+                    Some(EditCheckRefusal::Ambiguous { handles, .. }) => Some(handles.clone()),
+                    _ => None,
+                })
+        })
+        .unwrap_or_default()
 }
 
 /// Render a failure that never became an `anyhow::Error`.
@@ -615,6 +682,7 @@ mod tests {
                 EditCheckRefusal::Ambiguous {
                     message: "found 2".into(),
                     lines: vec![3, 9],
+                    handles: vec!["sym:a.rs#f@3".into(), "sym:a.rs#f@9".into()],
                 },
                 ErrorCode::Ambiguous,
                 Some(Remedy::retry_with("line", json!(3))),
@@ -649,17 +717,37 @@ mod tests {
         assert_eq!(legacy_status(&anyhow::anyhow!("boom")), None);
     }
 
+    fn ambiguous_search() -> anyhow::Error {
+        anyhow::Error::new(TargetError::Ambiguous {
+            input: "search".into(),
+            candidates: vec![
+                candidate("sym:a.rs#search"),
+                candidate("sym:crates/b.rs#Server::search"),
+            ],
+            candidates_total: 3,
+            overloads: 0,
+        })
+    }
+
+    fn candidate(handle: &str) -> codesage_protocol::ResolvedTarget {
+        codesage_protocol::ResolvedTarget {
+            handle: handle.into(),
+            kind: "function".into(),
+            path: None,
+            line_start: None,
+            line_end: None,
+            is_test: false,
+            confidence: 0.9,
+            via: codesage_protocol::ResolveVia::Unique,
+        }
+    }
+
     #[test]
     fn render_resolves_retry_against_the_request_arguments() {
         let mut arguments = Map::new();
         arguments.insert("project".into(), json!("/p"));
         arguments.insert("target".into(), json!("search"));
-        let error = anyhow::Error::new(codesage_graph::AmbiguousSymbol {
-            name: "search".into(),
-            definitions: 3,
-            candidates: vec!["a::search".into(), "b::search".into()],
-        });
-        let result = render_error("impact_analysis", Some(&arguments), &error);
+        let result = render_error("impact_analysis", Some(&arguments), &ambiguous_search());
         assert_eq!(result.is_error, Some(true));
         assert!(result.structured_content.is_none());
         let block = block(&result);
@@ -671,12 +759,117 @@ mod tests {
         assert_eq!(
             block["error"]["remedy"],
             json!({"tool": "impact_analysis", "arguments": {
-                "project": "/p", "target": "a::search", "is_file": false
+                "project": "/p", "target": "sym:a.rs#search"
             }})
         );
+        assert_eq!(
+            block["error"]["candidates"],
+            json!(["sym:a.rs#search", "sym:crates/b.rs#Server::search"])
+        );
         let text = result.content[0].as_text().unwrap().text.clone();
-        assert!(text.contains("ambiguous symbol 'search'"), "{text}");
+        assert!(text.contains("ambiguous target 'search'"), "{text}");
         assert_eq!(block["error"]["message"], text);
+    }
+
+    #[test]
+    fn the_retried_argument_is_the_one_that_carried_the_ambiguous_input() {
+        let mut arguments = Map::new();
+        arguments.insert("project".into(), json!("/p"));
+        arguments.insert("from".into(), json!("main"));
+        arguments.insert("to".into(), json!("search"));
+        let block = block(&render_error(
+            "trace_call_path",
+            Some(&arguments),
+            &ambiguous_search(),
+        ));
+        assert_eq!(
+            block["error"]["remedy"],
+            json!({"tool": "trace_call_path", "arguments": {
+                "project": "/p", "from": "main", "to": "sym:a.rs#search"
+            }}),
+            "only the endpoint that was ambiguous may be rewritten"
+        );
+    }
+
+    #[test]
+    fn a_padded_argument_is_still_the_one_that_gets_replaced() {
+        let mut arguments = Map::new();
+        arguments.insert("project".into(), json!("/p"));
+        arguments.insert("target".into(), json!("  search\n"));
+        let block = block(&render_error(
+            "impact_analysis",
+            Some(&arguments),
+            &ambiguous_search(),
+        ));
+        assert_eq!(
+            block["error"]["remedy"]["arguments"],
+            json!({ "project": "/p", "target": "sym:a.rs#search" }),
+            "the resolver trims; the argument must still be matched"
+        );
+    }
+
+    #[test]
+    fn no_argument_carrying_the_input_means_no_remedy() {
+        let mut arguments = Map::new();
+        arguments.insert("project".into(), json!("/p"));
+        arguments.insert("symbol".into(), json!("other"));
+        let block = block(&render_error(
+            "export_context",
+            Some(&arguments),
+            &ambiguous_search(),
+        ));
+        assert_eq!(block["error"]["code"], "E_AMBIGUOUS");
+        assert_eq!(
+            block["error"]["remedy"],
+            Value::Null,
+            "a `target` argument no tool but impact_analysis accepts must not be invented"
+        );
+        assert_eq!(
+            block["error"]["candidates"],
+            json!(["sym:a.rs#search", "sym:crates/b.rs#Server::search"])
+        );
+    }
+
+    #[test]
+    fn an_unsupported_target_kind_is_a_parameter_error_without_candidates() {
+        let error = anyhow::Error::new(TargetError::Unsupported {
+            input: "dir:src".into(),
+            kind: codesage_protocol::TargetKind::Dir,
+            accepted: "a `sym:` or `file:` handle",
+        })
+        .context("analyzing impact");
+        let classified = classify(&error);
+        assert_eq!(classified.code, ErrorCode::Param);
+        assert_eq!(classified.remedy, None);
+        let block = block(&render_error("impact_analysis", None, &error));
+        assert_eq!(block["error"]["code"], "E_PARAM");
+        assert_eq!(block["error"]["remedy"], Value::Null);
+        assert!(block["error"].get("candidates").is_none(), "{block:?}");
+        let message = block["error"]["message"].as_str().unwrap();
+        assert!(message.contains("dir:src"), "{message}");
+        assert!(message.contains("`sym:` or `file:`"), "{message}");
+    }
+
+    #[test]
+    fn a_missing_target_carries_its_nearest_candidates_without_a_blind_retry() {
+        let error = anyhow::Error::new(TargetError::NotFound {
+            input: "serch".into(),
+            nearest: vec![candidate("sym:a.rs#search")],
+        })
+        .context("analyzing impact");
+        let classified = classify(&error);
+        assert_eq!(classified.code, ErrorCode::NotFound);
+        assert_eq!(classified.remedy, None);
+        let block = block(&render_error("impact_analysis", None, &error));
+        assert_eq!(block["error"]["code"], "E_NOT_FOUND");
+        assert_eq!(block["error"]["remedy"], Value::Null);
+        assert_eq!(block["error"]["candidates"], json!(["sym:a.rs#search"]));
+    }
+
+    #[test]
+    fn an_ordinary_failure_carries_no_candidates_block() {
+        let block = block(&render_error("find_symbol", None, &anyhow::anyhow!("boom")));
+        assert!(block["error"].get("candidates").is_none(), "{block:?}");
     }
 
     #[test]

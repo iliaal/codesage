@@ -3,8 +3,8 @@
 
 use anyhow::Result;
 use codesage_graph::{
-    export_context, export_context_for_symbol, find_references, find_similar, find_symbol,
-    impact_analysis_report, list_dependencies, search_page,
+    FindSymbolOptions, TargetError, export_context, export_context_for_symbol, find_references,
+    find_similar, find_symbol_with_options, impact_analysis_report, list_dependencies, search_page,
 };
 use codesage_protocol::{
     ContextBundle, ExportRequest, FileCategory, FindReferencesRequest, FindSymbolRequest,
@@ -15,7 +15,39 @@ use crate::{
     find_project_root, load_symbol_context_db, open_db, open_db_read_only, with_query_stack,
 };
 
-pub(crate) fn cmd_find_symbol(name: &str, kind_str: Option<&str>, json: bool) -> Result<()> {
+/// Report a target that named several entities or none, in the shape the
+/// caller asked for: candidate handles one per line, or the same structured
+/// error the MCP contract emits under `--json`. The error is returned
+/// unchanged, so the command still exits nonzero.
+pub(crate) fn report_target_error(error: anyhow::Error, json: bool) -> anyhow::Error {
+    let Some(target) = error.downcast_ref::<TargetError>() else {
+        return error;
+    };
+    if json {
+        let block = serde_json::json!({
+            "error": {
+                "code": target.code(),
+                "message": target.to_string(),
+                "candidates": target.handles(),
+            },
+        });
+        if let Ok(text) = serde_json::to_string_pretty(&block) {
+            println!("{text}");
+        }
+    } else {
+        for handle in target.handles() {
+            println!("{handle}");
+        }
+    }
+    error
+}
+
+pub(crate) fn cmd_find_symbol(
+    name: &str,
+    kind_str: Option<&str>,
+    include_modules: bool,
+    json: bool,
+) -> Result<()> {
     let root = find_project_root()?;
     let db = open_db(&root)?;
 
@@ -24,28 +56,47 @@ pub(crate) fn cmd_find_symbol(name: &str, kind_str: Option<&str>, json: bool) ->
             SymbolKind::parse(kind).ok_or_else(|| anyhow::anyhow!("unknown symbol kind: {kind}"))
         })
         .transpose()?;
-    let results = find_symbol(
+    let found = find_symbol_with_options(
         &db,
         &FindSymbolRequest {
             name: name.to_string(),
             kind,
         },
+        &FindSymbolOptions { include_modules },
     )?;
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&codesage_protocol::FindSymbolResults { results })?
-        );
-    } else if results.is_empty() {
+        println!("{}", serde_json::to_string_pretty(&found)?);
+        return Ok(());
+    }
+    if found.results.is_empty() {
         println!("No symbols found for '{name}'");
-    } else {
-        for s in &results {
-            println!(
-                "{} {} -- {}:{}",
-                s.kind, s.qualified_name, s.file_path, s.line_start
-            );
+        // Only a guessed resolution holds leads; an exact non-symbol match
+        // (a file path, say) is not a near miss.
+        for handle in found
+            .target
+            .iter()
+            .filter(|t| t.guessed())
+            .flat_map(|t| t.handles())
+        {
+            println!("  nearest: {handle}");
         }
+        return Ok(());
+    }
+    for s in &found.results {
+        println!(
+            "{} {} -- {}:{}",
+            s.kind, s.qualified_name, s.file_path, s.line_start
+        );
+    }
+    if let Some(target) = &found.target
+        && target.ambiguous
+    {
+        println!(
+            "{} definitions share '{name}'; name one with its handle: {}",
+            target.candidates_total,
+            target.handles().join(", ")
+        );
     }
     Ok(())
 }
@@ -209,17 +260,14 @@ pub(crate) fn cmd_similar(symbol: &str, min_jaccard: f32, limit: usize, json: bo
     let root = find_project_root()?;
     let db = open_db(&root)?;
     let min_jaccard = normalize_min_jaccard(min_jaccard);
-    let hits = find_similar(&db, symbol, min_jaccard, limit)?;
+    let found = find_similar(&db, symbol, min_jaccard, limit)?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&codesage_protocol::FindSimilarResults { results: hits })?
-        );
-    } else if hits.is_empty() {
+        println!("{}", serde_json::to_string_pretty(&found)?);
+    } else if found.results.is_empty() {
         println!("No clones of '{symbol}' at Jaccard >= {min_jaccard:.2}");
     } else {
         println!("Clones of '{symbol}' (Jaccard >= {min_jaccard:.2}):");
-        for h in &hits {
+        for h in &found.results {
             println!(
                 "  {:.3}  {}:{}-{}  {}()",
                 h.jaccard, h.file_path, h.line_start, h.line_end, h.name
@@ -239,7 +287,8 @@ pub(crate) fn cmd_trace(from: &str, to: &str, max_depth: usize, json: bool) -> R
             to: to.to_string(),
             max_depth,
         },
-    )?;
+    )
+    .map_err(|e| report_target_error(e, json))?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -422,7 +471,8 @@ pub(crate) fn cmd_impact(
         summary_only,
     };
 
-    let report = impact_analysis_report(&db, &req, &opts)?;
+    let report =
+        impact_analysis_report(&db, &req, &opts).map_err(|e| report_target_error(e, json))?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -513,9 +563,15 @@ pub(crate) fn cmd_export(
     let root = find_project_root()?;
     let req = ExportRequest::from_target(target.to_string(), is_symbol, limit, callers, callees);
 
-    let bundle = if is_symbol {
+    // `export_format` folded `--json` into the format, so the bundle and any
+    // target refusal are reported on the same channel.
+    let json = format == "json";
+    // Branch on the resolved request, not the flag: a `sym:` handle is a
+    // symbol anchor whether or not `--symbol` was passed, and taking that
+    // path skips loading an embedder. Matches the MCP tool.
+    let bundle = if let Some(symbol) = req.symbol.clone() {
         let db = load_symbol_context_db(&root)?;
-        export_context_for_symbol(&db, target, &req)?
+        export_context_for_symbol(&db, &symbol, &req).map_err(|e| report_target_error(e, json))?
     } else {
         with_query_stack(&root, |db, embedder, reranker| {
             let query_embedding = embedder.embed_one(req.query.as_deref().unwrap_or_default())?;
@@ -529,7 +585,7 @@ pub(crate) fn cmd_export(
 
     match format {
         "json" => println!("{}", serde_json::to_string_pretty(&bundle)?),
-        "ingest" => print_bundle_ingest(&bundle, target, is_symbol),
+        "ingest" => print_bundle_ingest(&bundle, target, req.symbol.is_some()),
         _ => print_bundle_markdown(&bundle),
     }
     Ok(())

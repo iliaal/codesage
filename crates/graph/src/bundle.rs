@@ -4,11 +4,12 @@ use std::sync::{Arc, OnceLock};
 use anyhow::Result;
 use codesage_protocol::{
     ContextBundle, ExportRequest, ReferenceKind, SearchRequest, SearchResult, Symbol,
-    SymbolSummary, Visibility,
+    SymbolSummary, TargetKind, TargetResolution, Visibility,
 };
 use codesage_storage::Database;
 
 use crate::impact::{WalkCache, is_qualified_symbol_name};
+use crate::resolver::{ResolveOptions, TargetError, matched_symbols, resolve_symbols};
 use crate::search::{RerankFn, annotate_with_symbols, env_default_on, parse_db_language, search};
 
 /// Default-on; opt-out via `CODESAGE_BUNDLE_LINE_NUMBERS=0` (or "false").
@@ -161,6 +162,21 @@ pub fn export_context(
     }))
 }
 
+/// `"<what>: <input> (not found)"`, naming the resolver's nearest candidates
+/// when it found leads, so a renamed target says what it probably became.
+fn not_found_description(what: &str, resolution: &TargetResolution) -> String {
+    let nearest = resolution.handles();
+    if nearest.is_empty() {
+        format!("{what}: {} (not found)", resolution.input)
+    } else {
+        format!(
+            "{what}: {} (not found; nearest: {})",
+            resolution.input,
+            nearest.join(", ")
+        )
+    }
+}
+
 fn find_definition_for_summary(
     db: &Database,
     summary: &SymbolSummary,
@@ -179,17 +195,28 @@ fn find_definition_for_summary(
     Ok(candidates.into_iter().next())
 }
 
+/// A curated bundle around one named symbol.
+///
+/// `sym_name` accepts the whole target grammar (see [`crate::resolver`]): a
+/// `sym:` handle or `path:line` names one definition outright. A name several
+/// definitions share is [`TargetError::Ambiguous`] — a bundle welded from all
+/// of them would answer no question — and one that names nothing keeps the
+/// `found: false` bundle, naming the resolver's nearest candidates.
 pub fn export_context_for_symbol(
     db: &Database,
     sym_name: &str,
     req: &ExportRequest,
 ) -> Result<ContextBundle> {
-    let defs = db.find_symbols(sym_name, None)?;
+    let (resolution, symbols) = resolve_symbols(db, sym_name, ResolveOptions::symbol())?;
+    if let Some(error @ TargetError::Ambiguous { .. }) = TargetError::of(&resolution) {
+        return Err(error.into());
+    }
+    let defs = matched_symbols(&resolution, symbols);
     if defs.is_empty() {
         return Ok(ContextBundle {
             bounded: false,
             found: false,
-            target_description: format!("symbol: {sym_name} (not found)"),
+            target_description: not_found_description("symbol", &resolution),
             primary: Vec::new(),
             related: Vec::new(),
             symbol_definitions: Vec::new(),
@@ -261,13 +288,29 @@ pub fn feature_bundle(
     use codesage_protocol::FeatureFileRole;
     let limit = if limit == 0 { 5 } else { limit };
 
-    let feature = match db.load_feature(feature_id)? {
+    let resolution = crate::resolver::resolve_target(
+        db,
+        feature_id,
+        ResolveOptions {
+            kind_hint: Some(TargetKind::Feature),
+            ..ResolveOptions::default()
+        },
+    )?;
+    if let Some(error @ TargetError::Ambiguous { .. }) = TargetError::of(&resolution) {
+        return Err(error.into());
+    }
+    let feature = match resolution
+        .sole()
+        .map(|candidate| db.load_feature(&candidate.handle))
+        .transpose()?
+        .flatten()
+    {
         Some(f) => f,
         None => {
             return Ok(ContextBundle {
                 bounded: false,
                 found: false,
-                target_description: format!("feature: {feature_id} (not found)"),
+                target_description: not_found_description("feature", &resolution),
                 primary: Vec::new(),
                 related: Vec::new(),
                 symbol_definitions: Vec::new(),

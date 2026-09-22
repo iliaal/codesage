@@ -41,6 +41,7 @@ fn symbols(db: &Database, name: &str) -> Vec<codesage_protocol::Symbol> {
         },
     )
     .unwrap()
+    .results
 }
 
 #[test]

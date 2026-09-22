@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod handle;
 pub mod stat_cache;
+pub mod target;
 pub mod work;
 
 pub use handle::Handle;
+pub use target::{CONFIDENT, ResolveVia, ResolvedTarget, TargetKind, TargetResolution};
 
 pub const DEFAULT_EMBEDDING_DIM: usize = 384;
 
@@ -939,7 +941,23 @@ impl ImpactTarget {
     /// in Python/Go/JS, so a bare `.` is not enough to classify a target as a file.
     /// Callers with a CLI-style bool flag should pass `Some(true)` only when the user set it,
     /// else `None` (so an unset-false doesn't force a Symbol classification).
+    /// A handle names its own kind, so it outranks both the flag and the
+    /// heuristic: `sym:crates/g/src/a.rs#f` carries slashes and would read as
+    /// a path. `file:` unwraps to the path the resolver takes as written.
+    /// `dir:`, `chunk:`, and `feat_` stay verbatim so the resolver reads
+    /// their kind and the tool refuses them as a parameter error; unwrapping
+    /// a directory to its path would turn that refusal into a not-found on a
+    /// path that was never a file.
     pub fn from_hint(target: String, is_file: Option<bool>) -> Self {
+        if let Some(handle) = Handle::parse(&target) {
+            return match handle {
+                Handle::Symbol { .. } | Handle::Feature { .. } => {
+                    ImpactTarget::Symbol { name: target }
+                }
+                Handle::File { path } => ImpactTarget::File { path },
+                Handle::Dir { .. } | Handle::Chunk { .. } => ImpactTarget::File { path: target },
+            };
+        }
         let looks_like_file = is_file.unwrap_or_else(|| looks_like_file_target(&target));
         if looks_like_file {
             ImpactTarget::File { path: target }
@@ -1044,6 +1062,9 @@ impl ExportRequest {
         include_callers: bool,
         include_callees: bool,
     ) -> Self {
+        // A `sym:` handle names a definition outright; embedding it as a
+        // search query would answer a question nobody asked.
+        let is_symbol = is_symbol || matches!(Handle::parse(&target), Some(Handle::Symbol { .. }));
         if is_symbol {
             Self {
                 query: None,
@@ -2172,6 +2193,13 @@ pub struct FeatureMapStats {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindSymbolResults {
     pub results: Vec<Symbol>,
+    /// What the queried name resolved to: one candidate handle per indexed
+    /// definition, `ambiguous` when several carry the name, `candidates_total`
+    /// before the candidate cap, and `overloads` when some share one file and
+    /// qualified name. Module declarations (`mod x;`) are excluded from
+    /// `results` and from these candidates unless they were asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetResolution>,
 }
 
 /// `{"results": [...]}` envelope around `Vec<Reference>`. See [`FindSymbolResults`].
@@ -2204,6 +2232,12 @@ pub struct FindReferencesResults {
     /// "resolves to nothing".
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub to_resolution: Option<ToResolution>,
+    /// The same ambiguity `ambiguous` and `note` describe, in the shape every
+    /// tool now uses: one handle per definition, so a caller can split the
+    /// union itself. `ambiguous`, `definition_count`, and `note` remain for
+    /// this release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetResolution>,
 }
 
 /// Why some `find_references` rows lack `to`.
@@ -2250,6 +2284,10 @@ pub struct SearchResults {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindSimilarResults {
     pub results: Vec<SimilarSymbol>,
+    /// The definitions the queried name reached. Rows are their union, so
+    /// `ambiguous` says whether a clone belongs to the definition you meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetResolution>,
 }
 
 /// `{"results": [...]}` envelope around `Vec<ImpactEntry>`. See [`FindSymbolResults`].
@@ -2993,6 +3031,39 @@ mod tests {
         let json = serde_json::to_string(&file).unwrap();
         assert!(json.contains("\"type\":\"file\""));
         assert!(json.contains("\"path\":\"src/a.rs\""));
+    }
+
+    #[test]
+    fn a_handle_outranks_the_file_heuristic_and_the_flag() {
+        match ImpactTarget::from_hint("sym:src/a.rs#run".into(), None) {
+            ImpactTarget::Symbol { name } => assert_eq!(name, "sym:src/a.rs#run"),
+            other => panic!("a symbol handle carries slashes but names a symbol: {other:?}"),
+        }
+        match ImpactTarget::from_hint("sym:src/a.rs#run".into(), Some(true)) {
+            ImpactTarget::Symbol { name } => assert_eq!(name, "sym:src/a.rs#run"),
+            other => panic!("the handle outranks an explicit file flag: {other:?}"),
+        }
+        match ImpactTarget::from_hint("file:src/a.rs".into(), None) {
+            ImpactTarget::File { path } => assert_eq!(path, "src/a.rs", "the handle is unwrapped"),
+            other => panic!("a file handle names a file: {other:?}"),
+        }
+        for kept in ["dir:src", "chunk:src/a.rs:1-9"] {
+            match ImpactTarget::from_hint(kept.into(), Some(true)) {
+                ImpactTarget::File { path } => assert_eq!(
+                    path, kept,
+                    "a handle the walk cannot seed from is kept for the resolver to refuse"
+                ),
+                other => panic!("{kept}: {other:?}"),
+            }
+        }
+        match ImpactTarget::from_hint("feat_0123456789abcdef".into(), Some(true)) {
+            ImpactTarget::Symbol { name } => assert_eq!(name, "feat_0123456789abcdef"),
+            other => panic!("a feature handle is kept verbatim: {other:?}"),
+        }
+
+        let bundle = ExportRequest::from_target("sym:src/a.rs#run".into(), false, 5, false, false);
+        assert_eq!(bundle.symbol.as_deref(), Some("sym:src/a.rs#run"));
+        assert_eq!(bundle.query, None, "a handle is never a search query");
     }
 
     #[test]

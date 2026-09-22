@@ -261,5 +261,11 @@ fn rust_pub_items_and_trait_impl_methods_resolve_cross_file() {
         dependents(&db, "Store::flush"),
         BTreeSet::from(["src/api.rs".to_string()])
     );
-    assert!(path_found(&db, "flush_all", "flush"));
+    // `flush` names the trait signature and the impl method; the impl is the
+    // one the call in `api.rs` reaches.
+    assert!(path_found(
+        &db,
+        "flush_all",
+        "sym:src/store.rs#Store::flush"
+    ));
 }

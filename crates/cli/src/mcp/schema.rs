@@ -107,8 +107,10 @@ fn merge_meta_property(schema: &mut serde_json::Map<String, serde_json::Value>) 
     if let serde_json::Value::Object(props) = props {
         props.insert("_meta".to_string(), meta_property_schema());
         props.insert("next".to_string(), super::next::schema());
+        // A tool that declares its own `target` (the union tools carry the full
+        // `TargetResolution`) keeps it; the envelope stub is for the rest.
         for (name, fragment) in super::envelope::schema_properties() {
-            props.insert(name.to_string(), fragment);
+            props.entry(name.to_string()).or_insert(fragment);
         }
     }
 }
@@ -272,6 +274,49 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    /// The union tools declare the full `TargetResolution`; the envelope's
+    /// `{ambiguous, candidates_total}` stub must not replace it.
+    #[test]
+    fn union_tools_keep_their_own_target_schema() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        for name in ["find_symbol", "find_references", "find_similar"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("tool `{name}` missing"));
+            let out = serde_json::Value::Object((**tool.output_schema.as_ref().unwrap()).clone());
+            let target = &out["properties"]["target"];
+            assert!(
+                target.get("description").is_some(),
+                "`{name}` target lacks a description: {target}"
+            );
+            let mut fragments = vec![target];
+            if let Some(any_of) = target.get("anyOf").and_then(|v| v.as_array()) {
+                fragments.extend(any_of.iter());
+            }
+            let declares_resolved = fragments.iter().any(|fragment| {
+                let resolved = resolve(&out, fragment);
+                resolved
+                    .get("properties")
+                    .is_some_and(|p| p.get("resolved").is_some() && p.get("input").is_some())
+            });
+            assert!(
+                declares_resolved,
+                "`{name}` outputSchema `target` must be the full TargetResolution: {target}"
+            );
+        }
+        let overview = tools.iter().find(|t| t.name == "project_overview").unwrap();
+        let out = serde_json::Value::Object((**overview.output_schema.as_ref().unwrap()).clone());
+        let stub = &out["properties"]["target"];
+        assert!(stub.is_object(), "project_overview lacks the envelope stub");
+        assert!(
+            stub["properties"].get("resolved").is_none(),
+            "tools without their own target keep the envelope stub: {stub}"
+        );
     }
 
     #[test]

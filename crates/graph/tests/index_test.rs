@@ -50,7 +50,8 @@ fn find_symbol_by_name() {
             kind: None,
         },
     )
-    .unwrap();
+    .unwrap()
+    .results;
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].kind, SymbolKind::Class);
@@ -69,7 +70,8 @@ fn find_symbol_with_kind_filter() {
             kind: Some(SymbolKind::Function),
         },
     )
-    .unwrap();
+    .unwrap()
+    .results;
 
     assert_eq!(funcs.len(), 1);
     assert_eq!(funcs[0].file_path, "util.c");
@@ -110,7 +112,8 @@ fn incremental_reindexes_changed_file() {
             kind: None,
         },
     )
-    .unwrap();
+    .unwrap()
+    .results;
     assert_eq!(results.len(), 1);
 
     let old = find_symbol(
@@ -120,7 +123,8 @@ fn incremental_reindexes_changed_file() {
             kind: None,
         },
     )
-    .unwrap();
+    .unwrap()
+    .results;
     assert!(old.is_empty());
 }
 
@@ -143,7 +147,8 @@ fn incremental_removes_deleted_files() {
             kind: None,
         },
     )
-    .unwrap();
+    .unwrap()
+    .results;
     assert!(results.is_empty());
 }
 
@@ -170,7 +175,8 @@ fn full_index_keeps_a_file_whose_parse_recovered_from_unknown_macros() {
             kind: None,
         },
     )
-    .unwrap();
+    .unwrap()
+    .results;
     assert_eq!(results.len(), 1, "{results:?}");
     assert_eq!(results[0].file_path, "ext.c");
 }

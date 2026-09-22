@@ -77,6 +77,7 @@ fn seed_similar(root: &Path, db: &Database) {
 fn similar_names(db: &Database) -> Vec<String> {
     find_similar(db, "alpha", 1.0, 10)
         .unwrap()
+        .results
         .into_iter()
         .map(|hit| hit.name)
         .collect()

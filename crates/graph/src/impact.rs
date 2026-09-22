@@ -6,7 +6,7 @@ use anyhow::Result;
 use codesage_protocol::{
     CategoryCount, DistanceCount, FileCategory, Handle, ImpactEntry, ImpactOptions, ImpactReason,
     ImpactReport, ImpactRequest, ImpactSummary, ImpactTarget, Reference, ReferenceKind,
-    SiblingSymbol, Symbol,
+    SiblingSymbol, Symbol, TargetKind, TargetResolution,
 };
 use codesage_storage::Database;
 
@@ -14,6 +14,7 @@ use crate::bundle::{
     import_ref_targets_file_with_modules, import_refs_for_file, resolve_callee_definitions,
     resolve_callee_definitions_with_modules,
 };
+use crate::resolver::{ResolveOptions, TargetError, matched_symbols, resolve_symbols};
 
 pub(crate) fn is_qualified_symbol_name(name: &str) -> bool {
     name.contains('\\') || name.contains('.') || name.contains("::")
@@ -22,32 +23,53 @@ pub(crate) fn is_qualified_symbol_name(name: &str) -> bool {
 /// Bound per-level fan-out; capped walks report counts as lower bounds.
 pub(crate) const MAX_FRONTIER: usize = 512;
 
-/// An unqualified symbol target that names several distinct definitions.
-/// Typed so callers can offer the first candidate as a machine-usable retry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AmbiguousSymbol {
-    pub name: String,
-    pub definitions: usize,
-    /// Sorted, deduplicated qualified names; always at least two.
-    pub candidates: Vec<String>,
+/// What an impact target names, plus the definitions behind it.
+///
+/// `nearest` buys case- and suffix-matched leads for a miss at the cost of a
+/// full path scan, so only the user-facing entry points ask for it: the
+/// internal reachability walks resolve unindexed paths constantly and read a
+/// miss as "no seeds", not as an error.
+fn resolve_impact_target(
+    db: &Database,
+    target: &ImpactTarget,
+    nearest: bool,
+) -> Result<(TargetResolution, Vec<Symbol>)> {
+    let (input, opts) = match target {
+        ImpactTarget::Symbol { name } => (name.as_str(), ResolveOptions::symbol()),
+        ImpactTarget::File { path } => (path.as_str(), ResolveOptions::file()),
+    };
+    resolve_symbols(db, input, opts.with_nearest(nearest))
 }
 
-impl std::fmt::Display for AmbiguousSymbol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ambiguous symbol '{}': {} definitions — qualify with one of: {}, \
-             or target a single file instead",
-            self.name,
-            self.definitions,
-            self.candidates.join(", ")
-        )
+/// The target kinds an impact walk has an answer for, for the refusal text.
+const ACCEPTED_IMPACT_TARGETS: &str =
+    "a `sym:` or `file:` handle, an indexed path, a qualified name, or a bare name";
+
+/// Refuse a user-facing impact call whose target names several entities,
+/// none, or a kind the walk cannot seed from (`dir:`, `chunk:`, `feat_`),
+/// before the walk spends anything on it.
+fn require_impact_target(
+    db: &Database,
+    target: &ImpactTarget,
+) -> Result<(TargetResolution, Vec<Symbol>)> {
+    let (resolution, candidates) = resolve_impact_target(db, target, true)?;
+    if !matches!(
+        resolution.kind,
+        TargetKind::Symbol | TargetKind::File | TargetKind::Text
+    ) {
+        return Err(TargetError::Unsupported {
+            input: resolution.input,
+            kind: resolution.kind,
+            accepted: ACCEPTED_IMPACT_TARGETS,
+        }
+        .into());
     }
+    crate::resolver::require_one(&resolution)?;
+    Ok((resolution, candidates))
 }
-
-impl std::error::Error for AmbiguousSymbol {}
 
 pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactEntry>> {
+    require_impact_target(db, &req.target)?;
     Ok(impact_analysis_walk(db, req, MAX_FRONTIER)?.0)
 }
 
@@ -383,33 +405,19 @@ pub(crate) fn impact_analysis_walk_shared(
             seed_count: 0,
         });
     }
-    let seed_symbols: Vec<Symbol> = match &req.target {
-        ImpactTarget::Symbol { name } => {
-            let syms = db.find_symbols(name, None)?;
-            if !is_qualified_symbol_name(name) && syms.len() > 1 {
-                // Identical qualified names cannot disambiguate definitions;
-                // retain their union instead of suggesting an unusable name.
-                let mut candidates: Vec<String> =
-                    syms.iter().map(|s| s.qualified_name.clone()).collect();
-                candidates.sort();
-                candidates.dedup();
-                if candidates.len() > 1 {
-                    return Err(AmbiguousSymbol {
-                        name: name.clone(),
-                        definitions: syms.len(),
-                        candidates,
-                    }
-                    .into());
-                }
-            }
-            syms
-        }
-        ImpactTarget::File { path } => db.symbols_for_file(path)?,
-    };
-
-    let mut file_frontier = match &req.target {
-        ImpactTarget::File { path } if db.file_id_for_path(path)?.is_some() => vec![path.clone()],
-        _ => Vec::new(),
+    // One resolution decides both seeds and origin: a union across several
+    // definitions would answer a question nobody asked, so an ambiguous
+    // target refuses with their handles instead.
+    let (resolution, candidates) = resolve_impact_target(db, &req.target, false)?;
+    if let Some(error @ TargetError::Ambiguous { .. }) = TargetError::of(&resolution) {
+        return Err(error.into());
+    }
+    let (seed_symbols, mut file_frontier): (Vec<Symbol>, Vec<String>) = match resolution.kind {
+        TargetKind::Symbol => (matched_symbols(&resolution, candidates), Vec::new()),
+        _ => match resolution.sole().and_then(|c| c.path.clone()) {
+            Some(path) => (db.symbols_for_file(&path)?, vec![path]),
+            None => (Vec::new(), Vec::new()),
+        },
     };
     if seed_symbols.is_empty() && file_frontier.is_empty() {
         return Ok(WalkOutcome {
@@ -432,13 +440,10 @@ pub(crate) fn impact_analysis_walk_shared(
     } else {
         Arc::new(crate::rust_modules::RustModules::default())
     };
-    let origin_files: HashSet<String> = match &req.target {
-        ImpactTarget::File { path } => {
-            let mut s = HashSet::new();
-            s.insert(path.clone());
-            s
-        }
-        ImpactTarget::Symbol { .. } => seed_symbols.iter().map(|s| s.file_path.clone()).collect(),
+    let origin_files: HashSet<String> = if file_frontier.is_empty() {
+        seed_symbols.iter().map(|s| s.file_path.clone()).collect()
+    } else {
+        file_frontier.iter().cloned().collect()
     };
 
     // Per dependent file: shortest distance, the first 10 distinct reasons
@@ -770,6 +775,7 @@ pub fn impact_analysis_report(
     req: &ImpactRequest,
     opts: &ImpactOptions,
 ) -> Result<ImpactReport> {
+    let (resolution, candidates) = require_impact_target(db, &req.target)?;
     let (mut entries, bounded) = impact_analysis_walk(db, req, MAX_FRONTIER)?;
 
     // Summary reflects the full result set, before any limit truncation.
@@ -796,7 +802,7 @@ pub fn impact_analysis_report(
     let mut forward_dependencies = Vec::new();
     let mut sibling_symbols = Vec::new();
     if opts.include_forward || opts.include_siblings {
-        let target_files = impact_target_files(db, &req.target)?;
+        let (target_files, target_name) = impact_target_files(&resolution, candidates);
         if opts.include_forward {
             let mut fwd: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for f in &target_files {
@@ -815,7 +821,7 @@ pub fn impact_analysis_report(
             forward_dependencies = fwd.into_iter().collect();
         }
         if opts.include_siblings {
-            sibling_symbols = collect_sibling_symbols(db, &req.target, &target_files)?;
+            sibling_symbols = collect_sibling_symbols(db, target_name.as_deref(), &target_files)?;
         }
     }
 
@@ -830,20 +836,25 @@ pub fn impact_analysis_report(
     })
 }
 
-fn impact_target_files(db: &Database, target: &ImpactTarget) -> Result<Vec<String>> {
-    match target {
-        ImpactTarget::File { path } => Ok(vec![path.clone()]),
-        ImpactTarget::Symbol { name } => {
-            let mut files: Vec<String> = db
-                .find_symbols(name, None)?
-                .iter()
-                .map(|s| s.file_path.clone())
-                .collect();
-            files.sort();
-            files.dedup();
-            Ok(files)
-        }
+/// The files a resolved target lives in, and the bare name to exclude from
+/// its siblings (`None` for a file target).
+fn impact_target_files(
+    resolution: &TargetResolution,
+    symbols: Vec<Symbol>,
+) -> (Vec<String>, Option<String>) {
+    if resolution.kind != TargetKind::Symbol {
+        let files = resolution
+            .sole()
+            .and_then(|c| c.path.clone())
+            .into_iter()
+            .collect();
+        return (files, None);
     }
+    let symbols = matched_symbols(resolution, symbols);
+    let mut files: Vec<String> = symbols.iter().map(|s| s.file_path.clone()).collect();
+    files.sort();
+    files.dedup();
+    (files, symbols.first().map(|s| s.name.clone()))
 }
 
 /// Symbols defined in the target's file(s), excluding the target symbol itself.
@@ -851,13 +862,9 @@ fn impact_target_files(db: &Database, target: &ImpactTarget) -> Result<Vec<Strin
 /// list is capped at [`SIBLING_SYMBOL_CAP`].
 fn collect_sibling_symbols(
     db: &Database,
-    target: &ImpactTarget,
+    target_name: Option<&str>,
     target_files: &[String],
 ) -> Result<Vec<SiblingSymbol>> {
-    let target_name = match target {
-        ImpactTarget::Symbol { name } => Some(name.as_str()),
-        ImpactTarget::File { .. } => None,
-    };
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut out: Vec<SiblingSymbol> = Vec::new();
     for f in target_files {

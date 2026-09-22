@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use codesage_protocol::{
-    DependencyEntry, FindReferencesRequest, FindReferencesResults, FindSymbolRequest, Reference,
-    ReferenceKind, Symbol, SymbolKind, ToResolution,
+    DependencyEntry, FindReferencesRequest, FindReferencesResults, FindSymbolRequest,
+    FindSymbolResults, Reference, ReferenceKind, Symbol, SymbolKind, ToResolution,
 };
 use codesage_storage::Database;
 
@@ -14,9 +14,52 @@ use crate::bundle::{
     import_refs_for_file, resolve_callee_definitions_with_modules,
 };
 use crate::impact::is_qualified_symbol_name;
+use crate::resolver::{ResolveOptions, matched_symbols, resolve_symbols, retain_definitions};
 
-pub fn find_symbol(db: &Database, req: &FindSymbolRequest) -> Result<Vec<Symbol>> {
-    db.find_symbols(&req.name, req.kind)
+/// Opt-in widenings for [`find_symbol_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct FindSymbolOptions {
+    /// Keep module declarations (`mod x;`). Off by default: a declaration is
+    /// not the definition a name lookup is after. Asking for
+    /// [`SymbolKind::Module`] or [`SymbolKind::Namespace`] keeps them too.
+    pub include_modules: bool,
+}
+
+/// Definitions named by `req.name`, plus the resolution that found them.
+///
+/// `req.name` accepts the whole target grammar (see [`crate::resolver`]), so
+/// a `sym:` handle or `path:line` names one definition outright. The returned
+/// `target` carries every candidate's handle, `ambiguous`, and
+/// `candidates_total`; when the resolver could only guess (a case- or
+/// suffix-matched near miss) `results` stays empty and the guesses appear in
+/// `target` as leads.
+pub fn find_symbol(db: &Database, req: &FindSymbolRequest) -> Result<FindSymbolResults> {
+    find_symbol_with_options(db, req, &FindSymbolOptions::default())
+}
+
+/// [`find_symbol`] with module declarations included on request.
+pub fn find_symbol_with_options(
+    db: &Database,
+    req: &FindSymbolRequest,
+    opts: &FindSymbolOptions,
+) -> Result<FindSymbolResults> {
+    let include_modules = opts.include_modules
+        || matches!(req.kind, Some(SymbolKind::Module | SymbolKind::Namespace));
+    // `kind` narrows the resolution itself, so `target` describes the
+    // definitions the caller asked about rather than every one sharing the
+    // name.
+    let (target, symbols) = resolve_symbols(
+        db,
+        &req.name,
+        ResolveOptions::default()
+            .with_modules(include_modules)
+            .with_kind(req.kind),
+    )?;
+    let results = matched_symbols(&target, symbols);
+    Ok(FindSymbolResults {
+        results,
+        target: Some(target),
+    })
 }
 
 /// Name-based references, with homonym counts and incomplete-count disclosure.
@@ -34,8 +77,39 @@ pub fn find_references_with_budget(
     req: &FindReferencesRequest,
     to_budget: Duration,
 ) -> Result<FindReferencesResults> {
-    let mut results = db.find_references(&req.symbol_name, req.kind)?;
-    let definitions = db.find_symbols(&req.symbol_name, None)?;
+    let (target, candidates) = resolve_symbols(
+        db,
+        &req.symbol_name,
+        ResolveOptions::symbol().with_limit(MAX_TARGET_CANDIDATES),
+    )?;
+    let mut definitions = matched_symbols(&target, candidates);
+    // Rows are keyed on how call sites spell the name. A spelling that is
+    // itself a definition's name or qualified name (or matched nothing) is
+    // queried as written, so a qualified input keeps its narrower rows; a
+    // `sym:` handle or other grammar form is queried by the bare names of the
+    // definitions it resolved to, as the union those rows already are. The
+    // disclosure (`definition_count`, `ambiguous`, `note`, `to`) then covers
+    // every definition behind those bare names, not only the ones the input
+    // resolved to; `target` alone keeps the input's own resolution.
+    let spelling = req.symbol_name.trim();
+    let mut results = if definitions.is_empty()
+        || definitions
+            .iter()
+            .any(|s| s.name == spelling || s.qualified_name == spelling)
+    {
+        db.find_references(spelling, req.kind)?
+    } else {
+        let names = distinct_sorted(definitions.iter().map(|s| s.name.as_str()));
+        let mut rows = Vec::new();
+        let mut named = Vec::new();
+        for name in names {
+            rows.extend(db.find_references(name, req.kind)?);
+            named.extend(db.find_symbols(name, None)?);
+        }
+        retain_definitions(&mut named, false);
+        definitions = named;
+        rows
+    };
     let definition_count = definitions.len();
     let to_resolution = attach_handles(db, &mut results, &definitions, to_budget)?;
     let ambiguous = definition_count > 1;
@@ -89,6 +163,19 @@ pub fn find_references_with_budget(
     } else {
         None
     };
+    // The machine-usable half of the same disclosure: one handle per
+    // definition, which every target-taking tool accepts.
+    let note = match (ambiguous, note) {
+        (true, Some(note)) => {
+            let handles: Vec<String> = definitions.iter().map(|s| s.handle().to_string()).collect();
+            let handles: Vec<&str> = handles.iter().map(String::as_str).collect();
+            Some(format!(
+                "{note} Scope to one with its handle: {}.",
+                sample_list(&handles, MAX_TARGET_CANDIDATES)
+            ))
+        }
+        (_, note) => note,
+    };
     Ok(FindReferencesResults {
         results,
         counts_floor: true,
@@ -96,8 +183,14 @@ pub fn find_references_with_budget(
         ambiguous,
         note,
         to_resolution,
+        target: Some(target),
     })
 }
+
+/// Definition handles carried on a `find_references` envelope. Wider than the
+/// resolver default because the rows are already the union across all of
+/// them, so the list is what an agent splits the union by.
+const MAX_TARGET_CANDIDATES: usize = 25;
 
 /// Distinct (caller file, spelling) pairs `find_references` resolves before
 /// leaving the remaining rows without `to`.
@@ -572,6 +665,46 @@ mod tests {
         .unwrap()
     }
 
+    /// `open` is a function in one file and a constant in another: asking
+    /// for functions must not report the constant as an ambiguity.
+    #[test]
+    fn find_symbol_kind_filter_narrows_target_as_well_as_results() {
+        let db = Database::open_in_memory().unwrap();
+        let a = file(&db, "a.rs");
+        let b = file(&db, "b.rs");
+        db.insert_symbols(a, &[symbol("open", "a.rs")]).unwrap();
+        let mut constant = symbol("open", "b.rs");
+        constant.kind = SymbolKind::Constant;
+        db.insert_symbols(b, &[constant]).unwrap();
+
+        let unfiltered = find_symbol(
+            &db,
+            &FindSymbolRequest {
+                name: "open".to_string(),
+                kind: None,
+            },
+        )
+        .unwrap();
+        let target = unfiltered.target.expect("target");
+        assert_eq!(unfiltered.results.len(), 2);
+        assert!(target.ambiguous);
+
+        let functions = find_symbol(
+            &db,
+            &FindSymbolRequest {
+                name: "open".to_string(),
+                kind: Some(SymbolKind::Function),
+            },
+        )
+        .unwrap();
+        let target = functions.target.expect("target");
+        assert_eq!(functions.results.len(), 1);
+        assert_eq!(functions.results[0].file_path, "a.rs");
+        assert!(!target.ambiguous, "{target:?}");
+        assert_eq!(target.candidates_total, 1);
+        assert_eq!(target.handles(), ["sym:a.rs#open"]);
+    }
+
     #[test]
     fn envelope_with_no_definition_flags_external_target() {
         let db = Database::open_in_memory().unwrap();
@@ -674,7 +807,12 @@ mod tests {
         assert!(!note.contains("indistinguishable"), "{note}");
         assert!(note.contains("a.rs, b.rs"), "{note}");
         assert!(!note.contains("qualified name ("), "{note}");
-        assert!(!note.contains("beta::helper"), "{note}");
+        // A qualified name only one of them carries cannot scope the set;
+        // a handle per definition can, which is what the note offers.
+        assert!(
+            note.ends_with("Scope to one with its handle: sym:a.rs#helper, sym:b.rs#beta::helper."),
+            "{note}"
+        );
     }
 
     #[test]

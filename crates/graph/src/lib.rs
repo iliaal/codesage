@@ -11,6 +11,7 @@ mod index;
 mod lookups;
 mod overview;
 mod rehearsal;
+pub mod resolver;
 mod rust_modules;
 mod scc;
 mod search;
@@ -30,19 +31,20 @@ pub use git_history::{
     find_coupling_ranked, git_history_index, git_history_index_with_options, recommend_tests,
     recommend_tests_with_reachability,
 };
-pub use impact::{AmbiguousSymbol, impact_analysis, impact_analysis_report};
+pub use impact::{impact_analysis, impact_analysis_report};
 pub use index::{
     STRUCTURAL_INTERPRETATION, full_index, incremental_index, index_files, remove_files,
 };
 pub use lookups::{
-    find_references, find_references_with_budget, find_symbol, list_dependencies,
-    list_dependencies_batch,
+    FindSymbolOptions, find_references, find_references_with_budget, find_symbol,
+    find_symbol_with_options, list_dependencies, list_dependencies_batch,
 };
 pub use overview::{
     build_project_overview, build_project_overview_with_options,
     build_project_overview_with_top_risk,
 };
 pub use rehearsal::{build_branch_only_rehearsal, build_review_rehearsal};
+pub use resolver::{ResolveOptions, TargetError, require_one, resolve_target};
 pub use search::{RerankFn, search, search_page};
 pub use semantic::{
     ArtifactLookup, EmbedderInit, LazyEmbedder, SemanticFingerprint, SemanticTableState,

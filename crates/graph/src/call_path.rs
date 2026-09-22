@@ -7,6 +7,7 @@ use codesage_protocol::{CallPathReport, CallPathRequest, CallPathStep, Reference
 use codesage_storage::Database;
 
 use crate::impact::WalkCache;
+use crate::resolver::{ResolveOptions, TargetError, matched_symbols, resolve_symbols};
 
 /// Control-flow edges only: imports and type relationships do not prove a call.
 /// Route handlers count as framework dispatch.
@@ -32,19 +33,22 @@ fn key_of(s: &Symbol) -> SymbolKey {
 }
 
 /// Breadth-first over callee edges, so the first path found is a shortest one.
+///
+/// `from` and `to` take the whole target grammar (see [`crate::resolver`]).
+/// Either naming several definitions is [`TargetError::Ambiguous`]: the chain
+/// the walk would report names one of them, so the answer is not a union.
 pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathReport> {
     codesage_protocol::work::checkpoint()?;
-    let origins = db.find_symbols(&req.from, None)?;
-    if origins.is_empty() {
-        return Ok(unfound(format!("symbol '{}' not found", req.from), false));
-    }
-    let targets = db.find_symbols(&req.to, None)?;
-    if targets.is_empty() {
-        return Ok(unfound(format!("symbol '{}' not found", req.to), false));
-    }
+    let origins = match resolve_endpoint(db, &req.from)? {
+        Endpoint::Found(symbols) => symbols,
+        Endpoint::Missing(note) => return Ok(unfound(note, false)),
+    };
+    let targets = match resolve_endpoint(db, &req.to)? {
+        Endpoint::Found(symbols) => symbols,
+        Endpoint::Missing(note) => return Ok(unfound(note, false)),
+    };
     let target_keys: HashSet<SymbolKey> = targets.iter().map(key_of).collect();
 
-    // Equal-depth seeds preserve shortest-path search across same-named origins.
     let mut queue: VecDeque<(Symbol, usize)> = VecDeque::new();
     let mut visited: HashSet<SymbolKey> = HashSet::new();
     // child -> (parent, line in parent's body where the child is called)
@@ -124,6 +128,36 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
         )
     };
     Ok(unfound(note, hit_bound))
+}
+
+enum Endpoint {
+    Found(Vec<Symbol>),
+    /// Why the endpoint named nothing, naming the resolver's nearest
+    /// candidates so a renamed endpoint reads as a rename rather than as an
+    /// absent call chain.
+    Missing(String),
+}
+
+/// The definitions one endpoint names. Several is
+/// [`TargetError::Ambiguous`]; none is [`Endpoint::Missing`].
+fn resolve_endpoint(db: &Database, input: &str) -> Result<Endpoint> {
+    let (resolution, symbols) = resolve_symbols(db, input, ResolveOptions::symbol())?;
+    if let Some(error @ TargetError::Ambiguous { .. }) = TargetError::of(&resolution) {
+        return Err(error.into());
+    }
+    let symbols = matched_symbols(&resolution, symbols);
+    if !symbols.is_empty() {
+        return Ok(Endpoint::Found(symbols));
+    }
+    let nearest = resolution.handles();
+    Ok(Endpoint::Missing(if nearest.is_empty() {
+        format!("symbol '{input}' not found")
+    } else {
+        format!(
+            "symbol '{input}' not found; nearest: {}",
+            nearest.join(", ")
+        )
+    }))
 }
 
 /// Callee definitions invoked inside `sym`'s body, each with the line of the
