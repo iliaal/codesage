@@ -1,7 +1,7 @@
 ---
 name: codesage-reindex
 description: Refresh a project's index incrementally and report retained totals separately from work performed. Clean orphan model tables after successful indexing.
-argument-hint: "[project-path — defaults to cwd]"
+argument-hint: "[project-path, defaults to cwd]"
 ---
 
 # Refresh a CodeSage index

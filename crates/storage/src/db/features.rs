@@ -253,8 +253,8 @@ impl Database {
 
     /// Features that include the given file path in any role. Inverse of
     /// `feature.files[].path`. Empty result means no mapped feature owns
-    /// or contexts this file (which is common — not every file belongs to
-    /// a feature slice).
+    /// or contexts this file. That is common: not every file belongs to a
+    /// feature slice.
     pub fn features_for_file(&self, file_path: &str) -> Result<Vec<FeatureRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT f.feature_id, f.title, f.summary, f.kind, f.source, f.confidence,

@@ -34,10 +34,10 @@ test -x "$REVIEW_STATE"
 PARAMS="categories=<sorted csv>;severity=<severity>;focus=<all|product>;deep=<0|1>"
 ```
 
-`PARAMS` is the canonical review-scope string; pass the same value to every `feature-states`, `plan-feature`, and `merge` call so freshness fingerprints bind to this run's scope. Every `.codesage/...` path below lives under the project, not the session's working directory — always write it as `$PROJECT/.codesage/...`.
+`PARAMS` is the canonical review-scope string; pass the same value to every `feature-states`, `plan-feature`, and `merge` call so freshness fingerprints bind to this run's scope. Every `.codesage/...` path below lives under the project, not the session's working directory; always write it as `$PROJECT/.codesage/...`.
 
 > **Before touching any `.codesage/` path:** `.codesage/` is repository content, so a cloned
-> repo can ship it — or any directory under it — as a symlink. Refuse to read, write, create,
+> repo can ship it (or any directory under it) as a symlink. Refuse to read, write, create,
 > or delete through one. Check with `test -L <path>` (not `test -e`, which follows links) on
 > `.codesage` itself and on each subdirectory you are about to use, and stop with an error if
 > any is a symlink. Apply the same check to every **leaf** you touch: a `*.json` findings
@@ -83,7 +83,7 @@ Hash freshness for the inventory in one process:
   --params "$PARAMS"
 ```
 
-The helper reads each unique slice file once even when features overlap. Skip only records where `up_to_date` is true — except when `--feature` names one slice: an explicit request always re-reviews, even a fresh one. The fingerprint covers every entry, owned, context, and test file plus the run's `PARAMS`, so widening categories or lowering the severity floor re-reviews content-unchanged slices. Findings mtimes and triage edits don't affect it. Legacy documents without `reviewed_state` are reviewed once and upgraded during merge.
+The helper reads each unique slice file once even when features overlap. Skip only records where `up_to_date` is true, except when `--feature` names one slice: an explicit request always re-reviews, even a fresh one. The fingerprint covers every entry, owned, context, and test file plus the run's `PARAMS`, so widening categories or lowering the severity floor re-reviews content-unchanged slices. Findings mtimes and triage edits don't affect it. Legacy documents without `reviewed_state` are reviewed once and upgraded during merge.
 
 Apply `--focus` and `--kind`.
 
@@ -181,7 +181,7 @@ For deep mode, save each lens response separately and combine them in fixed `cor
   --output "$PROJECT/.codesage/reviews/$RUN_ID/responses/<feature_id>.json"
 ```
 
-Include only the lenses that were dispatched, and pass their paths explicitly in lens order rather than relying on glob order. `combine` rejects any lens response carrying an `error` field — a failed lens fails the feature (retry that lens once or mark the feature errored); never combine around it. The validation step below removes duplicate candidates by evidence fingerprint or close title/location identity before assigning IDs.
+Include only the lenses that were dispatched, and pass their paths explicitly in lens order rather than relying on glob order. `combine` rejects any lens response carrying an `error` field: a failed lens fails the feature (retry that lens once or mark the feature errored); never combine around it. The validation step below removes duplicate candidates by evidence fingerprint or close title/location identity before assigning IDs.
 
 Write parsed JSON to `$PROJECT/.codesage/reviews/<RUN_ID>/responses/<feature_id>.json`, then run:
 

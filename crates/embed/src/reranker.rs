@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn three_class_head_takes_last_column_softmax() {
-        // [contradict=0, neutral=0, entail=3] — the entail column is last by
+        // [contradict=0, neutral=0, entail=3]: the entail column is last by
         // NLI convention; softmax over the row should dominate.
         let logits = vec![0.0, 0.0, 3.0];
         let scores = extract_relevance_scores(&[1, 3], &logits, 1);

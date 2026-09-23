@@ -179,9 +179,9 @@ fn python_project_seed(
 
 /// Walk the project's source roots and collect `.py` files (cap 2_000 to keep
 /// the routing-only `feature_files` rows bounded). Honors `.gitignore` and
-/// `[index].exclude_patterns` via `walk_files`. Skips test/fixture files —
-/// those land on the `python-test-suite` feature instead — and generated
-/// stubs (`*_pb2.py`, `*.gen.py`).
+/// `[index].exclude_patterns` via `walk_files`. Skips generated stubs
+/// (`*_pb2.py`, `*.gen.py`) and test/fixture files, which land on the
+/// `python-test-suite` feature instead.
 fn python_project_source_files(ctx: &MapperContext) -> Vec<String> {
     let root = ctx.root;
     let scan_dirs: Vec<PathBuf> = ["src", "lib"]
@@ -448,8 +448,8 @@ fn extract_ini_multiline_value(section_body: &str, key: &str) -> Option<String> 
 /// Convert a dotted module path (`acme.cli`) into a repo-relative file
 /// path (`acme/cli.py` or `src/acme/cli.py` or `acme/__init__.py`).
 /// Falls back to `None` when no candidate resolves to an existing file
-/// or every candidate is filtered out by `[index].exclude_patterns` —
-/// callers should then record the manifest as `entry_path` so the seed
+/// or every candidate is filtered out by `[index].exclude_patterns`.
+/// Callers should then record the manifest as `entry_path` so the seed
 /// still emits.
 fn resolve_script_module_path(ctx: &MapperContext, module: &str) -> Option<String> {
     let root = ctx.root;
@@ -1008,7 +1008,7 @@ fn strip_django_converters(raw: &str) -> String {
 
 /// Normalize a `re_path()` / `url()` regex into a readable path: drop the
 /// `^`/`$` anchors, rewrite named capture groups `(?P<name>…)` to `<name>`,
-/// and unescape `\/` and `\.`. Best-effort — remaining regex metacharacters
+/// and unescape `\/` and `\.`. Best-effort: remaining regex metacharacters
 /// are left as-is rather than guessed at.
 fn normalize_django_regex_route(raw: &str) -> Option<String> {
     let trimmed = raw.trim();

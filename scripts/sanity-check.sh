@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# Local sanity checks — same gates CI will enforce on push. Run before
-# pushing when you've made code changes to avoid the "CI caught a diff
-# after local fmt then later edit" class of break (see commit a43c51d
-# for the incident that motivated this).
+# Local run of the gates CI enforces on push, including the fmt check that
+# catches edits made after the last `cargo fmt` (commit a43c51d).
 #
-# Not auto-installed as a git hook; invoke manually. Exits nonzero on
-# any failure so you can chain it in a pre-push or wrap it in an alias.
+# Not installed as a git hook. Exits nonzero on the first failure, so it can
+# be chained from a pre-push hook or alias.
 #
 # Usage:
 #   bash scripts/sanity-check.sh          # fmt + clippy + tests + script regressions

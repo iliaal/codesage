@@ -6,7 +6,7 @@ argument-hint: X.Y.Z
 Cut a codesage release for version `$ARGUMENTS`.
 
 Gate the release behind a prose audit and the canonical sanity checks,
-including CUDA lint. If any gate fails, stop and report — do not run `scripts/release.sh`.
+including CUDA lint. If any gate fails, stop and report; do not run `scripts/release.sh`.
 If every gate passes, hand off to the script, which handles the CHANGELOG
 rewrite, version bump, release build, commit, tag, and (after a prompt) the
 push.

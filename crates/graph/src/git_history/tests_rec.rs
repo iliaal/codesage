@@ -317,7 +317,7 @@ pub struct ReachabilityOptions {
     pub min_input_budget: usize,
     /// Wall-clock limit for the whole request. Checked between admitted
     /// symbols, at the start of pricing each level and every 256 symbols
-    /// while pricing, and once before each level's caller lookup — never
+    /// while pricing, and once before each level's caller lookup. Never
     /// inside one symbol's resolution or inside that lookup, so the overrun
     /// is bounded by one admitted symbol's resolution plus one level's caller
     /// lookup plus one pricing window of up to 255 symbols (two COUNT queries

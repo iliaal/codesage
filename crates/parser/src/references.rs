@@ -531,7 +531,7 @@ pub fn extract_references(
             continue;
         };
         // A reference parked in a dead `#if 0` arm exists in no build, so the
-        // row must not exist at all — see `crate::preproc`.
+        // row must not exist at all; see `crate::preproc`.
         if dead.covers(&ref_cap.node) {
             continue;
         }

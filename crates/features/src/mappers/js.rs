@@ -1505,7 +1505,7 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
                         framework.tag().to_string(),
                         "route".to_string(),
                     ];
-                    // `all` binds every verb — treat as state-changing.
+                    // `all` binds every verb, so treat it as state-changing.
                     if route_is_auth_sensitive(&key.0, path) {
                         tags.push(AUTH_SENSITIVE_TAG.to_string());
                     }

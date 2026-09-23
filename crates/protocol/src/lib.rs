@@ -384,7 +384,7 @@ impl RationaleKind {
     }
 
     /// Recognize a marker keyword (case-insensitive). The trailing colon is
-    /// not part of the input — callers split it off before calling.
+    /// not part of the input; callers split it off before calling.
     pub fn from_marker(marker: &str) -> Option<Self> {
         match marker.to_ascii_uppercase().as_str() {
             "WHY" => Some(RationaleKind::Why),
@@ -450,8 +450,8 @@ pub enum TrustBoundary {
     /// Accepts user-controlled input directly (CLI argv, HTTP request bodies,
     /// stdin parsers).
     UserInput,
-    /// Calls a third-party external API (a more specific Network signal —
-    /// e.g. AWS SDK, Stripe, OpenAI client).
+    /// Calls a third-party external API, such as the AWS SDK, Stripe, or an
+    /// OpenAI client. A more specific Network signal.
     ExternalApi,
     /// Performs serialization that crosses a trust boundary (XML, YAML
     /// loaders, pickle, deserialization of untrusted input).
@@ -1189,12 +1189,12 @@ fn default_span_known() -> bool {
 /// Result envelope for `find_coupling`. Wraps the ranked list with enough
 /// context for an agent to tell apart the three empty-result causes:
 ///
-/// - file never indexed (not tracked, or no commits yet) — `file_indexed=false`
-/// - file has history but no co-change pair above the min-count threshold —
+/// - file never indexed (not tracked, or no commits yet): `file_indexed=false`
+/// - file has history but no co-change pair above the min-count threshold:
 ///   `file_indexed=true, file_commits>0, coupled=[]`, note explains
 /// - file-path shape doesn't match the index (wrong case, leading slash,
-///   etc.) — typically surfaces as `file_indexed=false` with a note suggesting
-///   the caller verify the path
+///   etc.): typically `file_indexed=false` with a note suggesting the caller
+///   verify the path
 ///
 /// Non-empty `coupled` responses still include the indexed-state fields so an
 /// agent can distinguish a thin result (`coupled.len() < limit`) from a full
@@ -1223,8 +1223,8 @@ pub struct CouplingReport {
 /// One symbol inside a file that contributes to its risk score, ranked by
 /// the heuristic `ln(1 + line_count) + ref_count + (in_cycle ? 1.0 : 0.0)`.
 /// `ref_count` is the import-aware resolved product-caller count, not a name
-/// match: a same-named definition in another file no longer lends its callers
-/// here, and test callsites never count. It is a lower bound of the true
+/// match: a same-named definition in another file lends no callers here, and
+/// test callsites never count. It is a lower bound of the true
 /// caller set: a spelling the resolver cannot tie to this definition is
 /// dropped, and Rust `extern_crate::item` spellings from other workspace
 /// crates do not resolve yet, so a library symbol called mostly from other
@@ -1299,13 +1299,13 @@ pub struct RiskAssessment {
     pub file: String,
     pub score: f64,
     /// True when this file has no `git_files` row, so every history-derived
-    /// term of `score` — churn percentile, fix ratio, and coupling pressure,
-    /// 0.59 of the composite weight — was never measured. `score` then
+    /// term of `score` (churn percentile, fix ratio, and coupling pressure,
+    /// 0.59 of the composite weight) was never measured. `score` then
     /// carries the structural terms alone and is not a low-risk verdict:
-    /// absence of history is absence of evidence. Four situations produce it
-    /// — a brand-new file, a path excluded from git indexing, `codesage
+    /// absence of history is absence of evidence. Four situations produce it:
+    /// a brand-new file, a path excluded from git indexing, `codesage
     /// git-index` never run, and history that fell outside the indexer's
-    /// window — and a `notes[]` line names the state. `assess_risk_diff`
+    /// window. A `notes[]` line names the state. `assess_risk_diff`
     /// excludes these files from `max_score` / `mean_score` and lists them
     /// under `unscored_files`. Not gated by `verbose`: it qualifies `score`
     /// itself, so it must reach every caller that reads the score.
@@ -1387,10 +1387,10 @@ pub struct RiskAssessment {
     pub notes: Vec<String>,
     /// Top symbols inside this file ranked by a heuristic that blends symbol
     /// length, reference count, and cycle membership. Answers the agent
-    /// follow-up "the file scored high — which symbols inside it drive that?"
+    /// follow-up "the file scored high; which symbols inside it drive that?"
     /// in one round-trip. Capped at 5. Empty when the file has no indexed
-    /// symbols (text files, generated files, files not yet indexed) — omitted
-    /// from JSON in that case so older agents see no schema churn.
+    /// symbols (text files, generated files, files not yet indexed), and then
+    /// omitted from JSON so older agents see no schema churn.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub top_symbols: Vec<TopSymbol>,
 }
@@ -1471,8 +1471,8 @@ impl Serialize for RiskAssessment {
 }
 
 /// Aggregate risk for a set of files (typically the file list of a patch or PR).
-/// Lets an agent ask one question — "how risky is this change?" — instead of
-/// per-file round-trips and manual aggregation.
+/// Lets an agent ask "how risky is this change?" once instead of making
+/// per-file round-trips and aggregating by hand.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RiskDiffAssessment {
     /// True when the caller supplied no files. Empty input is a usage signal,
@@ -1486,7 +1486,7 @@ pub struct RiskDiffAssessment {
     /// Files with no indexed git history are excluded (see `unscored_files`);
     /// 0.0 when `scored_file_count` is 0.
     pub max_score: f64,
-    /// Mean score over the patch's *scored* files — `scored_file_count` is the
+    /// Mean score over the patch's *scored* files; `scored_file_count` is the
     /// denominator. 0.0 when nothing in the patch was scored.
     pub mean_score: f64,
     /// File contributing `max_score`. None when the patch is empty or no file
@@ -1495,17 +1495,17 @@ pub struct RiskDiffAssessment {
     pub max_risk_file: Option<String>,
     /// Patch files whose history signals were never measured
     /// ([`RiskAssessment::unscored`]). They are excluded from `max_score` /
-    /// `mean_score` — averaging their structural-only score reports a
+    /// `mean_score`, because averaging their structural-only score reports a
     /// reassuring number for a patch whose riskiest file merely has no
-    /// indexed history — and named here so they stay visible. They remain in
+    /// indexed history. They are named here so they stay visible. They remain in
     /// `files` with their structural score, and in the structural rollups
     /// (`test_gap_files`, `wide_blast_files`).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub unscored_files: Vec<String>,
     /// How many files contributed to `max_score` / `mean_score`: the mean's
     /// denominator. `0` means no file in this patch had indexed git history,
-    /// so both aggregates are 0.0 by convention rather than measurements —
-    /// read `unscored_files` and run `codesage git-index`.
+    /// so both aggregates are 0.0 by convention rather than measurements.
+    /// Read `unscored_files` and run `codesage git-index`.
     #[serde(default)]
     pub scored_file_count: u32,
     /// Files with `test_gap == true`. Adding tests for these closes the most
@@ -1525,8 +1525,8 @@ pub struct RiskDiffAssessment {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub summary_notes: Vec<String>,
     /// When a patch touches 5+ files from a single directory, the per-file
-    /// entries for that directory move out of `files` into one cluster here —
-    /// keeping the top-3 by score fully detailed and listing the rest by name
+    /// entries for that directory move out of `files` into one cluster here.
+    /// The top 3 by score stay fully detailed; the rest are listed by name
     /// only. Rollup arrays (`test_gap_files`, `wide_blast_files`, etc.) still
     /// include every clustered file, so no information is lost.
     ///
@@ -1548,7 +1548,7 @@ pub struct RiskDiffAssessment {
     /// full string. Saves bytes on patches that touch many files in
     /// similar states (e.g. a refactor where every touched file lacks
     /// a co-located test). Templated notes (`"hotspot: churn 80%"`,
-    /// `"in import cycle of 4 files: …"`) are not aliased — only
+    /// `"in import cycle of 4 files: …"`) are not aliased; only
     /// non-templated categorical notes are eligible. Empty when no
     /// note repeated enough to trigger aliasing.
     #[serde(
@@ -1577,13 +1577,12 @@ impl RiskDiffAssessment {
 /// Result of `assess_risk_batch`: per-file decomposition for a list of
 /// files, no patch-level aggregation. Use when the agent has a list of
 /// files (e.g. from impact analysis or coupling) and wants individual
-/// risk scores for each in one round-trip — avoids the per-file MCP
-/// protocol overhead that retrospective session analysis showed
-/// dominates `assess_risk` call volume.
+/// risk scores for each in one round-trip, avoiding the per-file MCP
+/// overhead that dominates `assess_risk` call volume.
 ///
 /// Differs from [`RiskDiffAssessment`] in that it does *not* compute
 /// max/mean across the set, rollup arrays, summary notes, cycles, or
-/// directory clustering — those are patch-aggregate concerns. If the
+/// directory clustering; those are patch-aggregate concerns. If the
 /// agent wants "is this patch risky as a whole?", use `assess_risk_diff`
 /// instead. If it wants "give me each of these files' scores", use
 /// `assess_risk_batch`.
@@ -1619,17 +1618,16 @@ impl RiskBatchAssessment {
 /// contains at least one file from a patch. Reported by `assess_risk_diff`
 /// as `cycles_touching_patch` when any member of the patch participates
 /// in a cycle. Members are mutually reachable through `import`,
-/// `include`, `inheritance`, or `trait_use` references — i.e. they can't
+/// `include`, `inheritance`, or `trait_use` references, so they can't
 /// be compiled / type-checked / loaded independently. `max_churn_file`
 /// is a heuristic pointer at the best refactor target: the historically
 /// most-modified file usually accumulates the most cross-cutting
 /// dependencies and extracting it tends to break the cycle.
 ///
-/// Honest caveat: we do not compute "cycles newly introduced by the
-/// patch". We report cycles that *include* a patch file, some of which
-/// are pre-existing. Agents should frame PR guidance as "this patch
-/// touches an existing cycle" unless they can confirm the cycle didn't
-/// exist on the base branch.
+/// This does not compute "cycles newly introduced by the patch". It reports
+/// cycles that *include* a patch file, some of which are pre-existing.
+/// Agents should frame PR guidance as "this patch touches an existing cycle"
+/// unless they can confirm the cycle didn't exist on the base branch.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CycleEntry {
     pub members: Vec<String>,
@@ -1722,8 +1720,8 @@ pub struct ReachableTestEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TestRecommendations {
     /// Sibling tests resolved by language conventions (FooTest.php,
-    /// foo.test.ts, test_foo.py, foo_test.go), plus — from the reachability
-    /// variant — any input file that is itself a test. Always run these.
+    /// foo.test.ts, test_foo.py, foo_test.go), plus any input file that is
+    /// itself a test (reachability variant only). Always run these.
     pub primary: Vec<String>,
     /// Tests that historically change with one of the input files. Worth
     /// running when sibling tests don't exist or when behavior crosses
@@ -1896,7 +1894,7 @@ pub struct SessionSnapshot {
     pub lazy_edges: u32,
     /// Top-N highest-risk files at snapshot time. Used as the baseline set
     /// for `risk_regressions` in the diff. Files outside this set don't
-    /// get a per-file risk delta even if their risk goes up — keeps the
+    /// get a per-file risk delta even if their risk goes up, which keeps the
     /// snapshot bounded on big repos.
     pub top_risk_files: Vec<SessionRiskEntry>,
     /// Best-effort `git rev-parse HEAD` at snapshot time. None when not in
@@ -1995,7 +1993,7 @@ pub struct GitIndexStats {
 }
 
 /// The "shape" of a feature slice. Maps to the agent-facing reason the
-/// feature exists — what someone would call the entrypoint when describing
+/// feature exists: what someone would call the entrypoint when describing
 /// what it does.
 #[derive(
     Debug,
@@ -2112,9 +2110,8 @@ pub struct FeatureFileRef {
 /// Designed as a *retrieval surface*, not a workflow object: `find_feature`
 /// answers "what feature owns this file?", `feature_bundle` returns the
 /// curated context an agent would want before reviewing or modifying the
-/// slice. Mapping is deliberately conservative — a file may appear in
-/// multiple features (a shared helper imported by two routes) and that's
-/// fine; the goal is recall, not partition.
+/// slice. A file may appear in multiple features (a shared helper imported
+/// by two routes); the goal is recall, not partition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FeatureRecord {
     /// Stable SHA-256-derived id. Format: `feat_<16-hex>`. Computed from
@@ -2170,7 +2167,7 @@ pub struct FeatureRecord {
 }
 
 /// Envelope around `Vec<FeatureRecord>` for the `list_features` and
-/// `find_feature` MCP tools — same `{"results": [...]}` shape
+/// `find_feature` MCP tools, in the `{"results": [...]}` shape
 /// `render_with_kind` produces.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FeatureListResults {
@@ -2188,8 +2185,8 @@ pub struct FeatureMapStats {
 
 /// `{"results": [...]}` envelope around `Vec<Symbol>`. Exists only to back the
 /// MCP `outputSchema` for `find_symbol`. The MCP server wraps bare-array
-/// responses into this shape in `render_with_kind` (see commit `dc66de6`);
-/// the schema simply describes what the agent actually receives.
+/// responses into this shape in `render_with_kind`, so the schema describes
+/// what the agent receives.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindSymbolResults {
     pub results: Vec<Symbol>,
@@ -2256,7 +2253,7 @@ fn default_true() -> bool {
 /// `{"results": [...]}` envelope around `Vec<SearchResult>`. See [`FindSymbolResults`].
 ///
 /// The three optional fields disclose the relevance cliff of the returned
-/// page. They describe ranking flatness only — not whether the answer exists
+/// page. They describe ranking flatness only, not whether the answer exists
 /// (see [`SearchConfidence`]). All default to absent so pre-cliff JSON still
 /// deserializes.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2300,7 +2297,7 @@ pub struct ImpactAnalysisResults {
 /// so the report reduces to the classic reverse-impact list.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImpactOptions {
-    /// Also include the target's forward dependencies — the import targets
+    /// Also include the target's forward dependencies: the import targets
     /// (modules/symbols) its file imports.
     pub include_forward: bool,
     /// Also include the symbols defined alongside the target in the same file.
@@ -2309,7 +2306,7 @@ pub struct ImpactOptions {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub limit: Option<usize>,
     /// Drop per-reason detail (keep one exemplar reason per file) and attach a
-    /// `summary` rollup — keeps the response small on wide blast radii.
+    /// `summary` rollup, which keeps the response small on wide blast radii.
     pub summary_only: bool,
 }
 
@@ -2364,7 +2361,7 @@ pub struct EditBrief {
     pub empty: bool,
     /// The file ranks high on churn AND has enough commits for that rank to
     /// mean something. Churn percentile is a within-repo rank, so on its own it
-    /// always promotes the top quartile of any repo, however young — a file
+    /// always promotes the top quartile of any repo, however young: a file
     /// with two commits can sit at the 90th percentile. Renderers should key on
     /// this rather than re-deriving a threshold from `churn_percentile`.
     pub hotspot: bool,
@@ -2434,7 +2431,7 @@ pub struct CallPathReport {
     pub found: bool,
     /// Symbols from origin to target inclusive. Empty when `found` is false.
     pub steps: Vec<CallPathStep>,
-    /// Edge count — one less than `steps.len()`.
+    /// Edge count: one less than `steps.len()`.
     pub length: usize,
     /// Why a path was not found, or how a resolution bound limits the result.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -2629,7 +2626,7 @@ pub struct ImpactReport {
     pub bounded: bool,
     /// Reverse impact: files affected by changing the target, by distance.
     pub results: Vec<ImpactEntry>,
-    /// Forward dependencies — the import targets (modules/symbols) the target's
+    /// Forward dependencies: the import targets (modules/symbols) the target's
     /// file imports. Present with `include_forward`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub forward_dependencies: Vec<String>,
@@ -2665,8 +2662,8 @@ impl Default for ImpactReport {
 
 /// One-call orientation snapshot for an agent starting work on a project.
 /// Aggregates already-indexed facts (languages, freshness, features, risk,
-/// trust boundaries, conventions) plus suggested next tool calls. Bounded by
-/// construction — every list is capped — so it stays a digest, not a dump.
+/// trust boundaries, conventions) plus suggested next tool calls. Every list
+/// is capped.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProjectOverview {
     /// Absolute canonical project root.
@@ -2693,7 +2690,7 @@ pub struct ProjectOverview {
     /// indexed language.
     pub test_conventions: Vec<String>,
     /// A sample of mapped entrypoints (routes, CLI commands, services,
-    /// libraries) — the agent-facing surface area. Capped.
+    /// libraries): the agent-facing surface area. Capped.
     pub entrypoints: Vec<EntrypointSummary>,
     /// Recommended next CodeSage calls for common intents, given this project's
     /// current state.
@@ -2848,7 +2845,7 @@ impl ReviewSeverity {
 
 /// One predicted review objection for a patch. Composed from the same signals
 /// that back `assess_risk_diff`, `recommend_tests`, session checks, and feature
-/// mapping — no new analysis, just the objections a reviewer would likely raise.
+/// mapping; it adds no new analysis.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewObjection {
     pub severity: ReviewSeverity,
@@ -3160,7 +3157,7 @@ mod tests {
     }
 
     /// Backward compatibility: payloads serialized before the structured
-    /// `found` field existed must deserialize as `found=true` — absence of
+    /// `found` field existed must deserialize as `found=true`; absence of
     /// the field meant a success result under the old prose-sentinel scheme.
     #[test]
     fn found_defaults_to_true_when_absent() {
@@ -3451,9 +3448,9 @@ mod tests {
     }
 
     /// A trimmed payload (what an agent gets by default) still deserializes:
-    /// the hidden scalars fall back to their defaults, and crucially the
-    /// parsed value must not claim `verbose` — re-emitting it would
-    /// fabricate the zeroed scalars as measurements.
+    /// the hidden scalars fall back to their defaults, and the parsed value
+    /// must not claim `verbose`, since re-emitting it would fabricate the
+    /// zeroed scalars as measurements.
     #[test]
     fn risk_assessment_trimmed_payload_deserializes() {
         let mut trimmed = risk_fixture();

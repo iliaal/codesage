@@ -117,7 +117,7 @@ fn token_looks_code_shaped(tok: &str) -> bool {
 
 /// Extract every `identifier.identifier` pair from the query where both
 /// sides are ASCII identifiers of length ≥3. Returns tokens flat, not
-/// pairs — the caller feeds them into the FTS MATCH disjunction. Skips
+/// pairs; the caller feeds them into the FTS MATCH disjunction. Skips
 /// sentence-punctuation patterns like `e.g.` (1-char left side) and
 /// `i.e.` (1-char right side).
 fn extract_dotted_identifier_tokens(query: &str) -> Vec<&str> {
@@ -1538,7 +1538,7 @@ impl StemIndex {
     }
 }
 
-/// (db file path, chunk table) — see `Database::semantic_cache_key`.
+/// (db file path, chunk table); see `Database::semantic_cache_key`.
 type StemCacheKey = (String, String);
 type StemCacheMap = HashMap<StemCacheKey, Arc<StemIndex>>;
 
@@ -1671,7 +1671,7 @@ const SOFT_PENALTY_MODERATE: f32 = 0.5; // re-export barrels (__init__.py, packa
 const SOFT_PENALTY_MILD: f32 = 0.7; // .d.ts type declaration stubs
 
 const COMPAT_DIR_NAMES: &[&str] = &["compat", "_compat", "legacy", "_legacy"];
-// Only plural forms — "example" (singular) collides with the `com.example.*`
+// Only plural forms: "example" (singular) collides with the `com.example.*`
 // Java/Kotlin package namespace, which is production code, not sample code.
 const EXAMPLES_DIR_NAMES: &[&str] = &["examples", "_examples"];
 const REEXPORT_BASENAMES: &[&str] = &["__init__.py", "package-info.java"];
@@ -1931,7 +1931,7 @@ fn apply_path_penalties(results: &mut [SearchResult], query: &str, test_files: &
 // Bound score ratios, not rank movement: tightly clustered rows can pass several
 // neighbors. Stronger promotion regressed nlohmann's ADL conversion query.
 const STEM_MATCH_BOOST: f32 = 1.2;
-// Counted in characters, not bytes — see `stem_match_tokens`.
+// Counted in characters, not bytes; see `stem_match_tokens`.
 const STEM_MATCH_MIN_TOKEN_LEN: usize = 4;
 
 /// Require an underscore, digit, or mixed case; bare acronyms such as JSON
@@ -3332,7 +3332,7 @@ mod hybrid_tests {
             end_line: 1,
             distance,
         };
-        // l2_to_score spans ~6e-7 across these four distances — wider than
+        // l2_to_score spans ~6e-7 across these four distances: wider than
         // f32::EPSILON, far narrower than MIN_FUSED_RESCALE_SPAN.
         let semantic = vec![
             mk_row("top.rs", "fn top() {}", 0.2),
@@ -3434,8 +3434,8 @@ mod path_penalty_tests {
 
     #[test]
     fn penalties_compose_multiplicatively() {
-        // Test in compat/ — the test-like demote (0.3 * 0.5) AND the strong
-        // compat penalty stack: 0.15 * 0.3 = 0.045.
+        // Test in compat/: the test-like demote (0.3 * 0.5) AND the strong
+        // compat penalty stack to 0.15 * 0.3 = 0.045.
         assert_penalty("compat/tests/old_api_test.go", 0.045);
         // A test-shaped query lifts only the test-like part; compat remains.
         let p = path_penalty_for_query("compat/tests/old_api_test.go", true);

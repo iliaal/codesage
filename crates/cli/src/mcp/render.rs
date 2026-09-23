@@ -765,7 +765,7 @@ struct NestedTrim {
 }
 
 impl NestedTrim {
-    /// `files[0].cycle_files (50/4200)` — the outer array's key, the element
+    /// `files[0].cycle_files (50/4200)`: the outer array's key, the element
     /// index, and the nested field's kept/total counts.
     fn label(&self, outer_key: &str) -> String {
         format!(

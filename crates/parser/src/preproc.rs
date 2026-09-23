@@ -2,7 +2,7 @@
 //!
 //! `find_references` publishes `counts_floor`: the true count is at least the
 //! reported one. A call parked in `#if 0` breaks that promise in the other
-//! direction, so the row must not exist rather than carry a flag — a flagged
+//! direction, so the row must not exist rather than carry a flag: a flagged
 //! row still counts, and the count is the wrong number.
 //!
 //! Only *provably* dead groups qualify. `#ifdef X`, `#ifndef X` and `#if EXPR`
@@ -88,7 +88,7 @@ fn collect_dead_spans(node: &Node, source: &[u8], out: &mut Vec<(usize, usize)>)
             Some(false) => (true, false),
             // `#if 1`: the if-group is taken in every configuration, and the
             // preprocessor skips every later group of a conditional once one
-            // is taken — so the whole `#elif`/`#else` chain is dead.
+            // is taken, so the whole `#elif`/`#else` chain is dead.
             Some(true) => (false, true),
             None => return,
         },
@@ -122,7 +122,7 @@ fn collect_dead_spans(node: &Node, source: &[u8], out: &mut Vec<(usize, usize)>)
 /// one at end of file; the group node then reaches EOF, so its span covers
 /// every later symbol and reference in the file. `#endif` absent entirely lands
 /// in the same shape. Masking either would be silent data loss, which is worse
-/// than the bounded over-count the masking removes — so any shape that cannot
+/// than the bounded over-count the masking removes, so any shape that cannot
 /// be confirmed terminated is left live.
 fn terminated_by_endif(group: &Node) -> bool {
     // `#endif` closes the whole chain, so it is a child of the opening

@@ -1,7 +1,7 @@
 ; Pattern 0: import statement (captures the module source string)
 (import_statement source: (string) @ref)
 
-; Pattern 1: require("module") -- captures the module string
+; Pattern 1: require("module"), captures the module string
 (call_expression
   function: (identifier) @_fn
   arguments: (arguments (string) @ref)
@@ -16,7 +16,7 @@
 ; Pattern 4: re-export (export { x } from "./mod" / export * from "./mod")
 (export_statement source: (string) @ref)
 
-; Pattern 5: class inheritance (class Foo extends Bar) -- JS heritage form
+; Pattern 5: class inheritance (class Foo extends Bar), JS heritage form
 (class_heritage (identifier) @ref)
 
 ; Pattern 6: instantiation (new Foo())

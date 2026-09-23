@@ -2046,8 +2046,8 @@ fn top_symbols_keeps_test_twin_callers_off_the_product_symbol() {
 
 /// The row budget is charged from a name's count before its rows are read:
 /// a hub name above the budget is skipped and disclosed `bounded`, and the
-/// next name still resolves. Previously the hub was hydrated in full and the
-/// budget then cut every name after it.
+/// next name still resolves instead of the hub being hydrated in full and
+/// the budget cutting every name after it.
 #[test]
 fn top_symbols_skips_a_group_whose_name_count_alone_exceeds_the_row_budget() {
     use codesage_protocol::{ReferenceKind, Visibility};

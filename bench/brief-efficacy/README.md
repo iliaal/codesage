@@ -84,7 +84,7 @@ not establish fifty independent tasks or replace the controlled comparison.
 
 ## Data sources
 
-1. **Fire ledger** — `brief-fires.jsonl` (and rotation sibling
+1. **Fire ledger**: `brief-fires.jsonl` (and rotation sibling
    `brief-fires.jsonl.1`) in the CodeSage state dir (`$XDG_STATE_HOME/codesage`,
    else `~/.local/state/codesage`; relative or empty values are ignored, and
    if neither resolves the ledger falls back to the runtime dir). Not the
@@ -101,7 +101,7 @@ not establish fifty independent tasks or replace the controlled comparison.
    served/empty/repeat/cooldown/budget/unavailable/error), and on non-empty
    payloads `h` (FNV-1a 64-bit hex over the rendered payload text, per
    `crates/cli/src/brief_gate.rs`) and `tok` (chars/4).
-2. **Session transcripts** — `~/.claude/projects/<munged-cwd>/<session>.jsonl`,
+2. **Session transcripts**: `~/.claude/projects/<munged-cwd>/<session>.jsonl`,
    where `<munged-cwd>` is the project root with non-alphanumerics replaced by
    `-`. The served payload text lands in the transcript verbatim (the hook
    injects it as `additionalContext`), which is what makes the digest join
@@ -117,7 +117,7 @@ transcript by session id, then to the exact injected text by recomputing the
 FNV-1a digest over candidate payload blocks found in the transcript. Scored
 strictly:
 
-- **acted** — after the serve, a Bash tool call runs one of the served test
+- **acted**: after the serve, a Bash tool call runs one of the served test
   paths (a test-runner invocation naming the path), or a later full Read/Edit/Write
   touches one of the served co-change files.
   Collection, help, and version requests do not count. Shell control flow, redirects,
@@ -131,16 +131,16 @@ strictly:
   npm/pnpm/yarn scripts are not resolved to served test files; their path mentions
   cannot establish which tests they select. This makes the observed rate a
   conservative lower bound for the supported forms.
-- **ambiguous** — the only post-serve touch of a served co-change file is a
+- **ambiguous**: the only post-serve touch of a served co-change file is a
   *ranged* Read (`offset`/`limit` present). A ranged read after a serve is
   consistent with acting on the brief but also with ordinary navigation, so it
   never counts as acted.
-- **no-op** — none of the served content was exercised afterwards.
-- **hotspot-only** — the payload named no tests and no co-change files, so
+- **no-op**: none of the served content was exercised afterwards.
+- **hotspot-only**: the payload named no tests and no co-change files, so
   there is no detectable action; excluded from the acted/no-op denominator.
-- **branch-only** — the payload reports branch overlap without tests or
+- **branch-only**: the payload reports branch overlap without tests or
   co-change files; excluded because branch-related actions are not scored.
-- **unmatched** — transcript missing or the digest never found (e.g. the
+- **unmatched**: transcript missing or the digest never found (e.g. the
   session ran on another machine, or the transcript was pruned).
 
 Only successful Edit/Write/MultiEdit PreToolUse attachments count as exposure.
@@ -159,13 +159,13 @@ directories only when its session family is unique. The descriptive base rate
 still uses parent transcripts only; it is not a matched control for child actions.
 
 **Compliance ≠ adoption.** "acted" means the named action occurred after the
-serve — it does not prove the brief *caused* it. The agent may have run those
+serve. It does not prove the brief *caused* it. The agent may have run those
 tests anyway. The observational base rate cannot establish causality.
 
 ## Base rate
 
-The honest counterfactual — "for non-served edits, would the agent have run
-the tests a brief *would have* named?" — requires rebuilding would-have-served
+The true counterfactual (for non-served edits, would the agent have run
+the tests a brief *would have* named?) requires rebuilding would-have-served
 payloads from the index at each historical edit, which is out of scope for a
 transcript-only harness. Instead the analyzer computes the **unconditioned
 rate of file-named-test-following behavior**: across all transcripts of the

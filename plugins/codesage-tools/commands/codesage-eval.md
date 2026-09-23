@@ -6,7 +6,7 @@ argument-hint: "<project-path> [--max-cases N] [--min-files N] [--no-extract] [-
 
 # Evaluate CodeSage effectiveness on a specific project
 
-Wraps `${CLAUDE_PLUGIN_ROOT}/bin/codesage-eval`. Post-deployment effectiveness check: mine real user queries from this project's Claude Code session history, run them through CodeSage, and report how well retrieval actually performs on queries the user has asked on this codebase.
+Wraps `${CLAUDE_PLUGIN_ROOT}/bin/codesage-eval`. Post-deployment effectiveness check: mine real user queries from this project's Claude Code session history, run them through CodeSage, and report how well retrieval performs on queries the user has asked on this codebase.
 
 Use this AFTER `/codesage-onboard`. Mining requires enough Claude Code session history (rule of thumb: at least a dozen sessions with real queries). With `--no-extract`, an existing corpus replaces that prerequisite; session history and the extractor are not required.
 
@@ -14,7 +14,7 @@ This is separate from `/codesage-bench`, which runs a regression suite across al
 
 ## Step 1: Validate arguments
 
-`$ARGUMENTS` — first positional arg is the project path and must be an existing directory. For mining (without `--no-extract`), also require a corresponding `~/.claude/projects/<slug>/` directory with session transcripts and an available extractor. With `--no-extract`, require the existing `<corpus-dir>/<project-name>-session-eval.yaml` instead; do not require session history or the extractor. Both modes require a valid bench runner. Stop and explain any missing prerequisite for the selected mode.
+`$ARGUMENTS`: first positional arg is the project path and must be an existing directory. For mining (without `--no-extract`), also require a corresponding `~/.claude/projects/<slug>/` directory with session transcripts and an available extractor. With `--no-extract`, require the existing `<corpus-dir>/<project-name>-session-eval.yaml` instead; do not require session history or the extractor. Both modes require a valid bench runner. Stop and explain any missing prerequisite for the selected mode.
 
 ## Step 2: Run the eval
 
@@ -42,7 +42,7 @@ Reference baselines from prior runs of this corpus (stored under the history/ su
 
 ## Step 4: Warn about mining noise
 
-Heuristic session mining catches queries like "fix those 2 errors" or "do not run make start" that aren't really retrieval queries. Those create false negatives (retrieval can't find files for a meaningless query, so miss_rate inflates).
+Heuristic session mining catches queries like "fix those 2 errors" or "do not run make start" that aren't retrieval queries. Those create false negatives (retrieval can't find files for a meaningless query, so miss_rate inflates).
 
 After reporting the numbers, tell the user:
 
@@ -52,12 +52,12 @@ After reporting the numbers, tell the user:
 
 Based on the numbers:
 
-- **Miss rate > 25% AND queries look legitimate**: retrieval genuinely underperforms on this codebase. Candidates: more aggressive exclude patterns (via `/codesage-reset` after editing `.codesage/config.toml`), trying a different model, or accepting that the project has low retrieval affinity (thin/convention-heavy code).
+- **Miss rate > 25% AND queries look legitimate**: retrieval underperforms on this codebase. Candidates: more aggressive exclude patterns (via `/codesage-reset` after editing `.codesage/config.toml`), trying a different model, or accepting that the project has low retrieval affinity (thin/convention-heavy code).
 - **Miss rate < 15%**: healthy. This deployment is delivering value.
 - **High miss rate but queries look bad**: filter the corpus before concluding. Re-run with `--min-files 3` or hand-edit the YAML.
 
 ## Notes
 
 - The mined corpus YAML is saved to `$CODESAGE_BENCH_CORPUS_DIR` (default `./bench-corpora`) so subsequent `/codesage-bench` runs pick it up as part of the regression suite.
-- `--no-extract` reuses the existing corpus YAML — useful when you hand-edited it to remove noise and want to re-score.
+- `--no-extract` reuses the existing corpus YAML, useful when you hand-edited it to remove noise and want to re-score.
 - The bench runner uses `codesage search --json` directly, not the MCP. Effectiveness is measured on the underlying retrieval, not the MCP routing layer.

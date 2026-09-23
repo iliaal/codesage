@@ -222,8 +222,8 @@ fn read_pid(pidfile: &Path) -> Option<u32> {
 
 /// Same rule as the hook template's `hook_alive`: liveness from `kill(pid,
 /// 0)`; `ps -o args=` only demotes a live pid whose readable command line
-/// names no hook file — `<hooks_dir>/<hook>` spelled absolute or relative to
-/// `root`, `.git/hooks/<hook>`, or Husky's `.husky/<hook>` — which is pid
+/// names no hook file (`<hooks_dir>/<hook>` spelled absolute or relative to
+/// `root`, `.git/hooks/<hook>`, or Husky's `.husky/<hook>`). That is pid
 /// reuse, including a recycled pid now running the codesage binary. A
 /// missing or BusyBox `ps` never demotes. Pid-bearing locks have no age
 /// backstop by design; this check is what frees them.

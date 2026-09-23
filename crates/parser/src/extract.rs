@@ -291,7 +291,7 @@ pub fn extract_symbols(
         let def_node = def_cap.node;
 
         // A definition parked in a dead `#if 0` arm exists in no build, and
-        // must not claim a `seen_defs` key either — see `crate::preproc`.
+        // must not claim a `seen_defs` key either; see `crate::preproc`.
         if dead.covers(&def_node) {
             continue;
         }

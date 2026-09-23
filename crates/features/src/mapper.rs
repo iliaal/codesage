@@ -240,7 +240,7 @@ fn build_record(
             });
     }
     // Nearby-test discovery from filesystem conventions. Skip when the repo
-    // walk hit its cap — partial file lists produce false-negative test matches.
+    // walk hit its cap: partial file lists produce false-negative test matches.
     let nearby = if walk_truncated {
         Vec::new()
     } else {

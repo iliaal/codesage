@@ -1,7 +1,7 @@
 ---
 name: codesage-reset
 description: Fully regenerate a project's CodeSage index under its writer lock, with a separate offline recovery procedure for an unreadable database.
-argument-hint: "[project-path — defaults to cwd] [--yes]"
+argument-hint: "[project-path, defaults to cwd] [--yes]"
 ---
 
 # Rebuild a CodeSage index

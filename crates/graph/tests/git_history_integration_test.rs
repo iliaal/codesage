@@ -707,7 +707,7 @@ const HISTORY_WINDOW_DAYS: i64 = 730;
 const DECAY_TAU_DAYS: f64 = 180.0;
 
 /// Commit `path` with `lines` one-line functions at `unix_ts`, so the numstat
-/// added count — and therefore the churn units — are exact.
+/// added count, and therefore the churn units, are exact.
 fn commit_file_at(root: &std::path::Path, path: &str, lines: usize, subject: &str, unix_ts: i64) {
     let body: String = (0..lines).map(|i| format!("fn f{i}() {{}}\n")).collect();
     std::fs::write(root.join(path), body).unwrap();
@@ -766,7 +766,7 @@ fn old_head_checkout_still_indexes_files_and_co_changes() {
 fn head_inside_the_window_still_admits_the_whole_history() {
     // The failure mode that looks like it worked: HEAD is 700 days old, so a
     // wall-clock window admits only the 30-day sliver between HEAD's age and
-    // the 730-day bound — 2 of 20 commits. That truncates `total_commits`,
+    // the 730-day bound: 2 of 20 commits. That truncates `total_commits`,
     // which is the denominator of find_coupling's confidence, and drops the
     // pair under the count floor so coupling blames the file's commit count.
     let head_ts = unix_now() - 700 * DAY;

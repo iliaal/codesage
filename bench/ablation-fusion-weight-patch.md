@@ -5,9 +5,9 @@ file (`OnceLock` + `get_or_init`, default = the current const). With no env var
 set, fusion is byte-identical to today. Lets `ablation.py` sweep the two
 headline fusion knobs without a recompile per arm (one rebuild total).
 
-File: `crates/graph/src/query.rs`
+File: `crates/graph/src/search.rs`
 
-## Edit 1 — rename the RRF_K const to a `_DEFAULT` (line 77)
+## Edit 1: rename the RRF_K const to a `_DEFAULT` (line 52)
 
 The file already names env-overridable constants `*_DEFAULT`; match it.
 
@@ -24,7 +24,7 @@ const RRF_K: f64 = 60.0;
 const RRF_K_DEFAULT: f64 = 60.0;
 ```
 
-## Edit 2 — rename the BM25_WEIGHT const to a `_DEFAULT` (line 262)
+## Edit 2: rename the BM25_WEIGHT const to a `_DEFAULT` (line 377)
 
 ```rust
 // before
@@ -35,7 +35,7 @@ const BM25_WEIGHT: f64 = 2.0;
 const BM25_WEIGHT_DEFAULT: f64 = 2.0;
 ```
 
-## Edit 3 — add the cached env getters (insert just above `fn rrf_merge`, ~line 264)
+## Edit 3: add the cached env getters (insert just above `fn rrf_merge`, ~line 384)
 
 ```rust
 // Env overrides for fusion tuning without rebuilds. Cached on first read,
@@ -65,7 +65,7 @@ fn bm25_weight() -> f64 {
 }
 ```
 
-## Edit 4 — use the getters in `rrf_merge` (lines 279 and 287)
+## Edit 4: use the getters in `rrf_merge` (lines 413 and 423)
 
 ```rust
 // before

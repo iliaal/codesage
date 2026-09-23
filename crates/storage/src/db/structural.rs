@@ -47,9 +47,9 @@ fn deserialize_rationale(s: &str) -> Vec<RationaleEntry> {
 }
 
 /// Map a `(name, qualified_name, kind, path, line_start, line_end, col_start,
-/// col_end, rationale, visibility, is_test)` row — the column order shared by
-/// `find_symbols`, `symbols_for_files`, and `symbols_for_file` — into a
-/// `Symbol`. An unrecognized visibility string reads as unknown.
+/// col_end, rationale, visibility, is_test)` row into a `Symbol`. The column
+/// order is shared by `find_symbols`, `symbols_for_files`, and
+/// `symbols_for_file`. An unrecognized visibility string reads as unknown.
 fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     let kind_str: String = row.get(2)?;
     let rationale_json: String = row.get(8)?;
@@ -138,7 +138,7 @@ fn stored_fingerprint_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Stor
 impl Database {
     /// Return `(last_sha, last_indexed_at_unix)` for the structural index if a
     /// stamp exists. Mirrors [`Database::get_git_index_state`] but tracks the
-    /// structural/semantic layer — not the git history layer. Used by drift
+    /// structural/semantic layer, not the git history layer. Used by drift
     /// instrumentation (see `codesage doctor`) to detect cases where git hooks
     /// failed to trigger a reindex.
     pub fn get_structural_index_state(&self) -> Result<Option<(String, i64)>> {
@@ -147,7 +147,7 @@ impl Database {
 
     /// Stamp the HEAD SHA that the structural index was just built against.
     /// `indexed_at` is set to `unixepoch()` at the DB. Callers must only pass
-    /// real SHAs — the "not a git repo" case is the caller's to skip.
+    /// real SHAs; the "not a git repo" case is the caller's to skip.
     pub fn set_structural_index_state(&self, sha: &str) -> Result<()> {
         set_index_state(&self.conn, "structural_index_state", sha)
     }
@@ -456,7 +456,7 @@ impl Database {
     }
 
     /// Distinct files holding at least one reference whose name tail matches
-    /// `name` — the same rows `find_references` returns for a short name,
+    /// `name`: the same rows `find_references` returns for a short name,
     /// counted per file without hydrating them.
     pub fn count_referencing_files(&self, name: &str) -> Result<usize> {
         let mut stmt = self.conn.prepare_cached(
@@ -755,7 +755,7 @@ impl Database {
             HAVING MIN(r.lazy) = 0
             "#
         );
-        // The file list is bound twice — once per IN clause, in order.
+        // The file list is bound twice, once per IN clause, in order.
         let binds: Vec<&str> = files.iter().copied().chain(files.iter().copied()).collect();
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
@@ -963,7 +963,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// Every vec0 chunk table in the DB, across all models — not just the
+    /// Every vec0 chunk table in the DB, across all models, not just the
     /// one this connection was opened for. A real chunk table is a
     /// `chunks_`-prefixed table with a vec0 `_info` shadow sibling; the
     /// sibling check filters out FTS sidecars and vec0's own shadow tables,
@@ -1014,7 +1014,7 @@ impl Database {
     /// Remove one file from every per-path store: `files` (FK cascades cover
     /// symbols / refs / fingerprints / trust boundaries), semantic freshness,
     /// git history, feature membership, and EVERY model's chunk table plus
-    /// its FTS sidecar. Sweeping all chunk tables — not just the active one —
+    /// its FTS sidecar. Sweeping all chunk tables, not just the active one,
     /// matters because a structural-only pass (`codesage index --no-semantic`)
     /// opens without a model, and a per-model delete would leave the removed
     /// file searchable until the next semantic sweep. Savepoint-wrapped so a
@@ -1121,7 +1121,7 @@ impl Database {
     /// Count refs targeting each of the given short names in a single query.
     /// Matches against both `to_name` and `to_name_tail` so language-qualified
     /// callsites (`App\Foo::bar`, `pkg.foo.bar`) still resolve back to a
-    /// short-name lookup — mirrors the unqualified branch of `find_references`.
+    /// short-name lookup, mirroring the unqualified branch of `find_references`.
     /// Names with no matching refs are returned with a count of 0 so the caller
     /// can rely on a complete keyset.
     pub fn reference_counts_for_names(

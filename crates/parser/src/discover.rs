@@ -348,7 +348,7 @@ impl WatchFilter {
         if rel.as_os_str().is_empty() {
             return false;
         }
-        // Hidden files/dirs — matches `WalkBuilder::hidden(true)`.
+        // Hidden files/dirs, matching `WalkBuilder::hidden(true)`.
         if rel
             .components()
             .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))

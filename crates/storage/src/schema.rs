@@ -205,8 +205,8 @@ pub fn fts_table_name(chunk_table: &str) -> String {
 
 /// DDL for the FTS5 sidecar. `tokenchars '_'` keeps identifiers like
 /// `doc_cfg`, `mb_convert_case`, `moduleref` intact instead of splitting
-/// them into half-useful tokens. No Porter stemmer — we match code
-/// identifiers verbatim, not English.
+/// them into half-useful tokens. No Porter stemmer: code identifiers match
+/// verbatim, not as English.
 pub(crate) fn fts_schema(table_name: &str) -> String {
     let table = quote_ident(table_name);
     format!(
@@ -294,8 +294,8 @@ fn fts_sidecar_counts(
 }
 
 /// Read-path probe: does the FTS5 sidecar mirror `chunk_table`? Two cheap
-/// queries, never a rewrite — safe on every open, including read-only and
-/// migration-free handles.
+/// queries, never a rewrite, so it is safe on every open, including read-only
+/// and migration-free handles.
 pub(crate) fn fts_sidecar_health(
     conn: &Connection,
     chunk_table: &str,
@@ -653,7 +653,7 @@ fn migrate_0017_git_co_changes_recurrence(conn: &Connection) -> rusqlite::Result
 /// `semantic_models.fingerprint`: the embedding setup (model, pinned files,
 /// dimension, pooling, chunker) whose vectors the chunk table holds. NULL on a
 /// table populated before the column existed, which readers treat as
-/// "unknown" — stored vectors are not reused until a full rebuild records it.
+/// "unknown": stored vectors are not reused until a full rebuild records it.
 fn migrate_0015_semantic_models_fingerprint(conn: &Connection) -> rusqlite::Result<()> {
     let has_column: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('semantic_models') WHERE name = 'fingerprint'",
@@ -774,7 +774,7 @@ fn forget_superseded_migrations(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Detect `schema_migrations` rows this binary doesn't know about — i.e. the
+/// Detect `schema_migrations` rows this binary doesn't know about, meaning the
 /// DB was migrated by a newer codesage. Additive unknowns warn; a
 /// [`BREAKING_MIGRATION_PREFIX`] row hard-errors, because that name is the
 /// newer binary's declaration that older code must not proceed.
@@ -840,7 +840,7 @@ const NAME_TAIL_BACKFILL_CHUNK_ROWS: i64 = 500;
 
 /// Recompute `refs.to_name_tail` for every row, one id-ordered page at a
 /// time. `name_tail` splits past the last `\`, `/`, `.`, or two-char `::`,
-/// which has no faithful pure-SQL spelling in SQLite's string functions —
+/// which has no faithful pure-SQL spelling in SQLite's string functions,
 /// hence a Rust-side cursor rather than a set-based UPDATE. Paginating by
 /// `id > last_seen` (not OFFSET) keeps each page a bounded indexed range
 /// scan and stays correct while the UPDATEs themselves change no ids.
@@ -1062,7 +1062,7 @@ fn migrate_0007_symbols_rationale(conn: &Connection) -> rusqlite::Result<()> {
 
 /// Recompute `to_name_tail` under the dotted-tail rule (0001 only split on
 /// `\`, `/`, `::`; the dot matters for Go `fmt.Println`-style names).
-/// No-op when the column does not exist yet — 0001 runs first in the same
+/// No-op when the column does not exist yet: 0001 runs first in the same
 /// `run_migrations` pass and backfills on column creation. Paged through
 /// [`backfill_refs_name_tail`] so a php-src-scale `refs` table is never
 /// materialized into one `Vec`.
@@ -1298,7 +1298,7 @@ mod tests {
     #[test]
     fn init_db_sets_wal_journal_mode() {
         let conn = open_initialized();
-        // In-memory DBs report "memory" not "wal" — only file-backed DBs
+        // In-memory DBs report "memory" not "wal"; only file-backed DBs
         // honor journal_mode=WAL. Verify the file-backed path separately.
         let mode = pragma_string(&conn, "journal_mode");
         assert_eq!(mode, "memory", "in-memory db journal_mode is 'memory'");

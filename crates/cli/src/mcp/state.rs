@@ -150,7 +150,7 @@ fn evict_idle_from_map<T>(map: &ModelMap<T>, timeout: Duration) -> usize {
                 return true;
             }
             let Some(mut slot_guard) = entry.slot.try_lock() else {
-                return true; // busy (loading or cloning) — leave it
+                return true; // busy (loading or cloning); leave it
             };
             match slot_guard.as_ref() {
                 Some(arc) if Arc::strong_count(arc) == 1 => {

@@ -119,7 +119,7 @@ fn remove_file_purges_all_chunk_tables_fts_and_feature_files() {
         .unwrap();
     }
 
-    // Structural-only open: no active chunk table — the failure mode under test.
+    // Structural-only open with no active chunk table: the failure mode under test.
     {
         let db = Database::open(&db_path).expect("structural-only open");
         db.remove_file("a.rs").expect("remove_file");

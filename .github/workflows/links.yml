@@ -28,8 +28,6 @@ jobs:
           persist-credentials: false
       - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
-          # Scan all markdown in the repo. fail: true exits non-zero on any
-          # broken link, surfacing the failure as a check rejection.
           args: --verbose --no-progress './**/*.md'
           fail: true
         env:

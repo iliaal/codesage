@@ -14,7 +14,7 @@ Require an absolute onboarded project path and exactly one selector:
 
 - `--finding <id>`: locate one finding under `$PROJECT/.codesage/findings/*.json`.
 
-Every `.codesage/...` path below lives under the project, not the session's working directory — always write it as `$PROJECT/.codesage/...`.
+Every `.codesage/...` path below lives under the project, not the session's working directory; always write it as `$PROJECT/.codesage/...`.
 - `--feature <id>`: select findings in one feature.
 - `--all`: select across the project, grouped by feature.
 
@@ -38,7 +38,7 @@ Use `rev_$(date -u +%Y%m%dT%H%M%SZ)` as `RUN_ID`. For each feature:
 Prompt `codesage-feature-reviewer` with the same feature metadata and risk fields as `/codesage-review`, plus:
 
 ```text
-Revalidate these prior findings. Return a prior finding with its existing finding_id only when current code and evidence show the same defect. The echoed ID is advisory — the helper re-derives identity from evidence and location. These priors are targeted for revalidation regardless of status: return any of them whose defect is present, including false-positive and wont-fix ones; the standing suppression rule doesn't apply to targeted findings. Omit a finding when you can't find its defect. Report new regression findings without an ID.
+Revalidate these prior findings. Return a prior finding with its existing finding_id only when current code and evidence show the same defect. The echoed ID is advisory: the helper re-derives identity from evidence and location. These priors are targeted for revalidation regardless of status: return any of them whose defect is present, including false-positive and wont-fix ones; the standing suppression rule doesn't apply to targeted findings. Omit a finding when you can't find its defect. Report new regression findings without an ID.
 
 Prior findings under revalidation: <projected JSON>
 Severity threshold: low
@@ -72,7 +72,7 @@ The deterministic outcomes are:
 - Missing `fixed`, `false-positive`, or `wont-fix`: preserve status and history. Omission doesn't confirm or overturn user triage.
 - Report all `ack_sweep` entries and `suppressed` counts. Acknowledged targeted findings omitted from the response are flagged `foreign`; findings outside the target set are not swept.
 - New finding: apply the same verifier path as a normal review; keep unverified overflow open and label it.
-- Returned finding matching an untargeted prior: ignored by the merge and listed under `out_of_scope` in its output — not an error, and the untargeted prior is untouched.
+- Returned finding matching an untargeted prior: ignored by the merge and listed under `out_of_scope` in its output. This is not an error, and the untargeted prior is untouched.
 - Unselected finding in the same feature: preserve it unchanged; it was outside this revalidation run.
 
 Revalidation never advances the slice's content fingerprint or `reviewed_at_sha`; only a full review merge does, so a targeted recheck can't make changed code look fresh to the next `/codesage-review`.

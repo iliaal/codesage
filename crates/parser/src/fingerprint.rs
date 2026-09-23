@@ -170,7 +170,7 @@ pub fn file_fingerprints(
     out
 }
 /// Estimated Jaccard similarity: fraction of MinHash positions that agree.
-/// Same-language precondition — callers must only compare fingerprints the
+/// Same-language precondition: callers must only compare fingerprints the
 /// index grouped by language (see `find_similar`). The raw form cannot check
 /// this (grammar-local ids carry no provenance); use [`jaccard_checked`]
 /// when the pair's provenance is uncertain.

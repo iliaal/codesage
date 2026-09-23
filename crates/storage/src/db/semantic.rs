@@ -691,7 +691,7 @@ impl Database {
 
     /// Identity key for process-lifetime caches over this handle's semantic
     /// content: the database file path plus the active chunk table. `None`
-    /// for in-memory or table-less handles — every in-memory connection is a
+    /// for in-memory or table-less handles: every in-memory connection is a
     /// distinct database, so a path-keyed cache entry would alias unrelated
     /// handles.
     pub fn semantic_cache_key(&self) -> Option<(String, String)> {
@@ -816,7 +816,7 @@ mod tests {
         db.upsert_semantic_file_hash("aa", "h").unwrap();
         db.upsert_semantic_file_hash("bbbb", "h").unwrap(); // highest rowid
         // Pin indexed_at so MAX(indexed_at) can't be what distinguishes the
-        // tokens — isolating the collision to count/rowid.
+        // tokens, isolating the collision to count/rowid.
         db.conn
             .execute("UPDATE semantic_files SET indexed_at = 1000", [])
             .unwrap();

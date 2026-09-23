@@ -199,9 +199,9 @@ fn find_definition_for_summary(
 ///
 /// `sym_name` accepts the whole target grammar (see [`crate::resolver`]): a
 /// `sym:` handle or `path:line` names one definition outright. A name several
-/// definitions share is [`TargetError::Ambiguous`] — a bundle welded from all
-/// of them would answer no question — and one that names nothing keeps the
-/// `found: false` bundle, naming the resolver's nearest candidates.
+/// definitions share is [`TargetError::Ambiguous`], since a bundle welded
+/// from all of them would answer no question. One that names nothing keeps
+/// the `found: false` bundle, naming the resolver's nearest candidates.
 pub fn export_context_for_symbol(
     db: &Database,
     sym_name: &str,
@@ -270,12 +270,12 @@ pub fn export_context_for_symbol(
 /// Build a [`ContextBundle`] from a feature's curated files and symbol graph.
 ///
 /// Layout:
-/// - `primary[]` — chunks from owned + entry files, capped at `limit`.
-/// - `related[]` — up to two requested caller/callee chunks, then chunks
+/// - `primary[]`: chunks from owned + entry files, capped at `limit`.
+/// - `related[]`: up to two requested caller/callee chunks, then chunks
 ///   from tests and context files. The combined list is capped by `limit`.
-/// - `symbol_definitions[]` — entry-symbol definition (when present) +
+/// - `symbol_definitions[]`: entry-symbol definition (when present) +
 ///   any symbol definitions discovered while building primary chunks.
-/// - `target_description` — `"feature: <title> (<feature_id>)"`.
+/// - `target_description`: `"feature: <title> (<feature_id>)"`.
 ///
 /// Unknown feature IDs return an empty bundle with `found=false`.
 pub fn feature_bundle(
@@ -931,7 +931,7 @@ pub(crate) fn rust_crate_layout(file: &str) -> Option<(&str, bool)> {
 /// File-level counterpart of [`import_ref_targets_symbol`]: true when the
 /// import/include ref recorded in `importer_file` resolves to `target_file`.
 /// Backs `list_dependencies`' `imported_by`, whose SQL half only joins refs
-/// that name a symbol — path specifiers (`./util.js`, `dir/foo.h`) and Rust
+/// that name a symbol. Path specifiers (`./util.js`, `dir/foo.h`) and Rust
 /// `use crate::…` module paths name a file or module and never join.
 pub(crate) fn import_ref_targets_file(
     import_ref: &str,
@@ -991,7 +991,7 @@ pub(crate) fn import_ref_targets_file(
         });
     }
     // Quoted-include style: `util.h` or `sub/foo.h`. Resolve against the
-    // includer's directory, then the project root — both exact. No stem or
+    // includer's directory, then the project root, both exact. No stem or
     // suffix match: `sub/foo.h` must not claim every `*/sub/foo.h` in the
     // project. Includes reached through other `-I` paths stay unresolved.
     if import_ref.contains('/') || import_ref.contains('.') {

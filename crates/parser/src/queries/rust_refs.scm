@@ -25,13 +25,13 @@
 ; Pattern 8: type of an impl block (impl Type / impl Trait for Type)
 (impl_item type: (type_identifier) @ref)
 
-; Pattern 9: renamed use (use x::y as z) -- capture the source path
+; Pattern 9: renamed use (use x::y as z), captures the source path
 (use_declaration argument: (use_as_clause path: (_) @ref))
 
 ; Pattern 10: glob use, including nested groups and super::*
 (use_wildcard) @ref
 
-; Pattern 11: grouped use (use a::b::{X, Y as Z}) -- one ref per source name;
+; Pattern 11: grouped use (use a::b::{X, Y as Z}): one ref per source name;
 ; the enclosing scoped_use_list path is prepended in references.rs.
 (scoped_use_list list: (use_list [
   (identifier) @ref

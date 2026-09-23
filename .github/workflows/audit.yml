@@ -2,8 +2,7 @@ name: Audit
 
 on:
   schedule:
-    # Daily at 06:17 UTC. Off-peak hour, prime number minute to avoid
-    # synchronizing with everyone else's :00/:15/:30 cron jobs.
+    # Daily at 06:17 UTC; the off-round minute avoids the :00/:15/:30 cron peak.
     - cron: '17 6 * * *'
   pull_request:
     paths:

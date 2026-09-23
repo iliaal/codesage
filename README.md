@@ -26,7 +26,7 @@ CodeSage is a code intelligence engine for AI coding agents. It combines structu
 
 ## Capability summary
 
-Concrete answers to the questions a code-intelligence tool earns its keep on. The axes are the ones the broader ecosystem (GitNexus, SocratiCode, code-review-graph, claude-context, repowise) converges on; the right-hand column is what CodeSage actually ships.
+The rows follow the capabilities that GitNexus, SocratiCode, code-review-graph, claude-context, and repowise commonly advertise. The right-hand column is what CodeSage ships.
 
 | Capability | CodeSage |
 |---|---|
@@ -74,15 +74,15 @@ The daemon shares the indexed risk ranking across `project_overview` and `sessio
 
 The daemon is a same-UID co-trust boundary, not a same-UID isolation boundary. Its socket is private to the Unix user and checks peer credentials, but any process running as that user can ask the daemon to open any onboarded project index. Run untrusted agents under a separate Unix user when project isolation matters. MCP calls are agent-safety capped; CLI commands remain operator tools and can request larger limits or file lists.
 
-For Linux CPU inference, install the runtime described in [CPU setup](#cpu-setup-linux). CUDA also needs the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup)); on Apple Silicon, set `device = "coreml"` instead (see [CoreML setup](#coreml-setup-macos)). Each host needs its matching build and runtime dependencies. If you want `cargo install`, `codesage init`, and an on-demand local daemon hidden behind stdio MCP, use CodeSage.
+For Linux CPU inference, install the runtime described in [CPU setup](#cpu-setup-linux). CUDA also needs the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup)); on Apple Silicon, set `device = "coreml"` instead (see [CoreML setup](#coreml-setup-macos)). Each host needs its matching build and runtime dependencies.
 
 ## 📊 Benchmarks
 
 Retrieval quality is measured against semble's published corpus. See [External-corpus benchmark](#external-corpus-benchmark-semble) below for the current per-language table and its artifact.
 
-**The git-mined ripgrep and nest figures that stood here were removed on 2026-08-04.** They were measured at codesage 0.4.5, with 16 tagged releases since (`git tag --sort=v:refname`), so they describe a ranker that has been substantially rewritten. Neither corpus is present in `CODESAGE_BENCH_CORPUS_DIR`, so they cannot be re-measured at all. The same applies to the code-review-graph head-to-head that shared those corpora.
+The git-mined ripgrep and nest figures were removed on 2026-08-04. They were measured at codesage 0.4.5, 16 tagged releases earlier (`git tag --sort=v:refname`), and describe a ranker that has since been largely rewritten. Neither corpus is present in `CODESAGE_BENCH_CORPUS_DIR`, so they cannot be re-measured at all. The same applies to the code-review-graph head-to-head that shared those corpora.
 
-One design difference is worth stating as a **hypothesis**, not a result: CodeSage embeds chunks (~50-line regions) rather than individual function bodies, which should suit a commit-style query describing behavior spread across several functions. The measurement that motivated that claim is the one being withdrawn here, so it is untested at the current release.
+CodeSage embeds chunks (~50-line regions) rather than individual function bodies, which should suit a commit-style query describing behavior spread across several functions. Treat that as a hypothesis: the measurement behind it is one of the withdrawn figures, so it is untested at the current release.
 
 ### External-corpus benchmark (semble)
 
@@ -117,7 +117,7 @@ This section used to claim `recall@10 = 0.932 / NDCG@10 = 0.788` over 602 querie
 
 The harness retains usable results from nonzero exits and reports degradation per repository and language. It also records stderr and flags inference fallbacks even when a query exits successfully. Runs with skipped repositories or classified degradation are withheld from the published table.
 
-This is **not** a "codesage > semble" claim. A head-to-head would require running semble end-to-end on the same 63 repos under matched conditions, which is out of scope here. The number is codesage measured against semble's published ground truth.
+The table measures codesage against semble's published ground truth. It does not compare codesage with semble: a head-to-head would require running semble end-to-end on the same 63 repos under matched conditions, which is out of scope here.
 
 Use the annotation and repository revisions and embedding configurations recorded in the artifact. Clear experimental `CODESAGE_*` overrides and fully rebuild the indexes with the matching CUDA binary before scoring:
 
@@ -202,7 +202,7 @@ Pipes the staged file list through `assess_risk_diff`. Output shows the max risk
 git diff --cached --name-only | codesage tests-for
 ```
 
-Returns sibling tests (resolved by language convention) plus tests that historically change with the edited files (from co-change history). Replaces "I'll run all tests" with a focused list.
+Returns sibling tests (resolved by language convention) plus tests that historically change with the edited files (from co-change history).
 
 ### Audit a feature branch before opening a PR
 
@@ -210,7 +210,7 @@ Returns sibling tests (resolved by language convention) plus tests that historic
 git diff origin/main...HEAD --name-only | codesage risk-diff
 ```
 
-Same as the pre-commit check, but scoped to everything on the branch instead of just the staged diff. Useful as the last step before `gh pr create`.
+Same as the pre-commit check, scoped to everything on the branch instead of the staged diff. Run it as the last step before `gh pr create`.
 
 Use `codesage brief FILE --json` or `codesage rehearse FILE --json` to check whether other local or remote-tracking branches edit the same file. The scan uses merge-base diffs, excludes stacked branches and dependency manifests, and considers at most the newest 50 refs under a time budget. Read the scanned/total counts before interpreting an empty result. Branch evidence works without an index; rehearsal names the indexed checks it could not run.
 
@@ -243,7 +243,7 @@ This opt-in policy can reject patches based on heuristic risk. Read each objecti
 git log --since='1 week ago' --name-only --pretty='' | sort -u | codesage risk-diff --json | jq '.files[] | select(.score >= 0.5) | .file'
 ```
 
-Lists high-risk files touched in recent history. Good signal during a retrospective or a "where should we focus refactoring?" discussion.
+Lists high-risk files touched in recent history, for example when deciding where to focus refactoring.
 
 ### Which feature slices a branch touched
 
@@ -253,7 +253,7 @@ codesage features-list --since main --json | jq '.results[] | {id: .feature_id, 
 
 `--since <ref>` (also on MCP `list_features`) keeps only slices whose entry, owned, or context files changed since the ref, via `git diff <ref>...HEAD`. Scopes a review to the features a branch actually moved instead of the whole map.
 
-### Trifecta for one file
+### Three checks for one file
 
 ```bash
 codesage risk path/to/file.rs
@@ -261,7 +261,7 @@ codesage tests-for path/to/file.rs
 codesage coupling path/to/file.rs --limit 5
 ```
 
-When you're about to dive into one specific file. Risk score, suggested tests, and what historically co-changes calibrate caution before you start editing.
+Run these before you edit one specific file: the risk score, suggested tests, and historical co-change partners tell you how careful to be.
 
 ### Browse the project as feature slices
 
@@ -588,28 +588,28 @@ Corpora aren't bundled. Bring your own, or point the plugin at `$CODESAGE_BENCH_
 
 ## ⚠️ Known limitations
 
-Honest inventory of what CodeSage does not do well, measured on our canary corpora and from 30 days of real Claude Code session logs (the harness in `bench/analyze-codesage-quality.py` produces the same numbers locally).
+Measured on canary corpora and 30 days of Claude Code session logs; `bench/analyze-codesage-quality.py` reproduces the numbers locally.
 
-**Language surface is narrower than competitors'.** Nine languages today (Java added after C++ in 0.4.5). Graphify ships 25, SocratiCode 18+, and code-review-graph more than CodeSage (its README no longer states an exact count). The gap matters most if your stack is Ruby, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 47% of queries target a language codesage does not parse (588 of 1,251), with zero recall on those. The tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
+**Language surface is narrower than competitors'.** Nine languages today (Java added after C++ in 0.4.5). Graphify ships 25, SocratiCode 18+, and code-review-graph more than CodeSage (its README no longer states an exact count). The gap matters most if your stack is Ruby, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 47% of queries target a language codesage does not parse (588 of 1,251), with zero recall on those. To extend coverage, contribute tree-sitter query files under `crates/parser/src/queries/`.
 
-**Retrieval misses on cross-file refactor queries.** The failure mode is a commit subject like *printer: drop dependency on serde_derive* that describes a rename spanning several files with no distinctive literal to match on. Single-identifier lookups (`find_symbol`, `find_references`) are reliable. Pure semantic searches (`search`) are reliable. Diffuse multi-file refactor descriptions expressed in prose are the failure mode.
+**Retrieval misses on cross-file refactor queries.** The failure mode is a commit subject like *printer: drop dependency on serde_derive* that describes a rename spanning several files with no distinctive literal to match on. Single-identifier lookups (`find_symbol`, `find_references`) and focused semantic searches (`search`) are reliable.
 
 **`impact_analysis` reports a lower bound on dependencies.** The tool walks resolved reference and import edges up to a configurable depth. Name ambiguity can add false positives, while dynamic calls, unsupported syntax, unresolved imports, and traversal limits can omit real dependencies even in a fresh index. Read `counts_floor` and boundedness disclosures before interpreting an empty result. Reducing `--depth` to 1 and adding `--source-only` narrows the report further.
 
-**MCP tool-selection rate is low today.** When CodeSage MCP tools are available in a Claude Code session alongside `Grep`, the agent picks `Grep` on code-identifier queries: 1.1% CodeSage-pick rate over 30 days of sessions, 0/10 on a controlled active harness (measured 2026-04-24, not re-measured since). We sharpened tool descriptions and per-project CLAUDE.md guidance to call this out; the next measurement cycle will show whether the intervention landed. For a hook-level workaround today, see the LSP enforcement kit in the [Complementary tools](#complementary-tools) section.
+**MCP tool-selection rate is low today.** When CodeSage MCP tools are available in a Claude Code session alongside `Grep`, the agent picks `Grep` on code-identifier queries: 1.1% CodeSage-pick rate over 30 days of sessions, 0/10 on a controlled active harness (measured 2026-04-24, not re-measured since). Tool descriptions and per-project CLAUDE.md guidance have since been sharpened; that change has not been measured. For a hook-level workaround, see the LSP enforcement kit in the [Complementary tools](#complementary-tools) section.
 
-**`find_coupling` returns empty on young files.** Each empty result now carries a `note` field (`"no commits tracked"`, `"below min-count=3 threshold"`, `"path shape mismatch"`) so the agent can tell the cause. The underlying data just doesn't exist for recently-added files; the tool reports that honestly instead of inventing signal.
+**`find_coupling` returns empty on young files.** Each empty result now carries a `note` field (`"no commits tracked"`, `"below min-count=3 threshold"`, `"path shape mismatch"`) so the agent can tell the cause. Recently added files have no co-change history to report.
 
 ## 🔗 Pairs with
 
-- **[whetstone](https://github.com/iliaal/whetstone)**: agents, commands, and skills that tell coding agents *how* to work. CodeSage is the intelligence layer (what the code is); whetstone is the discipline layer (how to investigate, review, and ship). Install both for the full stack.
+- **[whetstone](https://github.com/iliaal/whetstone)**: agents, commands, and skills that tell coding agents *how* to work. CodeSage tells agents what the code is; whetstone covers how to investigate, review, and ship. They work well together.
 
 ## Complementary tools
 
-These address different layers than CodeSage and work well alongside it:
+These work at different layers and pair well with CodeSage:
 
-- **[rtk](https://github.com/rtk-ai/rtk)**: static compression proxy for noisy CLI output (`git diff`, `pytest`, `cargo build`). Different layer than CodeSage: CodeSage narrows *what the agent reads* for code questions, rtk compresses *how much it reads* for command output. Token-reduction claims from the two tools are additive, not overlapping; measure them separately when quoting.
-- **[claude-code-lsp-enforcement-kit](https://github.com/nesaminua/claude-code-lsp-enforcement-kit)**: hook pack that blocks `Grep` on code-symbol patterns and steers agents toward LSP / MCP tool calls. Provider-agnostic; auto-detects CodeSage's MCP alongside cclsp and Serena. Worth pairing if your tool-selection-rate numbers (see `bench/analyze-codesage-quality.py`) stay low after description-level interventions.
+- **[rtk](https://github.com/rtk-ai/rtk)**: static compression proxy for noisy CLI output (`git diff`, `pytest`, `cargo build`). CodeSage narrows *what the agent reads* for code questions; rtk compresses *how much it reads* for command output. Their token savings add up, so measure them separately when quoting.
+- **[claude-code-lsp-enforcement-kit](https://github.com/nesaminua/claude-code-lsp-enforcement-kit)**: hook pack that blocks `Grep` on code-symbol patterns and steers agents toward LSP / MCP tool calls. Provider-agnostic; auto-detects CodeSage's MCP alongside cclsp and Serena. Consider it if your tool-selection-rate numbers (see `bench/analyze-codesage-quality.py`) stay low after description-level interventions.
 
 ## Contributing
 

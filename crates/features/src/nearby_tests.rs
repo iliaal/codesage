@@ -24,7 +24,7 @@ impl<'a> TestFileIndex<'a> {
     }
 
     /// Contiguous run of test-shaped files under `pfx_slash` (which must end
-    /// in `/`), found by binary search — O(log n + hits) per declared prefix
+    /// in `/`), found by binary search: O(log n + hits) per declared prefix
     /// instead of a full-inventory scan.
     fn with_dir_prefix(&self, pfx_slash: &str) -> &[&'a str] {
         let lo = self.test_shaped.partition_point(|f| *f < pfx_slash);
@@ -415,8 +415,8 @@ mod tests {
     #[test]
     fn dotted_source_stem_keeps_matching_test_within_cap() {
         let s = seed("src/auth.service.ts", Language::TypeScript);
-        // Sorted unrelated dotted names previously consumed all five slots,
-        // excluding the actual test before build_record could attach it.
+        // Sorted unrelated dotted names must not consume all five slots and
+        // exclude the actual test before build_record can attach it.
         let all = [
             "tests/auth.a.spec.ts",
             "tests/auth.b.spec.ts",
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn substring_stem_does_not_attach_unrelated_test() {
-        // entry stem "main" must NOT match "maintenance_test" — that's a bare
+        // entry stem "main" must NOT match "maintenance_test": that's a bare
         // substring, not a word-boundary match. The noise file is outside the
         // entry's dir and any convention dir so only rule 2 could attach it.
         let s = seed("src/app/main.py", Language::Python);

@@ -58,14 +58,14 @@ pub struct DriftReport {
     /// `indexed_files_behind` is a lower bound. `Some(0)` with this set says
     /// nothing was found before the stop, not that nothing differs.
     pub indexed_files_behind_bounded: bool,
-    /// Classification — see [`DriftKind`] for semantics.
+    /// Classification; see [`DriftKind`] for semantics.
     pub kind: DriftKind,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DriftKind {
-    /// Not a git repo — nothing to measure.
+    /// Not a git repo; nothing to measure.
     NotGit,
     /// Git repo but no structural index has ever been stamped.
     NeverIndexed,
@@ -74,7 +74,7 @@ pub enum DriftKind {
     /// HEAD is N commits past the stored SHA on the same history line.
     BehindHead,
     /// Stored SHA is not an ancestor of HEAD. Rebase, branch switch, or force
-    /// update — content divergence is ambiguous by commit count alone.
+    /// update. Content divergence is ambiguous by commit count alone.
     UnrelatedAncestor,
     /// Any structured failure (git not on PATH, shallow clone, etc.). Recorded
     /// rather than hidden so the log keeps a signal.

@@ -76,7 +76,7 @@ fn is_cuda_source(rel: &str) -> bool {
 
 /// Classify a CMake `add_executable(...)` target as a test suite when the
 /// target name ends in `tests?` (with optional `_` or `-` separator,
-/// case-insensitive), or — when the name is neutral — every compilable
+/// case-insensitive), or when the name is neutral and every compilable
 /// source matches the test path heuristic.
 ///
 /// Target-name match wins outright. Source-path match alone (with a
@@ -704,8 +704,8 @@ fn filter_target_sources(ctx: &MapperContext, dir: &str, sources: &[String]) -> 
 }
 
 /// Same allow-check for the single build-system manifest pointed at by
-/// `context_files`. Empty result when the manifest itself is excluded —
-/// rare, but it would otherwise leak a phantom file ref.
+/// `context_files`. Empty result when the manifest itself is excluded,
+/// which is rare but would otherwise leak a phantom file ref.
 fn filter_target_context(ctx: &MapperContext, manifest: &str, reason: &str) -> Vec<SeedFile> {
     if !ctx.allowed(manifest) {
         return Vec::new();
@@ -931,7 +931,7 @@ fn is_cmake_identifier_byte(b: Option<u8>) -> bool {
 
 /// Splits a CMake command-args slice into individual words. Quoted
 /// strings (`"..."`) and bracket arguments (`[[...]]`) survive whitespace
-/// as single tokens — important for source paths that contain spaces.
+/// as single tokens, so source paths may contain spaces.
 /// Unquoted words are then split on `;` (CMake list separator); quoted
 /// values are NOT split that way (per CMake's documented semantics).
 /// Returns each word's unescaped content.

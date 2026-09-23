@@ -529,7 +529,7 @@ fn cpp_forward_declarations_emit_no_symbols() {
 #[test]
 fn javascript_module_exports_forms_are_captured() {
     // CJS entry points: `module.exports = ...` names the entry "exports",
-    // `module.exports.X = ...` names X — parity with the `exports.X` arm.
+    // `module.exports.X = ...` names X, matching the `exports.X` arm.
     let src = "module.exports = { start };\n\
                module.exports.stop = function () {};\n";
     let syms = symbols_from_source(src, Language::JavaScript);

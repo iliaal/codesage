@@ -14,7 +14,7 @@ pub(super) struct EditCheckParams {
     pub symbol_name: Option<String>,
     /// Preferred spelling of the declaration: the exact unqualified name, or
     /// a `sym:` handle naming the same `file_path` (its `@line` supplies
-    /// `line`). Alias of `symbol_name` — pass one, or the same value in both.
+    /// `line`). Alias of `symbol_name`: pass one, or the same value in both.
     pub target: Option<String>,
     /// One-based declaration start line at HEAD, required for ambiguous names.
     pub line: Option<usize>,

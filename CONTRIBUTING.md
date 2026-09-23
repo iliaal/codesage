@@ -1,6 +1,6 @@
 # Contributing to CodeSage
 
-CodeSage is pre-1.0 and under active development. The bar for contribution is simple: small, focused changes with tests.
+CodeSage is pre-1.0 and under active development. Send small, focused changes with tests.
 
 ## Reporting a bug
 
@@ -26,11 +26,11 @@ cargo test --workspace                              # full test suite
 cargo clippy --workspace                            # lint
 ```
 
-Always build with `--features cuda` when you want GPU. Without it, a GPU-configured project fails loudly at runtime, which is on purpose: a silent CPU fallback would mix incompatible embeddings into the same index.
+Build with `--features cuda` when you want GPU. Without it, a GPU-configured project fails at runtime on purpose: a silent CPU fallback would mix incompatible embeddings into the same index.
 
 ## Tests
 
-Every bug fix and every feature needs a test. The workspace has ~965; new code should grow that number. Use integration tests for anything that crosses a crate boundary (parsing plus storage, indexing plus search).
+Every bug fix and feature needs a test. Use integration tests for anything that crosses a crate boundary (parsing plus storage, indexing plus search).
 
 Run `cargo test --workspace` before you send a pull request. Tests that need GPU are gated, so the suite passes on CPU-only machines.
 
@@ -40,34 +40,38 @@ Run `cargo test --workspace` before you send a pull request. Tests that need GPU
 - `anyhow` for error handling workspace-wide. Shared domain types live in the `protocol` crate.
 - Tree-sitter queries are `.scm` files under `crates/parser/src/queries/`, embedded via `include_str!`.
 - All query commands emit JSON with `--json`.
-- Write a comment only when the reason isn't obvious from the code. If the next reader would ask "why is this here?", add the comment. Otherwise, let the code speak.
+- Write a comment only when the reason isn't obvious from the code, that is, when the next reader would ask "why is this here?".
 
 ## Commit messages
 
-Imperative mood, keep the subject under ~100 characters (~72 preferred for `git log --oneline` readability). The old 70-char hard limit was relaxed deliberately: measured history shows it systematically unobserved (~half of subjects exceed it), mostly because `type(scope):` prefixes don't fit in 70; 100 keeps one-line readability while fitting conventional prefixes. A body is optional but useful when the *why* isn't obvious from the diff. Conventional prefixes (`feat:`, `fix:`, `docs:`, `test:`, `chore:`) help with later parsing.
+Use the imperative mood and keep the subject under ~100 characters (~72 preferred for `git log --oneline`). The limit is 100 rather than 70 so conventional `type(scope):` prefixes fit. Add a body when the *why* isn't obvious from the diff. Conventional prefixes (`feat:`, `fix:`, `docs:`, `test:`, `chore:`) help with later parsing.
 
 ## CHANGELOG
 
-Every user-visible change updates `CHANGELOG.md` under `## [Unreleased]` in the same commit. User-visible means: new CLI flags or subcommands, new or changed MCP tools, behavior changes, breaking changes, schema migrations, hook template changes, config surface changes, or security fixes. Pure internal refactors, test-only changes, and doc-only changes don't need an entry. Enforced by the CI `check-changelog` job (which validates the `## [Unreleased]` block on PRs), not by a local hook — hooks are bypassable and slow down every commit, while CI is the source of truth at the PR boundary.
+Every user-visible change updates `CHANGELOG.md` under `## [Unreleased]` in the same commit. User-visible means: new CLI flags or subcommands, new or changed MCP tools, behavior changes, breaking changes, schema migrations, hook template changes, config surface changes, or security fixes. Pure internal refactors, test-only changes, and doc-only changes don't need an entry. The CI `check-changelog` job validates the `## [Unreleased]` block on PRs. There is no local hook for this, since hooks are bypassable and slow down every commit.
 
 One bullet per change. Describe what a user can now do, not how you implemented it.
 
 ## Pull requests
 
-Keep them focused. One topic per PR. Aim for under ~300 lines of diff; split if it grows. Explain the *why* in the PR description, the *what* in the commits, and the *how* in the code. CI must be green before review.
+Keep each PR to one topic. Aim for under ~300 lines of diff; split if it grows. Explain the *why* in the PR description, the *what* in the commits, and the *how* in the code. CI must be green before review.
 
 ## Keeping private data out of commits
 
-CodeSage is actively developed and dogfooded against private codebases. Two mechanisms keep that work from leaking into the public repo.
+CodeSage is dogfooded against private codebases. Two mechanisms keep that work out of the public repo.
 
-**Pre-commit leak check.** `codesage install-hooks --with-leak-check` installs a `pre-commit` hook that runs `scripts/leak-check.sh` over staged content. Plain `codesage install-hooks` does not add it: the hook execs a repo-shipped script, so wiring it automatically would hand a fresh clone of a malicious repo code execution on your next commit. When `scripts/leak-check.sh` is present, plain `install-hooks` prints a notice pointing you at the `--with-leak-check` flag. The script scans against extended-regex patterns in two files:
+### Pre-commit leak check
 
-- `scripts/leak-patterns.txt` — tracked, shared. Generic secret formats (private keys, AWS/GitHub/Slack tokens).
-- `.git/info/leak-patterns.txt` — local-only, per-developer. Add your own entries here: private repo names, internal domain terms, absolute home paths. This file never enters git.
+`codesage install-hooks --with-leak-check` installs a `pre-commit` hook that runs `scripts/leak-check.sh` over staged content. Plain `codesage install-hooks` does not add it: the hook execs a repo-shipped script, so wiring it automatically would hand a fresh clone of a malicious repo code execution on your next commit. When `scripts/leak-check.sh` is present, plain `install-hooks` prints a notice pointing you at the `--with-leak-check` flag. The script scans against extended-regex patterns in two files:
+
+- `scripts/leak-patterns.txt`: tracked, shared. Generic secret formats (private keys, AWS/GitHub/Slack tokens).
+- `.git/info/leak-patterns.txt`: local-only, per-developer. Add your own entries here: private repo names, internal domain terms, absolute home paths. This file never enters git.
 
 The script prints the offending `file:line` and blocks the commit. Bypass with `git commit --no-verify` only when you're sure the match is a false positive, and refine the pattern afterwards.
 
-**External test data via env vars.** Any path that points at private test data lives outside the repo and gets injected via environment variable. The existing example is `CODESAGE_BENCH_CORPUS_DIR` (default: `./bench-corpora`); set it to wherever your corpora actually live. Do not hardcode paths in tests, fixtures, or plugin commands.
+### External test data via env vars
+
+Any path that points at private test data lives outside the repo and gets injected via environment variable. The existing example is `CODESAGE_BENCH_CORPUS_DIR` (default: `./bench-corpora`); set it to wherever your corpora live. Do not hardcode paths in tests, fixtures, or plugin commands.
 
 Test fixtures under `crates/parser/tests/fixtures/` must be synthetic code, not copied from real repositories. If you need a fixture with a specific shape, write it; don't paste it in.
 

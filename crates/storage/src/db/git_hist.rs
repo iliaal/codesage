@@ -381,7 +381,7 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// Co-change weight for a file pair (symmetric — caller need not pre-sort).
+    /// Co-change weight for a file pair (symmetric; caller need not pre-sort).
     /// Returns 0.0 when the pair has fewer than three recorded co-changes.
     pub fn co_change_weight(&self, file_a: &str, file_b: &str) -> Result<f64> {
         let (lo, hi) = if file_a <= file_b {

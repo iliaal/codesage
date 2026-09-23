@@ -36,5 +36,5 @@ Pattern adopted from Serena's `cc-system-prompt-override`. Background: two conse
 ## Notes
 
 - The fragment is ~400 tokens. It will reduce prompt-cache reuse slightly (the cache key changes), but only when the system prompt itself is what's being cached. For most agent sessions the user-message content dominates.
-- The fragment is intentionally language-neutral. It does not name specific paths or projects — those belong in each project's `.claude/CLAUDE.md`.
+- The fragment is intentionally language-neutral. It does not name specific paths or projects; those belong in each project's `.claude/CLAUDE.md`.
 - If the override does not improve tool selection, inspect the task intent and chosen tools before changing the policy. Identifier spelling alone cannot distinguish literal search from structural retrieval; do not use it to block Grep calls.

@@ -212,7 +212,7 @@ fn hf_with_deadline<T: Send + 'static>(
 
 /// The HuggingFace client every download and file-list probe shares, built
 /// from the same [`hf_cache_from_env`] root the cached-only probe
-/// ([`cached_model_artifacts`]) consults — never `Api::new`, whose
+/// ([`cached_model_artifacts`]) consults. Never `Api::new`, whose
 /// `Cache::default` panics HOME-less (`dirs::home_dir().expect(..)`) and
 /// ignores `HF_HOME`, so a custom cache root would download into one
 /// directory while the probe reads another. Unresolvable environments
@@ -419,7 +419,7 @@ pub fn init_for_main() {
 /// dlopen the CUDA/cuDNN stack from the discovered NVIDIA library
 /// directories, once per process. Maps ~200 MB RSS and ~1.9 GB virtual, so
 /// it runs only from the session loader when a session actually requests the
-/// CUDA execution provider — never at startup.
+/// CUDA execution provider, never at startup.
 ///
 /// Writes no environment variables: this runs from whatever thread builds the
 /// session, where a `set_var` would race every concurrent `getenv` in the
@@ -614,7 +614,7 @@ impl ModelArtifacts {
     /// change detector that must stay cheap; `None` when a file cannot be
     /// stat'ed or its path cannot be canonicalised.
     ///
-    /// The path component is canonical — absolute, symlinks resolved — so a
+    /// The path component is canonical (absolute, symlinks resolved), so a
     /// relative `HF_HOME` keys the same files as its absolute spelling, and
     /// the same relative spelling from another directory keys other files.
     pub fn stat_key(&self) -> Option<String> {
@@ -964,8 +964,8 @@ fn resolve_hf_artifact_paths(
 /// Refuse a `model.onnx_data` next to the graph when the pin declares this
 /// revision ships none. ONNX Runtime resolves external tensor data relative
 /// to the graph file's directory, and the session is built from the graph
-/// path alone (`commit_from_file`), so a sidecar already at that path — left
-/// by an earlier run or an external `huggingface-cli download` — would be
+/// path alone (`commit_from_file`), so a sidecar already at that path, left
+/// by an earlier run or an external `huggingface-cli download`, would be
 /// loaded whether or not this process fetched it, with no pin to verify it
 /// against. One stat, no network. A stat failure other than `NotFound` is
 /// refused too: the check cannot vouch for a path it cannot inspect.
@@ -1086,7 +1086,7 @@ pub fn allow_any_model_from_env() -> bool {
 }
 
 /// Raw eligibility signal behind [`allow_any_model_from_env`]: the env var
-/// alone. Process-global — never consult it directly on a load path; loads
+/// alone. Process-global: never consult it directly on a load path; loads
 /// require the per-project opt-in on top.
 fn allow_any_eligible_from_env() -> bool {
     matches!(
@@ -1111,7 +1111,7 @@ fn find_project_root_from(start: &Path) -> Option<PathBuf> {
 
 /// Whether `root` is opted in: its canonical path is listed in the
 /// user-owned allowlist file. A missing or unreadable file, or an
-/// unresolvable config home (notably HOME-less daemon environments — see
+/// unresolvable config home (notably HOME-less daemon environments; see
 /// [`hf_cache_from_env`]), is "not listed": fail closed, never panic.
 fn project_allow_any_opted_in(root: &Path) -> bool {
     let Ok(canonical) = std::fs::canonicalize(root) else {
@@ -1176,7 +1176,7 @@ fn allow_any_for_project_root(
 
 /// Message for the loud warning emitted when a load proceeds unpinned: names
 /// the model and the resolved revision (`None` is the floating repository
-/// head — the bypass never pins).
+/// head; the bypass never pins).
 fn unpinned_load_message(model: &str, revision: Option<&str>) -> String {
     format!(
         "loading model {model:?} outside the validated-model pin set at {} — no hash \
@@ -1262,7 +1262,7 @@ fn verify_with_refetch<P>(
 /// snapshot path hf-hub hands out is a symlink into the cache's `blobs/`
 /// directory; the blob holds the actual corrupted bytes and must go too.
 /// The blob target is only deleted after proving it resolves inside the
-/// cache boundary — a crafted or corrupted link (`../../../../some-file`)
+/// cache boundary: a crafted or corrupted link (`../../../../some-file`)
 /// must not get an arbitrary external file deleted on the eviction path.
 /// On containment failure only the symlink itself is removed.
 fn evict_cached_artifact(path: &Path) -> Result<()> {
@@ -1408,8 +1408,8 @@ pub(crate) fn wants_token_type_ids<'a>(mut input_names: impl Iterator<Item = &'a
 
 /// Shared model-loading path for [`Embedder`] and [`Reranker`]: downloads the
 /// tokenizer + ONNX model (and the optional external-weights sidecar), builds a
-/// padding/truncating tokenizer, creates an ORT session — registering the CUDA
-/// execution provider when `device` requests the GPU — and asserts the CUDA
+/// padding/truncating tokenizer, creates an ORT session (registering the CUDA
+/// execution provider when `device` requests the GPU), and asserts the CUDA
 /// libraries actually mapped (the silent-CPU-fallback guard). Returns the
 /// session, tokenizer, and whether the model takes a `token_type_ids` input.
 pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, Tokenizer, bool)> {
@@ -1637,7 +1637,7 @@ impl Embedder {
     }
 
     /// The execution provider this session actually initialised on (`cpu`,
-    /// `cuda`, `coreml`) — the one a fingerprint over its vectors must name.
+    /// `cuda`, `coreml`): the one a fingerprint over its vectors must name.
     pub fn execution_provider(&self) -> &'static str {
         self.execution_provider
     }
@@ -2945,7 +2945,7 @@ mod tests {
         );
 
         // The directory moves: same names, same sizes, same mtimes, another
-        // location — another key, and the old spelling keys nothing.
+        // location: another key, and the old spelling keys nothing.
         let moved = dir.path().join("moved");
         std::fs::rename(&real, &moved).unwrap();
         let relocated = ModelArtifacts {

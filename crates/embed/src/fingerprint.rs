@@ -164,7 +164,7 @@ impl SemanticFingerprint {
 
     /// This fingerprint with its device component replaced by `provider`,
     /// the execution provider a session actually initialised. Everything
-    /// else — digest, stat key, pipeline — is carried over unchanged.
+    /// else (digest, stat key, pipeline) is carried over unchanged.
     pub fn with_execution_provider(&self, provider: &str) -> Self {
         let mut inputs = self.inputs.clone();
         inputs.execution_provider = provider.to_string();
@@ -229,7 +229,7 @@ fn render(inputs: &FingerprintInputs, artifact_digest: &str) -> String {
     )
 }
 
-/// The execution provider a configured `device` string selects — what the
+/// The execution provider a configured `device` string selects: what the
 /// config asks for, not necessarily what a session ends up running on.
 pub fn configured_execution_provider(device: &str) -> &'static str {
     if wants_cuda(device) {

@@ -426,7 +426,7 @@ fn scale_git_decay_multiplies_churn_and_pair_weights() {
     let b = db.git_file("b.rs").unwrap().expect("present");
     assert!((a.churn_score - 2.0).abs() < 1e-9);
     assert!((b.churn_score - 1.0).abs() < 1e-9);
-    // Counters are not scaled — only weights.
+    // Only weights are scaled, not counters.
     assert_eq!(a.fix_count, 1);
     assert_eq!(a.total_commits, 5);
 

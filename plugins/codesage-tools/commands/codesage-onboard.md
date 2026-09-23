@@ -14,7 +14,7 @@ Unlike plugins that register one MCP server per project, CodeSage uses **one glo
 
 Arguments are in `$ARGUMENTS`. The first positional arg must be a path that exists. If it doesn't look like a directory, stop and ask the user what to do.
 
-Default device is `gpu`. The binary errors out loudly if CUDA is requested but unavailable, so don't try to be clever — just pass the user's flag through.
+Default device is `gpu`. The binary errors out if CUDA is requested but unavailable, so pass the user's flag through unchanged.
 
 ## Step 2: Run the onboarding script
 
@@ -60,14 +60,14 @@ limit: 3
 
 Pick a generic query fitting the repo (e.g., "authentication" for a backend, "parser" for a compiler, "migration" for a database-heavy project). Report the top result and its score. A score above 0.5 on a reasonable query is healthy; below 0.4 suggests the index is small or the query missed.
 
-If the MCP call returns an error like "project is not onboarded", re-read the script output — onboarding probably failed partway through.
+If the MCP call returns an error like "project is not onboarded", re-read the script output; onboarding probably failed partway through.
 
 ## Step 6: Summarize for the user
 
 End with a short status block:
 
 - Project: `<path>`
-- MCP: `codesage` (connected/failed) — newly registered / already present
+- MCP: `codesage` (connected/failed), newly registered / already present
 - Index: `<N>` chunks
 - Hooks: installed / skipped / N/A
 - Hint: written / existed / skipped
@@ -79,6 +79,6 @@ Then a one-line reminder:
 
 ## Notes
 
-- The script is idempotent — re-running on the same project is safe and cheap.
+- The script is idempotent; re-running on the same project is safe and cheap.
 - The global `codesage` MCP registration is added on first onboard and reused thereafter; don't create per-project MCP entries.
 - If the user passes `--no-mcp` or `--no-hooks`, skip the matching verification step.

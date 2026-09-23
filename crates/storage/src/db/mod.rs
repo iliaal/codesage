@@ -809,7 +809,7 @@ impl Database {
     /// chunk table whose recorded fingerprint is absent or differs from
     /// `expected_fingerprint`: its vectors are another setup's output and
     /// must not be silently reused. An empty (or not-yet-created) table
-    /// opens fine — the pass that populates it attests it on completion.
+    /// opens fine; the pass that populates it attests it on completion.
     /// Query paths that know the configured setup should prefer this over
     /// [`Database::open_for_model`]; the model/dim gate alone cannot tell a
     /// pooling, device, or model-file change apart.
@@ -839,7 +839,7 @@ impl Database {
     /// `expected_fingerprint` (when `Some`) turns on the deny-by-default
     /// stored-vector gate; `repair_fts` selects the write-path FTS posture
     /// (bounded repair with a health signal on skip) versus the read-path one
-    /// (DDL only — a query must never pay for a sidecar rebuild).
+    /// (DDL only; a query must never pay for a sidecar rebuild).
     fn finish_open_for_model(
         conn: Connection,
         path: &Path,
@@ -924,7 +924,7 @@ impl Database {
     /// configured model name without constructing the embedder just to discover
     /// dimension. If no matching table exists, chunk reads degrade to empty
     /// results; if multiple tables match, the caller must resolve the ambiguity.
-    /// A missing database file is an error, never created here — every caller
+    /// A missing database file is an error, never created here: every caller
     /// is a read path on a project expected to already be indexed.
     ///
     /// Migration-free: runs no schema batch and no migrations, so a pure read
@@ -1067,7 +1067,7 @@ impl Database {
     /// fingerprint equals `expected`: deny-by-default against silent
     /// stale-vector reuse after a setup change (pooling, device, model-file
     /// revision) that keeps the model name and dimension identical. An empty
-    /// table passes — there are no vectors to vouch for yet. Fails on a
+    /// table passes, since there are no vectors to vouch for yet. Fails on a
     /// handle without a chunk table: there is nothing to check against.
     pub fn require_semantic_fingerprint(&self, expected: &str) -> Result<()> {
         anyhow::ensure!(
@@ -1078,8 +1078,8 @@ impl Database {
     }
 
     /// Whether this handle's FTS5 sidecar mirrors its chunk table. Two cheap
-    /// queries, never a rewrite — the read-path health signal for a sidecar
-    /// the open deliberately did not repair. Fails on a handle without a
+    /// queries, never a rewrite. This is the read-path health signal for a
+    /// sidecar the open deliberately did not repair. Fails on a handle without a
     /// chunk table.
     pub fn fts_health(&self) -> Result<FtsSidecarHealth> {
         anyhow::ensure!(
@@ -3037,7 +3037,7 @@ mod tests {
     #[test]
     fn open_does_not_materialize_a_db_through_a_dangling_symlink() {
         // `!path.exists()` is follow-semantics, so a dangling symlink reads as
-        // "missing" — the create must still refuse it.
+        // "missing"; the create must still refuse it.
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("outside.db");
         let cs = dir.path().join(".codesage");
@@ -3052,7 +3052,7 @@ mod tests {
         );
 
         // `open_connection` refuses before `create_private_db_file` runs, so
-        // exercise the O_NOFOLLOW pre-create directly too -- otherwise
+        // exercise the O_NOFOLLOW pre-create directly too. Otherwise
         // reverting that flag alone would leave this test green.
         assert!(create_private_db_file(&db_path).is_err());
         assert!(!target.exists(), "the pre-create followed the symlink");
@@ -3108,7 +3108,7 @@ mod tests {
         );
 
         // The refusal happens before hardening, so call hardening directly as
-        // well -- reverting its lstat alone must still turn this test red.
+        // well: reverting its lstat alone must still turn this test red.
         harden_db_path_permissions(&db_path).unwrap();
 
         let mode = std::fs::metadata(&victim_dir).unwrap().permissions().mode() & 0o777;

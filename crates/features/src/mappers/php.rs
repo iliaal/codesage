@@ -717,7 +717,7 @@ fn detect_root_extension_name(root: &Path) -> Option<String> {
 
 /// One Laravel route registration extracted from `routes/*.php`.
 /// `controller_class` is `None` when the route registers a closure or a
-/// non-class-resolved target — those still produce a per-registration
+/// non-class-resolved target. Those still produce a per-registration
 /// seed but can't be bridged back to a controller file.
 #[derive(Debug, Clone)]
 struct LaravelRoute {

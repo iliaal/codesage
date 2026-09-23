@@ -258,8 +258,8 @@ fn read_commit_epoch(root: &Path, sha: &str) -> Option<i64> {
     std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
 }
 
-/// Indexing mode. `Auto` is the recommended default — reuses prior state if valid,
-/// falls back to full rescan otherwise.
+/// Indexing mode. `Auto`, the recommended default, reuses prior state if valid
+/// and falls back to a full rescan otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexMode {
     /// Re-scan the whole history. Drops existing git_files/git_co_changes first.

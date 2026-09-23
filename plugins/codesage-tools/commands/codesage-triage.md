@@ -6,7 +6,7 @@ argument-hint: "<project-path> --finding <fnd_id> --status open|false-positive|w
 
 # Triage a codesage review finding
 
-Update the lifecycle state of a finding produced by `/codesage-review`. No LLM call — this is a pure local state edit on `.codesage/findings/<feature_id>.json`.
+Update the lifecycle state of a finding produced by `/codesage-review`. No LLM call; this is a pure local state edit on `.codesage/findings/<feature_id>.json`.
 
 ## Parse arguments
 
@@ -14,17 +14,17 @@ From `$ARGUMENTS`:
 - First positional argument: absolute project path (required).
 - `--finding <fnd_id>`: required, must look like `fnd_<8hex>`.
 - `--status <s>`: required, one of:
-  - `open` — the finding is real and not yet acted on (the default state from review).
-  - `false-positive` — the finding doesn't actually apply; subsequent reviews should not re-raise it.
-  - `wont-fix` — the finding is real but won't be acted on. Later reviews suppress it while preserving the human decision.
-  - `fixed` — the finding has been resolved in the source. A revalidation run reopens it only when current evidence shows the same defect is still present.
-- `--note "<text>"`: optional. Free-form context — why this is a false positive, link to a ticket, whatever the user wants future-them to read.
+  - `open`: the finding is real and not yet acted on (the default state from review).
+  - `false-positive`: the finding doesn't apply; subsequent reviews should not re-raise it.
+  - `wont-fix`: the finding is real but won't be acted on. Later reviews suppress it while preserving the human decision.
+  - `fixed`: the finding has been resolved in the source. A revalidation run reopens it only when current evidence shows the same defect is still present.
+- `--note "<text>"`: optional. Free-form context, such as why this is a false positive or a ticket link.
 - `--magnitude N --metric NAME`: optional together, only with `false-positive` or `wont-fix`. Acknowledge an explicitly measured quantity up to N. Use the finding's recorded metric and a finite, nonnegative value at least as large as its observed value. The source must still match the reviewed content. Do not invent a magnitude for a finding without one; revalidate with a reproducible measurement first.
 
 Reject invalid combinations early (missing finding_id, unknown status). Don't proceed if any are malformed.
 
 > **Before touching any `.codesage/` path:** `.codesage/` is repository content, so a cloned
-> repo can ship it — or any directory under it — as a symlink. Refuse to read, write, create,
+> repo can ship it (or any directory under it) as a symlink. Refuse to read, write, create,
 > or delete through one. Check with `test -L <path>` (not `test -e`, which follows links) on
 > `.codesage` itself and on each subdirectory you are about to use, and stop with an error if
 > any is a symlink. Apply the same check to every **leaf** you touch: a `*.json` findings
@@ -36,7 +36,9 @@ Reject invalid combinations early (missing finding_id, unknown status). Don't pr
 
 Walk `.codesage/findings/*.json` and find the file containing a finding with the matching `finding_id`. If no match, report `finding not found in <project>/.codesage/findings/` and stop. Suggest:
 
-> Did you mean one of these? — list 3-5 findings with similar IDs (prefix match) or recent ones.
+> Did you mean one of these?
+
+followed by 3-5 findings with similar IDs (prefix match) or recent ones.
 
 ## Update the record
 

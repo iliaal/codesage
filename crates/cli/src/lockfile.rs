@@ -12,7 +12,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Outcome of a non-blocking lock acquisition attempt.
 pub enum LockOutcome {
     /// We got the lock. Keep the [`IndexLock`] alive for the write
-    /// duration — the OS holds the `flock` while the `File` is open.
+    /// duration; the OS holds the `flock` while the `File` is open.
     Acquired(IndexLock),
     /// Another process already holds the lock on this project.
     AlreadyHeld,
@@ -126,7 +126,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             match try_acquire(root).unwrap() {
-                LockOutcome::Acquired(_) => break, // expected — lock round-trips
+                LockOutcome::Acquired(_) => break, // expected: lock round-trips
                 LockOutcome::AlreadyHeld if std::time::Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10));
                 }

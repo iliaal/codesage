@@ -25,7 +25,7 @@ const MAX_VISITED: usize = 4000;
 const MAX_REFS_PER_SYMBOL: usize = 200;
 
 /// A definition's identity. `Symbol` carries no id, so key on the triple that
-/// locates one — matching `impact.rs`'s `symbol_identity_key`.
+/// locates one, matching `impact.rs`'s `symbol_identity_key`.
 type SymbolKey = (String, String, u32);
 
 fn key_of(s: &Symbol) -> SymbolKey {

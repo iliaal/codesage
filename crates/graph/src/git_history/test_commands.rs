@@ -893,7 +893,7 @@ mod tests {
         }
         // Distinct directories visited: crates/graph/src, crates/graph/src/deep,
         // crates/graph, crates/graph/tests, crates/other/src, crates/other,
-        // crates, "" — each opened once.
+        // crates, "", each opened once.
         assert_eq!(memo.reads, 8, "{:?}", memo.names.keys().collect::<Vec<_>>());
         assert_eq!(
             memo.names.get("crates/graph").cloned().flatten().as_deref(),

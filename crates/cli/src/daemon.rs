@@ -208,7 +208,7 @@ mod unix {
         proxy_stdio(stream, default_project).await
     }
 
-    /// `codesage daemon status` — print the running daemon's pid + socket
+    /// `codesage daemon status`: print the running daemon's pid + socket
     /// path, or report "not running". Exit code 0 if running, 1 if not.
     pub(crate) async fn run_daemon_status(runtime_dir: Option<PathBuf>) -> Result<()> {
         let paths = existing_daemon_paths(runtime_dir)?;
@@ -299,7 +299,7 @@ mod unix {
         Ok(())
     }
 
-    /// `codesage daemon stop` — SIGTERM the running daemon and wait
+    /// `codesage daemon stop`: SIGTERM the running daemon and wait
     /// (bounded) for it to exit + clean up its socket/pid files.
     pub(crate) async fn run_daemon_stop(runtime_dir: Option<PathBuf>) -> Result<()> {
         let paths = existing_daemon_paths(runtime_dir)?;

@@ -541,8 +541,8 @@ fn impact_by_bare_name_refuses_when_definitions_share_a_qualified_name() {
         source_only: false,
     };
 
-    // A shared qualified name used to fall through to the union. Handles
-    // address each definition, so the same input is now one ambiguity.
+    // A shared qualified name must not fall through to the union. Handles
+    // address each definition, so the input is one ambiguity.
     let err = impact_analysis(&db, &req).unwrap_err();
     let target = err
         .downcast_ref::<TargetError>()

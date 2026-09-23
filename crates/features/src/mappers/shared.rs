@@ -50,10 +50,10 @@ pub fn rel_path(root: &Path, abs: &Path) -> String {
 }
 
 /// Walk a directory subtree under `start`, yielding repo-relative file
-/// paths. **Honors `.gitignore`, the project's `[index].exclude_patterns`
-/// when supplied, and a built-in hard-exclude list** — i.e. ignored
-/// sibling worktrees, vendored deps, build output, and editor caches
-/// don't leak into mapper output. Symlinks are skipped. Bounded by
+/// paths. Honors `.gitignore`, the project's `[index].exclude_patterns`
+/// when supplied, and a built-in hard-exclude list, so ignored sibling
+/// worktrees, vendored deps, build output, and editor caches don't leak
+/// into mapper output. Symlinks are skipped. Bounded by
 /// `max_files`; returns the partial set when exceeded.
 pub fn walk_files(
     root: &Path,
@@ -295,13 +295,13 @@ pub enum StringMode {
 /// `/* */` comments; string handling and extra comment/literal syntax vary.
 #[derive(Debug, Clone, Copy)]
 pub struct CommentSyntax {
-    /// Treat `#` as a line comment. `#[` is exempt — that's PHP attribute
+    /// Treat `#` as a line comment. `#[` is exempt: that's PHP attribute
     /// syntax, not a comment, and attributes on route definitions must
     /// survive the strip.
     pub hash_line_comments: bool,
     pub strings: StringMode,
     /// Recognize `` ` `` template literals (JS). Delimiters are preserved
-    /// and contents always blanked regardless of [`Self::strings`] —
+    /// and contents always blanked regardless of [`Self::strings`]:
     /// embedded `${…}` interpolation would need balanced-brace tracking,
     /// and losing identifiers inside `${}` is an acceptable false negative.
     pub template_literals: bool,

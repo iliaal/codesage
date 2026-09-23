@@ -510,7 +510,7 @@ fn append_trailing_rationale(def_node: &Node, source: &[u8], entries: &mut Vec<R
 
 /// Parse one C-family / PHP comment node into at most one rationale entry. The
 /// delimiters are stripped, then each interior line (with a leading docblock
-/// `*` removed) is scanned for the first `MARKER: text` — so both a single-line
+/// `*` removed) is scanned for the first `MARKER: text`, so both a single-line
 /// `// WHY: ...` and a multi-line `/** ... * WHY: ... */` docblock resolve.
 fn parse_clike_comment(raw: &str, node: &Node) -> Option<RationaleEntry> {
     let body = strip_clike_comment_markers(raw);
@@ -549,7 +549,7 @@ fn parse_clike_comment(raw: &str, node: &Node) -> Option<RationaleEntry> {
 fn strip_clike_comment_markers(raw: &str) -> String {
     let trimmed = raw.trim();
     if let Some(rest) = trimmed.strip_prefix('#') {
-        // PHP `#` line comment. `#[...]` attributes never reach here — the
+        // PHP `#` line comment. `#[...]` attributes never reach here; the
         // grammar emits them as `attribute_list`, not `comment`.
         return rest.trim_start().to_string();
     }

@@ -31,7 +31,7 @@ pub enum MatchMode {
     /// `to_name == prefix` or `to_name starts with prefix + "."`. Used for
     /// Python dotted modules like `os.path`.
     PrefixDot,
-    /// Match if the recorded name *contains* the substring. Use sparingly —
+    /// Match if the recorded name *contains* the substring. Use sparingly:
     /// only when the captured form varies across PHP function vs static call
     /// vs method call sites that all share the same suffix.
     Contains,
@@ -162,7 +162,7 @@ const RUST_RULES: &[TrustBoundaryRule] = &[
 /// PHP. `to_name` for `use` imports is the full namespaced path. For function
 /// and static calls the `to_name` is also recorded (e.g. `exec`, `mysqli_query`).
 const PHP_RULES: &[TrustBoundaryRule] = &[
-    // network — HTTP clients + cURL family
+    // network: HTTP clients + cURL family
     rule("GuzzleHttp", MatchMode::PrefixBackslash, NETWORK_API),
     rule(
         "Symfony\\Component\\HttpClient",
@@ -413,7 +413,7 @@ const PHP_RULES: &[TrustBoundaryRule] = &[
         MatchMode::PrefixBackslash,
         USER_INPUT,
     ),
-    // Laravel form-request classes and the FormRequest base — every
+    // Laravel form-request classes and the FormRequest base: every
     // request DTO that extends this is by definition user-controlled.
     rule(
         "Illuminate\\Foundation\\Http\\FormRequest",
@@ -468,7 +468,7 @@ const C_RULES: &[TrustBoundaryRule] = &[
     rule("sys/wait.h", MatchMode::Exact, EXEC),
     rule("spawn.h", MatchMode::Exact, EXEC),
     rule("sys/exec.h", MatchMode::Exact, EXEC),
-    // unistd.h is fs+exec — keep both, since callers can rely on either
+    // unistd.h is fs+exec; keep both, since callers can rely on either
     rule(
         "unistd.h",
         MatchMode::Exact,
@@ -560,7 +560,7 @@ const PYTHON_RULES: &[TrustBoundaryRule] = &[
     rule("shutil", MatchMode::PrefixDot, FS),
     rule("tempfile", MatchMode::PrefixDot, FS),
     rule("glob", MatchMode::PrefixDot, FS),
-    // process-exec — subprocess/multiprocessing plus the classic os-module
+    // process-exec: subprocess/multiprocessing plus the classic os-module
     // shell/exec sinks. The exec/spawn families share a bare prefix (no dot
     // separator: `os.execv`, `os.spawnl`), so they match by `Contains` rather
     // than `PrefixDot`.

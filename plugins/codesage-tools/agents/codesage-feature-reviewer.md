@@ -98,7 +98,7 @@ Return exactly one fenced JSON object and no prose:
 }
 ```
 
-New findings have no `finding_id`. Echo an applicable prior finding's ID with current location and evidence; the ID is advisory — the orchestrator re-derives identity from evidence and location, so accurate evidence matters more than the echo. Empty findings are valid. `reviewed_files` is required and contains repo-relative paths actually inspected during this response.
+New findings have no `finding_id`. Echo an applicable prior finding's ID with current location and evidence; the ID is advisory: the orchestrator re-derives identity from evidence and location, so accurate evidence matters more than the echo. Empty findings are valid. `reviewed_files` is required and contains repo-relative paths actually inspected during this response.
 
 A finding may include `"magnitude": {"metric": "unbounded-queue-items", "value": 12}` only when current evidence establishes that finite, nonnegative quantity. The metric names a stable measurement, including its unit and population where needed; larger values must mean worse impact. Explain how the evidence establishes the value in `summary`. Never derive magnitude from severity or invent a number for a qualitative defect. For an acknowledged prior, measure the same metric again and return its current value even when equal or lower. If the metric cannot be measured, return the applicable finding without magnitude; the helper reopens it with an explicit uncertainty reason. A renamed file can retain acknowledgement only through a unique whole-file content hash; the helper also checks other feature documents when an entrypoint rename changes feature identity. Do not infer identity from a rewrite or an echoed ID.
 

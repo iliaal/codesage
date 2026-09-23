@@ -21,8 +21,8 @@ use serde_json::{Map, Value, json};
 
 use super::CodeSageServer;
 
-/// Tools whose payload is machine-internal — raw vectors, reranker scores,
-/// daemon counters — and whose only consumers are CodeSage's own CLI paths.
+/// Tools whose payload is machine-internal (raw vectors, reranker scores,
+/// daemon counters) and whose only consumers are CodeSage's own CLI paths.
 /// `daemon_stats` also returns before the envelope step in `dispatch_tool`.
 const UNENVELOPED_TOOLS: &[&str] = &["embed_texts", "rerank_pairs", "daemon_stats"];
 

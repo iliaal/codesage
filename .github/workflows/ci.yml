@@ -60,9 +60,8 @@ jobs:
         with:
           persist-credentials: false
       # Validates the `## [Unreleased]` block (section order, terse bullets).
-      # Runs on every PR — the script itself is stdlib-only and passes when
-      # there is no Unreleased content to check, so scoping by paths is
-      # unnecessary overhead.
+      # Not path-filtered: the stdlib-only script is cheap and passes when
+      # there is no Unreleased content.
       - run: python3 scripts/check-changelog.py CHANGELOG.md
 
   build:

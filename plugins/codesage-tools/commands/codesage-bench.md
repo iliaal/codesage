@@ -20,7 +20,7 @@ Corpus directory resolution (first match wins):
 ${CLAUDE_PLUGIN_ROOT}/bin/codesage-bench $ARGUMENTS
 ```
 
-No re-indexing happens — this only runs `codesage search` against existing indexes. Each corpus takes 10-60 seconds depending on case count. Background and poll if total runtime exceeds ~2 minutes.
+No re-indexing happens; this only runs `codesage search` against existing indexes. Each corpus takes 10-60 seconds depending on case count. Background and poll if total runtime exceeds ~2 minutes.
 
 ## Step 2: Report the summary
 
@@ -31,7 +31,7 @@ Parse the summary table and surface per corpus:
 - Median first-hit rank (1 is ideal)
 - Mean recall@5 and recall@10
 
-Flag anything off — reasonable healthy thresholds across application codebases:
+Flag anything off. Healthy thresholds across application codebases:
 
 - `miss_rate ≤ ~15%` per corpus
 - `median_first_hit ≤ 3`
@@ -46,7 +46,7 @@ If any corpus returns `FAIL` or produces unexpectedly high miss rates, check whe
 Read the corresponding scorecard file under `history/` to see failed queries. Present the list to the user and offer to:
 
 1. Update the eval YAML to remove or replace stale references
-2. Leave it alone — the surprise is the benchmark doing its job
+2. Leave it alone: the surprise is the benchmark doing its job
 
 Do not silently "fix" the YAML without explicit direction.
 
@@ -54,7 +54,7 @@ Do not silently "fix" the YAML without explicit direction.
 
 If the user says "compare to last run" or similar, take the two most recent scorecards per corpus in `<corpus-dir>/history/`, compute deltas on the aggregates, and report them.
 
-Not automatic — only on request.
+Only on request.
 
 ## Step 5: Status block
 
@@ -66,6 +66,6 @@ Not automatic — only on request.
 
 ## Notes
 
-- Light regression check only — prints, saves, does not alert on thresholds automatically. User eyeballs the aggregates.
+- Light regression check only: prints and saves, never alerts on thresholds. The user reviews the aggregates.
 - Every run is saved to `history/`; old runs are never deleted by this command.
-- The runner calls `codesage search --json` directly; it does NOT go through the MCP. This is intentional — benchmarks should exercise the retrieval pipeline without the MCP routing layer in the way.
+- The runner calls `codesage search --json` directly; it does NOT go through the MCP. This is intentional: benchmarks should exercise the retrieval pipeline without the MCP routing layer in the way.

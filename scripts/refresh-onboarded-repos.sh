@@ -5,9 +5,8 @@
 #   3. Re-run the plugin's onboard script with --refresh-hint to update
 #      the per-repo .claude/CLAUDE.md so the agent learns about new tools
 #
-# Excludes ~/ai/bench-repos/* and ~/ai/codesage_ref/* per the
-# `feedback_bench_repos_test_only` rule. Bench fixtures and competitor
-# mirrors should not be touched by routine upgrade sweeps.
+# Excludes ~/ai/bench-repos/* and ~/ai/codesage_ref/*: bench fixtures and
+# competitor mirrors stay out of routine upgrade sweeps.
 #
 # Usage:
 #   bash scripts/refresh-onboarded-repos.sh             # do it

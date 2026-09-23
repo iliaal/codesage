@@ -468,7 +468,7 @@ pub fn semantic_table_state(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactLookup {
     /// The local hf-hub cache first, then the same resolution the session
-    /// loader performs — which downloads on a cache miss.
+    /// loader performs, which downloads on a cache miss.
     Resolve,
     /// The local hf-hub cache only. Absent artifacts are `None`, never a
     /// download: for `status` and any other path that must not block on the

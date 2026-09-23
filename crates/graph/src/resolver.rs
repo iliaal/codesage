@@ -5,11 +5,11 @@
 //! thing to `find_symbol`, `impact_analysis`, `trace_call_path`,
 //! `export_context`, and `feature_bundle`:
 //!
-//! 1. a handle — `sym:path#qualified[@line]`, `file:path`, `dir:path`,
+//! 1. a handle: `sym:path#qualified[@line]`, `file:path`, `dir:path`,
 //!    `chunk:path:start-end`, `feat_<hex16>`
 //! 2. `route:METHOD path` or `cmd:name`
 //! 3. an indexed file path, exactly as stored
-//! 4. `path:line` — the definition enclosing that line
+//! 4. `path:line`: the definition enclosing that line
 //! 5. a qualified symbol name (`Db::open`, `App\Db::open`, `Class.method`)
 //! 6. a bare symbol name
 //! 7. a feature id
@@ -451,7 +451,7 @@ pub(crate) fn matched_symbols(resolution: &TargetResolution, symbols: Vec<Symbol
 }
 
 /// A `mod x;` declaration: a module or namespace symbol with no body on its
-/// own line. Excluded from definition results by default — an agent that
+/// own line. Excluded from definition results by default: an agent that
 /// searched for `render` wants the module's contents, not the line that
 /// declares it.
 pub fn is_module_declaration(sym: &Symbol) -> bool {

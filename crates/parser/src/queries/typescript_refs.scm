@@ -3,7 +3,7 @@
 ; Pattern 0: import statement (captures the module source string)
 (import_statement source: (string) @ref)
 
-; Pattern 1: require("module") -- captures the module string
+; Pattern 1: require("module"), captures the module string
 (call_expression
   function: (identifier) @_fn
   arguments: (arguments (string) @ref)
@@ -21,7 +21,7 @@
 ; Pattern 5: instantiation (new Foo())
 (new_expression constructor: (identifier) @ref)
 
-; Pattern 6: class inheritance (class Foo extends Bar) -- TS extends_clause form
+; Pattern 6: class inheritance (class Foo extends Bar), TS extends_clause form
 (extends_clause value: (identifier) @ref)
 
 ; Patterns 7-9: local, named, and namespace import bindings.

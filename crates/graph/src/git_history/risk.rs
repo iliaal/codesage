@@ -612,7 +612,7 @@ const MAX_SCORE_WARNING: f64 = 0.50;
 /// `git_co_changes`, which only ever gains a row alongside `git_files` because
 /// `run_full` and `run_incremental` derive both from the same filtered commit
 /// pass, so an unscored file has no visible pair either; that is a producer
-/// invariant, not a schema constraint, and it carries the whole margin — with
+/// invariant, not a schema constraint, and it carries the whole margin: with
 /// coupling included the bound is exactly [`MAX_SCORE_WARNING`], which the
 /// `>=` gate fires on.
 const UNSCORED_REACHABLE_WEIGHT: f64 =
@@ -652,14 +652,14 @@ const _: () = assert!(
 );
 
 /// Risk score for a single file. Composes:
-/// - churn percentile (0..1) — weight [`CHURN_WEIGHT`]
-/// - fix ratio (fix_count / total_commits, capped at 1.0) — [`FIX_RATIO_WEIGHT`]
-/// - dependent file pressure (capped via 20 dependents) — [`DEPENDENT_WEIGHT`]
-/// - coupled file pressure (capped via 10 coupled) — [`COUPLING_WEIGHT`]
+/// - churn percentile (0..1): [`CHURN_WEIGHT`]
+/// - fix ratio (fix_count / total_commits, capped at 1.0): [`FIX_RATIO_WEIGHT`]
+/// - dependent file pressure (capped via 20 dependents): [`DEPENDENT_WEIGHT`]
+/// - coupled file pressure (capped via 10 coupled): [`COUPLING_WEIGHT`]
 /// - test gap (no sibling test, no test among coupled, and no test within
-///   `DEPENDENT_DEPTH` reverse-dependency hops) — [`TEST_GAP_WEIGHT`]
-/// - cycle membership ((cycle_size - 1) / 4, capped at size 5) — [`CYCLE_WEIGHT`]
-/// - trust boundary count (capped at 5 distinct boundaries) — [`TRUST_BOUNDARY_WEIGHT`]
+///   `DEPENDENT_DEPTH` reverse-dependency hops): [`TEST_GAP_WEIGHT`]
+/// - cycle membership ((cycle_size - 1) / 4, capped at size 5): [`CYCLE_WEIGHT`]
+/// - trust boundary count (capped at 5 distinct boundaries): [`TRUST_BOUNDARY_WEIGHT`]
 ///
 /// Includes the signal decomposition; structural signals remain usable without git history.
 /// Every field is populated and `verbose` starts true; a caller that wants
@@ -1347,7 +1347,7 @@ fn compute_top_symbols(
     }
 
     // One batched name-count query seeds the ranking. Refs match by short name
-    // (and tail-name fallback for qualified callsites) — same shape as
+    // (and tail-name fallback for qualified callsites), the same shape as
     // `find_references`, and an upper bound on what resolution can keep.
     let mut names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
     names.sort_unstable();
@@ -1910,8 +1910,8 @@ fn cycle_entry_for_file(
     file_path: &str,
 ) -> Result<Option<CycleEntry>> {
     for component in cycles.components.iter() {
-        // Trivial SCCs (single-node, no self-edge) aren't cycles — same rule
-        // as `find_cycles_touching`.
+        // Trivial SCCs (single-node, no self-edge) aren't cycles, the same
+        // rule as `find_cycles_touching`.
         if component.len() < 2 {
             continue;
         }
