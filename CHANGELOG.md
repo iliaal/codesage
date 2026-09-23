@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.35.0] - 2026-09-22
+
 ### Added
 
 - `find_symbol` and `find_references` rows carry `is_test: true` for test code (omitted when false); a reference is test code when its enclosing definition or its file is.
@@ -8,7 +10,7 @@
 - `list_dependencies` and `codesage dependencies` report import targets named only from test code under `test_imports` (omitted when empty).
 - `project_overview` accepts `include_tests` (default false) to rank test files in `top_risk_files`.
 - Schema migration `0024_is_test` (`files.is_test`, `symbols.is_test`); the next `codesage index` reparses existing files under `extraction=6`.
-- Every successful MCP response carries `tool`, `index`, `cost`, and — when the answer is not exact — `completeness {kind, kinds, recover}` and `target`; `index` reports the index generation, indexed SHA, structural/semantic freshness, and `dirty_paths`.
+- Every successful MCP response carries `tool`, `index`, and `cost`, plus `completeness {kind, kinds, recover}` and `target` when the answer is not exact; `index` reports the index generation, indexed SHA, structural/semantic freshness, and `dirty_paths`.
 - `index.structural` is `behind` when an indexed file's HEAD content differs from the index, `unknown` when drift could not be determined, and omitted when fresh.
 - `CODESAGE_ENVELOPE=legacy` in the daemon's environment suppresses every envelope key for that daemon's lifetime.
 - `find_coupling` and `assess_risk` `top_coupled` rows carry `p_cochange` and `p_reverse`.
@@ -34,10 +36,10 @@
 
 ### Deprecated
 
-- `_meta` and the per-tool incompleteness fields (`counts_floor`, `bounded`, `truncated`, `callers_truncated`, `reachable_capped`, `reach_walk_capped`, `unmodelled`, `unscored`, `unscored_files`, `unwalked_files`, `partial_files`, `unindexed_files`, `no_symbol_files`) — read `completeness` and `index` instead; removed in the next minor.
-- `find_coupling` `confidence` and `reverse_confidence` — read `p_cochange` and `p_reverse` instead; removed in the next minor.
-- `impact_analysis` `is_file` and `export_context` `is_symbol` — the target grammar names its own kind and a handle already overrides both; removed in the next minor.
-- The legacy entity-naming arguments `name`, `symbol_name`, `file_path`, `file_paths`, and `feature_id` — pass `target` / `targets` instead; removed in the next minor. `find_references` keeps `name` as its primary spelling.
+- `_meta` and the per-tool incompleteness fields (`counts_floor`, `bounded`, `truncated`, `callers_truncated`, `reachable_capped`, `reach_walk_capped`, `unmodelled`, `unscored`, `unscored_files`, `unwalked_files`, `partial_files`, `unindexed_files`, `no_symbol_files`): read `completeness` and `index` instead; removed in the next minor.
+- `find_coupling` `confidence` and `reverse_confidence`: read `p_cochange` and `p_reverse` instead; removed in the next minor.
+- `impact_analysis` `is_file` and `export_context` `is_symbol`: the target grammar names its own kind and a handle already overrides both; removed in the next minor.
+- The legacy entity-naming arguments `name`, `symbol_name`, `file_path`, `file_paths`, and `feature_id`: pass `target` / `targets` instead; removed in the next minor. `find_references` keeps `name` as its primary spelling.
 
 ### Fixed
 
@@ -1126,5 +1128,7 @@ Initial public release.
 
 [0.33.1]: https://github.com/iliaal/codesage/releases/tag/v0.33.1
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.34.0...HEAD
 [0.34.0]: https://github.com/iliaal/codesage/releases/tag/v0.34.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.35.0...HEAD
+[0.35.0]: https://github.com/iliaal/codesage/releases/tag/v0.35.0
