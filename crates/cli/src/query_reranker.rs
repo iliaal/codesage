@@ -319,7 +319,7 @@ mod daemon {
     mod tests {
         use super::*;
         use rmcp::model::{
-            CallToolResponse, CallToolResult, ContentBlock, ServerCapabilities, ServerInfo,
+            CallToolResponse, CallToolResult, ContentBlock, ServerCapabilities, ServerConfig,
         };
         use rmcp::service::RequestContext;
         use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -336,8 +336,8 @@ mod daemon {
         }
 
         impl ServerHandler for FakeDaemon {
-            fn get_info(&self) -> ServerInfo {
-                ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            fn get_info(&self) -> ServerConfig {
+                ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             }
 
             async fn call_tool(

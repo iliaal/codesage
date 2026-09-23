@@ -34,7 +34,7 @@ use codesage_protocol::{
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, tool::schema_for_type, wrapper::Parameters},
-    model::{CallToolResult, Implementation, ServerInfo},
+    model::{CallToolResult, Implementation, ServerConfig},
     tool, tool_handler, tool_router,
 };
 
@@ -293,9 +293,9 @@ impl ServerHandler for CodeSageServer {
         self.dispatch_tool(request, context).await
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         use rmcp::model::ServerCapabilities;
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("codesage", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Structural and semantic code intelligence across multiple projects. \
