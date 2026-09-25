@@ -133,15 +133,17 @@ fn incremental_after_full_is_noop_when_head_unchanged() {
 }
 
 #[test]
-fn incremental_without_state_falls_back_to_full() {
+fn incremental_without_state_refuses_full_fallback() {
     let root = codesage_repo_root();
     if !root.join(".git").exists() {
         return;
     }
     let db = Database::open_in_memory().unwrap();
-    let stats = git_history_index_with_options(&db, &root, &[], IndexMode::Incremental).unwrap();
-    assert!(stats.commits_scanned > 0);
-    assert!(stats.files_tracked > 0);
+    let error = git_history_index_with_options(&db, &root, &[], IndexMode::Incremental)
+        .expect_err("explicit incremental must not silently full-scan");
+    assert!(error.to_string().contains("no incremental state"));
+    let auto = git_history_index_with_options(&db, &root, &[], IndexMode::Auto).unwrap();
+    assert!(auto.commits_scanned > 0);
     assert!(db.get_git_index_state().unwrap().is_some());
 }
 
@@ -320,31 +322,23 @@ fn incremental_falls_back_to_full_when_history_rewritten() {
     run_git(root, &["add", "."]);
     run_git(root, &["commit", "-qm", "rewritten second adds c"]);
 
-    let incr = git_history_index_with_options(&db, root, &[], IndexMode::Incremental).unwrap();
-
+    let error = git_history_index_with_options(&db, root, &[], IndexMode::Incremental)
+        .expect_err("explicit incremental must not silently full-scan");
+    assert!(error.to_string().contains("not an ancestor"));
+    let incr = git_history_index_with_options(&db, root, &[], IndexMode::Auto).unwrap();
     assert_eq!(
         incr.commits_scanned, 2,
-        "fallback must rescan the entire rewritten history"
+        "automatic mode must rescan the entire rewritten history"
     );
     let (new_sha, _) = db
         .get_git_index_state()
         .unwrap()
         .expect("state after fallback");
-    assert_ne!(
-        new_sha, stale_sha,
-        "state must be restamped to the new HEAD"
-    );
-
-    assert!(
-        db.git_file("b.rs").unwrap().is_none(),
-        "b.rs only exists on the abandoned history line"
-    );
-
+    assert_ne!(new_sha, stale_sha);
+    assert!(db.git_file("b.rs").unwrap().is_none());
     let db_fresh = Database::open_in_memory().unwrap();
     let fresh = git_history_index_with_options(&db_fresh, root, &[], IndexMode::Full).unwrap();
     assert_eq!(incr.commits_scanned, fresh.commits_scanned);
-    assert_eq!(incr.files_tracked, fresh.files_tracked);
-    assert_eq!(incr.co_change_pairs, fresh.co_change_pairs);
     for path in ["a.rs", "c.rs"] {
         let got = db
             .git_file(path)

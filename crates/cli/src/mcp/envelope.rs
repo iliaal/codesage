@@ -381,7 +381,7 @@ pub(super) struct IndexFacts {
     /// `files_behind` is a lower bound: the comparison stopped at its
     /// candidate cap or time budget.
     files_behind_bounded: bool,
-    /// `Some("partial" | "none")`; `None` means every indexed file has chunks.
+    /// `Some("partial" | "none" | "unknown")`; `None` means every indexed file has chunks.
     semantic: Option<&'static str>,
     computed_at: Instant,
 }
@@ -486,7 +486,7 @@ impl CodeSageServer {
             semantic: None,
             computed_at: Instant::now(),
         };
-        match codesage_storage::Database::open_existing(db_path) {
+        match codesage_storage::Database::open_read_only(db_path) {
             Ok(db) => {
                 let drift = codesage_graph::drift::check_drift(root, &db);
                 facts.head = drift.stored_sha.as_deref().map(short_sha);
@@ -510,7 +510,7 @@ impl CodeSageServer {
     fn semantic_state(
         &self,
         root: &Path,
-        db_path: &Path,
+        _db_path: &Path,
         db: &codesage_storage::Database,
     ) -> Option<&'static str> {
         let files = db.file_count().unwrap_or(0);
@@ -518,29 +518,26 @@ impl CodeSageServer {
             return None;
         }
         let Some(model) = self.configured_model(root) else {
-            // Nothing to scope by: every chunk table is equally plausible.
-            return coverage_of(db.semantic_file_count().unwrap_or(0), files);
+            return match db.semantic_file_count() {
+                Ok(count) => coverage_of(count, files),
+                Err(_) => Some("unknown"),
+            };
         };
-        match codesage_storage::Database::open_for_existing_model(db_path, &model)
-            .and_then(|scoped| scoped.semantic_freshness())
-        {
+        match db.semantic_freshness_for_model(&model) {
             Ok(None) => Some("none"),
             Ok(Some(freshness)) if freshness.indexed_files == 0 => Some("none"),
-            Ok(Some(freshness)) if !freshness.is_fresh() => Some("partial"),
-            Ok(Some(_)) => None,
-            Err(error) => {
-                // Ambiguous or pre-registry chunk tables: the fallback count is
-                // coarser but stays scoped to the configured model.
-                tracing::debug!(error = %error, "envelope semantic freshness fell back to a count");
-                coverage_of(db.semantic_file_count_for_model(&model).unwrap_or(0), files)
+            Ok(Some(freshness)) if freshness.missing_files > 0 || freshness.stale_files > 0 => {
+                Some("partial")
             }
+            Ok(Some(_)) => None,
+            Err(_) => Some("unknown"),
         }
     }
 
     /// The project's configured embedding model, without the watcher side
     /// effect `resolve_project` carries: `edit_check` is enveloped too.
     fn configured_model(&self, root: &Path) -> Option<String> {
-        self.resolve_project_inner(&root.to_string_lossy())
+        self.resolve_project_read_only(&root.to_string_lossy())
             .ok()
             .map(|state| state.embedding_config.model)
             .filter(|model| !model.is_empty())
@@ -693,7 +690,7 @@ pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
                     "files_behind": {"type": "integer", "minimum": 1, "description": "Indexed files whose content at HEAD differs from the indexed content, plus supported source files committed since indexing. Absent when none do, including when HEAD has moved by commits that touched nothing indexed."},
                     "files_behind_bounded": {"const": true, "description": "`files_behind` (0 when absent) is a lower bound: the content comparison stopped at its 2,000-path cap or 500 ms budget before checking every candidate. Absent when the comparison completed."},
                     "structural": {"enum": ["behind", "dirty", "unknown"], "description": "`behind`: at least one indexed file's HEAD content differs from the index (`files_behind` counts them), or, when that comparison could not run or stopped before finding one (`files_behind_bounded`), the indexed SHA is not HEAD. `dirty`: a path in this response differs on disk from the index. `unknown`: drift could not be determined (git failed, the index carries no commit stamp, or it could not be opened). Absent when fresh."},
-                    "semantic": {"enum": ["partial", "none"], "description": "Semantic coverage of the indexed file set by the configured embedding model: none when that model has no chunks, partial when some indexed files lack chunks for it or their chunks predate the current content. Absent when the configured model covers every indexed file."},
+                    "semantic": {"enum": ["partial", "none", "unknown"], "description": "Semantic coverage of the indexed file set by the configured embedding model: none when that model has no chunks, partial when some indexed files lack chunks for it or their chunks predate the current content, unknown when the semantic schema or model registry cannot be read safely. Absent when the configured model covers every indexed file."},
                     "dirty_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths in this response that changed on disk since indexing."}
                 }
             }),
@@ -1186,6 +1183,36 @@ mod tests {
         // covering every file; the active model has none, and `search` with it
         // returns nothing.
         let index = semantic_state_for("chunks/empty");
+        assert_eq!(index["semantic"], "none", "{index}");
+    }
+
+    /// A structurally indexed project (`codesage index --no-semantic`) has an
+    /// empty but perfectly readable `semantic_models` registry. The configured
+    /// model simply has no chunks, which is `none`; `unknown` is reserved for a
+    /// registry or schema that cannot be read.
+    #[test]
+    fn a_configured_model_with_an_empty_registry_reports_none_not_unknown() {
+        let (_dir, project) = indexed_project(&[("src/a.rs", "fn a() {}")]);
+        let db_path = Path::new(&project).join(".codesage").join("index.db");
+        let db = Database::open_existing_read(&db_path).unwrap();
+        assert_eq!(
+            db.semantic_freshness_for_model("never/embedded").unwrap(),
+            None
+        );
+        drop(db);
+        std::fs::write(
+            Path::new(&project).join(".codesage").join("config.toml"),
+            "[embedding]\nmodel = \"never/embedded\"\ndevice = \"cpu\"\n",
+        )
+        .unwrap();
+
+        let index = enveloped(
+            &server(true),
+            "find_symbol",
+            &project,
+            json!({"results": [{"file_path": "src/a.rs"}]}),
+        )["index"]
+            .clone();
         assert_eq!(index["semantic"], "none", "{index}");
     }
 

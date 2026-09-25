@@ -343,8 +343,8 @@ enum Commands {
         /// Force a full rescan even if incremental state exists
         #[arg(long, conflicts_with = "incremental")]
         full: bool,
-        /// Force incremental mode (fails open to full if no valid prior state). Default
-        /// is auto: incremental if state is valid, else full.
+        /// Force incremental mode and fail when prior state is missing, legacy, or rewritten.
+        /// The default Auto mode safely falls back to a full scan.
         #[arg(long)]
         incremental: bool,
         /// Wait up to SECS for the project index lock instead of skipping
@@ -635,6 +635,13 @@ pub(crate) fn open_db(root: &Path) -> Result<Database> {
 /// No chmod or migrations; suitable for read-only evidence paths.
 pub(crate) fn open_db_read_only(root: &Path) -> Result<Database> {
     Database::open_read_only(&db_path(root)).context("failed to open index database read-only")
+}
+
+/// Existing index for overview reads: structural compatibility migrations may
+/// run, but semantic-schema damage remains visible instead of being repaired.
+pub(crate) fn open_db_for_overview(root: &Path) -> Result<Database> {
+    Database::open_existing_for_overview(&db_path(root))
+        .context("failed to prepare index database for overview")
 }
 
 pub(crate) fn open_db_for_model(root: &Path, model: &str, dim: usize) -> Result<Database> {

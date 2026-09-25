@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use crate::{PROJECT_DIR, find_project_root, flush_stdio, open_db};
+use crate::{PROJECT_DIR, find_project_root, flush_stdio, open_db, open_db_for_overview};
 
 pub(crate) fn cmd_session_start(session_id: &str, json: bool) -> Result<()> {
     let root = find_project_root()?;
@@ -96,7 +96,7 @@ pub(crate) fn cmd_session_end(session_id: &str, json: bool) -> Result<()> {
 
 pub(crate) fn cmd_overview(json: bool) -> Result<()> {
     let root = find_project_root()?;
-    let db = open_db(&root)?;
+    let db = open_db_for_overview(&root)?;
     let overview = codesage_graph::build_project_overview(&root, &db)?;
 
     if json {

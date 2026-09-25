@@ -8,7 +8,7 @@ use codesage_protocol::{
     DependencyEntry, FileInfo, Handle, Language, RationaleEntry, Reference, ReferenceKind, Symbol,
     SymbolKind, TrustBoundary, Visibility,
 };
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use crate::schema::name_tail;
 
@@ -150,6 +150,55 @@ impl Database {
     /// real SHAs; the "not a git repo" case is the caller's to skip.
     pub fn set_structural_index_state(&self, sha: &str) -> Result<()> {
         set_index_state(&self.conn, "structural_index_state", sha)
+    }
+
+    /// Return the canonical exclusion fingerprint used by the last git-history
+    /// pass. `None` means no state or a legacy row without provenance.
+    pub fn git_index_exclusion_fingerprint(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT exclude_fingerprint FROM git_index_state WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Persist the effective git-history exclusion fingerprint alongside the
+    /// index state. Callers should do this in the same transaction as the
+    /// history write so a crash cannot pair data with the wrong policy.
+    pub fn set_git_index_exclusion_fingerprint(&self, fingerprint: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE git_index_state SET exclude_fingerprint = ?1 WHERE id = 1",
+            params![fingerprint],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `semantic_files` has the columns the freshness read path
+    /// requires. A path-only legacy table is not valid coverage evidence.
+    pub fn semantic_file_schema_is_current(&self) -> Result<bool> {
+        let required: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('semantic_files')
+             WHERE name IN ('chunk_table', 'path', 'content_hash', 'indexed_at')",
+            [],
+            |row| row.get(0),
+        )?;
+        let pk_columns: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('semantic_files') WHERE pk > 0",
+            [],
+            |row| row.get(0),
+        )?;
+        let pk_order: Option<String> = self.conn.query_row(
+            "SELECT group_concat(name, ',') FROM (
+                SELECT name FROM pragma_table_info('semantic_files')
+                WHERE pk > 0 ORDER BY pk)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(required == 4 && pk_columns == 2 && pk_order.as_deref() == Some("chunk_table,path"))
     }
 
     pub fn all_file_interpretations(&self) -> Result<HashMap<String, Option<String>>> {
@@ -1014,6 +1063,8 @@ impl Database {
     /// Remove one file from every per-path store: `files` (FK cascades cover
     /// symbols / refs / fingerprints / trust boundaries), semantic freshness,
     /// git history, feature membership, and EVERY model's chunk table plus
+    /// its FTS sidecar. An entry-file deletion also removes its feature head;
+    /// ordinary owned-file deletions retain a feature with remaining files.
     /// its FTS sidecar. Sweeping all chunk tables, not just the active one,
     /// matters because a structural-only pass (`codesage index --no-semantic`)
     /// opens without a model, and a per-model delete would leave the removed
@@ -1038,6 +1089,9 @@ impl Database {
                 .execute(params![path])?;
             self.conn
                 .prepare_cached("DELETE FROM feature_files WHERE path = ?1")?
+                .execute(params![path])?;
+            self.conn
+                .prepare_cached("DELETE FROM features WHERE entry_path = ?1")?
                 .execute(params![path])?;
             for table in self.all_chunk_table_names()? {
                 let sql = format!(
@@ -1324,4 +1378,60 @@ fn escape_like(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+#[cfg(test)]
+mod tests {
+    use codesage_protocol::{
+        FeatureConfidence, FeatureFileRef, FeatureFileRole, FeatureKind, FeatureRecord, Language,
+    };
+
+    use super::Database;
+
+    fn feature(id: &str, entry: &str, owned: &str) -> FeatureRecord {
+        FeatureRecord {
+            feature_id: id.into(),
+            title: id.into(),
+            summary: String::new(),
+            kind: FeatureKind::Library,
+            source: "test".into(),
+            confidence: FeatureConfidence::High,
+            entry_path: entry.into(),
+            entry_symbol: None,
+            entry_route: None,
+            entry_command: None,
+            test_command: None,
+            language: Language::Rust,
+            tags: Vec::new(),
+            files: vec![
+                FeatureFileRef {
+                    path: entry.into(),
+                    role: FeatureFileRole::Entry,
+                    reason: None,
+                },
+                FeatureFileRef {
+                    path: owned.into(),
+                    role: FeatureFileRole::Owned,
+                    reason: None,
+                },
+            ],
+            trust_boundaries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn removing_entry_removes_head_but_owned_removal_keeps_head() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_feature(&feature("entry", "src/entry.rs", "src/owned.rs"))
+            .unwrap();
+        db.remove_file("src/entry.rs").unwrap();
+        assert!(db.load_feature("entry").unwrap().is_none());
+
+        db.upsert_feature(&feature("owned", "src/entry.rs", "src/owned.rs"))
+            .unwrap();
+        db.remove_file("src/owned.rs").unwrap();
+        let loaded = db.load_feature("owned").unwrap().expect("head remains");
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(loaded.files[0].path, "src/entry.rs");
+    }
 }
