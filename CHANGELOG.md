@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+### Fixed
+
+- Git drift, git-history exclusion provenance, FTS health, read-only overview
+  migrations, semantic freshness, Next/Laravel route classification, and release
+  verification now preserve correctness across legacy, damaged, and hostile
+  index states.
+
+
 ## [0.35.0] - 2026-09-22
 
 ### Added

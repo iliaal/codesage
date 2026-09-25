@@ -358,6 +358,10 @@ fn check_hooks(root: &Path) -> Check {
                 return Check::new("hooks", Status::Warn, format!("{e:#}"));
             }
         };
+    // Hooks installed before the automatic history mode still pass the strict
+    // `--incremental`. That now works against a legacy index, but a later
+    // policy change would fail every commit, so the stale template is named.
+    let mut stale_templates: Vec<&str> = Vec::new();
 
     let mut installed = Vec::new();
     let mut foreign = Vec::new();
@@ -370,6 +374,9 @@ fn check_hooks(root: &Path) -> Check {
         match std::fs::read_to_string(&p) {
             Ok(body) if body.contains("codesage install-hooks") => {
                 installed.push(*name);
+                if body.contains("git-index --incremental") {
+                    stale_templates.push(*name);
+                }
                 match hook_embedded_binary(&body) {
                     Some(bin)
                         if !dead_binaries.contains(&bin)
@@ -427,6 +434,19 @@ fn check_hooks(root: &Path) -> Check {
         );
     }
 
+    if !stale_templates.is_empty() {
+        return Check::new(
+            "hooks",
+            Status::Warn,
+            format!(
+                "{kind}: installed hook(s) [{}] pass the strict `git-index --incremental` from an \
+                 older template; a changed history exclusion policy would fail every commit \
+                 (re-run `codesage install-hooks`)",
+                stale_templates.join(",")
+            ),
+        );
+    }
+
     if installed.len() == REQUIRED_HOOKS.len() {
         Check::new(
             "hooks",
@@ -444,8 +464,8 @@ fn check_hooks(root: &Path) -> Check {
         }
         parts.push(format!(
             "foreign=[{}] — existing non-codesage hook(s); codesage is not wired there. \
-             Chain `codesage index --lock-wait 60` and `codesage git-index --incremental \
-             --lock-wait 60` into them, or move them aside and re-run `codesage install-hooks`",
+             Chain `codesage index --lock-wait 60` and `codesage git-index --lock-wait 60` \
+             into them, or move them aside and re-run `codesage install-hooks`",
             foreign.join(",")
         ));
         if !missing.is_empty() {
@@ -865,6 +885,34 @@ mod tests {
 
         std::fs::create_dir_all(husky.join("_")).unwrap();
         std::fs::write(husky.join("_").join("h"), "#!/bin/sh\n").unwrap();
+        let check = check_hooks(dir.path());
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[test]
+    fn check_hooks_names_hooks_installed_from_the_strict_incremental_template() {
+        let dir = init_git_repo();
+        let current = crate::commands::hooks::generate_post_commit_hook_body("/bin/sh");
+        let stale = current.replace(
+            "git-index --lock-wait",
+            "git-index --incremental --lock-wait",
+        );
+        for hook in REQUIRED_HOOKS {
+            std::fs::write(dir.path().join(".git/hooks").join(hook), &stale).unwrap();
+        }
+
+        let check = check_hooks(dir.path());
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("git-index --incremental")
+                && check.message.contains("codesage install-hooks"),
+            "a stale template must be named with its fix: {}",
+            check.message
+        );
+
+        for hook in REQUIRED_HOOKS {
+            std::fs::write(dir.path().join(".git/hooks").join(hook), &current).unwrap();
+        }
         let check = check_hooks(dir.path());
         assert_eq!(check.status, Status::Pass, "{}", check.message);
     }

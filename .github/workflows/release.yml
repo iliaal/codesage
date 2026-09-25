@@ -12,9 +12,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify:
+    name: Verify tagged source
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck shfmt
+      - name: Install CPU runtime for workspace tests
+        run: |
+          python3 -m pip install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/onnxruntime" 'onnxruntime==1.24.4'
+          echo "ORT_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/onnxruntime/capi/libonnxruntime.so.1.24.4" >> "$GITHUB_ENV"
+      - run: bash scripts/sanity-check.sh --cuda
+
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    needs: verify
     permissions:
       contents: write # Creates the release for the pushed tag.
     steps:

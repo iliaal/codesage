@@ -375,6 +375,9 @@ impl Database {
 
     /// Distinct semantic files across all models; works on structural-only handles.
     pub fn semantic_file_count(&self) -> Result<usize> {
+        if !self.semantic_file_schema_is_current()? {
+            anyhow::bail!("semantic_files schema is missing required columns");
+        }
         let n: i64 =
             self.conn
                 .query_row("SELECT COUNT(DISTINCT path) FROM semantic_files", [], |r| {
@@ -385,6 +388,9 @@ impl Database {
 
     /// Count only this model's semantic files; old models remain until cleanup.
     pub fn semantic_file_count_for_model(&self, model: &str) -> Result<usize> {
+        if !self.semantic_file_schema_is_current()? {
+            anyhow::bail!("semantic_files schema is missing required columns");
+        }
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(DISTINCT sf.path) FROM semantic_files sf
              JOIN semantic_models sm ON sm.chunk_table = sf.chunk_table WHERE sm.model = ?1",
@@ -474,6 +480,47 @@ impl Database {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
 
+        Ok(Some(SemanticFreshness {
+            indexed_files: indexed_files as usize,
+            missing_files: missing_files as usize,
+            stale_files: stale_files as usize,
+        }))
+    }
+    /// Hash-aware semantic freshness for one configured model without opening
+    /// a writable/model-specific connection.
+    pub fn semantic_freshness_for_model(&self, model: &str) -> Result<Option<SemanticFreshness>> {
+        if !self.semantic_file_schema_is_current()? {
+            anyhow::bail!("semantic_files schema is missing required columns");
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk_table FROM semantic_models WHERE model = ?1 ORDER BY chunk_table",
+        )?;
+        let tables: Vec<String> = stmt
+            .query_map([model], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if tables.len() > 1 {
+            anyhow::bail!("multiple semantic tables match model {model:?}");
+        }
+        let Some(chunk_table) = tables.into_iter().next() else {
+            return Ok(None);
+        };
+        let indexed_files: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM semantic_files WHERE chunk_table = ?1",
+            [&chunk_table],
+            |row| row.get(0),
+        )?;
+        let (missing_files, stale_files): (i64, i64) = self.conn.query_row(
+            "SELECT
+                 COALESCE(SUM(CASE WHEN sf.path IS NULL THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE
+                     WHEN sf.path IS NOT NULL AND sf.content_hash <> f.content_hash THEN 1
+                     ELSE 0 END), 0)
+             FROM files f
+             LEFT JOIN semantic_files sf
+               ON sf.chunk_table = ?1 AND sf.path = f.path",
+            [&chunk_table],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         Ok(Some(SemanticFreshness {
             indexed_files: indexed_files as usize,
             missing_files: missing_files as usize,

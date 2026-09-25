@@ -201,6 +201,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0022_refs_lazy",
         "0023_symbols_visibility",
         "0024_is_test",
+        "0025_git_exclusion_fingerprint",
     ];
     for migration in expected_migrations {
         let count: i64 = conn

@@ -62,7 +62,7 @@ pub(crate) fn install_hooks_at(
 
     let hook_body = generate_post_commit_hook_body(codesage_path);
 
-    // Incremental git indexing detects rewritten ancestry and falls back to a full scan.
+    // The hook uses automatic history mode so first/legacy/rewritten state falls back safely.
     let hook_names = ["post-commit", "post-merge", "post-checkout", "post-rewrite"];
     let mut outcome = InstallOutcome::default();
     for name in &hook_names {
@@ -77,8 +77,8 @@ pub(crate) fn install_hooks_at(
                 );
                 println!(
                     "      to wire it up, chain `codesage index --lock-wait 60` and \
-                     `codesage git-index --incremental --lock-wait 60` into your existing \
-                     hook (backgrounded), or move it aside and re-run `codesage install-hooks`"
+                     `codesage git-index --lock-wait 60` into your existing \
+                     hook (backgrounded), or move them aside and re-run `codesage install-hooks`"
                 );
                 outcome.skipped.push(format!("{name} (foreign hook)"));
                 continue;
@@ -316,7 +316,7 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
            echo \"[$(date)] index exit=$rc\" >>\"$log\"\n\
            index_rc=$rc\n\
            # shellcheck disable=SC2086\n\
-           $IONICE $NICE {bin} git-index --incremental --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
+           $IONICE $NICE {bin} git-index --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
            echo \"[$(date)] git-index exit=$rc\" >>\"$log\"\n\
            [ -n \"$stamp\" ] && [ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$state\"\n\
            [ \"$index_rc\" -ne 0 ] && exit \"$index_rc\"\n\
@@ -623,9 +623,9 @@ mod tests {
         );
         assert!(
             body.contains(
-                "'/usr/local/bin/codesage' git-index --incremental --lock-wait 60 >>\"$log\" 2>&1; rc=$?"
+                "'/usr/local/bin/codesage' git-index --lock-wait 60 >>\"$log\" 2>&1; rc=$?"
             ),
-            "expected logged `git-index --incremental --lock-wait` invocation, got:\n{body}"
+            "expected logged automatic `git-index --lock-wait` invocation, got:\n{body}"
         );
         assert!(
             !body.contains("--lock-wait 60 &&"),
