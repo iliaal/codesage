@@ -21,8 +21,6 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck shfmt
       - name: Install CPU runtime for workspace tests
         run: |
           python3 -m pip install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/onnxruntime" 'onnxruntime==1.24.4'
