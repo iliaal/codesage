@@ -599,6 +599,16 @@ pub fn extract_references(
         if stripped.is_empty() {
             continue;
         }
+        // PHP's relative class types name the enclosing class hierarchy, not
+        // a class called `self`; PHP keywords are case-insensitive.
+        if language == Language::Php
+            && kind == ReferenceKind::TypeHint
+            && ["self", "static", "parent"]
+                .iter()
+                .any(|pseudo| stripped.eq_ignore_ascii_case(pseudo))
+        {
+            continue;
+        }
 
         // Grouped-import leaves are captured bare; prepend the enclosing base
         // path so the stored name resolves the same way a flat import does.

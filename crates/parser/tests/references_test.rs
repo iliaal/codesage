@@ -154,6 +154,28 @@ $a2 = fn(): ArrowUnionA|ArrowUnionB => null;
 }
 
 #[test]
+fn php_self_static_and_parent_type_hints_are_not_class_references() {
+    let source = "<?php
+class Node extends Base {
+    public function a(): self {}
+    public function b(): ?self {}
+    public function c(): static|null {}
+    public function d(self|false $x): Parent {}
+    public function e(): ?STATIC {}
+    public function f(Selfish $x): ?Parental {}
+}
+";
+    let refs = refs_from_source(source, Language::Php);
+    let types: Vec<_> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::TypeHint)
+        .map(|r| (r.line, r.to_name.as_str()))
+        .collect();
+    assert_eq!(types, [(8, "Selfish"), (8, "Parental")]);
+    assert!(has_ref(&refs, "Base", ReferenceKind::Inheritance));
+}
+
+#[test]
 fn typescript_type_declarations_are_not_type_hint_uses() {
     let source = "class DeclaredClass {}\nabstract class DeclaredAbstract {}\nconst value = class DeclaredExpression {};\ninterface DeclaredInterface {}\ntype DeclaredAlias<DeclaredParameter> = Target;\ntype Mapped = { [DeclaredKey in Keys]: Item };\ntype Inferred = Source extends infer DeclaredInferred extends Bound ? Yes : No;\n";
     let refs = refs_from_source(source, Language::TypeScript);
