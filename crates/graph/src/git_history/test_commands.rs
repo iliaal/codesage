@@ -10,6 +10,8 @@ use anyhow::Result;
 use codesage_protocol::{InlineTestModule, Symbol, SymbolKind, TestCommand};
 use codesage_storage::Database;
 
+mod js_runner;
+
 pub(super) const SOURCE_CONVENTION: &str = "convention";
 pub(super) const SOURCE_INLINE: &str = "inline";
 pub(super) const SOURCE_FEATURE: &str = "feature_test_command";
@@ -367,30 +369,11 @@ fn convention_commands(
     }
     if !js.is_empty() {
         js.sort();
-        let vitest = root_has(
-            root,
-            &[
-                "vitest.config.ts",
-                "vitest.config.js",
-                "vitest.config.mts",
-                "vitest.config.mjs",
-                "vitest.config.cts",
-                "vitest.config.cjs",
-                "vitest.workspace.ts",
-                "vitest.workspace.js",
-            ],
-        );
-        let (runner, framework) = if vitest {
-            ("npx vitest run", "vitest")
-        } else {
-            ("npx jest", "jest")
-        };
-        out.push(command(
-            format!("{runner} {}", path_args(&js)),
-            js,
-            framework,
-            SOURCE_CONVENTION,
-        ));
+        let (js_commands, unresolved) = js_runner::commands(root, &js);
+        out.extend(js_commands);
+        if !unresolved.is_empty() {
+            notes.push(js_runner::unresolved_note(&unresolved));
+        }
     }
     for class in java.keys().filter(|c| !flag_safe(c)) {
         notes.push(dropped_token_note("Java test class", class));

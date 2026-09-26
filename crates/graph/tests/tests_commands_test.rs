@@ -588,11 +588,170 @@ fn js_runner_follows_vitest_config_presence() {
     let cmd = find(&r, "npx vitest run src/button.test.ts");
     assert_eq!(cmd.framework, "vitest");
 
+    // Without a config, a manifest, or a runner import nothing names a
+    // runner, so no command is guessed.
     let dir = make(false);
     let db = indexed(dir.path());
     let r = recs(dir.path(), &db, &["src/button.ts"]);
-    let cmd = find(&r, "npx jest src/button.test.ts");
-    assert_eq!(cmd.framework, "jest");
+    assert_no_js_command(&r, "src/button.test.ts");
+}
+
+fn assert_no_js_command(r: &TestRecommendations, path: &str) {
+    assert!(
+        r.commands
+            .iter()
+            .all(|c| !c.covers.iter().any(|p| p == path)),
+        "{:?}",
+        commands(r)
+    );
+    assert!(
+        r.notes.iter().any(
+            |n| n.starts_with("no JavaScript/TypeScript test runner named for") && n.contains(path)
+        ),
+        "{:?}",
+        r.notes
+    );
+}
+
+/// A root package with `src/a.<ext>` and its sibling test.
+fn js_fixture(package_json: Option<&str>, ext: &str, test_body: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    if let Some(manifest) = package_json {
+        write(root, "package.json", manifest);
+    }
+    write(
+        root,
+        &format!("src/a.{ext}"),
+        "export function a() { return 1; }\n",
+    );
+    write(root, &format!("src/a.test.{ext}"), test_body);
+    dir
+}
+
+const JS_TEST_BODY: &str = "import { a } from './a';\ntest('a', () => { a(); });\n";
+
+#[test]
+fn js_runner_from_vitest_dependency() {
+    let dir = js_fixture(
+        Some(r#"{"name":"app","devDependencies":{"vitest":"^2.0.0","typescript":"^5"}}"#),
+        "ts",
+        JS_TEST_BODY,
+    );
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &["src/a.ts"]);
+    let cmd = find(&r, "npx vitest run src/a.test.ts");
+    assert_eq!(cmd.framework, "vitest");
+    assert_eq!(cmd.covers, vec!["src/a.test.ts".to_string()]);
+}
+
+#[test]
+fn js_runner_from_jest_test_script() {
+    let dir = js_fixture(
+        Some(r#"{"name":"app","scripts":{"test":"jest --coverage"}}"#),
+        "js",
+        JS_TEST_BODY,
+    );
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &["src/a.js"]);
+    assert_eq!(find(&r, "npx jest src/a.test.js").framework, "jest");
+}
+
+#[test]
+fn js_runner_from_mocha_test_script() {
+    let dir = js_fixture(
+        Some(r#"{"name":"app","scripts":{"test":"c8 mocha"},"devDependencies":{"jest":"^29"}}"#),
+        "js",
+        "const { a } = require('./a');\ndescribe('a', () => { it('works', () => { a(); }); });\n",
+    );
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &["src/a.js"]);
+    assert_eq!(find(&r, "npx mocha src/a.test.js").framework, "mocha");
+    assert!(
+        !commands(&r).iter().any(|c| c.contains("jest")),
+        "{:?}",
+        commands(&r)
+    );
+}
+
+#[test]
+fn node_test_import_outranks_the_package_runner() {
+    let dir = js_fixture(
+        Some(r#"{"name":"app","scripts":{"test":"mocha"}}"#),
+        "js",
+        "import { test } from 'node:test';\nimport { a } from './a.js';\ntest('a', () => { a(); });\n",
+    );
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &["src/a.js"]);
+    assert_eq!(find(&r, "node --test src/a.test.js").framework, "node:test");
+    assert!(
+        !commands(&r).iter().any(|c| c.contains("mocha")),
+        "{:?}",
+        commands(&r)
+    );
+}
+
+#[test]
+fn nested_packages_resolve_their_own_runner_or_defer_to_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let js = "export function f() { return 1; }\n";
+    let test =
+        |name: &str| format!("import {{ f }} from './{name}';\ntest('f', () => {{ f(); }});\n");
+    write(
+        root,
+        "package.json",
+        r#"{"name":"mono","private":true,"workspaces":["packages/*"],"devDependencies":{"jest":"^29"}}"#,
+    );
+    write(root, "src/a.ts", js);
+    write(root, "src/a.test.ts", &test("a"));
+    write(
+        root,
+        "packages/web/package.json",
+        r#"{"name":"web","scripts":{"test":"vitest run"}}"#,
+    );
+    write(root, "packages/web/src/b.ts", js);
+    write(root, "packages/web/src/b.test.ts", &test("b"));
+    write(root, "packages/lib/package.json", r#"{"name":"lib"}"#);
+    write(root, "packages/lib/src/c.ts", js);
+    write(root, "packages/lib/src/c.test.ts", &test("c"));
+    let db = indexed(root);
+
+    let r = recs(
+        root,
+        &db,
+        &["src/a.ts", "packages/web/src/b.ts", "packages/lib/src/c.ts"],
+    );
+
+    let web = find(&r, "(cd packages/web && npx vitest run src/b.test.ts)");
+    assert_eq!(web.framework, "vitest");
+    assert_eq!(web.covers, vec!["packages/web/src/b.test.ts".to_string()]);
+    let rooted = find(&r, "npx jest packages/lib/src/c.test.ts src/a.test.ts");
+    assert_eq!(rooted.framework, "jest");
+    assert_eq!(
+        rooted.covers,
+        vec![
+            "packages/lib/src/c.test.ts".to_string(),
+            "src/a.test.ts".to_string()
+        ]
+    );
+}
+
+#[test]
+fn js_without_runner_evidence_gets_a_note_and_no_command() {
+    let dir = js_fixture(
+        Some(r#"{"name":"app","scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#),
+        "js",
+        JS_TEST_BODY,
+    );
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &["src/a.js"]);
+    assert_no_js_command(&r, "src/a.test.js");
+    assert!(
+        !commands(&r).iter().any(|c| c.starts_with("npx")),
+        "{:?}",
+        commands(&r)
+    );
 }
 
 #[test]
