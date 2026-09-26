@@ -101,9 +101,8 @@ pub(crate) struct ImportCycles {
 
 impl ImportCycles {
     pub(crate) fn load(db: &Database) -> Result<Self> {
-        let pairs = db
-            .enumerate_file_import_pairs()
-            .with_context(|| "enumerate_file_import_pairs")?;
+        let pairs =
+            crate::import_graph::file_import_pairs(db).with_context(|| "file_import_pairs")?;
         let components = crate::scc::tarjan_scc(&pairs.eager)?;
         let suppressed_pairs = if pairs.lazy_only.is_empty() {
             Vec::new()
@@ -1076,7 +1075,7 @@ fn assess_risk_with_context(
         // Restore the current file because `cycle_files` contains only its peers.
         let mut scc: Vec<&str> = cycle_files.iter().map(String::as_str).collect();
         scc.push(file_path);
-        match db.import_edges_within(&scc) {
+        match crate::import_graph::import_edges_within(db, &scc) {
             Ok(edges) if !edges.is_empty() => {
                 let mut in_degree: std::collections::HashMap<&str, u32> =
                     std::collections::HashMap::new();

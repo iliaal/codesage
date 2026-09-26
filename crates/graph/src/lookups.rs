@@ -265,6 +265,9 @@ fn attach_handles(
             capped = true;
             break;
         }
+        if crate::bundle::is_go_package_import(row.kind, &row.from_file) {
+            continue;
+        }
         // Trivially same-file: the sole definition, spelled as it is defined.
         if let Some(only) = sole_definition
             && only.file_path == row.from_file
@@ -433,7 +436,8 @@ impl<'a> EvidenceCaches<'a> {
                             | ReferenceKind::ImportBinding
                             | ReferenceKind::TypeHint
                             | ReferenceKind::Instantiation
-                    ) && last_segment(name) == owner_tail
+                    ) && !crate::bundle::is_go_package_import(*kind, caller_file)
+                        && last_segment(name) == owner_tail
                 }) {
                     return Ok(true);
                 }

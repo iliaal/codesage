@@ -559,7 +559,7 @@ fn add_callees_for_symbol(
         if related.len() >= limit {
             break;
         }
-        if !is_callee_reference(r.kind) {
+        if !is_callee_reference(r.kind) || is_go_package_import(r.kind, &sym.file_path) {
             continue;
         }
         for def in cache.resolve_symbols(db, &sym.file_path, &r.to_name)? {
@@ -783,11 +783,22 @@ fn rust_module_subtree(def_file: &str) -> Option<String> {
     }
 }
 
+/// A Go `import` names a package path (`"errors"`, `"C"`, `"example.com/m/util"`),
+/// never a symbol, so it must not bind to a project symbol that happens to
+/// share the spelling. Package paths name directories, which the file-level
+/// path matcher does not resolve, so these rows carry no symbol or file edge.
+pub(crate) fn is_go_package_import(kind: ReferenceKind, from_file: &str) -> bool {
+    kind == ReferenceKind::Import && from_file.ends_with(".go")
+}
+
 // Fetch outgoing imports without computing list_file_dependencies' reverse edges.
 pub(crate) fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>> {
     let mut refs = Vec::new();
     if let Some(file_id) = db.file_id_for_path(caller_file)? {
         for (to_name, kind) in db.refs_outgoing_for_file_id(file_id)? {
+            if is_go_package_import(kind, caller_file) {
+                continue;
+            }
             // Bindings retain evidence when a specifier names a re-exporting barrel.
             if matches!(
                 kind,
@@ -990,18 +1001,45 @@ pub(crate) fn import_ref_targets_file(
                 .any(|c| c == target_file)
         });
     }
-    // Quoted-include style: `util.h` or `sub/foo.h`. Resolve against the
-    // includer's directory, then the project root, both exact. No stem or
-    // suffix match: `sub/foo.h` must not claim every `*/sub/foo.h` in the
-    // project. Includes reached through other `-I` paths stay unresolved.
-    if import_ref.contains('/') || import_ref.contains('.') {
+    quoted_include_candidates(import_ref, importer_file).any(|candidate| candidate == target_file)
+}
+
+/// Quoted-include style: `util.h` or `sub/foo.h`. Resolve against the
+/// includer's directory, then the project root, both exact. No stem or
+/// suffix match: `sub/foo.h` must not claim every `*/sub/foo.h` in the
+/// project. Includes reached through other `-I` paths stay unresolved, and a
+/// system include (`<stdio.h>`, stored with its brackets) names no project file.
+fn quoted_include_candidates<'a>(
+    import_ref: &'a str,
+    importer_file: &str,
+) -> impl Iterator<Item = String> + 'a {
+    let applies =
+        !import_ref.starts_with('<') && (import_ref.contains('/') || import_ref.contains('.'));
+    let base = importer_file.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let joined = applies.then(|| lexical_join(base, import_ref)).flatten();
+    joined
+        .into_iter()
+        .chain(applies.then(|| import_ref.to_string()))
+}
+
+/// Every indexed path a JavaScript/TypeScript module specifier or a C/C++
+/// include resolves to under the rules [`import_ref_targets_file`] applies to
+/// those importers: for a specifier without `::`,
+/// `import_ref_targets_file(spec, importer, t)` holds exactly when `t` is in
+/// this list. Lets a whole-graph consumer look targets up in the indexed file
+/// set instead of testing every (ref, file) pair. May repeat a path; a Rust
+/// path yields nothing.
+pub(crate) fn path_import_candidates(import_ref: &str, importer_file: &str) -> Vec<String> {
+    if import_ref.starts_with("./") || import_ref.starts_with("../") {
         let base = importer_file.rsplit_once('/').map_or("", |(dir, _)| dir);
-        if lexical_join(base, import_ref).is_some_and(|resolved| resolved == target_file) {
-            return true;
-        }
-        return import_ref == target_file;
+        return lexical_join(base, import_ref)
+            .map(|resolved| relative_file_candidates(&resolved).collect())
+            .unwrap_or_default();
     }
-    false
+    if import_ref.contains("::") {
+        return Vec::new();
+    }
+    quoted_include_candidates(import_ref, importer_file).collect()
 }
 
 pub(crate) fn import_ref_targets_file_with_modules(
@@ -1128,25 +1166,39 @@ fn lexical_join(base: &str, spec: &str) -> Option<String> {
 }
 
 fn relative_file_matches(resolved: &str, sym_file: &str) -> bool {
-    if resolved == sym_file {
-        return true;
-    }
-    // Directory dots are not file extensions (`dir.v1/foo` must not claim `dir.ts`).
+    relative_file_candidates(resolved).any(|candidate| candidate == sym_file)
+}
+
+/// `resolved` itself, then its extension variants. A named extension is
+/// swapped but never appended to (`foo.js` must not claim `foo.js.ts`); a bare
+/// path gains each extension or the directory-index form (`./utils` ->
+/// `utils/index.js`). Directory dots are not file extensions (`dir.v1/foo`
+/// must not claim `dir.ts`).
+fn relative_file_candidates(resolved: &str) -> impl Iterator<Item = String> + '_ {
     let segment_start = resolved.rfind('/').map_or(0, |i| i + 1);
-    match resolved[segment_start..].rfind('.') {
-        // Swap emitted extensions, but do not append: `foo.js` must not claim `foo.js.ts`.
-        Some(dot) => {
-            let stem = &resolved[..segment_start + dot];
-            IMPORT_EXTENSIONS
-                .iter()
-                .any(|ext| sym_file == format!("{stem}.{ext}"))
-        }
-        // No extension: `./foo` -> `foo.ts`, or the directory-index form
-        // `./utils` -> `utils/index.js`.
-        None => IMPORT_EXTENSIONS.iter().any(|ext| {
-            sym_file == format!("{resolved}.{ext}") || sym_file == format!("{resolved}/index.{ext}")
-        }),
-    }
+    let dot = resolved[segment_start..]
+        .rfind('.')
+        .map(|dot| segment_start + dot);
+    let swapped = dot.into_iter().flat_map(move |dot| {
+        IMPORT_EXTENSIONS
+            .iter()
+            .map(move |ext| format!("{}.{ext}", &resolved[..dot]))
+    });
+    let appended = dot
+        .is_none()
+        .then_some(resolved)
+        .into_iter()
+        .flat_map(|resolved| {
+            IMPORT_EXTENSIONS.iter().flat_map(move |ext| {
+                [
+                    format!("{resolved}.{ext}"),
+                    format!("{resolved}/index.{ext}"),
+                ]
+            })
+        });
+    std::iter::once(resolved.to_string())
+        .chain(swapped)
+        .chain(appended)
 }
 
 pub(crate) fn is_callee_reference(kind: ReferenceKind) -> bool {
@@ -1197,6 +1249,56 @@ fn add_related_from_file(
 #[cfg(test)]
 mod import_path_tests {
     use super::*;
+
+    /// The cycle graph looks candidates up in the file set; `list_dependencies`
+    /// tests each file with the predicate. Both must name the same targets.
+    #[test]
+    fn path_import_candidates_agree_with_the_file_predicate() {
+        let targets = [
+            "lib/b.js",
+            "lib/b.ts",
+            "lib/b.d.ts",
+            "lib/b/index.js",
+            "lib/b/index.tsx",
+            "lib/b.js.ts",
+            "b.js",
+            "lib/dir.v1/foo.ts",
+            "lib/dir.ts",
+            "src/x.h",
+            "x.h",
+            "sub/y.h",
+            "src/sub/y.h",
+            "other/sub/y.h",
+            "stdio.h",
+            "src/stdio.h",
+            "src/<stdio.h>",
+        ];
+        let cases = [
+            ("./b", "lib/a.js"),
+            ("./b.js", "lib/a.ts"),
+            ("../b.js", "lib/sub/a.js"),
+            ("./b.js", "a.js"),
+            ("./dir.v1/foo", "lib/a.ts"),
+            ("../../escape.js", "lib/a.js"),
+            ("lodash/fp", "lib/a.js"),
+            ("x.h", "src/main.c"),
+            ("sub/y.h", "src/main.c"),
+            ("sub/y.h", "main.c"),
+            ("<stdio.h>", "src/main.c"),
+            ("stdio.h", "src/main.c"),
+        ];
+        for (spec, importer) in cases {
+            let candidates = path_import_candidates(spec, importer);
+            for target in targets {
+                assert_eq!(
+                    candidates.iter().any(|c| c == target),
+                    import_ref_targets_file(spec, importer, target),
+                    "{spec} from {importer} -> {target}: {candidates:?}"
+                );
+            }
+        }
+        assert!(path_import_candidates("<stdio.h>", "src/main.c").is_empty());
+    }
 
     #[test]
     fn glob_imports_resolve_only_the_named_module() {

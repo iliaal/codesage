@@ -7,6 +7,7 @@ pub mod edit_check;
 mod git_history;
 pub mod hook_health;
 mod impact;
+mod import_graph;
 mod index;
 mod lookups;
 mod overview;
@@ -32,6 +33,7 @@ pub use git_history::{
     recommend_tests_with_reachability,
 };
 pub use impact::{impact_analysis, impact_analysis_report};
+pub use import_graph::file_import_pairs;
 pub use index::{
     STRUCTURAL_INTERPRETATION, full_index, incremental_index, index_files, remove_files,
 };
