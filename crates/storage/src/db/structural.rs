@@ -357,7 +357,9 @@ impl Database {
 
     /// Resolve an indexed repo-relative path to its files.id; None if absent.
     pub fn file_id_for_path(&self, path: &str) -> Result<Option<i64>> {
-        let mut stmt = self.conn.prepare("SELECT id FROM files WHERE path = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM files WHERE path = ?1")?;
         match stmt.query_row(params![path], |row| row.get::<_, i64>(0)) {
             Ok(id) => Ok(Some(id)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -669,46 +671,23 @@ impl Database {
     /// These name a file rather than a symbol, so the refs x symbols join in
     /// [`Self::enumerate_file_import_pairs`] never sees them; the graph crate
     /// resolves them against the indexed file set. `lazy_only` is true when
-    /// every directive spelling that specifier in that file is lazy. With
-    /// `from_files`, only directives written in those files are returned.
-    pub fn path_import_refs(
-        &self,
-        from_files: Option<&[&str]>,
-    ) -> Result<Vec<(String, String, bool)>> {
-        const BASE: &str = "SELECT f.path, r.to_name, MIN(r.lazy)
+    /// every directive spelling that specifier in that file is lazy.
+    pub fn path_import_refs(&self) -> Result<Vec<(String, String, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, r.to_name, MIN(r.lazy)
              FROM refs r JOIN files f ON r.from_file_id = f.id
              WHERE ((r.kind = 'import' AND f.language IN ('javascript', 'typescript'))
-                    OR (r.kind = 'include' AND f.language IN ('c', 'cpp')))";
-        let read = |row: &rusqlite::Row<'_>| {
+                    OR (r.kind = 'include' AND f.language IN ('c', 'cpp')))
+             GROUP BY f.path, r.to_name",
+        )?;
+        let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)? != 0,
             ))
-        };
-        let Some(files) = from_files else {
-            let mut stmt = self
-                .conn
-                .prepare(&format!("{BASE} GROUP BY f.path, r.to_name"))?;
-            return Ok(stmt
-                .query_map([], read)?
-                .collect::<rusqlite::Result<Vec<_>>>()?);
-        };
-        let mut out = Vec::new();
-        // Bind in chunks so a large component stays under SQLite's variable cap.
-        for chunk in files.chunks(500) {
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mut stmt = self.conn.prepare(&format!(
-                "{BASE} AND f.path IN ({placeholders}) GROUP BY f.path, r.to_name"
-            ))?;
-            out.extend(
-                stmt.query_map(rusqlite::params_from_iter(chunk.iter()), read)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?,
-            );
-        }
-        Ok(out)
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Unresolved (from_path, to_name) import/include pairs for bulk resolution.

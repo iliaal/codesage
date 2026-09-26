@@ -83,6 +83,16 @@ fn javascript_typescript_and_c_header_pairs_cycle_like_php() {
     assert_eq!(cycle_of(&db, "ts/e.ts"), vec!["ts/f.ts".to_string()]);
     assert_eq!(cycle_of(&db, "c/x.h"), vec!["c/y.h".to_string()]);
     assert_eq!(cycle_of(&db, "php/A.php"), vec!["php/B.php".to_string()]);
+    // Cycle-break guidance reads the same path-resolved edges as the SCCs.
+    for file in ["js/a.js", "ts/e.ts", "c/x.h"] {
+        let notes = assess_risk(&db, file).unwrap().notes;
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("candidate break point: ")),
+            "{file}: {notes:?}"
+        );
+    }
 
     let main = assess_risk(&db, "c/main.c").unwrap();
     assert!(!main.in_cycle, "{main:?}");
