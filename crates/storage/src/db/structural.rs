@@ -752,54 +752,6 @@ impl Database {
         Ok(token)
     }
 
-    /// Load-time import edges with both endpoints in `files`, avoiding a
-    /// whole-index sweep. Pairs joined only by lazy directives are excluded.
-    pub fn import_edges_within(&self, files: &[&str]) -> Result<Vec<(String, String)>> {
-        if files.len() < 2 {
-            return Ok(Vec::new());
-        }
-        let placeholders = std::iter::repeat_n("?", files.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT f_from.path, f_to.path
-            FROM refs r
-            JOIN files f_from ON r.from_file_id = f_from.id
-            JOIN symbols s ON (
-              s.qualified_name = r.to_name
-              OR (
-                s.name = r.to_name
-                AND NOT EXISTS (
-                  SELECT 1
-                  FROM symbols s2
-                  WHERE s2.name = r.to_name
-                    AND s2.file_id <> s.file_id
-                )
-              )
-            )
-            JOIN files f_to ON s.file_id = f_to.id
-            WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
-                   OR (r.kind = 'import_binding' AND f_from.language = 'python'))
-              AND NOT (r.kind = 'import' AND f_from.language = 'go')
-              AND f_from.path <> f_to.path
-              AND f_from.path IN ({placeholders})
-              AND f_to.path IN ({placeholders})
-            GROUP BY f_from.path, f_to.path
-            HAVING MIN(r.lazy) = 0
-            "#
-        );
-        // The file list is bound twice, once per IN clause, in order.
-        let binds: Vec<&str> = files.iter().copied().chain(files.iter().copied()).collect();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(binds), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
     pub fn list_file_dependencies(&self, file_path: &str) -> Result<DependencyEntry> {
         if self.file_id_for_path(file_path)?.is_none() {
             return Ok(DependencyEntry {
