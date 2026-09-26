@@ -168,8 +168,8 @@ impl HistoryAnchor {
 /// SHA); a read-side consumer that holds no path uses
 /// [`history_predates_wall_clock_window`] against the newest timestamp its
 /// rows carry instead.
-fn anchor_at_commit(root: &Path, sha: &str) -> HistoryAnchor {
-    match commit_epoch(root, sha) {
+fn anchor_at_commit(root: &Path, sha: &str) -> Result<HistoryAnchor> {
+    Ok(match commit_epoch(root, sha)? {
         Some(epoch) => HistoryAnchor {
             epoch,
             source: HistoryAnchorSource::HeadCommit,
@@ -182,7 +182,7 @@ fn anchor_at_commit(root: &Path, sha: &str) -> HistoryAnchor {
             );
             wall_clock_anchor()
         }
-    }
+    })
 }
 
 fn wall_clock_anchor() -> HistoryAnchor {
@@ -227,35 +227,63 @@ fn lock_memo<K, V>(memo: &Mutex<HashMap<K, V>>) -> MutexGuard<'_, HashMap<K, V>>
 /// Committer epoch of `sha`, memoized per (root, SHA). `sha` must be a resolved
 /// object name: the memo assumes an immutable date, which a symbolic revision
 /// such as `HEAD` would not have.
-fn commit_epoch(root: &Path, sha: &str) -> Option<i64> {
+///
+/// `Ok(None)` means git could not name the commit (an unborn HEAD, a missing
+/// object, no usable git). Output git produced but that is not an epoch is an
+/// error: measuring from a guessed clock would index the wrong window.
+fn commit_epoch(root: &Path, sha: &str) -> Result<Option<i64>> {
     // `--` would not neutralize an attached-value option such as `-O/path`.
     if sha.starts_with('-') {
-        return None;
+        return Ok(None);
     }
     let key = (root.to_path_buf(), sha.to_string());
     let memo = commit_epoch_memo();
     if let Some(hit) = lock_memo(memo).get(&key) {
-        return Some(*hit);
+        return Ok(Some(*hit));
     }
-    let epoch = read_commit_epoch(root, sha)?;
+    let Some(epoch) = read_commit_epoch(root, sha)? else {
+        return Ok(None);
+    };
     let mut guard = lock_memo(memo);
     if guard.len() >= COMMIT_EPOCH_MEMO_CAP {
         guard.clear();
     }
     guard.insert(key, epoch);
-    Some(epoch)
+    Ok(Some(epoch))
 }
 
-fn read_commit_epoch(root: &Path, sha: &str) -> Option<i64> {
-    let out = Command::new("git")
-        .args(["log", "-1", "--format=%ct", sha, "--"])
+fn read_commit_epoch(root: &Path, sha: &str) -> Result<Option<i64>> {
+    // `log.showSignature` would print verification text ahead of the date.
+    let Ok(out) = Command::new("git")
+        .args([
+            "log",
+            "--no-show-signature",
+            "-1",
+            "--format=%ct",
+            sha,
+            "--",
+        ])
         .current_dir(root)
         .output()
-        .ok()?;
+    else {
+        return Ok(None);
+    };
     if !out.status.success() {
-        return None;
+        return Ok(None);
     }
-    std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
+    parse_commit_epoch(&out.stdout)
+        .map(Some)
+        .with_context(|| format!("reading the committer date of {sha} in {}", root.display()))
+}
+
+fn parse_commit_epoch(stdout: &[u8]) -> Result<i64> {
+    let text = std::str::from_utf8(stdout).context("git log output not UTF-8")?;
+    text.trim().parse().map_err(|_| {
+        anyhow!(
+            "git log printed {:?} where a unix epoch was expected",
+            text.trim()
+        )
+    })
 }
 
 /// Indexing mode. `Auto`, the recommended default, reuses prior state if valid
@@ -285,7 +313,7 @@ pub fn git_history_index_with_options(
 ) -> Result<GitIndexStats> {
     let (exclude_set, test_like_set) = compile_excludes(extra_excludes)?;
     let head_sha = resolve_head_sha(root)?;
-    let anchor = anchor_at_commit(root, &head_sha);
+    let anchor = anchor_at_commit(root, &head_sha)?;
     log_anchor(root, anchor);
 
     let effective_mode = match mode {
@@ -294,7 +322,7 @@ pub fn git_history_index_with_options(
             Some((last_sha, last_indexed_at)) if last_sha == head_sha => {
                 // HEAD is unchanged, so the anchor is too: the decay below is a
                 // no-op unless the last pass measured from a different clock.
-                let previous = previous_anchor(root, &last_sha, last_indexed_at, anchor);
+                let previous = previous_anchor(root, &last_sha, last_indexed_at, anchor)?;
                 db.execute_batch(|db| {
                     decay_git_history_between(db, previous, anchor.epoch)?;
                     db.prune_git_author_events(anchor.cutoff())?;
@@ -325,7 +353,7 @@ pub fn git_history_index_with_options(
                 .expect("incremental path checked state present above");
             let anchors = PassAnchors {
                 current: anchor,
-                previous: previous_anchor(root, &last_sha, last_at, anchor),
+                previous: previous_anchor(root, &last_sha, last_at, anchor)?,
             };
             run_incremental(
                 db,
@@ -373,11 +401,11 @@ fn previous_anchor(
     last_sha: &str,
     last_indexed_at: i64,
     current: HistoryAnchor,
-) -> i64 {
-    match current.source {
-        HistoryAnchorSource::HeadCommit => commit_epoch(root, last_sha).unwrap_or(last_indexed_at),
+) -> Result<i64> {
+    Ok(match current.source {
+        HistoryAnchorSource::HeadCommit => commit_epoch(root, last_sha)?.unwrap_or(last_indexed_at),
         HistoryAnchorSource::WallClock => last_indexed_at,
-    }
+    })
 }
 
 /// Returns two glob sets:
@@ -413,7 +441,7 @@ fn run_full(
     anchor: HistoryAnchor,
 ) -> Result<GitIndexStats> {
     let raw = run_git_log(root, None, anchor.cutoff())?;
-    let commits = parse_log(&raw);
+    let commits = parse_log(&raw)?;
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
     let mut pairs: HashMap<(String, String), PairStats> = HashMap::new();
@@ -478,7 +506,7 @@ fn run_incremental(
     let anchor = anchors.current;
     let range = format!("{last_sha}..{head_sha}");
     let raw = run_git_log(root, Some(&range), anchor.cutoff())?;
-    let commits = parse_log(&raw);
+    let commits = parse_log(&raw)?;
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
     let mut pairs: HashMap<(String, String), PairStats> = HashMap::new();
@@ -746,6 +774,8 @@ fn run_git_log(root: &Path, range: Option<&str>, since_epoch: i64) -> Result<Str
     let since_arg = format!("--since=@{since_epoch}");
     let mut args: Vec<&str> = vec![
         "log",
+        // `log.showSignature` would interleave verification text with records.
+        "--no-show-signature",
         "--no-merges",
         "--numstat",
         "-z",
@@ -771,7 +801,10 @@ fn run_git_log(root: &Path, range: Option<&str>, since_epoch: i64) -> Result<Str
     String::from_utf8(output.stdout).context("git log output not UTF-8")
 }
 
-fn parse_log(raw: &str) -> Vec<Commit> {
+/// Parse `run_git_log` output. A record that is neither a commit header nor a
+/// numstat line is an error rather than a skip: text injected ahead of a header
+/// hides that commit and attributes its files to the previous one.
+fn parse_log(raw: &str) -> Result<Vec<Commit>> {
     let mut commits = Vec::new();
     let mut current: Option<Commit> = None;
     let mut skipped_commits = 0usize;
@@ -826,6 +859,12 @@ fn parse_log(raw: &str) -> Vec<Commit> {
         let mut parts = line.splitn(3, '\t');
         let added_s = parts.next().unwrap_or("-");
         let deleted_s = parts.next().unwrap_or("-");
+        if !is_numstat_count(added_s) {
+            let excerpt: String = line.chars().take(120).collect();
+            return Err(anyhow!(
+                "git log printed a record that is neither a commit header nor a numstat line: {excerpt:?}"
+            ));
+        }
         let Some(path) = parts.next() else {
             continue;
         };
@@ -868,7 +907,12 @@ fn parse_log(raw: &str) -> Vec<Commit> {
             "parse_log skipped unparseable git output entries"
         );
     }
-    commits
+    Ok(commits)
+}
+
+/// Numstat's added-lines field: a decimal count, or `-` for a binary file.
+fn is_numstat_count(field: &str) -> bool {
+    field == "-" || (!field.is_empty() && field.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn is_fix_commit(subject: &str) -> bool {
@@ -987,7 +1031,7 @@ mod tests {
     fn parse_log_handles_basic_format() {
         let raw = "commit\tabc\t1700000000\tfix: x\0\n10\t2\tsrc/a.rs\x005\t1\tsrc/b.rs\0\
                    \0commit\tdef\t1700001000\tfeat: y\0\n3\t0\tsrc/c.rs\0-\t-\tbinary.bin\0";
-        let commits = parse_log(raw);
+        let commits = parse_log(raw).unwrap();
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].subject, "fix: x");
         assert_eq!(commits[0].changes.len(), 2);
@@ -1331,7 +1375,7 @@ mod tests {
             "fixture must have an unborn HEAD"
         );
 
-        let anchor = anchor_at_commit(empty.path(), "HEAD");
+        let anchor = anchor_at_commit(empty.path(), "HEAD").unwrap();
         assert_eq!(anchor.source, HistoryAnchorSource::WallClock);
         assert!(
             (anchor.epoch - unix_now()).abs() < 60,
@@ -1344,6 +1388,35 @@ mod tests {
     #[test]
     fn commit_epoch_rejects_dash_prefixed_revisions() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(commit_epoch(dir.path(), "-O/etc/passwd"), None);
+        assert_eq!(commit_epoch(dir.path(), "-O/etc/passwd").unwrap(), None);
+    }
+
+    #[test]
+    fn commit_epoch_output_that_is_not_an_epoch_is_an_error() {
+        assert_eq!(parse_commit_epoch(b"1790424195\n").unwrap(), 1_790_424_195);
+        let err = parse_commit_epoch(b"No signature\n1790424195\n").unwrap_err();
+        assert!(err.to_string().contains("No signature"), "{err}");
+        assert!(parse_commit_epoch(b"").is_err());
+    }
+
+    #[test]
+    fn parse_log_rejects_text_injected_ahead_of_a_commit_header() {
+        // `log.showSignature` output shape: the second commit's header rides
+        // behind verification text, so a lenient parser would fold c.rs into
+        // the first commit.
+        let raw = "commit\tabc\t1700000000\tfeat: x\0\n1\t0\ta.rs\0\0\
+                   No signature\ncommit\tdef\t1700001000\tfeat: y\0\n2\t0\tc.rs\0";
+        let err = parse_log(raw).unwrap_err();
+        assert!(err.to_string().contains("No signature"), "{err}");
+    }
+
+    #[test]
+    fn numstat_count_field_accepts_digits_and_binary_marker_only() {
+        assert!(is_numstat_count("0"));
+        assert!(is_numstat_count("123"));
+        assert!(is_numstat_count("-"));
+        assert!(!is_numstat_count(""));
+        assert!(!is_numstat_count("-1"));
+        assert!(!is_numstat_count("gpg: Good signature"));
     }
 }
