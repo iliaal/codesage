@@ -374,8 +374,11 @@ impl Database {
     /// `(from, None)` drops them. The moves apply as one simultaneous
     /// substitution, so a swap or a chain needs no ordering, and a pair whose
     /// two ends land on one path is dropped. Merged counters add, timestamps
-    /// widen, and window masks OR, which is what a full scan keying every
-    /// commit to the successor path would have produced.
+    /// widen, and window masks OR. That equals a full scan keying every commit
+    /// to the successor only while no successor already holds history of its
+    /// own (a merge would count a commit that touched both paths twice) and
+    /// no move changes which co-change pairs are admitted; callers that cannot
+    /// rule those out must rescan instead.
     pub fn rekey_git_history(&self, moves: &[(String, Option<String>)]) -> Result<()> {
         if moves.is_empty() {
             return Ok(());
@@ -412,7 +415,7 @@ impl Database {
         let mut pair_rows: Vec<(String, String, CoChangeWrite)> = Vec::new();
         let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
         {
-            let mut pairs_of = self.conn.prepare(
+            let mut pairs_of = self.conn.prepare_cached(
                 "SELECT file_a, file_b, weight, count, last_observed_at, first_observed_at,
                         window_mask
                  FROM git_co_changes WHERE file_a = ?1 OR file_b = ?1",
@@ -443,15 +446,17 @@ impl Database {
                 }
             }
         }
-        for from in targets.keys() {
-            self.conn.execute(
-                "DELETE FROM git_files WHERE path = ?1",
-                rusqlite::params![from],
-            )?;
-            self.conn.execute(
-                "DELETE FROM git_co_changes WHERE file_a = ?1 OR file_b = ?1",
-                rusqlite::params![from],
-            )?;
+        {
+            let mut delete_file = self
+                .conn
+                .prepare_cached("DELETE FROM git_files WHERE path = ?1")?;
+            let mut delete_pairs = self
+                .conn
+                .prepare_cached("DELETE FROM git_co_changes WHERE file_a = ?1 OR file_b = ?1")?;
+            for from in targets.keys() {
+                delete_file.execute(rusqlite::params![from])?;
+                delete_pairs.execute(rusqlite::params![from])?;
+            }
         }
 
         for row in file_rows {
@@ -481,8 +486,10 @@ impl Database {
     /// makes the merged span unknown.
     fn merge_git_co_change(&self, file_a: &str, file_b: &str, w: &CoChangeWrite) -> Result<()> {
         let (lo, hi) = Self::order_co_change_pair(file_a, file_b)?;
-        let merged_mask: i64 = self.conn.query_row(
-            "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at,
+        let merged_mask: i64 = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at,
                                          first_observed_at, window_mask, windows)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(file_a, file_b) DO UPDATE SET
@@ -504,22 +511,25 @@ impl Database {
                      ELSE window_mask | excluded.window_mask
                  END
              RETURNING window_mask",
-            rusqlite::params![
-                lo,
-                hi,
-                w.weight,
-                w.count,
-                w.last_observed_at,
-                w.first_observed_at,
-                w.window_mask as i64,
-                windows_of(w.window_mask)
-            ],
-            |r| r.get(0),
-        )?;
-        self.conn.execute(
-            "UPDATE git_co_changes SET windows = ?3 WHERE file_a = ?1 AND file_b = ?2",
-            rusqlite::params![lo, hi, windows_of(merged_mask as u64)],
-        )?;
+            )?
+            .query_row(
+                rusqlite::params![
+                    lo,
+                    hi,
+                    w.weight,
+                    w.count,
+                    w.last_observed_at,
+                    w.first_observed_at,
+                    w.window_mask as i64,
+                    windows_of(w.window_mask)
+                ],
+                |r| r.get(0),
+            )?;
+        self.conn
+            .prepare_cached(
+                "UPDATE git_co_changes SET windows = ?3 WHERE file_a = ?1 AND file_b = ?2",
+            )?
+            .execute(rusqlite::params![lo, hi, windows_of(merged_mask as u64)])?;
         Ok(())
     }
 

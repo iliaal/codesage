@@ -379,3 +379,126 @@ fn renames_across_the_exclusion_boundary_carry_only_indexed_history() {
     assert_eq!(commits(&full, "vendor/out.rs"), None, "excluded successor");
     assert!(full.co_changes_for("peer.rs", 10).unwrap().is_empty());
 }
+
+#[test]
+fn rename_onto_a_path_with_recorded_history_matches_a_full_scan() {
+    let mut repo = Repo::new();
+    for tag in 1..=3 {
+        repo.edit(&["a.rs", "c.rs", "peer.rs"], tag);
+    }
+    let incremental = repo.full();
+    repo.git(&["rm", "-q", "c.rs"]);
+    repo.commit("feat: drop c");
+    repo.mv("a.rs", "c.rs");
+    repo.commit("feat: a takes c's name");
+    repo.index(&incremental, IndexMode::Incremental);
+
+    let full = repo.full();
+    assert_same_history(&incremental, &full, &["a.rs", "c.rs", "peer.rs"]);
+    assert_eq!(
+        commits(&full, "c.rs"),
+        Some(5),
+        "3 shared commits, the delete, and the rename"
+    );
+    let pairs = full.co_changes_for("peer.rs", 10).unwrap();
+    assert_eq!((pairs[0].file.as_str(), pairs[0].count), ("c.rs", 3));
+}
+
+#[test]
+fn rename_into_the_test_tree_matches_a_full_scan() {
+    let mut repo = Repo::new();
+    for tag in 1..=3 {
+        repo.edit(&["src/x.rs", "tests/t.rs"], tag);
+    }
+    let incremental = repo.full();
+    assert_eq!(
+        incremental.co_changes_for("tests/t.rs", 10).unwrap().len(),
+        1
+    );
+    repo.mv("src/x.rs", "tests/u.rs");
+    repo.commit("feat: x becomes a test");
+    repo.index(&incremental, IndexMode::Incremental);
+
+    let full = repo.full();
+    assert_same_history(
+        &incremental,
+        &full,
+        &["src/x.rs", "tests/u.rs", "tests/t.rs"],
+    );
+    assert!(
+        full.co_changes_for("tests/t.rs", 10).unwrap().is_empty(),
+        "test-test pairs are never recorded"
+    );
+}
+
+#[test]
+fn rename_out_of_the_test_tree_matches_a_full_scan() {
+    let mut repo = Repo::new();
+    for tag in 1..=3 {
+        repo.edit(&["tests/a.rs", "tests/b.rs"], tag);
+    }
+    let incremental = repo.full();
+    assert!(
+        incremental
+            .co_changes_for("tests/b.rs", 10)
+            .unwrap()
+            .is_empty()
+    );
+    repo.mv("tests/a.rs", "src/a.rs");
+    repo.commit("feat: a leaves the tests");
+    repo.index(&incremental, IndexMode::Incremental);
+
+    let full = repo.full();
+    assert_same_history(
+        &incremental,
+        &full,
+        &["tests/a.rs", "src/a.rs", "tests/b.rs"],
+    );
+    let pairs = full.co_changes_for("tests/b.rs", 10).unwrap();
+    assert_eq!((pairs[0].file.as_str(), pairs[0].count), ("src/a.rs", 3));
+}
+
+#[test]
+fn branch_edit_merged_across_a_rename_follows_the_file() {
+    let mut repo = Repo::new();
+    repo.git(&["config", "merge.renames", "true"]);
+    for tag in 1..=3 {
+        repo.edit(&["a.rs"], tag);
+    }
+    let main = repo.git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let main = main.trim().to_owned();
+    let before_fork = repo.full();
+
+    repo.git(&["checkout", "-q", "-b", "feature"]);
+    repo.edit(&["a.rs"], 4);
+    repo.git(&["checkout", "-q", &main]);
+    repo.mv("a.rs", "c.rs");
+    repo.commit("feat: rename a to c on main");
+    let after_rename = repo.full();
+    assert_eq!(commits(&after_rename, "c.rs"), Some(4));
+    repo.git(&["merge", "-q", "--no-edit", "feature"]);
+    repo.next_ts += DAY;
+
+    let full = repo.full();
+    assert_eq!(
+        commits(&full, "a.rs"),
+        None,
+        "the branch edit must not resurrect the dead path"
+    );
+    assert_eq!(
+        commits(&full, "c.rs"),
+        Some(5),
+        "3 edits, the branch edit, the rename"
+    );
+
+    // One incremental range holding the rename and the branch edit agrees.
+    repo.index(&before_fork, IndexMode::Incremental);
+    assert_same_history(&before_fork, &full, &["a.rs", "c.rs"]);
+
+    // Documented limit: when the rename was indexed in an earlier pass, the
+    // later range holds no rename to follow, so the branch edit stays on a.rs
+    // until `git-index --full`.
+    repo.index(&after_rename, IndexMode::Incremental);
+    assert_eq!(commits(&after_rename, "a.rs"), Some(1));
+    assert_eq!(commits(&after_rename, "c.rs"), Some(4));
+}

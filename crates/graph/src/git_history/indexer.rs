@@ -18,10 +18,19 @@
 //!   incremental pass re-keys stored rows for paths renamed inside its range.
 //!   Copies are not followed (`-M` overrides `diff.renames=copies`).
 //!
+//! An edit to the old path on a parallel branch that `--topo-order` lists
+//! before the rename is recovered afterwards: a change left on a path absent
+//! from HEAD follows the pass's rename map to a path HEAD holds. An
+//! incremental pass re-keys stored rows only while that stays exact; a range
+//! that renames a file onto a path with recorded history, or across the
+//! test-like boundary, is rescanned in full.
+//!
 //! Rename limits: a dead file whose path a later file reuses shares that
-//! file's history, as it always has without renames. An edit to the old path
-//! on a parallel branch that `--topo-order` lists before the rename stays on
-//! the old path.
+//! file's history, as it always has without renames, and a file created at a
+//! renamed-away path and deleted again before HEAD is folded into the rename's
+//! successor. An incremental pass sees only its own range's renames, so a
+//! branch edit to the old path that arrives in a later pass than the rename
+//! stays on the old path until `git-index --full`.
 //!
 //! Recurrence (`git_co_changes.window_mask` / `windows`): every shared commit
 //! sets bit `(ts / 90d) % 64` in the pair's mask, numbered against the unix
@@ -452,7 +461,8 @@ fn run_full(
 ) -> Result<GitIndexStats> {
     let raw = run_git_log(root, None, anchor.cutoff())?;
     let mut commits = parse_log(&raw)?;
-    follow_renames(&mut commits, exclude_set);
+    let successor = follow_renames(&mut commits, exclude_set);
+    remap_dead_paths(root, head_sha, &mut commits, &successor)?;
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
     let mut pairs: HashMap<(String, String), PairStats> = HashMap::new();
@@ -518,15 +528,24 @@ fn run_incremental(
     let range = format!("{last_sha}..{head_sha}");
     let raw = run_git_log(root, Some(&range), anchor.cutoff())?;
     let mut commits = parse_log(&raw)?;
+    let successor = follow_renames(&mut commits, exclude_set);
+    remap_dead_paths(root, head_sha, &mut commits, &successor)?;
     // Stored rows are keyed by the names files had at `last_sha`; a rename in
     // this range moves them, exactly as a full scan would key those commits.
-    let moves: Vec<(String, Option<String>)> = follow_renames(&mut commits, exclude_set)
+    let moves: Vec<(String, Option<String>)> = successor
         .into_iter()
         .map(|(from, to)| {
             let kept = !is_excluded(exclude_set, &from) && !is_excluded(exclude_set, &to);
             (from, kept.then_some(to))
         })
         .collect();
+    if rekey_diverges_from_full_scan(db, &moves, test_like_set)? {
+        tracing::info!(
+            root = %root.display(),
+            "a rename in the incremental range cannot be re-keyed exactly; rescanning in full"
+        );
+        return run_full(db, root, exclude_set, test_like_set, head_sha, anchor);
+    }
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
     let mut pairs: HashMap<(String, String), PairStats> = HashMap::new();
@@ -625,29 +644,15 @@ fn decay_git_history_between(db: &Database, from_anchor: i64, to_anchor: i64) ->
 fn follow_renames(commits: &mut [Commit], exclude_set: &GlobSet) -> HashMap<String, String> {
     let mut successor: HashMap<String, String> = HashMap::new();
     for commit in commits.iter_mut() {
-        let mut keyed: Vec<FileChange> = Vec::with_capacity(commit.changes.len());
-        let mut slot: HashMap<String, usize> = HashMap::new();
-        for change in std::mem::take(&mut commit.changes) {
-            if is_excluded(exclude_set, &change.path) {
-                continue;
-            }
-            let path = successor.get(&change.path).cloned().unwrap_or(change.path);
-            match slot.get(&path) {
-                Some(&i) => {
-                    keyed[i].added = keyed[i].added.saturating_add(change.added);
-                    keyed[i].deleted = keyed[i].deleted.saturating_add(change.deleted);
-                }
-                None => {
-                    slot.insert(path.clone(), keyed.len());
-                    keyed.push(FileChange {
-                        path,
-                        added: change.added,
-                        deleted: change.deleted,
-                    });
-                }
-            }
-        }
-        commit.changes = keyed;
+        let keyed: Vec<FileChange> = std::mem::take(&mut commit.changes)
+            .into_iter()
+            .filter(|change| !is_excluded(exclude_set, &change.path))
+            .map(|change| FileChange {
+                path: successor.get(&change.path).cloned().unwrap_or(change.path),
+                ..change
+            })
+            .collect();
+        commit.changes = merge_same_path(keyed);
         // Resolve every rename against the state before this commit, so a swap
         // inside one commit does not chase its own entries.
         let moves: Vec<(String, String)> = commit
@@ -667,6 +672,115 @@ fn follow_renames(commits: &mut [Commit], exclude_set: &GlobSet) -> HashMap<Stri
         }
     }
     successor
+}
+
+/// Whether re-keying stored rows by `moves` would disagree with a full scan.
+/// A successor that already holds history of its own would be merged with it,
+/// counting a commit that touched both paths twice; a move across the test-like
+/// boundary changes which co-change pairs a full scan admits. Renames are rare,
+/// so a rescan costs little and keeps the rows exact.
+fn rekey_diverges_from_full_scan(
+    db: &Database,
+    moves: &[(String, Option<String>)],
+    test_like_set: &GlobSet,
+) -> Result<bool> {
+    let sources: std::collections::HashSet<&str> =
+        moves.iter().map(|(from, _)| from.as_str()).collect();
+    for (from, to) in moves {
+        let Some(to) = to else {
+            continue;
+        };
+        if test_like_set.is_match(from) != test_like_set.is_match(to) {
+            return Ok(true);
+        }
+        if !sources.contains(to.as_str()) && db.git_file(to)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Re-key changes left on a path HEAD no longer holds. `--topo-order` can list
+/// a parallel branch's edit to a file before the rename that happened on the
+/// other side of a merge, so `follow_renames` saw the edit first and kept the
+/// old path. Following the pass's final rename map (chains included) to a
+/// path HEAD does hold recovers it. Only runs when the pass saw a rename.
+fn remap_dead_paths(
+    root: &Path,
+    head_sha: &str,
+    commits: &mut [Commit],
+    successor: &HashMap<String, String>,
+) -> Result<()> {
+    if successor.is_empty() {
+        return Ok(());
+    }
+    let live = head_paths(root, head_sha)?;
+    for commit in commits.iter_mut() {
+        let mut remapped = false;
+        for change in &mut commit.changes {
+            if live.contains(&change.path) {
+                continue;
+            }
+            let mut path = &change.path;
+            for _ in 0..successor.len() {
+                let Some(next) = successor.get(path) else {
+                    break;
+                };
+                path = next;
+                if live.contains(path) {
+                    break;
+                }
+            }
+            if live.contains(path) {
+                change.path = path.clone();
+                remapped = true;
+            }
+        }
+        if remapped {
+            commit.changes = merge_same_path(std::mem::take(&mut commit.changes));
+        }
+    }
+    Ok(())
+}
+
+/// Every path in `sha`'s tree, repository-relative like `git log` paths.
+fn head_paths(root: &Path, sha: &str) -> Result<std::collections::HashSet<String>> {
+    let out = Command::new("git")
+        .args(["ls-tree", "-r", "-z", "--name-only", "--full-tree", sha])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("git ls-tree {sha} in {}", root.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git ls-tree {sha} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8(out.stdout).context("git ls-tree output not UTF-8")?;
+    Ok(text
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Merge changes that share a path, so the commit counts once for it.
+fn merge_same_path(changes: Vec<FileChange>) -> Vec<FileChange> {
+    let mut merged: Vec<FileChange> = Vec::with_capacity(changes.len());
+    let mut slot: HashMap<String, usize> = HashMap::new();
+    for change in changes {
+        match slot.get(&change.path) {
+            Some(&i) => {
+                merged[i].added = merged[i].added.saturating_add(change.added);
+                merged[i].deleted = merged[i].deleted.saturating_add(change.deleted);
+            }
+            None => {
+                slot.insert(change.path.clone(), merged.len());
+                merged.push(change);
+            }
+        }
+    }
+    merged
 }
 
 fn filter_kept<'a>(commit: &'a Commit, exclude_set: &GlobSet) -> Option<Vec<&'a FileChange>> {
@@ -856,6 +970,8 @@ fn run_git_log(root: &Path, range: Option<&str>, since_epoch: i64) -> Result<Str
         // `log.showSignature` would interleave verification text with records.
         "--no-show-signature",
         "--no-merges",
+        // `log.showRoot=false` would drop the root commit's numstat.
+        "--root",
         // Children before parents regardless of committer-date skew, which
         // `follow_renames` needs to apply a rename to everything older.
         "--topo-order",

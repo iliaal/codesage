@@ -1,4 +1,4 @@
-//! `log.showSignature=true` must not change what `git-index` reads.
+//! User `log.*` configuration must not change what `git-index` reads.
 #![cfg(unix)]
 
 use std::path::Path;
@@ -146,4 +146,31 @@ fn show_signature_config_does_not_change_full_or_incremental_history() {
     let report = find_coupling(&signed, "b.rs", 10).unwrap();
     assert_eq!(report.coupled.len(), 1);
     assert_eq!(report.coupled[0].count, 5);
+}
+
+#[test]
+fn show_root_false_still_counts_the_root_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::create_dir_all(root.join(".git/disabled-hooks")).unwrap();
+    for (name, value) in [
+        ("user.email", "root@example.invalid"),
+        ("user.name", "Root"),
+        ("commit.gpgsign", "false"),
+        ("core.hooksPath", ".git/disabled-hooks"),
+        ("log.showRoot", "false"),
+    ] {
+        git(root, &["config", name, value]);
+    }
+    commit_pair(root, 1);
+    commit_pair(root, 2);
+    // The fixture's config must actually hide the root commit's numstat.
+    let raw = git(root, &["log", "--numstat", "--format=%s"]);
+    assert_eq!(raw.matches("a.rs").count(), 1, "{raw:?}");
+
+    let db = Database::open_in_memory().unwrap();
+    let stats = index(root, &db, IndexMode::Full);
+    assert_eq!(stats_tuple(&stats), (2, 2, 0));
+    assert_eq!(db.git_file("a.rs").unwrap().unwrap().total_commits, 2);
 }

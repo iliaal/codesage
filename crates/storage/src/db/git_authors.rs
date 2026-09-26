@@ -53,7 +53,7 @@ impl Database {
     pub(super) fn rekey_git_author_events(&self, moves: &[(String, Option<String>)]) -> Result<()> {
         let mut moved: Vec<(&str, String, String, i64)> = Vec::new();
         {
-            let mut events_of = self.conn.prepare(
+            let mut events_of = self.conn.prepare_cached(
                 "SELECT commit_sha, author, committed_at FROM git_author_events
                  WHERE file_path = ?1",
             )?;
@@ -69,17 +69,19 @@ impl Database {
                 }
             }
         }
+        let mut delete = self
+            .conn
+            .prepare_cached("DELETE FROM git_author_events WHERE file_path = ?1")?;
         for (from, _) in moves {
-            self.conn
-                .execute("DELETE FROM git_author_events WHERE file_path = ?1", [from])?;
+            delete.execute([from])?;
         }
+        let mut insert = self.conn.prepare_cached(
+            "INSERT INTO git_author_events (file_path, commit_sha, author, committed_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_path, commit_sha) DO NOTHING",
+        )?;
         for (to, sha, author, committed_at) in moved {
-            self.conn.execute(
-                "INSERT INTO git_author_events (file_path, commit_sha, author, committed_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(file_path, commit_sha) DO NOTHING",
-                params![to, sha, author, committed_at],
-            )?;
+            insert.execute(params![to, sha, author, committed_at])?;
         }
         Ok(())
     }
