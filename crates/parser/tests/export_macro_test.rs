@@ -107,36 +107,111 @@ fn cpp_export_macro_classes_structs_functions_and_members_are_indexed() {
     assert_eq!((gadget.line_start, gadget.line_end), (22, 25));
 }
 
+/// Class-head macros become spaces; a macro opening a declaration becomes a
+/// same-length `[[a ...]]` attribute, so the definition still starts at the
+/// macro's own byte.
 #[test]
-fn cpp_export_macro_spans_equal_a_hand_blanked_source() {
-    let mut blanked = EXPORTED.to_string();
-    for (macro_text, from_line) in [
-        ("MYLIB_API", 1),
-        ("Q_DECL_EXPORT", 0),
-        ("MYLIB_DEPRECATED_EXPORT", 0),
-        ("MYLIB_DEPRECATED(\"use Widget\")", 0),
-        ("CORE_API", 0),
-    ] {
-        let lines: Vec<String> = blanked
-            .split_inclusive('\n')
-            .enumerate()
-            .map(|(i, line)| {
-                if i >= from_line {
-                    line.replace(macro_text, &" ".repeat(macro_text.len()))
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect();
-        blanked = lines.concat();
-    }
-    assert_eq!(blanked.len(), EXPORTED.len());
-    assert!(blanked.starts_with("#define MYLIB_API "));
-    assert!(!blanked.contains("Q_DECL_EXPORT"));
+fn cpp_export_macro_spans_equal_a_hand_rewritten_source() {
+    let rewritten = EXPORTED
+        .replacen("    MYLIB_API static", "    [[a    ]] static", 1)
+        .replacen("MYLIB_API int free_fn", "[[a    ]] int free_fn", 1)
+        .replacen("class MYLIB_API Widget", "class           Widget", 1)
+        .replacen("struct MYLIB_API Point", "struct           Point", 1)
+        .replacen("class Q_DECL_EXPORT", "class              ", 1)
+        .replacen(
+            "class MYLIB_DEPRECATED_EXPORT",
+            "class                        ",
+            1,
+        )
+        .replacen(
+            "class MYLIB_DEPRECATED(\"use Widget\")",
+            &format!("class {}", " ".repeat(30)),
+            1,
+        )
+        .replacen("class CORE_API", "class         ", 1);
+    assert_eq!(rewritten.len(), EXPORTED.len());
+    assert!(rewritten.starts_with("#define MYLIB_API "));
+    assert_eq!(rewritten.matches("_API").count(), 1, "{rewritten}");
+    assert!(!rewritten.contains("_EXPORT") && !rewritten.contains("_DEPRECATED"));
 
-    let with_macros = spans(&symbols(EXPORTED, Language::Cpp));
-    let without = spans(&symbols(&blanked, Language::Cpp));
-    assert_eq!(with_macros, without);
+    let with_macros = symbols(EXPORTED, Language::Cpp);
+    assert_eq!(
+        spans(&with_macros),
+        spans(&symbols(&rewritten, Language::Cpp))
+    );
+
+    let free_fn = find(&with_macros, "free_fn", SymbolKind::Function);
+    assert_eq!((free_fn.line_start, free_fn.col_start), (18, 0));
+    let make = find(&with_macros, "Widget::make", SymbolKind::Method);
+    assert_eq!((make.line_start, make.col_start), (6, 4));
+}
+
+#[test]
+fn cpp_export_macro_on_its_own_line_keeps_leading_rationale_and_start() {
+    let source = "// WHY: exported for plugins.\nMYLIB_API\nint g(int a) { return a; }\n";
+    let syms = symbols(source, Language::Cpp);
+    let g = find(&syms, "g", SymbolKind::Function);
+    assert_eq!((g.line_start, g.line_end, g.col_start), (2, 3, 0));
+    assert!(
+        g.rationale
+            .iter()
+            .any(|r| r.text.contains("exported for plugins")),
+        "leading rationale lost: {:?}",
+        g.rationale
+    );
+}
+
+/// `edit_check` swaps a definition's byte range for a replacement and
+/// reparses; the range must cover the export macro so none is left behind.
+#[test]
+fn cpp_export_macro_definition_byte_range_covers_the_macro() {
+    let source = "extern \"C\" CORE_API int g(int a) { return a; }\n\
+template <typename T> ENGINE_API T get() { return T(); }\n";
+    let tree = parse_file(source.as_bytes(), Language::Cpp).unwrap();
+    assert!(
+        !tree.root_node().has_error(),
+        "{}",
+        tree.root_node().to_sexp()
+    );
+    let mut defs = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_definition" {
+            defs.push(node.byte_range());
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    defs.sort_by_key(|r| r.start);
+    let texts: Vec<_> = defs.iter().map(|r| &source[r.clone()]).collect();
+    assert_eq!(
+        texts,
+        [
+            "CORE_API int g(int a) { return a; }",
+            "ENGINE_API T get() { return T(); }"
+        ]
+    );
+    let mut proposed = source.to_string();
+    proposed.replace_range(defs[0].clone(), "int g(int a, int b) { return a; }");
+    assert!(!proposed.contains("CORE_API"));
+    let reparsed = parse_file(proposed.as_bytes(), Language::Cpp).unwrap();
+    assert!(!reparsed.root_node().has_error());
+}
+
+#[test]
+fn cpp_macro_shaped_class_names_and_types_keep_their_base_parse() {
+    let syms = symbols("class RENDER_API final { void m(); };\n", Language::Cpp);
+    find(&syms, "RENDER_API", SymbolKind::Class);
+    find(&syms, "RENDER_API::m", SymbolKind::Method);
+
+    for source in ["MY_TYPE_API const x;\n", "MY_TYPE_API const x = 1;\n"] {
+        let tree = parse_file(source.as_bytes(), Language::Cpp).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{source:?}: {}",
+            tree.root_node().to_sexp()
+        );
+    }
 }
 
 #[test]

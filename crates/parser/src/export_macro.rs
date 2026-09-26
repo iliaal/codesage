@@ -5,10 +5,11 @@
 //! recovers `Widget` as an error, so the class and every member declared in
 //! it vanish from the index. CodeSage never runs the preprocessor, so the
 //! macro token (and a parenthesized argument list such as
-//! `MYLIB_DEPRECATED("use x")`) is overwritten with spaces instead. Only bytes
-//! other than `\n` / `\r` change, so every byte offset, line, and column the
-//! tree reports stays valid for the original source, which is what every
-//! extractor reads node text from.
+//! `MYLIB_DEPRECATED("use x")`) is overwritten instead: with spaces in a class
+//! head, and with a same-length `[[a   ]]` attribute at the start of a
+//! declaration (see `Form`). Only bytes other than `\n` / `\r` change, so
+//! every byte offset, line, and column the tree reports stays valid for the
+//! original source, which is what every extractor reads node text from.
 //!
 //! A token is blanked only when it is macro-shaped and sits where a
 //! declaration head can take an attribute, never where a value can appear.
@@ -98,6 +99,23 @@ enum Kind {
     Scope,
 }
 
+/// How a qualifying macro is overwritten.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Form {
+    /// Spaces. Used in class heads, where the class node already starts at
+    /// the `class` keyword, and after a specifier keyword, where the
+    /// declaration already starts at that keyword. An attribute would add
+    /// nothing there and breaks some heads (`friend class [[a]] W;`).
+    Spaces,
+    /// `[[a   ]]`: a C++11 attribute of the same length. At the start of a
+    /// declaration the attribute keeps the definition node starting where
+    /// the macro starts, so symbol spans, `col_start`, leading-comment
+    /// rationale (which needs the comment on the row above the node), and
+    /// `edit_check`'s replaced byte range all still cover the macro, as
+    /// they do for any other attribute. `[[ ]]` with no name does not parse.
+    Attribute,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Token {
     kind: Kind,
@@ -121,11 +139,25 @@ pub(crate) fn neutralize(source: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = source.to_vec();
-    for (start, end) in spans {
-        for b in &mut out[start..end] {
+    for (start, end, form) in spans {
+        // A candidate is at least six bytes (`XX_API`), so `[[a` always
+        // overwrites its own name; `]]` falls back to spaces when an argument
+        // list ends on a line break, which the attribute cannot absorb.
+        let attribute = form == Form::Attribute
+            && end - start >= 5
+            && !source[end - 2..end]
+                .iter()
+                .any(|b| matches!(b, b'\n' | b'\r'));
+        let span = &mut out[start..end];
+        for b in span.iter_mut() {
             if *b != b'\n' && *b != b'\r' {
                 *b = b' ';
             }
+        }
+        if attribute {
+            let n = span.len();
+            span[..3].copy_from_slice(b"[[a");
+            span[n - 2..].copy_from_slice(b"]]");
         }
     }
     Some(out)
@@ -198,7 +230,7 @@ fn skip_candidates(tokens: &[Token], source: &[u8], mut j: usize) -> usize {
     j
 }
 
-fn blank_spans(tokens: &[Token], source: &[u8]) -> Vec<(usize, usize)> {
+fn blank_spans(tokens: &[Token], source: &[u8]) -> Vec<(usize, usize, Form)> {
     let mut spans = Vec::new();
     // The last token that was not itself blanked: a run of export macros
     // (`FOO_API FOO_DEPRECATED void f();`) is judged against what precedes
@@ -210,9 +242,9 @@ fn blank_spans(tokens: &[Token], source: &[u8]) -> Vec<(usize, usize)> {
         if t.kind == Kind::Ident
             && is_candidate(text(&t, source))
             && let Some(next) = after_args(tokens, i)
-            && qualifies(tokens, source, prev.map(|p| &tokens[p]), prev, next)
+            && let Some(form) = qualifies(tokens, source, prev.map(|p| &tokens[p]), prev, next)
         {
-            spans.push((t.start, tokens[next - 1].end));
+            spans.push((t.start, tokens[next - 1].end, form));
             i = next;
             continue;
         }
@@ -228,20 +260,21 @@ fn qualifies(
     prev: Option<&Token>,
     prev_idx: Option<usize>,
     next: usize,
-) -> bool {
+) -> Option<Form> {
     let head = skip_candidates(tokens, source, next);
-    let Some(first) = tokens.get(head) else {
-        return false;
-    };
+    let first = tokens.get(head)?;
     let after = tokens.get(head + 1).map(|t| t.kind);
 
     // `class MACRO Name {` / `: base` / `final` / `<args>` / `ns::Name`.
     // Anything else after the name (`struct MY_API value;`) means the
-    // macro-shaped word is itself the type name.
+    // macro-shaped word is itself the type name, and so does a "name" that
+    // is really the `final` specifier (`class RENDER_API final {`).
     if ident_is(prev, source, &CLASS_KEYS) {
-        return first.kind == Kind::Ident
+        let named = first.kind == Kind::Ident
+            && !ident_is(Some(first), source, &[b"final"])
             && (matches!(after, Some(Kind::Punct(b'{' | b':' | b'<') | Kind::Scope))
                 || ident_is(tokens.get(head + 1), source, &[b"final"]));
+        return named.then_some(Form::Spaces);
     }
 
     let declaration_start = match prev.map(|t| t.kind) {
@@ -255,9 +288,14 @@ fn qualifies(
         _ => false,
     };
     if !declaration_start {
-        return false;
+        return None;
     }
-    match first.kind {
+    let form = if prev.map(|t| t.kind) == Some(Kind::Ident) {
+        Form::Spaces
+    } else {
+        Form::Attribute
+    };
+    let shaped = match first.kind {
         Kind::Punct(b'~') => true,
         // `MACRO type name ...`: a following `;`, `=`, `,`, `[`, `)`, brace,
         // or bit-field colon means `MACRO type` was itself a declaration of
@@ -268,23 +306,27 @@ fn qualifies(
                 None | Some(Kind::Punct(
                     b';' | b'=' | b',' | b'[' | b')' | b'{' | b'}' | b':'
                 ))
-            ) && single_type_head(tokens, source, head)
+            ) && declarator_head(tokens, source, head)
         }
         _ => false,
-    }
+    };
+    shaped.then_some(form)
 }
 
-/// Blanking must leave a head with at most one type before the declarator
-/// name. `ZEND_API void ZEND_FASTCALL f()` blanked to `void ZEND_FASTCALL f()`
-/// keeps two (the calling-convention macro reads as a second type), which
-/// tree-sitter-cpp recovers worse than the original run, so such a head is
-/// left as written.
-fn single_type_head(tokens: &[Token], source: &[u8], head: usize) -> bool {
+/// What blanking leaves must be one declaration head: a type and a
+/// declarator name (`int f(`, `const Foo& get(`, `A& operator=(`), or a bare
+/// name opening a parameter list (a constructor, `Foo(int)`), or a
+/// destructor. A head that keeps a second type is refused:
+/// `ZEND_API void ZEND_FASTCALL f()` blanked to `void ZEND_FASTCALL f()`
+/// reads the calling-convention macro as a type, which tree-sitter-cpp
+/// recovers worse than the original run. So is a head with no declarator
+/// name: in `MY_TYPE_API const x;` the macro-shaped word is the type.
+fn declarator_head(tokens: &[Token], source: &[u8], head: usize) -> bool {
     let mut idents = 0usize;
     let mut primitive = false;
     let mut after_scope = false;
     let mut j = head;
-    loop {
+    let stop = loop {
         if j >= head + MAX_HEAD_TOKENS {
             return false;
         }
@@ -296,7 +338,7 @@ fn single_type_head(tokens: &[Token], source: &[u8], head: usize) -> bool {
                 let word = text(t, source);
                 if word == b"operator" {
                     idents += 1;
-                    break;
+                    break Kind::Punct(b'(');
                 } else if PRIMITIVE_KEYS.contains(&word) {
                     primitive = true;
                 } else if !QUALIFIER_KEYS.contains(&word) && !after_scope {
@@ -305,10 +347,7 @@ fn single_type_head(tokens: &[Token], source: &[u8], head: usize) -> bool {
                 after_scope = false;
             }
             Kind::Scope => after_scope = true,
-            Kind::Punct(b'~') => {
-                idents += 1;
-                break;
-            }
+            Kind::Punct(b'~') => return idents + usize::from(primitive) == 0,
             Kind::Punct(b'*' | b'&') => {}
             Kind::Punct(b'<') => {
                 let mut depth = 0usize;
@@ -328,11 +367,15 @@ fn single_type_head(tokens: &[Token], source: &[u8], head: usize) -> bool {
                     return false;
                 }
             }
-            _ => break,
+            kind => break kind,
         }
         j += 1;
+    };
+    match idents + usize::from(primitive) {
+        2 => true,
+        1 => stop == Kind::Punct(b'('),
+        _ => false,
     }
-    idents.saturating_sub(1) + usize::from(primitive) <= 1
 }
 
 fn tokenize(src: &[u8]) -> Vec<Token> {
@@ -494,14 +537,35 @@ mod tests {
         out
     }
 
-    /// `src` with each listed macro text replaced by spaces, newlines kept.
+    /// `src` with each listed macro text overwritten, newlines kept. A
+    /// leading `@` marks the attribute form (`[[a` + spaces + `]]`).
     fn by_hand(src: &str, macros: &[&str]) -> String {
         let mut out = src.to_string();
         for m in macros {
-            let spaces: String = m.chars().map(|c| if c == '\n' { c } else { ' ' }).collect();
-            out = out.replacen(m, &spaces, 1);
+            let (text, attribute) = match m.strip_prefix('@') {
+                Some(text) => (text, true),
+                None => (*m, false),
+            };
+            let mut blank: Vec<u8> = text
+                .bytes()
+                .map(|c| if c == b'\n' { c } else { b' ' })
+                .collect();
+            if attribute {
+                let n = blank.len();
+                blank[..3].copy_from_slice(b"[[a");
+                blank[n - 2..].copy_from_slice(b"]]");
+            }
+            out = out.replacen(text, &String::from_utf8(blank).unwrap(), 1);
         }
         out
+    }
+
+    fn parses_cleanly(src: &str) -> bool {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::parse::ts_language(codesage_protocol::Language::Cpp))
+            .unwrap();
+        !parser.parse(src, None).unwrap().root_node().has_error()
     }
 
     #[test]
@@ -511,18 +575,24 @@ mod tests {
             ("struct Q_DECL_EXPORT P : B {};", &["Q_DECL_EXPORT"]),
             ("class FOO_API final_t final {};", &["FOO_API"]),
             ("template <> class FOO_API Box<int> {};", &["FOO_API"]),
-            ("class FOO_API ns::Outer {};", &["FOO_API"]),
-            ("MYLIB_API int f(int);", &["MYLIB_API"]),
-            ("MYLIB_API std::string name();", &["MYLIB_API"]),
-            ("extern \"C\" CORE_API void g();", &["CORE_API"]),
-            ("template <typename T> ENGINE_API T get();", &["ENGINE_API"]),
+            ("friend class FOO_API W;", &[][..]),
+            ("MYLIB_API int f(int);", &["@MYLIB_API"]),
+            ("MYLIB_API\nint g(int a) { return a; }", &["@MYLIB_API"]),
+            ("MYLIB_API std::string name();", &["@MYLIB_API"]),
+            ("extern \"C\" CORE_API void g();", &["@CORE_API"]),
+            (
+                "template <typename T> ENGINE_API T get() { return T(); }",
+                &["@ENGINE_API"],
+            ),
+            ("template <> ENGINE_API int get<int>();", &["@ENGINE_API"]),
             (
                 "class A { public: LIB_API ~A(); LIB_API static A make(); };",
-                &["LIB_API", "LIB_API"],
+                &["@LIB_API", "@LIB_API"],
             ),
+            ("static LIB_API int local() { return 0; }", &["LIB_API"]),
             (
                 "FOO_API FOO_DEPRECATED void h();",
-                &["FOO_API", "FOO_DEPRECATED"],
+                &["@FOO_API", "@FOO_DEPRECATED"],
             ),
             (
                 "class MYLIB_API MYLIB_DEPRECATED W {};",
@@ -531,6 +601,14 @@ mod tests {
             (
                 "#include \"x.h\"\nclass FOO_DEPRECATED(\"a\\\"b\",\n  2) W {};",
                 &["FOO_DEPRECATED(\"a\\\"b\",\n  2)"],
+            ),
+            (
+                "FOO_DEPRECATED(\"a\",\n  2) void f();",
+                &["@FOO_DEPRECATED(\"a\",\n  2)"],
+            ),
+            (
+                "FOO_DEPRECATED(\"a\"\n) void f();",
+                &["FOO_DEPRECATED(\"a\"\n)"],
             ),
             ("int n = 1'000; class MYLIB_API W {};", &["MYLIB_API"]),
             ("char q = '\\''; class MYLIB_API W {};", &["MYLIB_API"]),
@@ -541,21 +619,26 @@ mod tests {
             ("/* a */ class MYLIB_API W {};", &["MYLIB_API"]),
             (
                 "MYLIB_API const std::vector<std::pair<int, int>>& all() const;",
-                &["MYLIB_API"],
+                &["@MYLIB_API"],
             ),
-            ("MYLIB_API unsigned long long count();", &["MYLIB_API"]),
+            ("MYLIB_API unsigned long long count();", &["@MYLIB_API"]),
             (
                 "MYLIB_API bool operator==(const A&, const A&);",
-                &["MYLIB_API"],
+                &["@MYLIB_API"],
             ),
             (
                 "class A { LIB_API A(int); LIB_API virtual ~A(); };",
-                &["LIB_API", "LIB_API"],
+                &["@LIB_API", "@LIB_API"],
             ),
+            ("CORE_API ns::Foo::Foo() {}", &["@CORE_API"]),
         ] {
             let expected = by_hand(src, macros);
-            assert_ne!(expected, src, "fixture {src:?} names no macro text");
-            assert_eq!(blanked(src), expected, "{src:?}");
+            let out = blanked(src);
+            assert_eq!(out, expected, "{src:?}");
+            if !macros.is_empty() {
+                assert_ne!(expected, src, "fixture {src:?} names no macro text");
+                assert!(parses_cleanly(&out), "{out:?} does not parse cleanly");
+            }
         }
     }
 
@@ -584,6 +667,12 @@ mod tests {
             "ZEND_API void ZEND_FASTCALL f(int x) {}",
             "ZEND_API ZEND_COLD void g(int x) {}",
             "MYLIB_API BOOL WINAPI h();",
+            "class RENDER_API final { void m(); };",
+            "class RENDER_API final : public Base {};",
+            "MY_TYPE_API const x;",
+            "MY_TYPE_API const x = 1;",
+            "MY_TYPE_API volatile y;",
+            "MY_TYPE_API const *p;",
         ] {
             assert_eq!(blanked(src), src, "{src:?} was modified");
             assert!(neutralize(src.as_bytes()).is_none(), "{src:?}");
