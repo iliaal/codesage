@@ -265,7 +265,7 @@ fn attach_handles(
             capped = true;
             break;
         }
-        if crate::bundle::is_go_package_import(row.kind, &row.from_file) {
+        if crate::bundle::is_package_import(row.kind, &row.from_file, &row.to_name) {
             continue;
         }
         // Trivially same-file: the sole definition, spelled as it is defined.
@@ -436,7 +436,7 @@ impl<'a> EvidenceCaches<'a> {
                             | ReferenceKind::ImportBinding
                             | ReferenceKind::TypeHint
                             | ReferenceKind::Instantiation
-                    ) && !crate::bundle::is_go_package_import(*kind, caller_file)
+                    ) && !crate::bundle::is_package_import(*kind, caller_file, name)
                         && last_segment(name) == owner_tail
                 }) {
                     return Ok(true);

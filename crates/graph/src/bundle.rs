@@ -787,8 +787,19 @@ fn rust_module_subtree(def_file: &str) -> Option<String> {
 /// never a symbol, so it must not bind to a project symbol that happens to
 /// share the spelling. Package paths name directories, which the file-level
 /// path matcher does not resolve, so these rows carry no symbol or file edge.
-pub(crate) fn is_go_package_import(kind: ReferenceKind, from_file: &str) -> bool {
-    kind == ReferenceKind::Import && from_file.ends_with(".go")
+/// A Go `import` or a bare JavaScript/TypeScript module specifier
+/// (`'debounce'`, `'lodash/fp'`) names a package, never a project symbol.
+pub(crate) fn is_package_import(kind: ReferenceKind, from_file: &str, to_name: &str) -> bool {
+    if kind != ReferenceKind::Import {
+        return false;
+    }
+    if from_file.ends_with(".go") {
+        return true;
+    }
+    matches!(
+        importer_dialect(from_file),
+        ImporterDialect::JavaScript | ImporterDialect::TypeScript
+    ) && !(to_name.starts_with("./") || to_name.starts_with("../") || to_name.starts_with('/'))
 }
 
 // Fetch outgoing imports without computing list_file_dependencies' reverse edges.
@@ -796,7 +807,7 @@ pub(crate) fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<V
     let mut refs = Vec::new();
     if let Some(file_id) = db.file_id_for_path(caller_file)? {
         for (to_name, kind) in db.refs_outgoing_for_file_id(file_id)? {
-            if is_go_package_import(kind, caller_file) {
+            if is_package_import(kind, caller_file, &to_name) {
                 continue;
             }
             // Bindings retain evidence when a specifier names a re-exporting barrel.

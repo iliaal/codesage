@@ -952,7 +952,7 @@ fn resolve_references_to_symbol(
     let identity = symbol_identity_key(sym);
     for r in raw {
         codesage_protocol::work::checkpoint()?;
-        if crate::bundle::is_go_package_import(r.kind, &r.from_file) {
+        if crate::bundle::is_package_import(r.kind, &r.from_file, &r.to_name) {
             continue;
         }
         let cache_key = (r.from_file.clone(), r.to_name.clone());

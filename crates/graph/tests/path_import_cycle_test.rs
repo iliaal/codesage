@@ -462,6 +462,31 @@ fn a_bare_javascript_specifier_binds_to_no_same_named_project_symbol() {
     assert!(deps.imported_by.is_empty(), "{deps:?}");
 }
 
+#[test]
+fn a_bare_javascript_side_effect_import_is_no_symbol_evidence() {
+    let (_dir, db) = index_tree(&[
+        (
+            "src/a.ts",
+            "import 'debounce';\nexport function a(): number { return debounce(); }\n",
+        ),
+        (
+            "src/util.ts",
+            "export function debounce(): number { return 1; }\n",
+        ),
+    ]);
+    let rows = references(&db, "debounce");
+    let import = rows
+        .iter()
+        .find(|r| r.from_file == "src/a.ts" && r.kind == ReferenceKind::Import)
+        .expect("import 'debounce' is indexed as a reference row");
+    assert_eq!(import.to, None, "{import:?}");
+    let call = rows
+        .iter()
+        .find(|r| r.from_file == "src/a.ts" && r.kind == ReferenceKind::Call)
+        .expect("debounce() is indexed as a call");
+    assert_eq!(call.to, None, "{call:?}");
+}
+
 /// Pins the `find_references` `to` skip on its own: the definition sits in
 /// the importing file, so no import evidence is consulted.
 #[test]
