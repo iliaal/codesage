@@ -485,6 +485,68 @@ fn import_is_lazy(node: &Node, source: &[u8], language: Language) -> bool {
     false
 }
 
+/// True when a TypeScript import/export row belongs to a directive the
+/// compiler erases, so it loads nothing at module load time:
+/// `import type ...`, `export type { .. } from`, `import type X = require(..)`,
+/// a clause whose every named specifier is `type`, or (for a binding row) the
+/// row's own `type` specifier. A default or namespace binding, or any value
+/// specifier, keeps the directive load-time.
+fn ts_import_is_type_only(node: &Node) -> bool {
+    let has_type_token = |n: &Node| {
+        let mut cursor = n.walk();
+        n.children(&mut cursor)
+            .any(|child| !child.is_named() && child.kind() == "type")
+    };
+    let mut current = Some(*node);
+    while let Some(n) = current {
+        match n.kind() {
+            "import_specifier" | "export_specifier" if has_type_token(&n) => return true,
+            "import_statement" | "export_statement" => {
+                if has_type_token(&n) {
+                    return true;
+                }
+                let mut cursor = n.walk();
+                let clause = n
+                    .named_children(&mut cursor)
+                    .find(|child| matches!(child.kind(), "import_clause" | "export_clause"));
+                return clause.is_some_and(|clause| {
+                    let specifiers: Vec<Node> = if clause.kind() == "export_clause" {
+                        let mut cursor = clause.walk();
+                        clause.named_children(&mut cursor).collect()
+                    } else {
+                        let mut cursor = clause.walk();
+                        let parts: Vec<Node> = clause.named_children(&mut cursor).collect();
+                        match parts.as_slice() {
+                            [named] if named.kind() == "named_imports" => {
+                                let mut cursor = named.walk();
+                                named.named_children(&mut cursor).collect()
+                            }
+                            _ => return false,
+                        }
+                    };
+                    !specifiers.is_empty()
+                        && specifiers.iter().all(|specifier| {
+                            matches!(specifier.kind(), "import_specifier" | "export_specifier")
+                                && has_type_token(specifier)
+                        })
+                });
+            }
+            "string"
+            | "string_fragment"
+            | "identifier"
+            | "import_clause"
+            | "named_imports"
+            | "namespace_import"
+            | "import_specifier"
+            | "export_clause"
+            | "export_specifier"
+            | "import_require_clause" => current = n.parent(),
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// The pattern-index → `ReferenceKind` map for a language. Counterpart to
 /// `crate::extract::kind_map_for`; shared by `extract_references` and the
 /// validation gate so both agree on what each `@ref` pattern means.
@@ -654,7 +716,8 @@ pub fn extract_references(
         let lazy = matches!(
             kind,
             ReferenceKind::Import | ReferenceKind::ImportBinding | ReferenceKind::Include
-        ) && import_is_lazy(&ref_node, source, language);
+        ) && (import_is_lazy(&ref_node, source, language)
+            || (language == Language::TypeScript && ts_import_is_type_only(&ref_node)));
         if language == Language::Python && kind == ReferenceKind::ImportBinding {
             let statement = ref_node.parent().and_then(|parent| {
                 if parent.kind() == "aliased_import" {
@@ -864,6 +927,48 @@ mod tests {
         assert_eq!(lazy_flags(&refs, "./top"), vec![false]);
         assert_eq!(lazy_flags(&refs, "./fn"), vec![true]);
         assert_eq!(lazy_flags(&refs, "m"), vec![true]);
+    }
+
+    #[test]
+    fn typescript_type_only_directives_are_lazy_and_value_imports_are_not() {
+        let src = "import type { A } from './a';\n\
+                   import { type B, type C } from './b';\n\
+                   import { type D, E } from './d';\n\
+                   export type { F } from './f';\n\
+                   export { type G } from './g';\n\
+                   export { type H, I } from './h';\n\
+                   import type J from './j';\n\
+                   import type * as K from './k';\n\
+                   import L, { type M } from './l';\n\
+                   import './side';\n\
+                   export * from './all';\n\
+                   import N = require('./n');\n\
+                   import type O = require('./o');\n\
+                   import {} from './empty';\n\
+                   export type P = { q: number };\n\
+                   export function use(x: A): number { return x.q; }\n";
+        let refs = refs_from_source(src, Language::TypeScript);
+        for spec in ["./a", "./b", "./f", "./g", "./j", "./k", "./o"] {
+            assert_eq!(lazy_flags(&refs, spec), vec![true], "{spec}");
+        }
+        for spec in ["./d", "./h", "./l", "./side", "./all", "./n", "./empty"] {
+            assert_eq!(lazy_flags(&refs, spec), vec![false], "{spec}");
+        }
+        // Binding rows follow their own specifier inside a mixed clause.
+        assert_eq!(lazy_flags(&refs, "B"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "D"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "E"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "L"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "M"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "N"), vec![false]);
+    }
+
+    #[test]
+    fn javascript_has_no_type_only_directives() {
+        let src = "import { b } from './b.js';\nexport { c } from './c.js';\n";
+        let refs = refs_from_source(src, Language::JavaScript);
+        assert_eq!(lazy_flags(&refs, "./b.js"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./c.js"), vec![false]);
     }
 
     #[test]

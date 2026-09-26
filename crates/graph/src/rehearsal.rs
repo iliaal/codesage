@@ -268,7 +268,7 @@ pub fn build_review_rehearsal(
         }
         if c.lazy_edges > 0 {
             evidence.push(format!(
-                "lazy_edges: {} (function-body import pair(s) touching this cycle, excluded from cycle detection)",
+                "lazy_edges: {} (lazy import pair(s), function-body or type-only, touching this cycle, excluded from cycle detection)",
                 c.lazy_edges
             ));
         }

@@ -298,3 +298,198 @@ fn go_package_imports_bind_to_no_same_named_project_symbol() {
     );
     assert!(db.enumerate_file_import_edges().unwrap().is_empty());
 }
+
+fn assert_no_cycle(db: &Database, files: &[&str]) {
+    for file in files {
+        let risk = assess_risk(db, file).unwrap();
+        assert!(!risk.in_cycle, "{file}: {risk:?}");
+    }
+}
+
+#[test]
+fn typescript_type_only_imports_do_not_close_a_cycle() {
+    let (_dir, db) = index_tree(&[
+        (
+            "t/a.ts",
+            "import type { B } from './b';\nexport interface A { b?: B }\n",
+        ),
+        (
+            "t/b.ts",
+            "import type { A } from './a';\nexport interface B { a?: A }\n",
+        ),
+        (
+            "t/c.ts",
+            "import { type D } from './d';\nexport type C = { d?: D };\n",
+        ),
+        (
+            "t/d.ts",
+            "export type { C } from './c';\nexport interface D { n: number }\n",
+        ),
+        (
+            "t/e.ts",
+            "import { type F, f } from './f';\nexport const e = (x?: F) => f(x);\n",
+        ),
+        (
+            "t/f.ts",
+            "import { e } from './e';\nexport type F = number;\nexport const f = (x?: F) => e;\n",
+        ),
+    ]);
+    for file in ["t/a.ts", "t/b.ts", "t/c.ts", "t/d.ts"] {
+        let risk = assess_risk(&db, file).unwrap();
+        assert!(!risk.in_cycle, "{file}: {risk:?}");
+        assert_eq!(risk.lazy_edges, 2, "{file}: {risk:?}");
+    }
+    // A clause with one value specifier still loads the module.
+    assert_eq!(cycle_of(&db, "t/e.ts"), vec!["t/f.ts".to_string()]);
+}
+
+#[test]
+fn a_directive_loads_one_file_and_declaration_files_load_nothing() {
+    let (_dir, db) = index_tree(&[
+        (
+            "lib/a.js",
+            "const b = require('./b');\nmodule.exports = b;\n",
+        ),
+        (
+            "lib/b.d.ts",
+            "import './a';\nexport declare const b: number;\n",
+        ),
+        // Node resolves `./d` to d.js; the d.ts sibling is never loaded.
+        (
+            "lib/c.js",
+            "const d = require('./d');\nmodule.exports = d;\n",
+        ),
+        ("lib/d.js", "module.exports = 1;\n"),
+        (
+            "lib/d.ts",
+            "import { c } from './c';\nexport const d = c;\n",
+        ),
+        // From TypeScript, `./e` skips the declaration file for the runtime module.
+        (
+            "ts/app.ts",
+            "import { e } from './e';\nexport const app = e;\n",
+        ),
+        ("ts/e.d.ts", "export declare const e: number;\n"),
+        (
+            "ts/e.js",
+            "const app = require('./app');\nmodule.exports = { e: app };\n",
+        ),
+    ]);
+    assert_no_cycle(&db, &["lib/a.js", "lib/b.d.ts", "lib/c.js", "lib/d.ts"]);
+    let pairs = file_import_pairs(&db).unwrap();
+    assert!(
+        !pairs
+            .eager
+            .iter()
+            .any(|(from, to)| from.ends_with(".d.ts") || to.ends_with(".d.ts")),
+        "{pairs:?}"
+    );
+    assert!(
+        !pairs
+            .eager
+            .contains(&("lib/c.js".to_string(), "lib/d.ts".to_string())),
+        "{pairs:?}"
+    );
+    assert_eq!(cycle_of(&db, "ts/app.ts"), vec!["ts/e.js".to_string()]);
+    // list_dependencies keeps its over-approximation.
+    let deps = list_dependencies(&db, "lib/d.ts").unwrap();
+    assert!(deps.imported_by.iter().any(|p| p == "lib/c.js"), "{deps:?}");
+}
+
+#[test]
+fn a_quoted_include_stops_at_the_includer_directory() {
+    let (_dir, db) = index_tree(&[
+        ("src/x.h", "#include \"config.h\"\nint x(void);\n"),
+        ("src/config.h", "#define LOCAL 1\n"),
+        ("config.h", "#include \"src/x.h\"\n#define ROOT 1\n"),
+    ]);
+    assert_no_cycle(&db, &["src/x.h", "config.h"]);
+    let pairs = file_import_pairs(&db).unwrap();
+    assert!(
+        pairs
+            .eager
+            .contains(&("src/x.h".to_string(), "src/config.h".to_string())),
+        "{pairs:?}"
+    );
+}
+
+#[test]
+fn a_bare_javascript_specifier_is_not_joined_onto_the_importer_directory() {
+    let (_dir, db) = index_tree(&[
+        (
+            "src/a.js",
+            "import { b } from 'lib/b.js';\nexport const a = b;\n",
+        ),
+        (
+            "src/lib/b.js",
+            "import { a } from '../a.js';\nexport const b = a;\n",
+        ),
+    ]);
+    assert_no_cycle(&db, &["src/a.js", "src/lib/b.js"]);
+}
+
+/// Pins the `find_references` `to` skip on its own: the definition sits in
+/// the importing file, so no import evidence is consulted.
+#[test]
+fn a_go_import_in_the_defining_file_carries_no_to() {
+    let (_dir, db) = index_tree(&[
+        ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+        (
+            "util/k.go",
+            "package util\n\nimport \"K\"\n\ntype K struct{}\n",
+        ),
+    ]);
+    let row = references(&db, "K")
+        .into_iter()
+        .find(|r| r.kind == ReferenceKind::Import)
+        .expect("import \"K\" is indexed as a reference row");
+    assert_eq!(row.to, None, "{row:?}");
+}
+
+/// Pins the owner-evidence paths: the Go import list feeding `names_owner`
+/// and the outgoing-ref scan for a method's owner type. The bare `Run()`
+/// spelling resolves to the lone `R.Run` definition, so only owner evidence
+/// stands between it and a `to`.
+#[test]
+fn a_go_import_spelled_like_a_method_owner_is_no_evidence() {
+    let (_dir, db) = index_tree(&[
+        ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+        (
+            "util/r.go",
+            "package util\n\ntype R struct{}\n\nfunc (r R) Run() int { return 1 }\n",
+        ),
+        (
+            "caller.go",
+            "package main\n\nimport \"R\"\n\nfunc use() int { return Run() }\n",
+        ),
+    ]);
+    let row = references(&db, "Run")
+        .into_iter()
+        .find(|r| r.from_file == "caller.go")
+        .expect("Run() is indexed as a reference row");
+    assert_eq!(row.kind, ReferenceKind::Call);
+    assert_eq!(row.to, None, "{row:?}");
+}
+
+/// A class declared in a `.d.ts` joins by symbol name, not by path; the
+/// declaration endpoint must still form no cycle edge.
+#[test]
+fn a_symbol_joined_declaration_file_endpoint_forms_no_edge() {
+    let (_dir, db) = index_tree(&[
+        (
+            "t/a.ts",
+            "import { B } from './b';\nexport class A extends B {}\n",
+        ),
+        ("t/b.d.ts", "export declare class B extends A {}\n"),
+    ]);
+    let pairs = file_import_pairs(&db).unwrap();
+    assert!(
+        !pairs
+            .eager
+            .iter()
+            .chain(&pairs.lazy_only)
+            .any(|(from, to)| from == "t/b.d.ts" || to == "t/b.d.ts"),
+        "{pairs:?}"
+    );
+    assert_no_cycle(&db, &["t/a.ts", "t/b.d.ts"]);
+}

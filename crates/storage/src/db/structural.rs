@@ -541,12 +541,13 @@ impl Database {
     /// Distinct cross-file load-time import/include/inheritance/trait-use
     /// edges, plus Python import bindings. Match qualified names or short
     /// names unique to one file. A pair whose directives are all lazy
-    /// (function-body imports) is excluded; see [`Self::lazy_import_pairs`].
+    /// (function-body or TypeScript type-only imports) is excluded; see
+    /// [`Self::lazy_import_pairs`].
     pub fn enumerate_file_import_edges(&self) -> Result<Vec<(String, String)>> {
         Ok(self.enumerate_file_import_pairs()?.eager)
     }
 
-    /// Cross-file pairs connected only by lazy (function-body) import
+    /// Cross-file pairs connected only by lazy (function-body or type-only) import
     /// directives. These are the edges `enumerate_file_import_edges` drops.
     pub fn lazy_import_pairs(&self) -> Result<Vec<(String, String)>> {
         Ok(self.enumerate_file_import_pairs()?.lazy_only)
