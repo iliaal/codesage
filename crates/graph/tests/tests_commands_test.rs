@@ -723,7 +723,7 @@ fn nested_packages_resolve_their_own_runner_or_defer_to_the_root() {
         &["src/a.ts", "packages/web/src/b.ts", "packages/lib/src/c.ts"],
     );
 
-    let web = find(&r, "(cd packages/web && npx vitest run src/b.test.ts)");
+    let web = find(&r, "(cd -- ./packages/web && npx vitest run src/b.test.ts)");
     assert_eq!(web.framework, "vitest");
     assert_eq!(web.covers, vec!["packages/web/src/b.test.ts".to_string()]);
     let rooted = find(&r, "npx jest packages/lib/src/c.test.ts src/a.test.ts");
@@ -995,4 +995,106 @@ fn rehearsal_note_caps_at_five_commands() {
          cargo test -p c2 --test it; cargo test -p c3 --test it; \
          cargo test -p c4 --test it (+2 more)"
     );
+}
+
+#[test]
+fn vitest_config_outranks_a_lone_playwright_dependency() {
+    let dir = js_fixture(
+        Some(r#"{"name":"app","devDependencies":{"@playwright/test":"^1.40"}}"#),
+        "ts",
+        JS_TEST_BODY,
+    );
+    write(dir.path(), "vitest.config.ts", "export default {};\n");
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &["src/a.ts"]);
+    assert_eq!(find(&r, "npx vitest run src/a.test.ts").framework, "vitest");
+    assert!(
+        !commands(&r).iter().any(|c| c.contains("playwright")),
+        "{:?}",
+        commands(&r)
+    );
+}
+
+#[test]
+fn nested_package_dirs_are_anchored_for_cd() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "-my pkg/package.json",
+        r#"{"name":"odd","scripts":{"test":"mocha"}}"#,
+    );
+    write(
+        root,
+        "-my pkg/src/b.js",
+        "export function b() { return 1; }\n",
+    );
+    write(
+        root,
+        "-my pkg/src/b.test.js",
+        "const { b } = require('./b');\nit('b', () => { b(); });\n",
+    );
+    let db = indexed(root);
+    let r = recs(root, &db, &["-my pkg/src/b.test.js"]);
+    let cmd = find(&r, "(cd -- './-my pkg' && npx mocha src/b.test.js)");
+    assert_eq!(cmd.covers, vec!["-my pkg/src/b.test.js".to_string()]);
+}
+
+#[test]
+fn bun_and_playwright_commands_follow_their_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"name":"app","scripts":{"test":"bun test"}}"#,
+    );
+    write(
+        root,
+        "src/a.test.ts",
+        "import { test, expect } from 'bun:test';\ntest('a', () => { expect(1).toBe(1); });\n",
+    );
+    write(
+        root,
+        "e2e/login.spec.ts",
+        "import { test } from '@playwright/test';\ntest('login', async ({ page }) => { await page.goto('/'); });\n",
+    );
+    let db = indexed(root);
+    let r = recs(root, &db, &["src/a.test.ts", "e2e/login.spec.ts"]);
+    assert_eq!(find(&r, "bun test ./src/a.test.ts").framework, "bun");
+    assert_eq!(
+        find(&r, "npx playwright test e2e/login.spec.ts").framework,
+        "playwright"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_test_path_linked_to_a_fifo_does_not_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write(
+        &root,
+        "package.json",
+        r#"{"name":"app","devDependencies":{"jest":"^29"}}"#,
+    );
+    write(&root, "src/a.js", "export function a() { return 1; }\n");
+    let fifo = root.join("pipe");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: `c` is a NUL-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    std::os::unix::fs::symlink(&fifo, root.join("src/evil.test.js")).unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_root = root.clone();
+    std::thread::spawn(move || {
+        let db = indexed(&worker_root);
+        let r = recs(&worker_root, &db, &["src/evil.test.js"]);
+        let _ = tx.send(r);
+    });
+    let r = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("recommend_tests blocked on a FIFO-backed test path");
+    // Package evidence still names jest; only the file read was refused.
+    assert_eq!(find(&r, "npx jest src/evil.test.js").framework, "jest");
 }

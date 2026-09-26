@@ -2,8 +2,9 @@
 //!
 //! A runner is named only from evidence under the project root: the test
 //! file's own import of a runner-owned module, then the nearest
-//! `package.json` (`scripts.test`, declared dependencies, a `jest` key), then
-//! a vitest config beside it. A path with no evidence gets no command, since
+//! `package.json` (`scripts.test`, a declared unit runner, a `jest` key),
+//! then a vitest config beside it, then a lone `@playwright/test`
+//! dependency. A path with no evidence gets no command, since
 //! a suggested runner that is not installed fails or makes `npx` download it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -13,7 +14,7 @@ use codesage_protocol::TestCommand;
 use serde_json::Value;
 
 use super::{
-    MAX_SOURCE_BYTES, SOURCE_CONVENTION, command, extension, parent_dir, path_arg,
+    SOURCE_CONVENTION, command, extension, parent_dir, path_arg, read_regular_bounded,
     read_source_bounded, safe_relative_dir, shell_quote,
 };
 
@@ -111,16 +112,11 @@ fn read_package(root: &Path, dir: &str) -> Option<PackageInfo> {
     } else {
         root.join(dir).join("package.json")
     };
-    let meta = std::fs::metadata(&manifest).ok()?;
-    if !meta.is_file() {
+    if !std::fs::metadata(&manifest).ok()?.is_file() {
         return None;
     }
-    if meta.len() > MAX_SOURCE_BYTES {
-        return Some(PackageInfo::default());
-    }
-    let parsed = std::fs::read_to_string(&manifest)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let parsed =
+        read_regular_bounded(&manifest).and_then(|text| serde_json::from_str::<Value>(&text).ok());
     Some(parsed.map(|v| package_info(&v)).unwrap_or_default())
 }
 
@@ -178,8 +174,7 @@ pub(super) fn runner_from_script(script: &str) -> Option<JsRunner> {
     None
 }
 
-/// A single declared unit runner; `@playwright/test` only when no unit
-/// runner is declared. Several unit runners decide nothing.
+/// A single declared unit runner. Several unit runners decide nothing.
 fn runner_from_deps(deps: &BTreeSet<String>) -> Option<JsRunner> {
     let unit: Vec<JsRunner> = [
         ("vitest", JsRunner::Vitest),
@@ -192,7 +187,6 @@ fn runner_from_deps(deps: &BTreeSet<String>) -> Option<JsRunner> {
     .collect();
     match unit.as_slice() {
         [one] => Some(*one),
-        [] if deps.contains("@playwright/test") => Some(JsRunner::Playwright),
         _ => None,
     }
 }
@@ -238,7 +232,11 @@ fn has_vitest_config(root: &Path, dir: &str) -> bool {
     VITEST_CONFIGS.iter().any(|name| base.join(name).is_file())
 }
 
+/// A lone `@playwright/test` dependency is the weakest evidence: projects
+/// add it for end-to-end suites beside a unit runner configured elsewhere,
+/// and real Playwright specs already resolve through their own import.
 fn package_evidence(root: &Path, dir: &str, memo: &mut PackageMemo) -> Option<JsRunner> {
+    let mut playwright_only = false;
     if let Some(pkg) = memo.get(root, dir) {
         let found = pkg
             .scripts_test
@@ -249,8 +247,15 @@ fn package_evidence(root: &Path, dir: &str, memo: &mut PackageMemo) -> Option<Js
         if found.is_some() {
             return found;
         }
+        playwright_only = pkg.deps.contains("@playwright/test")
+            && !["vitest", "jest", "mocha"]
+                .iter()
+                .any(|d| pkg.deps.contains(*d));
     }
-    has_vitest_config(root, dir).then_some(JsRunner::Vitest)
+    if has_vitest_config(root, dir) {
+        return Some(JsRunner::Vitest);
+    }
+    playwright_only.then_some(JsRunner::Playwright)
 }
 
 /// Ancestor directories of `path`, nearest first, ending at the root (`""`).
@@ -305,7 +310,9 @@ pub(super) fn resolve(
 /// directory and runner, plus the paths no evidence names a runner for.
 /// A nested package's command runs in a subshell that enters the package,
 /// so its config and local binaries apply and the caller's working
-/// directory is left at the project root.
+/// directory is left at the project root. The directory is written
+/// `./<dir>` after `--` so `cd` never reads it as `-` (`$OLDPWD`), an
+/// option, or a `CDPATH` lookup.
 pub(super) fn commands(root: Option<&Path>, paths: &[String]) -> (Vec<TestCommand>, Vec<String>) {
     let Some(root) = root else {
         return (Vec::new(), paths.to_vec());
@@ -338,7 +345,7 @@ pub(super) fn commands(root: Option<&Path>, paths: &[String]) -> (Vec<TestComman
             let text = if dir.is_empty() {
                 run
             } else {
-                format!("(cd {} && {run})", shell_quote(&dir))
+                format!("(cd -- {} && {run})", shell_quote(&format!("./{dir}")))
             };
             command(text, covers, runner.framework(), SOURCE_CONVENTION)
         })
@@ -403,10 +410,7 @@ mod tests {
             runner_from_deps(&deps(&["jest", "@playwright/test"])),
             Some(JsRunner::Jest)
         );
-        assert_eq!(
-            runner_from_deps(&deps(&["@playwright/test"])),
-            Some(JsRunner::Playwright)
-        );
+        assert_eq!(runner_from_deps(&deps(&["@playwright/test"])), None);
         assert_eq!(runner_from_deps(&deps(&["vitest", "jest"])), None);
         assert_eq!(runner_from_deps(&deps(&[])), None);
     }
