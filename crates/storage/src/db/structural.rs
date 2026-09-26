@@ -581,7 +581,7 @@ impl Database {
             JOIN files f_to ON s.file_id = f_to.id
             WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
-              AND NOT (r.kind = 'import' AND f_from.language = 'go')
+              AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
               AND f_from.path <> f_to.path
             GROUP BY f_from.path, f_to.path
         "#;
@@ -624,7 +624,7 @@ impl Database {
             JOIN files f_to ON s.file_id = f_to.id
             WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
-              AND NOT (r.kind = 'import' AND f_from.language = 'go')
+              AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
               AND f_from.path = ?1
               AND f_from.path <> f_to.path
         "#;
@@ -655,7 +655,7 @@ impl Database {
             JOIN files f_to ON s.file_id = f_to.id
             WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
-              AND NOT (r.kind = 'import' AND f_from.language = 'go')
+              AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
               AND f_to.path = ?1
               AND f_from.path <> f_to.path
         "#;
@@ -798,6 +798,7 @@ impl Database {
              FROM refs r JOIN files f ON r.from_file_id = f.id
              WHERE r.to_name = ?1
                AND r.kind IN ('import', 'include')
+               AND f.language NOT IN ('javascript', 'typescript')
                AND f.path <> ?1
              UNION
              SELECT DISTINCT f_from.path
@@ -819,7 +820,7 @@ impl Database {
              WHERE f_to.path = ?1
                AND (r.kind IN ('import', 'include')
                     OR (r.kind = 'import_binding' AND f_from.language = 'python'))
-               AND NOT (r.kind = 'import' AND f_from.language = 'go')
+               AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
                AND f_from.path <> f_to.path
              ORDER BY 1",
         )?;

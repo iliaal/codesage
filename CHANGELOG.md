@@ -14,7 +14,7 @@
 - `codesage git-index` keeps a file's churn, fix count, author events, and co-change pairs across `git mv`, including branch edits merged across the rename; copies start their own history.
 - `find_coupling`, `assess_risk`, and `recommend_tests` name a renamed file's live path after `codesage git-index --full` re-keys existing history.
 - A Go `import` no longer resolves to a same-named project symbol in `find_references` `to`, `impact_analysis`, `recommend_tests` reachability, `list_dependencies` `imported_by`, or import-cycle detection.
-- `list_dependencies`, `impact_analysis`, `find_references` `to`, and call resolution no longer link a `.h` include to a same-named `.hpp` or a bare JavaScript package specifier to a project file.
+- `list_dependencies`, `impact_analysis`, `find_references` `to`, call resolution, and import-cycle detection no longer link a `.h` include to a same-named `.hpp` or resolve a bare JavaScript package specifier to a project file or same-named symbol.
 - The same tools no longer link an extensionless JavaScript import to a `.py` or `.h` file, `./logo.svg` or `./x.json` to a sibling `.tsx` / `.js`, or `.mjs` / `.jsx` specifiers to a `.ts` file.
 - PHP class names in nullable, union, intersection, and DNF type hints, typed properties, variadic parameters, and closure and arrow-function return types produce `type_hint` references; `self`, `static`, and `parent` no longer do.
 - C++ classes, structs, and functions declared with an export macro (`class MYLIB_API Widget`, `class Q_DECL_EXPORT Alpha`, `MYLIB_API int f() {}`) are indexed with their members.

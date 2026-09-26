@@ -438,6 +438,30 @@ fn a_bare_javascript_specifier_is_not_joined_onto_the_importer_directory() {
     assert_no_cycle(&db, &["src/a.js", "src/lib/b.js"]);
 }
 
+#[test]
+fn a_bare_javascript_specifier_binds_to_no_same_named_project_symbol() {
+    let (_dir, db) = index_tree(&[
+        (
+            "src/a.ts",
+            "import debounce from 'debounce';\nexport const a = debounce;\n",
+        ),
+        (
+            "src/util.ts",
+            "import { a } from './a';\nexport function debounce(): number { return a ? 1 : 0; }\n",
+        ),
+        (
+            "src/c.js",
+            "import { b } from 'src/lib/b.js';\nexport const c = b;\n",
+        ),
+        ("src/lib/b.js", "export const b = 1;\n"),
+    ]);
+    assert_no_cycle(&db, &["src/a.ts", "src/util.ts"]);
+    let deps = list_dependencies(&db, "src/util.ts").unwrap();
+    assert!(deps.imported_by.is_empty(), "{deps:?}");
+    let deps = list_dependencies(&db, "src/lib/b.js").unwrap();
+    assert!(deps.imported_by.is_empty(), "{deps:?}");
+}
+
 /// Pins the `find_references` `to` skip on its own: the definition sits in
 /// the importing file, so no import evidence is consulted.
 #[test]
