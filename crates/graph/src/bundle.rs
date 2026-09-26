@@ -1197,6 +1197,14 @@ fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bo
             None => false,
         };
     }
+    // A bare JavaScript/TypeScript specifier names a package or an unmodelled
+    // `baseUrl`/`paths` mapping, matching `import_ref_targets_file`.
+    if matches!(
+        importer_dialect(caller_file),
+        ImporterDialect::JavaScript | ImporterDialect::TypeScript
+    ) {
+        return false;
+    }
     // Do not infer extensions for package paths. Include suffixes require a
     // separator boundary so `net/utils.h` cannot claim `net_utils.h`.
     spec == sym_file || sym_file.ends_with(&format!("/{spec}"))
@@ -1500,6 +1508,22 @@ mod import_path_tests {
                 "{import} from {caller} -> {unrelated}"
             );
         }
+    }
+
+    #[test]
+    fn bare_javascript_specifiers_name_no_file_for_symbol_resolution() {
+        assert!(!import_path_targets_file(
+            "lib/b.js",
+            "src/a.js",
+            "src/lib/b.js"
+        ));
+        assert!(!import_path_targets_file("lib/b", "src/a.ts", "lib/b.ts"));
+        assert!(import_path_targets_file("util.h", "src/a.c", "src/util.h"));
+        assert!(import_path_targets_file(
+            "net/utils.h",
+            "src/a.cpp",
+            "include/net/utils.h"
+        ));
     }
 
     #[test]
