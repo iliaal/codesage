@@ -2056,7 +2056,6 @@ mod tests {
             db.lazy_import_pairs().unwrap(),
             vec![("a.py".to_string(), "b.py".to_string())]
         );
-        assert_eq!(db.import_edges_within(&["a.py", "b.py"]).unwrap().len(), 1);
         let token_before = db.import_cycle_validity_token().unwrap();
 
         let mut rows = db.find_references("other", None).unwrap();
@@ -2081,7 +2080,6 @@ mod tests {
             ]
         );
         assert!(db.lazy_import_pairs().unwrap().is_empty());
-        assert_eq!(db.import_edges_within(&["a.py", "b.py"]).unwrap().len(), 2);
         assert_ne!(db.import_cycle_validity_token().unwrap(), token_before);
     }
 

@@ -357,7 +357,9 @@ impl Database {
 
     /// Resolve an indexed repo-relative path to its files.id; None if absent.
     pub fn file_id_for_path(&self, path: &str) -> Result<Option<i64>> {
-        let mut stmt = self.conn.prepare("SELECT id FROM files WHERE path = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM files WHERE path = ?1")?;
         match stmt.query_row(params![path], |row| row.get::<_, i64>(0)) {
             Ok(id) => Ok(Some(id)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -541,12 +543,13 @@ impl Database {
     /// Distinct cross-file load-time import/include/inheritance/trait-use
     /// edges, plus Python import bindings. Match qualified names or short
     /// names unique to one file. A pair whose directives are all lazy
-    /// (function-body imports) is excluded; see [`Self::lazy_import_pairs`].
+    /// (function-body or TypeScript type-only imports) is excluded; see
+    /// [`Self::lazy_import_pairs`].
     pub fn enumerate_file_import_edges(&self) -> Result<Vec<(String, String)>> {
         Ok(self.enumerate_file_import_pairs()?.eager)
     }
 
-    /// Cross-file pairs connected only by lazy (function-body) import
+    /// Cross-file pairs connected only by lazy (function-body or type-only) import
     /// directives. These are the edges `enumerate_file_import_edges` drops.
     pub fn lazy_import_pairs(&self) -> Result<Vec<(String, String)>> {
         Ok(self.enumerate_file_import_pairs()?.lazy_only)
@@ -554,7 +557,10 @@ impl Database {
 
     /// Both partitions of the cross-file import graph from one pass over the
     /// refs x symbols join. `MIN(lazy) = 0` means at least one load-time
-    /// directive joins the pair.
+    /// directive joins the pair. Only directives that name a symbol form an
+    /// edge here: path specifiers (`./b.js`, `"y.h"`) come from
+    /// [`Self::path_import_refs`], and a Go import names a package, never a
+    /// symbol, so it joins nothing.
     pub fn enumerate_file_import_pairs(&self) -> Result<ImportPairs> {
         let sql = r#"
             SELECT f_from.path, f_to.path, MIN(r.lazy)
@@ -575,6 +581,7 @@ impl Database {
             JOIN files f_to ON s.file_id = f_to.id
             WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
+              AND NOT (r.kind = 'import' AND f_from.language = 'go')
               AND f_from.path <> f_to.path
             GROUP BY f_from.path, f_to.path
         "#;
@@ -617,6 +624,7 @@ impl Database {
             JOIN files f_to ON s.file_id = f_to.id
             WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
+              AND NOT (r.kind = 'import' AND f_from.language = 'go')
               AND f_from.path = ?1
               AND f_from.path <> f_to.path
         "#;
@@ -647,6 +655,7 @@ impl Database {
             JOIN files f_to ON s.file_id = f_to.id
             WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
+              AND NOT (r.kind = 'import' AND f_from.language = 'go')
               AND f_to.path = ?1
               AND f_from.path <> f_to.path
         "#;
@@ -655,6 +664,30 @@ impl Database {
             .query_map(params![file_path], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// `(from_path, specifier, lazy_only)` for JavaScript/TypeScript `import`
+    /// and C/C++ `include` directives, grouped per importer and specifier.
+    /// These name a file rather than a symbol, so the refs x symbols join in
+    /// [`Self::enumerate_file_import_pairs`] never sees them; the graph crate
+    /// resolves them against the indexed file set. `lazy_only` is true when
+    /// every directive spelling that specifier in that file is lazy.
+    pub fn path_import_refs(&self) -> Result<Vec<(String, String, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, r.to_name, MIN(r.lazy)
+             FROM refs r JOIN files f ON r.from_file_id = f.id
+             WHERE ((r.kind = 'import' AND f.language IN ('javascript', 'typescript'))
+                    OR (r.kind = 'include' AND f.language IN ('c', 'cpp')))
+             GROUP BY f.path, r.to_name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Unresolved (from_path, to_name) import/include pairs for bulk resolution.
@@ -717,53 +750,6 @@ impl Database {
             },
         )?;
         Ok(token)
-    }
-
-    /// Load-time import edges with both endpoints in `files`, avoiding a
-    /// whole-index sweep. Pairs joined only by lazy directives are excluded.
-    pub fn import_edges_within(&self, files: &[&str]) -> Result<Vec<(String, String)>> {
-        if files.len() < 2 {
-            return Ok(Vec::new());
-        }
-        let placeholders = std::iter::repeat_n("?", files.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            r#"
-            SELECT f_from.path, f_to.path
-            FROM refs r
-            JOIN files f_from ON r.from_file_id = f_from.id
-            JOIN symbols s ON (
-              s.qualified_name = r.to_name
-              OR (
-                s.name = r.to_name
-                AND NOT EXISTS (
-                  SELECT 1
-                  FROM symbols s2
-                  WHERE s2.name = r.to_name
-                    AND s2.file_id <> s.file_id
-                )
-              )
-            )
-            JOIN files f_to ON s.file_id = f_to.id
-            WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
-                   OR (r.kind = 'import_binding' AND f_from.language = 'python'))
-              AND f_from.path <> f_to.path
-              AND f_from.path IN ({placeholders})
-              AND f_to.path IN ({placeholders})
-            GROUP BY f_from.path, f_to.path
-            HAVING MIN(r.lazy) = 0
-            "#
-        );
-        // The file list is bound twice, once per IN clause, in order.
-        let binds: Vec<&str> = files.iter().copied().chain(files.iter().copied()).collect();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(binds), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
     }
 
     pub fn list_file_dependencies(&self, file_path: &str) -> Result<DependencyEntry> {
@@ -833,6 +819,7 @@ impl Database {
              WHERE f_to.path = ?1
                AND (r.kind IN ('import', 'include')
                     OR (r.kind = 'import_binding' AND f_from.language = 'python'))
+               AND NOT (r.kind = 'import' AND f_from.language = 'go')
                AND f_from.path <> f_to.path
              ORDER BY 1",
         )?;

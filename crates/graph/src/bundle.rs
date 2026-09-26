@@ -783,11 +783,22 @@ fn rust_module_subtree(def_file: &str) -> Option<String> {
     }
 }
 
+/// A Go `import` names a package path (`"errors"`, `"C"`, `"example.com/m/util"`),
+/// never a symbol, so it must not bind to a project symbol that happens to
+/// share the spelling. Package paths name directories, which the file-level
+/// path matcher does not resolve, so these rows carry no symbol or file edge.
+pub(crate) fn is_go_package_import(kind: ReferenceKind, from_file: &str) -> bool {
+    kind == ReferenceKind::Import && from_file.ends_with(".go")
+}
+
 // Fetch outgoing imports without computing list_file_dependencies' reverse edges.
 pub(crate) fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>> {
     let mut refs = Vec::new();
     if let Some(file_id) = db.file_id_for_path(caller_file)? {
         for (to_name, kind) in db.refs_outgoing_for_file_id(file_id)? {
+            if is_go_package_import(kind, caller_file) {
+                continue;
+            }
             // Bindings retain evidence when a specifier names a re-exporting barrel.
             if matches!(
                 kind,
@@ -990,18 +1001,76 @@ pub(crate) fn import_ref_targets_file(
                 .any(|c| c == target_file)
         });
     }
-    // Quoted-include style: `util.h` or `sub/foo.h`. Resolve against the
-    // includer's directory, then the project root, both exact. No stem or
-    // suffix match: `sub/foo.h` must not claim every `*/sub/foo.h` in the
-    // project. Includes reached through other `-I` paths stay unresolved.
-    if import_ref.contains('/') || import_ref.contains('.') {
-        let base = importer_file.rsplit_once('/').map_or("", |(dir, _)| dir);
-        if lexical_join(base, import_ref).is_some_and(|resolved| resolved == target_file) {
-            return true;
+    // A bare JavaScript/TypeScript specifier (`lodash/fp`, `lib/b.js`) names a
+    // package or a `baseUrl`/`paths` mapping, neither of which is modelled.
+    importer_dialect(importer_file) == ImporterDialect::CFamily
+        && quoted_include_candidates(import_ref, importer_file).any(|c| c == target_file)
+}
+
+/// How an importer's directives name files, from its extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImporterDialect {
+    JavaScript,
+    TypeScript,
+    CFamily,
+    Other,
+}
+
+fn importer_dialect(importer_file: &str) -> ImporterDialect {
+    match codesage_parser::detect::detect_language(std::path::Path::new(importer_file)) {
+        Some(codesage_protocol::Language::JavaScript) => ImporterDialect::JavaScript,
+        Some(codesage_protocol::Language::TypeScript) => ImporterDialect::TypeScript,
+        Some(codesage_protocol::Language::C | codesage_protocol::Language::Cpp) => {
+            ImporterDialect::CFamily
         }
-        return import_ref == target_file;
+        _ => ImporterDialect::Other,
     }
-    false
+}
+
+/// Quoted-include style: `util.h` or `sub/foo.h`. Resolve against the
+/// includer's directory, then the project root, both exact and in that
+/// order. No stem or suffix match: `sub/foo.h` must not claim every
+/// `*/sub/foo.h` in the project. Includes reached through other `-I` paths
+/// stay unresolved, and a system include (`<stdio.h>`, stored with its
+/// brackets) names no project file.
+fn quoted_include_candidates<'a>(
+    import_ref: &'a str,
+    importer_file: &str,
+) -> impl Iterator<Item = String> + 'a {
+    let applies =
+        !import_ref.starts_with('<') && (import_ref.contains('/') || import_ref.contains('.'));
+    let base = importer_file.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let joined = applies.then(|| lexical_join(base, import_ref)).flatten();
+    joined
+        .into_iter()
+        .chain(applies.then(|| import_ref.to_string()))
+}
+
+/// The indexed paths a JavaScript/TypeScript module specifier or a C/C++
+/// include may name, in the order the language's resolver tries them. For a
+/// JS/TS or C/C++ importer and a specifier without `::`,
+/// `import_ref_targets_file(spec, importer, t)` holds exactly when `t` is in
+/// this list, so `list_dependencies` keeps every candidate while a consumer
+/// that needs the one file actually loaded takes the first indexed entry.
+/// Every other importer (Rust, Python, Go, ...) yields nothing. May repeat a
+/// path.
+pub(crate) fn path_import_candidates(import_ref: &str, importer_file: &str) -> Vec<String> {
+    let dialect = importer_dialect(importer_file);
+    let relative = import_ref.starts_with("./") || import_ref.starts_with("../");
+    match dialect {
+        ImporterDialect::JavaScript | ImporterDialect::TypeScript | ImporterDialect::CFamily
+            if relative =>
+        {
+            let base = importer_file.rsplit_once('/').map_or("", |(dir, _)| dir);
+            lexical_join(base, import_ref)
+                .map(|resolved| relative_file_candidates(&resolved, dialect))
+                .unwrap_or_default()
+        }
+        ImporterDialect::CFamily if !import_ref.contains("::") => {
+            quoted_include_candidates(import_ref, importer_file).collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 pub(crate) fn import_ref_targets_file_with_modules(
@@ -1077,14 +1146,39 @@ fn is_path_specifier(s: &str) -> bool {
     s.starts_with("./") || s.starts_with("../") || s.contains('/')
 }
 
-/// Extensions a path specifier may omit or misname. TypeScript ESM is the
-/// reason `.js` maps to `.ts`: the spec requires the *emitted* extension in the
-/// specifier, so `./foo.js` routinely refers to `foo.ts` on disk. The same
-/// swap covers the explicit module flavors: `./foo.mjs` for `foo.mts` and
-/// `./foo.cjs` for `foo.cts` on disk.
-const IMPORT_EXTENSIONS: [&str; 12] = [
-    "js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts", "d.ts", "h", "hpp", "py",
-];
+/// Extensions a bare relative JavaScript/TypeScript specifier (`./foo`) may
+/// omit, in resolver order: TypeScript tries its own sources and declarations
+/// before JavaScript, Node-style JavaScript resolution the reverse. The same
+/// list, in the same order, is tried for the directory-index form
+/// (`./utils` -> `utils/index.ts`).
+const TS_EXTENSION_ORDER: [&str; 9] =
+    ["ts", "tsx", "d.ts", "js", "jsx", "mts", "cts", "mjs", "cjs"];
+const JS_EXTENSION_ORDER: [&str; 9] =
+    ["js", "jsx", "mjs", "cjs", "ts", "tsx", "d.ts", "mts", "cts"];
+
+/// The source files an emitted JavaScript extension may stand for. TypeScript
+/// ESM requires the *emitted* extension in the specifier, so `./foo.js`
+/// routinely names `foo.ts` on disk; `./foo.mjs` names `foo.mts`, `./foo.cjs`
+/// names `foo.cts`, and `./foo.jsx` names `foo.tsx`. No other extension is
+/// swapped.
+fn emitted_extension_sources(ext: &str) -> &'static [&'static str] {
+    match ext {
+        "js" => &["ts", "tsx", "d.ts"],
+        "jsx" => &["tsx"],
+        "mjs" => &["mts"],
+        "cjs" => &["cts"],
+        _ => &[],
+    }
+}
+
+/// Extensions the resolver takes as written, never appending another: every
+/// JavaScript/TypeScript module flavor plus JSON.
+fn is_complete_module_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" | "json"
+    )
+}
 
 fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bool {
     if caller_file.ends_with(".rs") && spec.starts_with("./") {
@@ -1097,7 +1191,9 @@ fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bo
     if spec.starts_with("./") || spec.starts_with("../") {
         let base = caller_file.rsplit_once('/').map_or("", |(dir, _)| dir);
         return match lexical_join(base, spec) {
-            Some(resolved) => relative_file_matches(&resolved, sym_file),
+            Some(resolved) => {
+                relative_file_matches(&resolved, sym_file, importer_dialect(caller_file))
+            }
             None => false,
         };
     }
@@ -1127,26 +1223,53 @@ fn lexical_join(base: &str, spec: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-fn relative_file_matches(resolved: &str, sym_file: &str) -> bool {
-    if resolved == sym_file {
-        return true;
-    }
-    // Directory dots are not file extensions (`dir.v1/foo` must not claim `dir.ts`).
+fn relative_file_matches(resolved: &str, sym_file: &str, dialect: ImporterDialect) -> bool {
+    relative_file_candidates(resolved, dialect)
+        .iter()
+        .any(|candidate| candidate == sym_file)
+}
+
+/// The files a relative specifier, already joined onto the importer's
+/// directory, may name, in resolver order. A C/C++ include and any importer
+/// outside JavaScript/TypeScript name exactly `resolved`. For JavaScript and
+/// TypeScript, an emitted extension also names its TypeScript source (see
+/// [`emitted_extension_sources`]), tried first from a TypeScript importer; a
+/// complete module extension is never appended to (`foo.js` must not claim
+/// `foo.js.ts`); anything else, including no extension or a non-module one
+/// (`./vite.config`, `./logo.svg`), gains each JS/TS extension and then the
+/// directory-index form. Directory dots are not extensions (`dir.v1/foo`
+/// must not claim `dir.ts`).
+fn relative_file_candidates(resolved: &str, dialect: ImporterDialect) -> Vec<String> {
+    let order = match dialect {
+        ImporterDialect::TypeScript => &TS_EXTENSION_ORDER,
+        ImporterDialect::JavaScript => &JS_EXTENSION_ORDER,
+        ImporterDialect::CFamily | ImporterDialect::Other => return vec![resolved.to_string()],
+    };
     let segment_start = resolved.rfind('/').map_or(0, |i| i + 1);
-    match resolved[segment_start..].rfind('.') {
-        // Swap emitted extensions, but do not append: `foo.js` must not claim `foo.js.ts`.
-        Some(dot) => {
-            let stem = &resolved[..segment_start + dot];
-            IMPORT_EXTENSIONS
-                .iter()
-                .any(|ext| sym_file == format!("{stem}.{ext}"))
-        }
-        // No extension: `./foo` -> `foo.ts`, or the directory-index form
-        // `./utils` -> `utils/index.js`.
-        None => IMPORT_EXTENSIONS.iter().any(|ext| {
-            sym_file == format!("{resolved}.{ext}") || sym_file == format!("{resolved}/index.{ext}")
-        }),
+    let dot = resolved[segment_start..]
+        .rfind('.')
+        .map(|dot| segment_start + dot);
+    if let Some(dot) = dot
+        && is_complete_module_extension(&resolved[dot + 1..])
+    {
+        let stem = &resolved[..dot];
+        let sources = emitted_extension_sources(&resolved[dot + 1..])
+            .iter()
+            .map(|source| format!("{stem}.{source}"));
+        return if dialect == ImporterDialect::TypeScript {
+            sources
+                .chain(std::iter::once(resolved.to_string()))
+                .collect()
+        } else {
+            std::iter::once(resolved.to_string())
+                .chain(sources)
+                .collect()
+        };
     }
+    std::iter::once(resolved.to_string())
+        .chain(order.iter().map(|ext| format!("{resolved}.{ext}")))
+        .chain(order.iter().map(|ext| format!("{resolved}/index.{ext}")))
+        .collect()
 }
 
 pub(crate) fn is_callee_reference(kind: ReferenceKind) -> bool {
@@ -1197,6 +1320,124 @@ fn add_related_from_file(
 #[cfg(test)]
 mod import_path_tests {
     use super::*;
+
+    /// The cycle graph looks candidates up in the file set; `list_dependencies`
+    /// tests each file with the predicate. Both must name the same targets.
+    #[test]
+    fn path_import_candidates_agree_with_the_file_predicate() {
+        let targets = [
+            "lib/b.js",
+            "lib/b.ts",
+            "lib/b.d.ts",
+            "lib/b/index.js",
+            "lib/b/index.tsx",
+            "lib/b.js.ts",
+            "b.js",
+            "lib/dir.v1/foo.ts",
+            "lib/dir.ts",
+            "src/x.h",
+            "x.h",
+            "sub/y.h",
+            "src/sub/y.h",
+            "other/sub/y.h",
+            "stdio.h",
+            "src/stdio.h",
+            "src/<stdio.h>",
+        ];
+        let cases = [
+            ("./b", "lib/a.js"),
+            ("./b.js", "lib/a.ts"),
+            ("../b.js", "lib/sub/a.js"),
+            ("./b.js", "a.js"),
+            ("./dir.v1/foo", "lib/a.ts"),
+            ("../../escape.js", "lib/a.js"),
+            ("lodash/fp", "lib/a.js"),
+            ("x.h", "src/main.c"),
+            ("sub/y.h", "src/main.c"),
+            ("sub/y.h", "main.c"),
+            ("<stdio.h>", "src/main.c"),
+            ("stdio.h", "src/main.c"),
+        ];
+        for (spec, importer) in cases {
+            let candidates = path_import_candidates(spec, importer);
+            for target in targets {
+                assert_eq!(
+                    candidates.iter().any(|c| c == target),
+                    import_ref_targets_file(spec, importer, target),
+                    "{spec} from {importer} -> {target}: {candidates:?}"
+                );
+            }
+        }
+        assert!(path_import_candidates("<stdio.h>", "src/main.c").is_empty());
+    }
+
+    #[test]
+    fn candidates_follow_each_resolvers_order() {
+        let first = |spec: &str, importer: &str| path_import_candidates(spec, importer)[0].clone();
+        assert_eq!(first("./b.js", "lib/a.ts"), "lib/b.ts");
+        assert_eq!(first("./b.js", "lib/a.js"), "lib/b.js");
+        assert_eq!(first("./b", "lib/a.ts"), "lib/b");
+        assert_eq!(path_import_candidates("./b", "lib/a.ts")[1], "lib/b.ts");
+        assert_eq!(path_import_candidates("./b", "lib/a.js")[1], "lib/b.js");
+        assert_eq!(
+            path_import_candidates("x.h", "src/main.c"),
+            vec!["src/x.h".to_string(), "x.h".to_string()]
+        );
+    }
+
+    #[test]
+    fn only_emitted_javascript_extensions_are_swapped() {
+        // A C include names exactly one path: no `.h` -> `.hpp` swap.
+        assert_eq!(
+            path_import_candidates("../inc/foo.h", "src/a.c"),
+            vec!["inc/foo.h".to_string()]
+        );
+        assert!(!import_ref_targets_file(
+            "../inc/foo.h",
+            "src/a.c",
+            "inc/foo.hpp"
+        ));
+        // Non-module extensions never swap to a code sibling.
+        assert!(!import_ref_targets_file(
+            "./logo.svg",
+            "src/a.tsx",
+            "src/logo.tsx"
+        ));
+        assert!(!import_ref_targets_file("./x.json", "src/a.js", "src/x.js"));
+        assert_eq!(
+            path_import_candidates("./x.json", "src/a.js"),
+            vec!["src/x.json".to_string()]
+        );
+        // A non-module extension is appended to, as TypeScript does.
+        assert!(import_ref_targets_file(
+            "./vite.config",
+            "a.ts",
+            "vite.config.ts"
+        ));
+        // An extensionless JavaScript specifier gains only JS/TS extensions.
+        assert!(!import_ref_targets_file("./x", "src/a.js", "src/x.py"));
+        assert!(!import_ref_targets_file("./x", "src/a.js", "src/x.h"));
+        assert!(import_ref_targets_file("./x", "src/a.js", "src/x.mjs"));
+        // Each emitted extension maps only to its own source flavor.
+        assert!(import_ref_targets_file("./c.jsx", "a.ts", "c.tsx"));
+        assert!(!import_ref_targets_file("./c.jsx", "a.ts", "c.ts"));
+        assert!(!import_ref_targets_file("./c.mjs", "a.ts", "c.ts"));
+    }
+
+    #[test]
+    fn bare_javascript_specifiers_and_non_js_c_importers_name_no_file() {
+        assert!(!import_ref_targets_file(
+            "lib/b.js",
+            "src/a.js",
+            "src/lib/b.js"
+        ));
+        assert!(!import_ref_targets_file("lib/b.js", "src/a.js", "lib/b.js"));
+        assert!(path_import_candidates("lib/b.js", "src/a.js").is_empty());
+        // Rust module declarations and Python/Go importers are resolved elsewhere.
+        assert!(path_import_candidates("./foo", "src/lib.rs").is_empty());
+        assert!(path_import_candidates("./util", "cmd/main.go").is_empty());
+        assert!(path_import_candidates("x.h", "a.py").is_empty());
+    }
 
     #[test]
     fn glob_imports_resolve_only_the_named_module() {

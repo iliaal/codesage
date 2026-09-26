@@ -97,14 +97,31 @@ pub(crate) struct ImportCycles {
     pub(crate) suppressed_pairs: Vec<(String, String)>,
     suppressed_by_file: HashMap<String, u32>,
     suppressed_from: HashMap<String, Vec<String>>,
+    /// Load-time edges whose endpoints share a non-trivial component, kept so
+    /// cycle-break guidance reads the exact edges the SCCs came from without
+    /// re-resolving imports per request.
+    component_edges: Vec<(String, String)>,
 }
 
 impl ImportCycles {
     pub(crate) fn load(db: &Database) -> Result<Self> {
-        let pairs = db
-            .enumerate_file_import_pairs()
-            .with_context(|| "enumerate_file_import_pairs")?;
+        let pairs =
+            crate::import_graph::file_import_pairs(db).with_context(|| "file_import_pairs")?;
         let components = crate::scc::tarjan_scc(&pairs.eager)?;
+        let component_edges = {
+            let index = component_index(&components);
+            pairs
+                .eager
+                .iter()
+                .filter(|(from, to)| {
+                    matches!(
+                        (index.get(from.as_str()), index.get(to.as_str())),
+                        (Some(a), Some(b)) if a == b
+                    )
+                })
+                .cloned()
+                .collect()
+        };
         let suppressed_pairs = if pairs.lazy_only.is_empty() {
             Vec::new()
         } else {
@@ -144,6 +161,7 @@ impl ImportCycles {
             suppressed_pairs,
             suppressed_by_file,
             suppressed_from,
+            component_edges,
         })
     }
 
@@ -153,7 +171,18 @@ impl ImportCycles {
             suppressed_pairs: Vec::new(),
             suppressed_by_file: HashMap::new(),
             suppressed_from: HashMap::new(),
+            component_edges: Vec::new(),
         }
+    }
+
+    /// Load-time edges with both endpoints in `members`, one component's files.
+    fn edges_within(&self, members: &[&str]) -> Vec<(String, String)> {
+        let set: HashSet<&str> = members.iter().copied().collect();
+        self.component_edges
+            .iter()
+            .filter(|(from, to)| set.contains(from.as_str()) && set.contains(to.as_str()))
+            .cloned()
+            .collect()
     }
 
     /// Suppressed pairs with either endpoint equal to `file`.
@@ -893,28 +922,32 @@ fn assess_risk_with_context(
 
     // Cycle lookup failure must not discard the other risk signals.
     let mut cycle_signal_failed = false;
-    let (in_cycle, cycle_size, cycle_files, lazy_edges) = if let Some(cycles) = precomputed_cycles {
+    let (in_cycle, cycle_size, cycle_files, lazy_edges, cycle_graph) = if let Some(cycles) =
+        precomputed_cycles
+    {
         let (in_cycle, size, files) = cycle_membership(&cycles.entries, file_path);
         (
             in_cycle,
             size,
             files,
             cycles.cycles.lazy_edges_for(file_path),
+            Some(Arc::clone(&cycles.cycles)),
         )
     } else {
         // Every lookup, including the churn read inside the entry, degrades
         // together so a git_files fault cannot discard the other signals.
         let signal = import_cycle_components(db).and_then(|cycles| {
             let entry = cycle_entry_for_file(db, &cycles, file_path)?;
-            Ok((entry, cycles.lazy_edges_for(file_path)))
+            let lazy = cycles.lazy_edges_for(file_path);
+            Ok((entry, lazy, cycles))
         });
         match signal {
-            Ok((entry, lazy)) => {
+            Ok((entry, lazy, cycles)) => {
                 let (in_cycle, size, files) = match entry {
                     Some(cycle) => cycle_membership(&[cycle], file_path),
                     None => (false, 0, Vec::new()),
                 };
-                (in_cycle, size, files, lazy)
+                (in_cycle, size, files, lazy, Some(cycles))
             }
             Err(e) => {
                 codesage_protocol::work::checkpoint()?;
@@ -926,7 +959,7 @@ fn assess_risk_with_context(
                 }
                 tracing::warn!(error = %e, file = %file_path, "cycle detection failed; omitting cycle signal from risk score");
                 cycle_signal_failed = true;
-                (false, 0, Vec::new(), 0)
+                (false, 0, Vec::new(), 0, None)
             }
         }
     };
@@ -1076,55 +1109,47 @@ fn assess_risk_with_context(
         // Restore the current file because `cycle_files` contains only its peers.
         let mut scc: Vec<&str> = cycle_files.iter().map(String::as_str).collect();
         scc.push(file_path);
-        match db.import_edges_within(&scc) {
-            Ok(edges) if !edges.is_empty() => {
-                let mut in_degree: std::collections::HashMap<&str, u32> =
-                    std::collections::HashMap::new();
-                for (_from, to) in &edges {
-                    *in_degree.entry(to.as_str()).or_insert(0) += 1;
-                }
-                let max_in_degree = in_degree.values().copied().max().unwrap_or(0);
-                let ring_like = max_in_degree <= 2 && edges.len() <= scc.len() + scc.len() / 2;
-                if ring_like {
-                    let weakest = edges
-                        .iter()
-                        .map(|(from, to)| (db.co_change_weight(from, to).unwrap_or(0.0), from, to))
-                        .min_by(|(wa, fa, ta), (wb, fb, tb)| {
-                            wa.partial_cmp(wb)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                                .then_with(|| fa.cmp(fb))
-                                .then_with(|| ta.cmp(tb))
-                        });
-                    if let Some((weight, from, to)) = weakest {
-                        if weight > 0.0 {
-                            notes.push(format!(
+        let edges = cycle_graph
+            .as_ref()
+            .map(|cycles| cycles.edges_within(&scc))
+            .unwrap_or_default();
+        if !edges.is_empty() {
+            let mut in_degree: std::collections::HashMap<&str, u32> =
+                std::collections::HashMap::new();
+            for (_from, to) in &edges {
+                *in_degree.entry(to.as_str()).or_insert(0) += 1;
+            }
+            let max_in_degree = in_degree.values().copied().max().unwrap_or(0);
+            let ring_like = max_in_degree <= 2 && edges.len() <= scc.len() + scc.len() / 2;
+            if ring_like {
+                let weakest = edges
+                    .iter()
+                    .map(|(from, to)| (db.co_change_weight(from, to).unwrap_or(0.0), from, to))
+                    .min_by(|(wa, fa, ta), (wb, fb, tb)| {
+                        wa.partial_cmp(wb)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| fa.cmp(fb))
+                            .then_with(|| ta.cmp(tb))
+                    });
+                if let Some((weight, from, to)) = weakest {
+                    if weight > 0.0 {
+                        notes.push(format!(
                                 "candidate break point: {from} → {to} (lowest co-change weight {weight:.2} among cycle edges)"
                             ));
-                        } else {
-                            notes.push(format!(
+                    } else {
+                        notes.push(format!(
                                 "candidate break point: {from} → {to} (these cycle files do not co-change in git history)"
                             ));
-                        }
                     }
-                } else {
-                    let mut ranked: Vec<(&str, u32)> = in_degree.into_iter().collect();
-                    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-                    let hubs: Vec<&str> = ranked.iter().take(3).map(|(f, _)| *f).collect();
-                    notes.push(format!(
+                }
+            } else {
+                let mut ranked: Vec<(&str, u32)> = in_degree.into_iter().collect();
+                ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                let hubs: Vec<&str> = ranked.iter().take(3).map(|(f, _)| *f).collect();
+                notes.push(format!(
                         "cycle is hub-dominated (not a simple ring); cutting one edge won't break it — most-depended-on within the cycle (decoupling targets): {}",
                         hubs.join(", ")
                     ));
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                codesage_protocol::work::checkpoint()?;
-                if e.downcast_ref::<codesage_protocol::work::WorkStopped>()
-                    .is_some()
-                {
-                    return Err(e);
-                }
-                tracing::warn!(error = %e, file = %file_path, "cycle-break guidance failed; omitting from risk notes");
             }
         }
     }

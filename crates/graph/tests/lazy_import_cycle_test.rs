@@ -3,8 +3,8 @@
 //! eager fixture hoists that import to module scope and must still cycle.
 
 use codesage_graph::{
-    assess_risk, assess_risk_diff, build_review_rehearsal, full_index, impact_analysis,
-    list_dependencies, session_end, session_start,
+    assess_risk, assess_risk_diff, build_review_rehearsal, file_import_pairs, full_index,
+    impact_analysis, list_dependencies, session_end, session_start,
 };
 use codesage_protocol::{ImpactRequest, ImpactTarget, ReferenceKind};
 use codesage_storage::Database;
@@ -184,7 +184,7 @@ fn rehearsal_and_session_stop_objecting_to_a_lazy_cycle() {
 }
 
 #[test]
-fn javascript_require_in_a_function_body_is_marked_lazy_but_never_formed_a_file_edge() {
+fn javascript_require_in_a_function_body_is_a_lazy_path_edge_that_does_not_close_a_cycle() {
     let (_dir, db) = index_fixture("js_lazy");
 
     let lazy = db
@@ -202,8 +202,24 @@ fn javascript_require_in_a_function_body_is_marked_lazy_but_never_formed_a_file_
         .expect("module-scope require('./a') is indexed");
     assert!(!eager.lazy, "{eager:?}");
 
-    // Module-path strings resolve to no symbol, so the cycle consumer never
-    // saw a JS file edge either way; the mark only reaches reference rows.
+    // Module-path strings name no symbol, so the symbol-joined storage half
+    // stays empty; the cycle graph resolves them to files the way
+    // `list_dependencies` does, and the lazy mark then decides the pair.
     assert!(db.enumerate_file_import_edges().unwrap().is_empty());
     assert!(db.lazy_import_pairs().unwrap().is_empty());
+    let pairs = file_import_pairs(&db).unwrap();
+    assert_eq!(pairs.eager, vec![("b.js".to_string(), "a.js".to_string())]);
+    assert_eq!(
+        pairs.lazy_only,
+        vec![("a.js".to_string(), "b.js".to_string())]
+    );
+
+    for file in ["a.js", "b.js"] {
+        let risk = assess_risk(&db, file).unwrap();
+        assert!(!risk.in_cycle, "{file}: {risk:?}");
+        assert_eq!(risk.cycle_size, 0);
+        assert_eq!(risk.lazy_edges, 1, "{file}: {risk:?}");
+    }
+    let diff = assess_risk_diff(&db, &["a.js".to_string(), "b.js".to_string()]).unwrap();
+    assert!(diff.cycles_touching_patch.is_empty(), "{diff:?}");
 }

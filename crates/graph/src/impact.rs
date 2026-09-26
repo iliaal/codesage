@@ -952,6 +952,9 @@ fn resolve_references_to_symbol(
     let identity = symbol_identity_key(sym);
     for r in raw {
         codesage_protocol::work::checkpoint()?;
+        if crate::bundle::is_go_package_import(r.kind, &r.from_file) {
+            continue;
+        }
         let cache_key = (r.from_file.clone(), r.to_name.clone());
         if !cache.contains_key(&cache_key) {
             let resolved = match shared.as_deref_mut() {

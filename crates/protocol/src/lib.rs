@@ -532,9 +532,12 @@ pub struct Reference {
     /// JSON; `line` is what agents navigate by.
     #[serde(skip)]
     pub col: u32,
-    /// True for a Python or JavaScript/TypeScript import directive written
-    /// inside a function, method, or arrow-function body that is not
-    /// immediately invoked: the module is loaded on use, not at load time.
+    /// True for an import directive that loads nothing at module load time:
+    /// a Python or JavaScript/TypeScript directive written inside a function,
+    /// method, or arrow-function body that is not immediately invoked (the
+    /// module is loaded on use), or a TypeScript type-only directive the
+    /// compiler erases (`import type`, `export type { .. } from`, a clause of
+    /// only `type` specifiers, or a binding's own `type` specifier).
     /// Cycle detection drops a file pair whose import edges are all lazy;
     /// dependency listings, impact analysis, and call resolution keep them.
     /// A wrapper invoked where it is written (`(...)()`, `new`, `.call`,
@@ -1362,7 +1365,8 @@ pub struct RiskAssessment {
     /// response staleness scan reaches them only through this field.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub cycle_files: Vec<String>,
-    /// Lazy-only import pairs (every directive inside a function body) with
+    /// Lazy-only import pairs (every directive a function-body or TypeScript
+    /// type-only import) with
     /// this file as an endpoint that would close or enlarge an import cycle if
     /// counted as load-time edges, and were therefore excluded from cycle
     /// detection. Emitted only when nonzero, regardless of `verbose`, so an
@@ -1634,7 +1638,8 @@ pub struct CycleEntry {
     pub size: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_churn_file: Option<String>,
-    /// Lazy-only import pairs (every directive a function-body import) with
+    /// Lazy-only import pairs (every directive a function-body or TypeScript
+    /// type-only import) with
     /// at least one endpoint among `members` that would enlarge this SCC if
     /// counted as load-time edges. Absent when zero.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -1889,7 +1894,8 @@ pub struct SessionSnapshot {
     /// the outer Vec is sorted by (descending size, members) for stable
     /// equality across snapshot/recompute cycles.
     pub cycles: Vec<Vec<String>>,
-    /// Lazy-only import pairs (every directive a function-body import) that
+    /// Lazy-only import pairs (every directive a function-body or TypeScript
+    /// type-only import) that
     /// would close or enlarge a cycle if counted as load-time edges, excluded
     /// from `cycles`. Absent when zero.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -1965,7 +1971,8 @@ pub struct SessionDiff {
     /// the agent's edits). Reported for completeness; doesn't affect pass.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub resolved_cycles: Vec<Vec<String>>,
-    /// Lazy-only import pairs (every directive a function-body import) that
+    /// Lazy-only import pairs (every directive a function-body or TypeScript
+    /// type-only import) that
     /// would close or enlarge a cycle if counted as load-time edges, excluded
     /// from cycle detection at `session_end`. Absent when zero.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
