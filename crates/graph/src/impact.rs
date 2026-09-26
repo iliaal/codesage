@@ -1149,7 +1149,7 @@ mod tests {
         let db = setup_caller_import_project();
         db.execute_raw_for_tests(&format!(
             "INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col)
-             VALUES (3, printf('%.*c', {}, 'x'), 'oversized', 'import', 5, 0)",
+             VALUES (3, './' || printf('%.*c', {}, 'x'), 'oversized', 'import', 5, 0)",
             WalkCache::MAX_REFERENCE_BYTES + 1
         ))
         .unwrap();
