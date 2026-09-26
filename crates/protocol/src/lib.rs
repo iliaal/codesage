@@ -1824,7 +1824,9 @@ pub struct TestRecommendations {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TestCommand {
     /// Shell command, relative to the project root (`cargo test -p acme
-    /// --test integration`, `pytest tests/test_x.py`, `go test ./pkg/util`).
+    /// --test integration`, `pytest tests/test_x.py`, `go test ./pkg/util`);
+    /// a nested JavaScript package's runner is wrapped as
+    /// `(cd -- ./<dir> && ...)`.
     pub command: String,
     /// What the command exercises: test file paths; a `.phpt` directory
     /// withheld from `primary` for size (`ext/standard/tests`); module ids
@@ -1832,8 +1834,8 @@ pub struct TestCommand {
     /// changed files the feature owns, as the caller spelled them.
     pub covers: Vec<String>,
     /// Runner family: `cargo`, `pytest`, `phpunit`, `artisan`, `run-tests`,
-    /// `go`, `vitest`, `jest`, `maven`, `gradle`; for feature commands, the
-    /// command's first token.
+    /// `go`, `vitest`, `jest`, `mocha`, `node:test`, `bun`, `playwright`,
+    /// `maven`, `gradle`; for feature commands, the command's first token.
     pub framework: String,
     /// `convention` (from `primary` / `reachable` paths), `inline` (a test
     /// module inside a changed file), or `feature_test_command` (the mapped

@@ -10,6 +10,8 @@ use anyhow::Result;
 use codesage_protocol::{InlineTestModule, Symbol, SymbolKind, TestCommand};
 use codesage_storage::Database;
 
+mod js_runner;
+
 pub(super) const SOURCE_CONVENTION: &str = "convention";
 pub(super) const SOURCE_INLINE: &str = "inline";
 pub(super) const SOURCE_FEATURE: &str = "feature_test_command";
@@ -121,11 +123,7 @@ impl ManifestMemo {
             root.join(dir).join("Cargo.toml")
         };
         self.reads += 1;
-        let name = std::fs::metadata(&manifest)
-            .ok()
-            .filter(|m| m.is_file() && m.len() <= MAX_SOURCE_BYTES)
-            .and_then(|_| std::fs::read_to_string(&manifest).ok())
-            .and_then(|text| cargo_package_name(&text));
+        let name = read_regular_bounded(&manifest).and_then(|text| cargo_package_name(&text));
         self.names.insert(dir.to_string(), name.clone());
         name
     }
@@ -367,30 +365,11 @@ fn convention_commands(
     }
     if !js.is_empty() {
         js.sort();
-        let vitest = root_has(
-            root,
-            &[
-                "vitest.config.ts",
-                "vitest.config.js",
-                "vitest.config.mts",
-                "vitest.config.mjs",
-                "vitest.config.cts",
-                "vitest.config.cjs",
-                "vitest.workspace.ts",
-                "vitest.workspace.js",
-            ],
-        );
-        let (runner, framework) = if vitest {
-            ("npx vitest run", "vitest")
-        } else {
-            ("npx jest", "jest")
-        };
-        out.push(command(
-            format!("{runner} {}", path_args(&js)),
-            js,
-            framework,
-            SOURCE_CONVENTION,
-        ));
+        let (js_commands, unresolved) = js_runner::commands(root, &js);
+        out.extend(js_commands);
+        if !unresolved.is_empty() {
+            notes.push(js_runner::unresolved_note(&unresolved));
+        }
     }
     for class in java.keys().filter(|c| !flag_safe(c)) {
         notes.push(dropped_token_note("Java test class", class));
@@ -591,12 +570,45 @@ fn within(sym: &Symbol, module: &Symbol) -> bool {
 /// The changed file's text when the root is known and the file is within
 /// [`MAX_SOURCE_BYTES`]; otherwise `None` and the symbol count is used.
 fn read_source_bounded(root: Option<&Path>, path: &str) -> Option<String> {
-    let full = root?.join(path);
-    let size = std::fs::metadata(&full).ok()?.len();
-    if size > MAX_SOURCE_BYTES {
+    read_regular_bounded(&root?.join(path))
+}
+
+/// UTF-8 text of a regular file (symlinks followed) holding at most
+/// [`MAX_SOURCE_BYTES`]. Paths can be caller-named and unindexed, so a FIFO
+/// or device must never be opened for a blocking read: the type is checked
+/// before the open, the open is non-blocking in case the path was swapped
+/// since, the type is checked again on the handle, and the read stops one
+/// byte past the cap whatever the stat length said.
+fn read_regular_bounded(path: &Path) -> Option<String> {
+    use std::io::Read;
+    if !std::fs::metadata(path).ok()?.is_file() {
         return None;
     }
-    std::fs::read_to_string(full).ok()
+    let file = open_nonblocking(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_SOURCE_BYTES {
+        return None;
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_SOURCE_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > MAX_SOURCE_BYTES {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
+#[cfg(unix)]
+fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 /// Outermost test modules of one Rust file with their test counts. Nested
@@ -952,6 +964,36 @@ mod tests {
         let krate = RustCrate::for_path(Some(root), "src/lib.rs", &mut memo);
         assert_eq!(krate.dir, "");
         assert_eq!(krate.name, None);
+    }
+
+    #[test]
+    fn bounded_reads_take_only_small_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("ok.js"), "test('x', () => {});\n").unwrap();
+        assert!(read_regular_bounded(&root.join("ok.js")).is_some());
+        let big = vec![b'a'; MAX_SOURCE_BYTES as usize + 1];
+        std::fs::write(root.join("big.js"), big).unwrap();
+        assert_eq!(read_regular_bounded(&root.join("big.js")), None);
+        assert_eq!(read_regular_bounded(root), None);
+        assert_eq!(read_regular_bounded(&root.join("missing.js")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reads_refuse_fifos_and_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe.js");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let link = dir.path().join("link.js");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        assert_eq!(read_regular_bounded(&fifo), None);
+        assert_eq!(read_regular_bounded(&link), None);
+        let zero = dir.path().join("zero.js");
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        assert_eq!(read_regular_bounded(&zero), None);
     }
 
     #[test]
