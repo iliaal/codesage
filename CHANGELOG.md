@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.36.0] - 2026-09-26
+
 ### Changed
 
 - `find_references` marks TypeScript type-only directives (`import type`, `export type { .. } from`, `import type X = require(..)`, clauses whose every specifier is `type`) `lazy: true`, and import-cycle detection skips them.
@@ -1150,5 +1152,7 @@ Initial public release.
 
 [0.34.0]: https://github.com/iliaal/codesage/releases/tag/v0.34.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.35.0...HEAD
 [0.35.0]: https://github.com/iliaal/codesage/releases/tag/v0.35.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.36.0...HEAD
+[0.36.0]: https://github.com/iliaal/codesage/releases/tag/v0.36.0
