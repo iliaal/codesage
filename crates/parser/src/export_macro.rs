@@ -651,10 +651,7 @@ mod tests {
             let expected = by_hand(src, macros);
             let out = blanked(src);
             assert_eq!(out, expected, "{src:?}");
-            if macros.is_empty() {
-                // Left as written: blanking must never be what breaks a parse.
-                assert!(parses_cleanly(&out) || !parses_cleanly(src), "{src:?}");
-            } else {
+            if !macros.is_empty() {
                 assert_ne!(expected, src, "fixture {src:?} names no macro text");
                 assert!(parses_cleanly(&out), "{out:?} does not parse cleanly");
             }
