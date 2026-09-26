@@ -677,8 +677,9 @@ fn follow_renames(commits: &mut [Commit], exclude_set: &GlobSet) -> HashMap<Stri
 /// Whether re-keying stored rows by `moves` would disagree with a full scan.
 /// A successor that already holds history of its own would be merged with it,
 /// counting a commit that touched both paths twice; a move across the test-like
-/// boundary changes which co-change pairs a full scan admits. Renames are rare,
-/// so a rescan costs little and keeps the rows exact.
+/// boundary changes which co-change pairs a full scan admits. Two recorded
+/// sources folding onto one successor double-count the same way. Renames are
+/// rare, so a rescan costs little and keeps the rows exact.
 fn rekey_diverges_from_full_scan(
     db: &Database,
     moves: &[(String, Option<String>)],
@@ -686,6 +687,7 @@ fn rekey_diverges_from_full_scan(
 ) -> Result<bool> {
     let sources: std::collections::HashSet<&str> =
         moves.iter().map(|(from, _)| from.as_str()).collect();
+    let mut recorded_sources: HashMap<&str, usize> = HashMap::new();
     for (from, to) in moves {
         let Some(to) = to else {
             continue;
@@ -695,6 +697,13 @@ fn rekey_diverges_from_full_scan(
         }
         if !sources.contains(to.as_str()) && db.git_file(to)?.is_some() {
             return Ok(true);
+        }
+        if db.git_file(from)?.is_some() {
+            let count = recorded_sources.entry(to.as_str()).or_default();
+            *count += 1;
+            if *count > 1 {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -756,10 +765,13 @@ fn head_paths(root: &Path, sha: &str) -> Result<std::collections::HashSet<String
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let text = String::from_utf8(out.stdout).context("git ls-tree output not UTF-8")?;
-    Ok(text
-        .split('\0')
-        .filter(|path| !path.is_empty())
+    // `run_git_log` only yields UTF-8 paths, so a non-UTF-8 tree entry can
+    // never match a change and is skipped rather than failing the pass.
+    Ok(out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
         .map(str::to_owned)
         .collect())
 }

@@ -405,6 +405,55 @@ fn rename_onto_a_path_with_recorded_history_matches_a_full_scan() {
 }
 
 #[test]
+fn two_recorded_files_renamed_onto_one_path_match_a_full_scan() {
+    let mut repo = Repo::new();
+    for tag in 1..=3 {
+        repo.edit(&["a.rs", "b.rs", "peer.rs"], tag);
+    }
+    let incremental = repo.full();
+    repo.mv("a.rs", "c.rs");
+    repo.commit("feat: a to c");
+    repo.git(&["rm", "-q", "c.rs"]);
+    repo.commit("feat: drop c");
+    repo.mv("b.rs", "c.rs");
+    repo.commit("feat: b to c");
+    repo.index(&incremental, IndexMode::Incremental);
+
+    let full = repo.full();
+    assert_same_history(&incremental, &full, &["a.rs", "b.rs", "c.rs", "peer.rs"]);
+    assert_eq!(commits(&full, "c.rs"), Some(6));
+    let pairs = full.co_changes_for("peer.rs", 10).unwrap();
+    assert_eq!((pairs[0].file.as_str(), pairs[0].count), ("c.rs", 3));
+}
+
+/// A HEAD path that is not UTF-8, committed outside the history window, must
+/// not fail a pass that consults HEAD's tree to follow a rename.
+#[cfg(unix)]
+#[test]
+fn non_utf8_head_path_does_not_fail_a_pass_with_a_rename() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut repo = Repo::new();
+    let in_window = repo.next_ts;
+    repo.next_ts = unix_now() - 1500 * DAY;
+    let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
+    std::fs::write(repo.root().join(name), "old\n").unwrap();
+    repo.commit("feat: latin-1 name");
+    repo.next_ts = in_window;
+    repo.edit(&["a.rs"], 1);
+    let incremental = repo.full();
+    repo.edit(&["a.rs"], 2);
+    repo.mv("a.rs", "c.rs");
+    repo.commit("feat: a to c");
+
+    repo.index(&incremental, IndexMode::Incremental);
+    let full = repo.full();
+    assert_same_history(&incremental, &full, &["a.rs", "c.rs"]);
+    assert_eq!(commits(&full, "a.rs"), None);
+    assert_eq!(commits(&full, "c.rs"), Some(3));
+}
+
+#[test]
 fn rename_into_the_test_tree_matches_a_full_scan() {
     let mut repo = Repo::new();
     for tag in 1..=3 {

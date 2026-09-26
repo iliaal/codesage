@@ -376,8 +376,9 @@ impl Database {
     /// two ends land on one path is dropped. Merged counters add, timestamps
     /// widen, and window masks OR. That equals a full scan keying every commit
     /// to the successor only while no successor already holds history of its
-    /// own (a merge would count a commit that touched both paths twice) and
-    /// no move changes which co-change pairs are admitted; callers that cannot
+    /// own and no two sources with history share a successor (either merge
+    /// would count a commit that touched both paths twice), and no move
+    /// changes which co-change pairs are admitted; callers that cannot
     /// rule those out must rescan instead.
     pub fn rekey_git_history(&self, moves: &[(String, Option<String>)]) -> Result<()> {
         if moves.is_empty() {
