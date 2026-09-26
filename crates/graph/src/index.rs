@@ -116,7 +116,7 @@ const STRUCTURAL_INDEX_BATCH_SIZE: usize = 50;
 /// Bump the relevant component whenever unchanged bytes can yield different
 /// symbols, references, fingerprints, or trust boundaries. Raw hashes stay separate.
 pub const STRUCTURAL_INTERPRETATION: &str =
-    "codesage/structural/v1;parser-queries=3;extraction=6;trust-boundaries=1";
+    "codesage/structural/v1;parser-queries=3;extraction=7;trust-boundaries=1";
 
 /// Whether an indexed file is test code. Rows written under the current
 /// interpretation carry a trustworthy `files.is_test`; a row indexed by an

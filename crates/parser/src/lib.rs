@@ -1,5 +1,6 @@
 pub mod detect;
 pub mod discover;
+mod export_macro;
 pub mod extract;
 pub mod fingerprint;
 pub mod parse;

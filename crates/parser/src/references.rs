@@ -164,6 +164,9 @@ fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         9 => Some(ReferenceKind::TraitUse), // use_declaration inside class
         10..=13 => Some(ReferenceKind::TypeHint), // param / promoted-property / return type hints
         14 => Some(ReferenceKind::Import), // group use (use App\Models\{User, Post};)
+        // nullable / union / intersection / DNF arms, typed property, variadic,
+        // closure and arrow-function return types
+        15..=22 => Some(ReferenceKind::TypeHint),
         _ => None,
     }
 }
@@ -594,6 +597,16 @@ pub fn extract_references(
         let raw = crate::parse::node_text_lossy(&ref_node, source);
         let stripped = strip_surrounding_quotes(&raw);
         if stripped.is_empty() {
+            continue;
+        }
+        // PHP's relative class types name the enclosing class hierarchy, not
+        // a class called `self`; PHP keywords are case-insensitive.
+        if language == Language::Php
+            && kind == ReferenceKind::TypeHint
+            && ["self", "static", "parent"]
+                .iter()
+                .any(|pseudo| stripped.eq_ignore_ascii_case(pseudo))
+        {
             continue;
         }
 
