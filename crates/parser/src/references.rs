@@ -164,6 +164,9 @@ fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         9 => Some(ReferenceKind::TraitUse), // use_declaration inside class
         10..=13 => Some(ReferenceKind::TypeHint), // param / promoted-property / return type hints
         14 => Some(ReferenceKind::Import), // group use (use App\Models\{User, Post};)
+        // nullable / union / intersection / DNF arms, typed property, variadic,
+        // closure and arrow-function return types
+        15..=22 => Some(ReferenceKind::TypeHint),
         _ => None,
     }
 }

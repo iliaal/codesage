@@ -89,6 +89,71 @@ fn typescript_type_hints_cover_annotations_generics_and_qualified_types() {
 }
 
 #[test]
+fn php_composite_property_variadic_and_closure_types_are_type_hints() {
+    let source = "<?php
+class User {
+    private Prop $p;
+    public ?NullProp $np;
+    public function a(Plain $x) {}
+    public function b(?Nullable $x): ?NullRet {}
+    public function c(UnionA|\\App\\UnionB $x): RetA|RetB {}
+    public function d(Variadic ...$xs) {}
+    public function e(InterA&InterB $x) {}
+    public function f((DnfA&DnfB)|DnfC $x) {}
+    public function g(?VarNull ...$xs) {}
+    public function __construct(private ?Promoted $p, int|string $s, ?int $n) {}
+}
+function h(): ?FnRet {}
+$c = function (ClosureParam $x): ClosureRet {};
+$c2 = function (): ?ClosureNullRet {};
+$a = fn(ArrowParam $x): ArrowRet => $x;
+$a2 = fn(): ArrowUnionA|ArrowUnionB => null;
+";
+    let refs = refs_from_source(source, Language::Php);
+    let mut types: Vec<_> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::TypeHint)
+        .map(|r| (r.line, r.to_name.as_str()))
+        .collect();
+    types.sort();
+    assert_eq!(
+        types,
+        [
+            (3, "Prop"),
+            (4, "NullProp"),
+            (5, "Plain"),
+            (6, "NullRet"),
+            (6, "Nullable"),
+            (7, "RetA"),
+            (7, "RetB"),
+            (7, "UnionA"),
+            (7, "\\App\\UnionB"),
+            (8, "Variadic"),
+            (9, "InterA"),
+            (9, "InterB"),
+            (10, "DnfA"),
+            (10, "DnfB"),
+            (10, "DnfC"),
+            (11, "VarNull"),
+            (12, "Promoted"),
+            (14, "FnRet"),
+            (15, "ClosureParam"),
+            (15, "ClosureRet"),
+            (16, "ClosureNullRet"),
+            (17, "ArrowParam"),
+            (17, "ArrowRet"),
+            (18, "ArrowUnionA"),
+            (18, "ArrowUnionB"),
+        ]
+    );
+    let nullable = refs
+        .iter()
+        .find(|r| r.to_name == "Nullable" && r.kind == ReferenceKind::TypeHint)
+        .unwrap();
+    assert_eq!((nullable.line, nullable.col), (6, 23));
+}
+
+#[test]
 fn typescript_type_declarations_are_not_type_hint_uses() {
     let source = "class DeclaredClass {}\nabstract class DeclaredAbstract {}\nconst value = class DeclaredExpression {};\ninterface DeclaredInterface {}\ntype DeclaredAlias<DeclaredParameter> = Target;\ntype Mapped = { [DeclaredKey in Keys]: Item };\ntype Inferred = Source extends infer DeclaredInferred extends Bound ? Yes : No;\n";
     let refs = refs_from_source(source, Language::TypeScript);
