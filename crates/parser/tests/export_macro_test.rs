@@ -285,6 +285,25 @@ int run() {
 }
 
 #[test]
+fn cpp_export_macro_before_friend_and_in_explicit_instantiations_parse_cleanly() {
+    let source = "class A { LIB_API friend void f(A&); void m(); };\n\
+template class FOO_API Foo<int>;\n";
+    let tree = parse_file(source.as_bytes(), Language::Cpp).unwrap();
+    assert!(
+        !tree.root_node().has_error(),
+        "{}",
+        tree.root_node().to_sexp()
+    );
+    let syms = symbols(source, Language::Cpp);
+    find(&syms, "A", SymbolKind::Class);
+    find(&syms, "A::m", SymbolKind::Method);
+    assert!(
+        !syms.iter().any(|s| s.qualified_name == "A::f"),
+        "a friend declaration became a member: {syms:#?}"
+    );
+}
+
+#[test]
 fn c_export_macro_function_definitions_keep_extracting() {
     let source = "ZEND_API int zend_startup(void) { return 0; }\n\
 PHPAPI int php_request_startup(void) { return 0; }\n\

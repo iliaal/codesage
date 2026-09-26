@@ -270,7 +270,13 @@ fn qualifies(
     // macro-shaped word is itself the type name, and so does a "name" that
     // is really the `final` specifier (`class RENDER_API final {`).
     if ident_is(prev, source, &CLASS_KEYS) {
-        let named = first.kind == Kind::Ident
+        // An explicit instantiation (`template class FOO_API Foo<int>;`,
+        // `extern template ...`) parses cleanly as written and not blanked.
+        let instantiation = prev_idx
+            .and_then(|p| p.checked_sub(1))
+            .is_some_and(|p| ident_is(tokens.get(p), source, &[b"template"]));
+        let named = !instantiation
+            && first.kind == Kind::Ident
             && !ident_is(Some(first), source, &[b"final"])
             && (matches!(after, Some(Kind::Punct(b'{' | b':' | b'<') | Kind::Scope))
                 || ident_is(tokens.get(head + 1), source, &[b"final"]));
@@ -290,7 +296,10 @@ fn qualifies(
     if !declaration_start {
         return None;
     }
-    let form = if prev.map(|t| t.kind) == Some(Kind::Ident) {
+    // tree-sitter-cpp takes no attribute before `friend` in a member list.
+    let form = if prev.map(|t| t.kind) == Some(Kind::Ident)
+        || ident_is(Some(first), source, &[b"friend"])
+    {
         Form::Spaces
     } else {
         Form::Attribute
@@ -631,11 +640,21 @@ mod tests {
                 &["@LIB_API", "@LIB_API"],
             ),
             ("CORE_API ns::Foo::Foo() {}", &["@CORE_API"]),
+            (
+                "class A { LIB_API friend void f(A&); void m(); };",
+                &["LIB_API"],
+            ),
+            ("template class FOO_API Foo<int>;", &[]),
+            ("extern template class FOO_API Foo<int>;", &[]),
+            ("extern template struct FOO_API Bar<int>;", &[]),
         ] {
             let expected = by_hand(src, macros);
             let out = blanked(src);
             assert_eq!(out, expected, "{src:?}");
-            if !macros.is_empty() {
+            if macros.is_empty() {
+                // Left as written: blanking must never be what breaks a parse.
+                assert!(parses_cleanly(&out) || !parses_cleanly(src), "{src:?}");
+            } else {
                 assert_ne!(expected, src, "fixture {src:?} names no macro text");
                 assert!(parses_cleanly(&out), "{out:?} does not parse cleanly");
             }
