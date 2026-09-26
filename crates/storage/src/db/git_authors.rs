@@ -46,6 +46,44 @@ impl Database {
         Ok(())
     }
 
+    /// Author-event half of [`Database::rekey_git_history`]: every event of a
+    /// `from` path is read before any is rewritten, so the moves compose as one
+    /// substitution. An event already recorded for the same commit under the
+    /// successor path is kept once.
+    pub(super) fn rekey_git_author_events(&self, moves: &[(String, Option<String>)]) -> Result<()> {
+        let mut moved: Vec<(&str, String, String, i64)> = Vec::new();
+        {
+            let mut events_of = self.conn.prepare(
+                "SELECT commit_sha, author, committed_at FROM git_author_events
+                 WHERE file_path = ?1",
+            )?;
+            for (from, to) in moves {
+                let Some(to) = to else {
+                    continue;
+                };
+                let events = events_of.query_map([from], |row| {
+                    Ok((to.as_str(), row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+                for event in events {
+                    moved.push(event?);
+                }
+            }
+        }
+        for (from, _) in moves {
+            self.conn
+                .execute("DELETE FROM git_author_events WHERE file_path = ?1", [from])?;
+        }
+        for (to, sha, author, committed_at) in moved {
+            self.conn.execute(
+                "INSERT INTO git_author_events (file_path, commit_sha, author, committed_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(file_path, commit_sha) DO NOTHING",
+                params![to, sha, author, committed_at],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn prune_git_author_events(&self, cutoff: i64) -> Result<()> {
         self.conn.execute(
             "DELETE FROM git_author_events WHERE committed_at < ?1",

@@ -369,6 +369,160 @@ impl Database {
         Ok(())
     }
 
+    /// Re-key history recorded under superseded paths. `(from, Some(to))`
+    /// folds `from`'s file row, co-change pairs, and author events into `to`;
+    /// `(from, None)` drops them. The moves apply as one simultaneous
+    /// substitution, so a swap or a chain needs no ordering, and a pair whose
+    /// two ends land on one path is dropped. Merged counters add, timestamps
+    /// widen, and window masks OR, which is what a full scan keying every
+    /// commit to the successor path would have produced.
+    pub fn rekey_git_history(&self, moves: &[(String, Option<String>)]) -> Result<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch("SAVEPOINT rekey_git_history")?;
+        let result = self.rekey_git_history_inner(moves);
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE rekey_git_history")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO rekey_git_history");
+                let _ = self.conn.execute_batch("RELEASE rekey_git_history");
+                Err(error)
+            }
+        }
+    }
+
+    fn rekey_git_history_inner(&self, moves: &[(String, Option<String>)]) -> Result<()> {
+        use std::collections::{HashMap, HashSet};
+        let targets: HashMap<&str, Option<&str>> = moves
+            .iter()
+            .map(|(from, to)| (from.as_str(), to.as_deref()))
+            .collect();
+        let successor = |path: &str| -> Option<String> {
+            match targets.get(path) {
+                Some(to) => to.map(str::to_owned),
+                None => Some(path.to_owned()),
+            }
+        };
+
+        let mut file_rows = Vec::new();
+        let mut pair_rows: Vec<(String, String, CoChangeWrite)> = Vec::new();
+        let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+        {
+            let mut pairs_of = self.conn.prepare(
+                "SELECT file_a, file_b, weight, count, last_observed_at, first_observed_at,
+                        window_mask
+                 FROM git_co_changes WHERE file_a = ?1 OR file_b = ?1",
+            )?;
+            for from in targets.keys() {
+                if let Some(row) = self.git_file(from)? {
+                    file_rows.push(row);
+                }
+                let rows = pairs_of
+                    .query_map(rusqlite::params![from], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            CoChangeWrite {
+                                weight: r.get(2)?,
+                                count: r.get::<_, i64>(3)? as u32,
+                                last_observed_at: r.get(4)?,
+                                first_observed_at: r.get(5)?,
+                                window_mask: r.get::<_, i64>(6)? as u64,
+                            },
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                for (a, b, write) in rows {
+                    if seen_pairs.insert((a.clone(), b.clone())) {
+                        pair_rows.push((a, b, write));
+                    }
+                }
+            }
+        }
+        for from in targets.keys() {
+            self.conn.execute(
+                "DELETE FROM git_files WHERE path = ?1",
+                rusqlite::params![from],
+            )?;
+            self.conn.execute(
+                "DELETE FROM git_co_changes WHERE file_a = ?1 OR file_b = ?1",
+                rusqlite::params![from],
+            )?;
+        }
+
+        for row in file_rows {
+            if let Some(to) = successor(&row.path) {
+                self.incr_git_file(
+                    &to,
+                    row.churn_score,
+                    row.fix_count,
+                    row.total_commits,
+                    row.last_commit_at,
+                )?;
+            }
+        }
+        for (a, b, write) in pair_rows {
+            let (Some(a), Some(b)) = (successor(&a), successor(&b)) else {
+                continue;
+            };
+            if a != b {
+                self.merge_git_co_change(&a, &b, &write)?;
+            }
+        }
+        self.rekey_git_author_events(moves)
+    }
+
+    /// Fold a whole pair row into another. Unlike an incremental delta, the
+    /// incoming row may itself be unbaselined, and either side's unknown span
+    /// makes the merged span unknown.
+    fn merge_git_co_change(&self, file_a: &str, file_b: &str, w: &CoChangeWrite) -> Result<()> {
+        let (lo, hi) = Self::order_co_change_pair(file_a, file_b)?;
+        let merged_mask: i64 = self.conn.query_row(
+            "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at,
+                                         first_observed_at, window_mask, windows)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(file_a, file_b) DO UPDATE SET
+                 weight = weight + excluded.weight,
+                 count = count + excluded.count,
+                 last_observed_at = CASE
+                     WHEN excluded.last_observed_at IS NULL THEN last_observed_at
+                     WHEN last_observed_at IS NULL THEN excluded.last_observed_at
+                     ELSE MAX(last_observed_at, excluded.last_observed_at)
+                 END,
+                 first_observed_at = CASE
+                     WHEN first_observed_at IS NULL OR excluded.first_observed_at IS NULL
+                     THEN NULL
+                     ELSE MIN(first_observed_at, excluded.first_observed_at)
+                 END,
+                 window_mask = CASE
+                     WHEN first_observed_at IS NULL OR excluded.first_observed_at IS NULL
+                     THEN 0
+                     ELSE window_mask | excluded.window_mask
+                 END
+             RETURNING window_mask",
+            rusqlite::params![
+                lo,
+                hi,
+                w.weight,
+                w.count,
+                w.last_observed_at,
+                w.first_observed_at,
+                w.window_mask as i64,
+                windows_of(w.window_mask)
+            ],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "UPDATE git_co_changes SET windows = ?3 WHERE file_a = ?1 AND file_b = ?2",
+            rusqlite::params![lo, hi, windows_of(merged_mask as u64)],
+        )?;
+        Ok(())
+    }
+
     /// True if a co-change pair has at least three observations. Order-insensitive
     /// (normalized like the upserts); a self-pair errors.
     pub fn co_change_pair_exists(&self, file_a: &str, file_b: &str) -> Result<bool> {
@@ -1168,6 +1322,115 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM git_co_changes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0, "rejected self-pair must not leave a row");
+    }
+
+    fn write(weight: f64, count: u32, mask: u64, first: i64, last: i64) -> CoChangeWrite {
+        CoChangeWrite {
+            weight,
+            count,
+            window_mask: mask,
+            first_observed_at: Some(first),
+            last_observed_at: Some(last),
+        }
+    }
+
+    fn moves(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+        pairs
+            .iter()
+            .map(|(from, to)| (from.to_string(), to.map(str::to_owned)))
+            .collect()
+    }
+
+    #[test]
+    fn rekey_folds_a_superseded_path_into_its_successor() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_git_file("a.rs", 2.0, 1, 4, Some(100)).unwrap();
+        db.upsert_git_file("c.rs", 0.5, 0, 1, Some(300)).unwrap();
+        db.upsert_git_co_change_full("a.rs", "b.rs", &write(3.0, 4, 0b01, 10, 100))
+            .unwrap();
+        db.upsert_git_co_change_full("b.rs", "c.rs", &write(1.0, 1, 0b10, 300, 300))
+            .unwrap();
+        db.upsert_git_co_change_full("a.rs", "c.rs", &write(0.5, 1, 0b01, 50, 50))
+            .unwrap();
+        db.upsert_git_author_event("a.rs", "s1", "x", 10).unwrap();
+        db.upsert_git_author_event("a.rs", "s2", "y", 20).unwrap();
+        db.upsert_git_author_event("c.rs", "s2", "y", 20).unwrap();
+
+        db.rekey_git_history(&moves(&[("a.rs", Some("c.rs"))]))
+            .unwrap();
+
+        assert!(db.git_file("a.rs").unwrap().is_none());
+        let c = db.git_file("c.rs").unwrap().unwrap();
+        assert_eq!(
+            (c.fix_count, c.total_commits, c.last_commit_at),
+            (1, 5, Some(300))
+        );
+        assert_eq!(c.churn_score, 2.5);
+        let pairs = db.co_changes_for("b.rs", 10).unwrap();
+        assert_eq!(pairs.len(), 1, "a.rs/c.rs pair collapsed; b pairs merged");
+        let p = &pairs[0];
+        assert_eq!(p.file, "c.rs");
+        assert_eq!((p.count, p.weight), (5, 4.0));
+        assert_eq!((p.window_mask, p.windows), (0b11, 2));
+        assert_eq!(
+            (p.first_observed_at, p.last_observed_at),
+            (Some(10), Some(300))
+        );
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM git_co_changes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the self-pair a.rs/c.rs must be dropped");
+        assert!(db.git_author_events("a.rs").unwrap().is_empty());
+        assert_eq!(
+            db.git_author_events("c.rs").unwrap(),
+            vec![("x".to_string(), 10), ("y".to_string(), 20)]
+        );
+    }
+
+    #[test]
+    fn rekey_applies_moves_simultaneously_and_drops_excluded_successors() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_git_file("a.rs", 1.0, 0, 1, None).unwrap();
+        db.upsert_git_file("b.rs", 2.0, 0, 2, None).unwrap();
+        db.upsert_git_file("gone.rs", 3.0, 0, 3, None).unwrap();
+        db.upsert_git_co_change_full("gone.rs", "peer.rs", &write(1.0, 3, 1, 1, 2))
+            .unwrap();
+        db.upsert_git_author_event("gone.rs", "s", "x", 1).unwrap();
+
+        db.rekey_git_history(&moves(&[
+            ("a.rs", Some("b.rs")),
+            ("b.rs", Some("a.rs")),
+            ("gone.rs", None),
+        ]))
+        .unwrap();
+
+        assert_eq!(db.git_file("a.rs").unwrap().unwrap().total_commits, 2);
+        assert_eq!(db.git_file("b.rs").unwrap().unwrap().total_commits, 1);
+        assert!(db.git_file("gone.rs").unwrap().is_none());
+        assert!(db.co_changes_for("peer.rs", 10).unwrap().is_empty());
+        assert!(db.git_author_events("gone.rs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn rekey_merge_with_an_unbaselined_row_keeps_the_span_unknown() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at)
+                 VALUES ('b.rs', 'c.rs', 2.0, 3, 500)",
+                [],
+            )
+            .unwrap();
+        db.upsert_git_co_change_full("a.rs", "b.rs", &write(1.0, 2, 0b100, 10, 20))
+            .unwrap();
+        db.rekey_git_history(&moves(&[("a.rs", Some("c.rs"))]))
+            .unwrap();
+        let row = &db.co_changes_for("b.rs", 10).unwrap()[0];
+        assert_eq!((row.count, row.weight), (5, 3.0));
+        assert_eq!(row.first_observed_at, None);
+        assert_eq!((row.window_mask, row.windows), (0, 1));
+        assert_eq!(row.last_observed_at, Some(500));
     }
 
     #[test]

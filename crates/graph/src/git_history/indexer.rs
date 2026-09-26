@@ -12,6 +12,16 @@
 //! - min visible co-change count = 3 (retain smaller counts for incremental indexing)
 //! - soft-skip `chore:` / `build:` commits UNLESS message contains migrate/refactor/adopt/deprecate
 //! - no-merges only (merge commits double-count work already in their parents)
+//! - rename continuity: commits are walked children-first and every change is
+//!   keyed to the path its file carries at HEAD, so a `git mv` keeps churn,
+//!   fixes, author events, and co-change pairs on the live path; an
+//!   incremental pass re-keys stored rows for paths renamed inside its range.
+//!   Copies are not followed (`-M` overrides `diff.renames=copies`).
+//!
+//! Rename limits: a dead file whose path a later file reuses shares that
+//! file's history, as it always has without renames. An edit to the old path
+//! on a parallel branch that `--topo-order` lists before the rename stays on
+//! the old path.
 //!
 //! Recurrence (`git_co_changes.window_mask` / `windows`): every shared commit
 //! sets bit `(ts / 90d) % 64` in the pair's mask, numbered against the unix
@@ -441,7 +451,8 @@ fn run_full(
     anchor: HistoryAnchor,
 ) -> Result<GitIndexStats> {
     let raw = run_git_log(root, None, anchor.cutoff())?;
-    let commits = parse_log(&raw)?;
+    let mut commits = parse_log(&raw)?;
+    follow_renames(&mut commits, exclude_set);
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
     let mut pairs: HashMap<(String, String), PairStats> = HashMap::new();
@@ -506,7 +517,16 @@ fn run_incremental(
     let anchor = anchors.current;
     let range = format!("{last_sha}..{head_sha}");
     let raw = run_git_log(root, Some(&range), anchor.cutoff())?;
-    let commits = parse_log(&raw)?;
+    let mut commits = parse_log(&raw)?;
+    // Stored rows are keyed by the names files had at `last_sha`; a rename in
+    // this range moves them, exactly as a full scan would key those commits.
+    let moves: Vec<(String, Option<String>)> = follow_renames(&mut commits, exclude_set)
+        .into_iter()
+        .map(|(from, to)| {
+            let kept = !is_excluded(exclude_set, &from) && !is_excluded(exclude_set, &to);
+            (from, kept.then_some(to))
+        })
+        .collect();
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
     let mut pairs: HashMap<(String, String), PairStats> = HashMap::new();
@@ -531,6 +551,7 @@ fn run_incremental(
     let mut co_change_kept = 0usize;
     db.execute_batch(|db| {
         decay_git_history_between(db, anchors.previous, anchor.epoch)?;
+        db.rekey_git_history(&moves)?;
         db.prune_git_author_events(anchor.cutoff())?;
         write_author_events(db, &commits, exclude_set)?;
         for (path, stats) in &files {
@@ -591,6 +612,61 @@ fn decay_git_history_between(db: &Database, from_anchor: i64, to_anchor: i64) ->
         db.scale_git_decay(factor)?;
     }
     Ok(())
+}
+
+/// Key every change to the path its file carries at the newest commit in
+/// `commits`, so history survives `git mv`. `commits` must list children before
+/// parents, as `run_git_log` does: a rename then applies to everything older.
+///
+/// A change whose historical path is excluded is dropped, since a pass that
+/// never stored it could not re-key it later. Changes a rename folds onto one
+/// path within a commit merge, so the commit counts once for that path.
+/// Returns each superseded path's current name.
+fn follow_renames(commits: &mut [Commit], exclude_set: &GlobSet) -> HashMap<String, String> {
+    let mut successor: HashMap<String, String> = HashMap::new();
+    for commit in commits.iter_mut() {
+        let mut keyed: Vec<FileChange> = Vec::with_capacity(commit.changes.len());
+        let mut slot: HashMap<String, usize> = HashMap::new();
+        for change in std::mem::take(&mut commit.changes) {
+            if is_excluded(exclude_set, &change.path) {
+                continue;
+            }
+            let path = successor.get(&change.path).cloned().unwrap_or(change.path);
+            match slot.get(&path) {
+                Some(&i) => {
+                    keyed[i].added = keyed[i].added.saturating_add(change.added);
+                    keyed[i].deleted = keyed[i].deleted.saturating_add(change.deleted);
+                }
+                None => {
+                    slot.insert(path.clone(), keyed.len());
+                    keyed.push(FileChange {
+                        path,
+                        added: change.added,
+                        deleted: change.deleted,
+                    });
+                }
+            }
+        }
+        commit.changes = keyed;
+        // Resolve every rename against the state before this commit, so a swap
+        // inside one commit does not chase its own entries.
+        let moves: Vec<(String, String)> = commit
+            .renames
+            .iter()
+            .map(|(old, new)| {
+                let current = successor.get(new).cloned().unwrap_or_else(|| new.clone());
+                (old.clone(), current)
+            })
+            .collect();
+        for (old, current) in moves {
+            if old == current {
+                successor.remove(&old);
+            } else {
+                successor.insert(old, current);
+            }
+        }
+    }
+    successor
 }
 
 fn filter_kept<'a>(commit: &'a Commit, exclude_set: &GlobSet) -> Option<Vec<&'a FileChange>> {
@@ -760,6 +836,9 @@ struct Commit {
     timestamp: i64,
     subject: String,
     changes: Vec<FileChange>,
+    /// `(old, new)` for every rename git detected in this commit, binary
+    /// files included.
+    renames: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -777,6 +856,12 @@ fn run_git_log(root: &Path, range: Option<&str>, since_epoch: i64) -> Result<Str
         // `log.showSignature` would interleave verification text with records.
         "--no-show-signature",
         "--no-merges",
+        // Children before parents regardless of committer-date skew, which
+        // `follow_renames` needs to apply a rename to everything older.
+        "--topo-order",
+        // Renames only, whatever `diff.renames` says: a copy record has the
+        // same numstat shape and would move the source's history onto the copy.
+        "-M",
         "--numstat",
         "-z",
         "--pretty=format:commit\x09%H\x09%ct\x09%ae%x1f%an%x1f%s%x00",
@@ -847,6 +932,7 @@ fn parse_log(raw: &str) -> Result<Vec<Commit>> {
                 timestamp: ts,
                 subject: subject.to_string(),
                 changes: Vec::new(),
+                renames: Vec::new(),
             });
             continue;
         }
@@ -868,20 +954,26 @@ fn parse_log(raw: &str) -> Result<Vec<Commit>> {
         let Some(path) = parts.next() else {
             continue;
         };
-        let path = if path.is_empty() {
-            let Some(_old_path) = records.next() else {
+        let (path, renamed_from) = if path.is_empty() {
+            let Some(old_path) = records.next() else {
                 break;
             };
             let Some(new_path) = records.next() else {
                 break;
             };
-            new_path
+            (new_path, Some(old_path))
         } else {
-            path
+            (path, None)
         };
         let Some(commit) = current.as_mut() else {
             continue;
         };
+        if let Some(old_path) = renamed_from
+            && !old_path.is_empty()
+            && !path.is_empty()
+        {
+            commit.renames.push((old_path.to_owned(), path.to_owned()));
+        }
         if path.is_empty() || added_s == "-" || deleted_s == "-" {
             continue;
         }
@@ -1408,6 +1500,111 @@ mod tests {
                    No signature\ncommit\tdef\t1700001000\tfeat: y\0\n2\t0\tc.rs\0";
         let err = parse_log(raw).unwrap_err();
         assert!(err.to_string().contains("No signature"), "{err}");
+    }
+
+    #[test]
+    fn parse_log_records_renames_including_binary_ones() {
+        let raw = "commit\tabc\t1700000000\tfeat: x\0\n0\t0\t\0old.rs\0new.rs\0\
+                   -\t-\t\0logo.png\0img/logo.png\x003\t1\tother.rs\0";
+        let commits = parse_log(raw).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(
+            commits[0].renames,
+            vec![
+                ("old.rs".to_string(), "new.rs".to_string()),
+                ("logo.png".to_string(), "img/logo.png".to_string()),
+            ]
+        );
+        let paths: Vec<&str> = commits[0].changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["new.rs", "other.rs"], "binary change skipped");
+    }
+
+    /// Newest-first commit carrying `changes` (paths) and `renames`.
+    fn commit_with(changes: &[&str], renames: &[(&str, &str)]) -> Commit {
+        Commit {
+            subject: "feat: x".into(),
+            changes: changes.iter().map(|p| make_change(p)).collect(),
+            renames: renames
+                .iter()
+                .map(|(old, new)| (old.to_string(), new.to_string()))
+                .collect(),
+            ..Commit::default()
+        }
+    }
+
+    fn paths_of(commit: &Commit) -> Vec<&str> {
+        commit.changes.iter().map(|c| c.path.as_str()).collect()
+    }
+
+    #[test]
+    fn follow_renames_keys_older_commits_to_the_newest_name() {
+        let none = GlobSet::empty();
+        // Newest first: b -> c, then a -> b, then edits under a.
+        let mut commits = vec![
+            commit_with(&["c.rs"], &[("b.rs", "c.rs")]),
+            commit_with(&["b.rs", "peer.rs"], &[("a.rs", "b.rs")]),
+            commit_with(&["a.rs", "peer.rs"], &[]),
+        ];
+        let successors = follow_renames(&mut commits, &none);
+        assert_eq!(paths_of(&commits[1]), ["c.rs", "peer.rs"]);
+        assert_eq!(paths_of(&commits[2]), ["c.rs", "peer.rs"]);
+        assert_eq!(successors.get("a.rs").map(String::as_str), Some("c.rs"));
+        assert_eq!(successors.get("b.rs").map(String::as_str), Some("c.rs"));
+        assert!(!successors.contains_key("c.rs"));
+    }
+
+    #[test]
+    fn follow_renames_applies_only_to_commits_older_than_the_rename() {
+        let none = GlobSet::empty();
+        // A new a.rs created after a.rs moved to c.rs is a different file.
+        let mut commits = vec![
+            commit_with(&["a.rs"], &[]),
+            commit_with(&["c.rs"], &[("a.rs", "c.rs")]),
+            commit_with(&["a.rs"], &[]),
+        ];
+        follow_renames(&mut commits, &none);
+        assert_eq!(paths_of(&commits[0]), ["a.rs"]);
+        assert_eq!(paths_of(&commits[2]), ["c.rs"]);
+    }
+
+    #[test]
+    fn follow_renames_rename_back_leaves_no_alias() {
+        let none = GlobSet::empty();
+        let mut commits = vec![
+            commit_with(&["a.rs"], &[("b.rs", "a.rs")]),
+            commit_with(&["b.rs"], &[("a.rs", "b.rs")]),
+            commit_with(&["a.rs"], &[]),
+        ];
+        let successors = follow_renames(&mut commits, &none);
+        assert!(commits.iter().all(|c| paths_of(c) == ["a.rs"]));
+        assert_eq!(successors.len(), 1);
+        assert_eq!(successors.get("b.rs").map(String::as_str), Some("a.rs"));
+    }
+
+    #[test]
+    fn follow_renames_resolves_a_swap_against_the_state_before_the_commit() {
+        let none = GlobSet::empty();
+        let mut commits = vec![
+            commit_with(&["a.rs", "b.rs"], &[("a.rs", "b.rs"), ("b.rs", "a.rs")]),
+            commit_with(&["a.rs"], &[]),
+            commit_with(&["b.rs"], &[]),
+        ];
+        follow_renames(&mut commits, &none);
+        assert_eq!(paths_of(&commits[1]), ["b.rs"]);
+        assert_eq!(paths_of(&commits[2]), ["a.rs"]);
+    }
+
+    #[test]
+    fn follow_renames_merges_paths_folded_onto_one_name_and_drops_excluded_origins() {
+        let vendor = build_exclude_set(&["vendor/**".to_string()]).unwrap();
+        let mut commits = vec![
+            commit_with(&["c.rs"], &[("a.rs", "c.rs"), ("vendor/v.rs", "src/v.rs")]),
+            commit_with(&["a.rs", "c.rs", "vendor/v.rs"], &[]),
+        ];
+        follow_renames(&mut commits, &vendor);
+        assert_eq!(paths_of(&commits[1]), ["c.rs"], "one change per path");
+        assert_eq!(commits[1].changes[0].added, 10);
+        assert_eq!(commits[1].changes[0].deleted, 2);
     }
 
     #[test]
