@@ -109,15 +109,21 @@ fn git_history_preserves_unicode_paths_and_rename_destinations() {
     git_history_index_with_options(&db, root, &[], IndexMode::Incremental).unwrap();
     let full = Database::open_in_memory().unwrap();
     git_history_index(&full, root).unwrap();
+    // The renamed file keeps its pre-rename commit under the new name.
     for path in paths.into_iter().chain(std::iter::once(new)) {
-        let expected = if path == "ascii.rs" { 2 } else { 1 };
+        let expected = match path {
+            p if p == old => None,
+            "ascii.rs" => Some(2),
+            p if p == new => Some(2),
+            _ => Some(1),
+        };
         assert_eq!(
-            db.git_file(path).unwrap().unwrap().total_commits,
+            db.git_file(path).unwrap().map(|row| row.total_commits),
             expected,
             "{path:?}"
         );
         assert_eq!(
-            full.git_file(path).unwrap().unwrap().total_commits,
+            full.git_file(path).unwrap().map(|row| row.total_commits),
             expected,
             "{path:?}"
         );
