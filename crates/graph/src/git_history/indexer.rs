@@ -472,12 +472,18 @@ fn compile_excludes(extra: &[String]) -> Result<(GlobSet, GlobSet)> {
     Ok((hard_set, test_set))
 }
 
+/// Bump when code-level rules that decide stored history rows change (commit
+/// soft-skips, fix-commit detection, pair accounting), so the next pass
+/// rebuilds instead of composing rows written under two rule sets.
+const HISTORY_POLICY_VERSION: u32 = 1;
+
 /// Canonical, order-independent identity for the effective exclusion policy:
 /// the hard exclusions plus the test-like set and per-commit file cap that
 /// decide which co-change pairs are stored. An empty user list is still a valid fingerprint so
 /// legacy NULL state cannot silently reuse rows built under another policy.
 fn effective_exclusion_fingerprint(extra_excludes: &[String]) -> String {
-    let mut encoded = format!("cap:{MAX_FILES_PER_COMMIT_FOR_COCHANGE}\0");
+    let mut encoded =
+        format!("policy:{HISTORY_POLICY_VERSION}\0cap:{MAX_FILES_PER_COMMIT_FOR_COCHANGE}\0");
     for pattern in TEST_LIKE_EXCLUDE_PATTERNS {
         encoded.push_str("test:");
         encoded.push_str(&pattern.len().to_string());
