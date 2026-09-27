@@ -443,9 +443,11 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     conn.execute_batch("PRAGMA mmap_size=268435456;")?;
     conn.execute_batch("PRAGMA cache_size=-65536;")?;
+    // Before SCHEMA: its `idx_semantic_files_path` statement fails on a table
+    // that lost its `path` column, which would block the open itself.
+    rebuild_malformed_semantic_files(conn)?;
     conn.execute_batch(SCHEMA)?;
-    run_migrations(conn)?;
-    rebuild_malformed_semantic_files(conn)
+    run_migrations(conn)
 }
 
 /// Whether `semantic_files` exists with the four freshness columns and the
@@ -467,28 +469,48 @@ pub(crate) fn semantic_files_shape_is_current(conn: &Connection) -> rusqlite::Re
 /// Migrations 0003/0004 run once, so a `semantic_files` table damaged or
 /// reshaped after they were stamped would make every semantic write fail.
 /// The table is only freshness bookkeeping: recreating it empty makes the
-/// next semantic pass re-embed, which is the repair the overview advises.
+/// next semantic pass re-embed, which is the repair the overview advises. A
+/// pre-0004 path-only table is recreated here too, which is what 0004 itself
+/// would do. An absent table is left for SCHEMA to create.
 fn rebuild_malformed_semantic_files(conn: &Connection) -> rusqlite::Result<()> {
-    if semantic_files_shape_is_current(conn)? {
+    let malformed = |conn: &Connection| -> rusqlite::Result<bool> {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'semantic_files')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(exists && !semantic_files_shape_is_current(conn)?)
+    };
+    if !malformed(conn)? {
         return Ok(());
     }
-    tracing::warn!("semantic_files has an unexpected shape; recreating it empty");
-    conn.execute_batch(
-        "BEGIN IMMEDIATE;
-         DROP TABLE IF EXISTS semantic_files;
-         CREATE TABLE semantic_files (
-             chunk_table TEXT NOT NULL,
-             path TEXT NOT NULL,
-             content_hash TEXT NOT NULL,
-             indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
-             PRIMARY KEY (chunk_table, path)
-         );
-         CREATE INDEX IF NOT EXISTS idx_semantic_files_path ON semantic_files(path);
-         COMMIT;",
-    )
-    .inspect_err(|_| {
-        let _ = conn.execute_batch("ROLLBACK");
-    })
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        // Another opener may have repaired it since the unlocked probe; a
+        // second DROP would discard rows written in between.
+        if !malformed(conn)? {
+            return Ok(());
+        }
+        tracing::warn!("semantic_files has an unexpected shape; recreating it empty");
+        conn.execute_batch(
+            "DROP TABLE semantic_files;
+             CREATE TABLE semantic_files (
+                 chunk_table TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                 PRIMARY KEY (chunk_table, path)
+             );
+             CREATE INDEX IF NOT EXISTS idx_semantic_files_path ON semantic_files(path);",
+        )
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT"),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 /// Migration bodies must be safe on an already-current schema: init_db creates
@@ -1361,7 +1383,8 @@ mod tests {
     #[test]
     fn init_db_recreates_a_malformed_semantic_files_table() {
         for damage in [
-            "DROP TABLE semantic_files",
+            "DROP TABLE semantic_files;
+             CREATE TABLE semantic_files(chunk_table TEXT, content_hash TEXT, indexed_at INTEGER)",
             "ALTER TABLE semantic_files RENAME COLUMN path TO legacy_path",
             "DROP TABLE semantic_files;
              CREATE TABLE semantic_files(chunk_table TEXT, path TEXT, content_hash TEXT, indexed_at INTEGER)",
