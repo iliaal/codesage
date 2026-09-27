@@ -350,7 +350,7 @@ impl CodeSageServer {
         self.blocking(move |s| {
             s.render(
                 &params.project,
-                s.with_project_root_db(&params.project, |root, db| {
+                s.with_project_root_db_read_only(&params.project, |root, db| {
                     codesage_graph::build_project_overview_with_options(
                         root,
                         db,

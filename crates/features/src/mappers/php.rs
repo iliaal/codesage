@@ -9,8 +9,9 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::mappers::shared::{
-    CommentSyntax, SOURCE_FILE_CAP, StringMode, collect_source_files, is_safe_dir, is_safe_file,
-    list_dir_files, list_dir_subdirs, read_to_string_bounded, rel_path, strip_comments, walk_files,
+    AUTH_SENSITIVE_TAG, CommentSyntax, SOURCE_FILE_CAP, StringMode, collect_source_files,
+    is_safe_dir, is_safe_file, list_dir_files, list_dir_subdirs, read_to_string_bounded, rel_path,
+    route_is_auth_sensitive, strip_comments, walk_files,
 };
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
@@ -737,6 +738,60 @@ fn line_at(text: &str, byte_off: usize) -> u32 {
     (text[..off].bytes().filter(|&b| b == b'\n').count() as u32) + 1
 }
 
+fn laravel_match_identity(registration: &str, verb_offset: usize) -> String {
+    let methods = laravel_match_methods(registration, verb_offset);
+    if methods.is_empty() {
+        "MATCH".to_string()
+    } else {
+        format!("MATCH[{}]", methods.join(","))
+    }
+}
+
+fn laravel_match_methods(registration: &str, verb_offset: usize) -> Vec<String> {
+    let Some(after_name) = registration
+        .get(verb_offset..)
+        .filter(|tail| tail.starts_with("match"))
+        .map(|_| verb_offset + "match".len())
+    else {
+        return Vec::new();
+    };
+    let Some(paren) = registration[after_name..].find('(').map(|i| after_name + i) else {
+        return Vec::new();
+    };
+    let match_start = paren + 1;
+    let Some(open) = registration[match_start..]
+        .find('[')
+        .map(|i| match_start + i)
+    else {
+        return Vec::new();
+    };
+    let Some(close) = registration[open..].find(']').map(|i| open + i) else {
+        return Vec::new();
+    };
+    let method_re = Regex::new(r#"['"]([A-Za-z]+)['"]"#).expect("valid method pattern");
+    method_re
+        .captures_iter(&registration[open..=close])
+        .filter_map(|caps| caps.get(1).map(|m| m.as_str().to_ascii_uppercase()))
+        .collect()
+}
+
+fn laravel_auth_method(verb: &str) -> &str {
+    let Some(methods) = verb
+        .strip_prefix("MATCH[")
+        .and_then(|v| v.strip_suffix(']'))
+    else {
+        return verb;
+    };
+    if methods
+        .split(',')
+        .all(|method| matches!(method, "GET" | "HEAD"))
+    {
+        "GET"
+    } else {
+        "MATCH"
+    }
+}
+
 fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
     let mut out = Vec::new();
     let routes_dir = root.join("routes");
@@ -983,10 +1038,18 @@ fn scan_route_region(
         {
             continue;
         }
-        let verb = cap
+        let raw_verb = cap
             .get(2)
             .map(|m| m.as_str().to_uppercase())
             .unwrap_or_default();
+        let verb = if raw_verb == "MATCH" {
+            laravel_match_identity(
+                whole.as_str(),
+                cap.get(2).map(|m| m.start() - whole.start()).unwrap_or(0),
+            )
+        } else {
+            raw_verb
+        };
         let pattern = cap.get(3).map(|m| m.as_str()).unwrap_or("");
         if verb.is_empty() || pattern.is_empty() {
             continue;
@@ -1167,11 +1230,17 @@ fn laravel_route_seeds(routes: &[LaravelRoute]) -> Vec<FeatureSeed> {
                 source: "laravel-route",
                 confidence: FeatureConfidence::High,
                 entry_route: Some(route.clone()),
-                tags: vec![
-                    "php".to_string(),
-                    "framework:laravel".to_string(),
-                    "route".to_string(),
-                ],
+                tags: {
+                    let mut tags = vec![
+                        "php".to_string(),
+                        "framework:laravel".to_string(),
+                        "route".to_string(),
+                    ];
+                    if route_is_auth_sensitive(laravel_auth_method(&r.verb), &r.pattern) {
+                        tags.push(AUTH_SENSITIVE_TAG.to_string());
+                    }
+                    tags
+                },
                 test_prefixes: vec!["tests/Feature".to_string(), "tests".to_string()],
                 ..FeatureSeed::new(
                     FeatureKind::Route,
@@ -1768,6 +1837,28 @@ mod tests {
     }
 
     #[test]
+    fn laravel_route_seed_tags_privileged_paths_and_methods() {
+        let route = |verb: &str, pattern: &str| LaravelRoute {
+            file: "routes/web.php".into(),
+            verb: verb.into(),
+            pattern: pattern.into(),
+            controller_class: None,
+            action: None,
+            line: 1,
+        };
+        let seeds = laravel_route_seeds(&[
+            route("POST", "/api/login"),
+            route("GET", "/admin/users"),
+            route("GET", "/authors"),
+            route("HEAD", "/token"),
+        ]);
+        assert!(seeds[0].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+        assert!(seeds[1].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+        assert!(!seeds[2].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+        assert!(seeds[3].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+    }
+
+    #[test]
     fn composer_bin_emits_cli_command_seed() {
         let dir = tempdir().unwrap();
         write(
@@ -1821,9 +1912,26 @@ mod tests {
             .iter()
             .find(|s| s.source == "php-ext")
             .expect("php-ext seed");
+
         assert!(s.title.contains("iconv"));
         assert!(s.tests.iter().any(|t| t.path.contains("bug001.phpt")));
         assert_eq!(s.entry_path, "ext/iconv/config.m4");
+    }
+    #[test]
+    fn laravel_match_uses_declared_methods_for_auth_classification() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "routes/web.php",
+            "<?php\nRoute::match(['GET', 'HEAD'], '/safe', fn () => null);\n\
+             Route::middleware(['auth'])->match(['POST'], '/write', fn () => null);\n",
+        );
+        let routes = parse_laravel_routes(dir.path()).unwrap();
+        assert_eq!(routes[0].verb, "MATCH[GET,HEAD]");
+        assert_eq!(routes[1].verb, "MATCH[POST]");
+        let seeds = laravel_route_seeds(&routes);
+        assert!(!seeds[0].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+        assert!(seeds[1].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
     }
 
     #[test]

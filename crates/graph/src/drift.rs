@@ -1,8 +1,14 @@
 //! Compare the structural index's recorded commit with HEAD without reindexing.
 //! Matching commits do not attest to working-tree or semantic-index freshness.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::{Duration, Instant};
 
 use codesage_parser::discover::{DEFAULT_EXCLUDE_PATTERNS, MAX_INDEXABLE_FILE_BYTES};
@@ -23,6 +29,192 @@ const DRIFT_CONTENT_BUDGET: Duration = Duration::from_millis(500);
 /// changed between the two commits, so a revert back to the indexed bytes is
 /// the rare case, and reading it would blow the budget.
 const MAX_DRIFT_BLOB_BYTES: u64 = 16 << 20;
+/// Hard upper bound for one metadata Git child. Content hashing gets a
+/// separate, shorter budget below; startup/configuration hangs must not pin
+/// status, overview, or rehearsal callers.
+const GIT_COMMAND_BUDGET: Duration = Duration::from_secs(2);
+const MAX_GIT_OUTPUT_BYTES: usize = 4 << 20;
+
+fn git_output(cwd: &Path, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take((MAX_GIT_OUTPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = tx.send(result);
+    });
+    let mut reaped = false;
+    let result = rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+        .and_then(Result::ok)
+        .filter(|bytes| bytes.len() <= MAX_GIT_OUTPUT_BYTES)
+        .and_then(|bytes| {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        reaped = true;
+                        break if status.success() { Some(bytes) } else { None };
+                    }
+                    Err(_) => break None,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(None) => break None,
+                }
+            }
+        });
+    if result.is_none() && !reaped {
+        #[cfg(unix)]
+        // SAFETY: the child was placed in its own process group above.
+        let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = reader.join();
+    result
+}
+
+fn git_output_with_stdin(
+    cwd: &Path,
+    args: &[&str],
+    input: &[u8],
+    deadline: Instant,
+) -> Option<(Option<i32>, Vec<u8>)> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+        let _ = stdin.flush();
+    });
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take((MAX_GIT_OUTPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = tx.send(result);
+    });
+    let mut reaped = false;
+    let result = rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+        .and_then(Result::ok)
+        .filter(|bytes| bytes.len() <= MAX_GIT_OUTPUT_BYTES)
+        .and_then(|bytes| {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        reaped = true;
+                        break Some((status.code(), bytes));
+                    }
+                    Err(_) => break None,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(None) => break None,
+                }
+            }
+        });
+    if result.is_none() && !reaped {
+        #[cfg(unix)]
+        // SAFETY: the child was placed in its own process group above.
+        let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = writer.join();
+    let _ = reader.join();
+    result
+}
+
+fn git_succeeded(cwd: &Path, args: &[&str], deadline: Instant) -> Option<bool> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().ok()?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    #[cfg(unix)]
+    // SAFETY: process_group(0) above created a group owned by this child.
+    let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
 
 /// Affected paths named in the drift summary.
 const DRIFT_SAMPLE: usize = 5;
@@ -245,24 +437,34 @@ pub fn check_drift(project_root: &Path, db: &Database) -> DriftReport {
         }
     };
 
-    let head_sha = git_head_sha(project_root);
+    let metadata_deadline = Instant::now() + GIT_COMMAND_BUDGET;
+    let head_lookup = git_head_lookup_with_deadline(project_root, metadata_deadline);
+    let head_sha = match &head_lookup {
+        HeadLookup::Found(sha) => Some(sha.clone()),
+        HeadLookup::Missing | HeadLookup::Indeterminate => None,
+    };
 
-    let (kind, commits_between) = match (&stored_sha, &head_sha) {
-        // An unborn HEAD is still a Git repository.
-        (_, None) => {
-            if git_common_dir(project_root).is_some() {
-                (DriftKind::NeverIndexed, None)
-            } else {
-                (DriftKind::NotGit, None)
+    let (kind, commits_between) = match (&stored_sha, &head_lookup) {
+        (_, HeadLookup::Indeterminate) => (DriftKind::Unknown, None),
+        (_, HeadLookup::Missing) => {
+            match git_common_dir_lookup_with_deadline(project_root, metadata_deadline) {
+                CommonDirLookup::Found(_) if stored_sha.is_none() => {
+                    (DriftKind::NeverIndexed, None)
+                }
+                CommonDirLookup::Found(_) => (DriftKind::Unknown, None),
+                CommonDirLookup::NotGit => (DriftKind::NotGit, None),
+                CommonDirLookup::Indeterminate => (DriftKind::Unknown, None),
             }
         }
-        (None, Some(_)) => (DriftKind::NeverIndexed, None),
-        (Some(stored), Some(head)) if stored == head => (DriftKind::Fresh, None),
-        (Some(stored), Some(head)) => match commits_between(project_root, stored, head) {
-            CommitsBetween::Count(n) => (DriftKind::BehindHead, Some(n)),
-            CommitsBetween::NotAncestor => (DriftKind::UnrelatedAncestor, None),
-            CommitsBetween::Unknown => (DriftKind::Unknown, None),
-        },
+        (None, HeadLookup::Found(_)) => (DriftKind::NeverIndexed, None),
+        (Some(stored), HeadLookup::Found(head)) if stored == head => (DriftKind::Fresh, None),
+        (Some(stored), HeadLookup::Found(head)) => {
+            match commits_between(project_root, stored, head, metadata_deadline) {
+                CommitsBetween::Count(n) => (DriftKind::BehindHead, Some(n)),
+                CommitsBetween::NotAncestor => (DriftKind::UnrelatedAncestor, None),
+                CommitsBetween::Unknown => (DriftKind::Unknown, None),
+            }
+        }
     };
 
     // The commit range is only a candidate list; the answer agents act on is
@@ -421,13 +623,29 @@ fn measure_indexed_files_behind(
     max_candidates: usize,
     budget: Duration,
 ) -> Option<FilesBehind> {
-    let changed = changed_paths(cwd, stored, head)?;
+    let deadline = Instant::now() + budget;
+    if Instant::now() >= deadline {
+        return Some(FilesBehind {
+            bounded: true,
+            ..FilesBehind::default()
+        });
+    }
+    let changed = match changed_paths(cwd, stored, head, deadline) {
+        Some(changed) => changed,
+        None if Instant::now() >= deadline => {
+            return Some(FilesBehind {
+                bounded: true,
+                ..FilesBehind::default()
+            });
+        }
+        None => return None,
+    };
     let mut behind = FilesBehind::default();
     if changed.is_empty() {
         return Some(behind);
     }
     let indexed = db.all_file_hashes().ok()?;
-    let deadline = Instant::now() + budget;
+
     let mut candidates: Vec<(String, Option<String>)> = changed
         .into_iter()
         .filter_map(|path| match indexed.get(&path) {
@@ -441,7 +659,9 @@ fn measure_indexed_files_behind(
         candidates.truncate(max_candidates);
         behind.bounded = true;
     }
-    retain_discoverable(cwd, head, &mut candidates);
+    if !retain_discoverable(cwd, head, &mut candidates, deadline) {
+        behind.bounded = true;
+    }
     if candidates.is_empty() {
         return Some(behind);
     }
@@ -451,118 +671,91 @@ fn measure_indexed_files_behind(
 
 /// Drop the never-indexed candidates discovery would skip even though HEAD
 /// carries them: paths `.gitignore` matches (the walker honors it, `git add
-/// -f` does not) and symlinks (the walker takes regular files only, while
+/// `-f` does not) and symlinks (the walker takes regular files only, while
 /// `cat-file` types a symlink as `blob`). Indexed candidates are kept as they
 /// are. A git failure drops nothing, which keeps the unverifiable case on the
 /// side that recommends a reindex.
-fn retain_discoverable(cwd: &Path, head: &str, candidates: &mut Vec<(String, Option<String>)>) {
+fn retain_discoverable(
+    cwd: &Path,
+    head: &str,
+    candidates: &mut Vec<(String, Option<String>)>,
+    deadline: Instant,
+) -> bool {
     let unindexed: Vec<&str> = candidates
         .iter()
         .filter(|(_, hash)| hash.is_none())
         .map(|(path, _)| path.as_str())
         .collect();
     if unindexed.is_empty() {
-        return;
+        return true;
     }
-    let ignored = gitignored_paths(cwd, &unindexed);
-    let symlinks = symlink_paths(cwd, head, &unindexed);
-    if ignored.is_empty() && symlinks.is_empty() {
-        return;
-    }
+    let ignored = gitignored_paths(cwd, &unindexed, deadline);
+    let symlinks = symlink_paths(cwd, head, &unindexed, deadline);
+    let complete = ignored.is_some() && symlinks.is_some();
     candidates.retain(|(path, hash)| {
-        hash.is_some() || !(ignored.contains(path) || symlinks.contains(path))
+        hash.is_some()
+            || !(ignored.as_ref().is_some_and(|paths| paths.contains(path))
+                || symlinks.as_ref().is_some_and(|paths| paths.contains(path)))
     });
+    complete
 }
 
-/// The subset of `paths` that `.gitignore`, `.git/info/exclude`, or the global
-/// excludes file matches. `--no-index` is required: without it git reports
-/// nothing for a tracked path, and every candidate here is tracked at HEAD.
-fn gitignored_paths(cwd: &Path, paths: &[&str]) -> std::collections::HashSet<String> {
-    use std::io::Write;
-    use std::process::Stdio;
-
-    let mut ignored = std::collections::HashSet::new();
-    let Ok(mut child) = Command::new("git")
-        .args(["check-ignore", "-z", "--stdin", "--no-index"])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return ignored;
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return ignored;
-    };
+fn gitignored_paths(
+    cwd: &Path,
+    paths: &[&str],
+    deadline: Instant,
+) -> Option<std::collections::HashSet<String>> {
     let requests: Vec<u8> = paths
         .iter()
         .flat_map(|path| path.bytes().chain(std::iter::once(0)))
         .collect();
-    // git writes matches as it reads, so the request side needs its own
-    // thread or the two processes deadlock on full pipes.
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&requests);
-    });
-    let out = child.wait_with_output();
-    let _ = writer.join();
-    let Ok(out) = out else {
-        return ignored;
-    };
-    // Exit 1 means no path is ignored; anything else past 0 is a failure.
-    if !matches!(out.status.code(), Some(0 | 1)) {
-        return ignored;
+    let (status, bytes) = git_output_with_stdin(
+        cwd,
+        &["check-ignore", "-z", "--stdin", "--no-index"],
+        &requests,
+        deadline,
+    )?;
+    match status {
+        Some(0) => Some(
+            String::from_utf8_lossy(&bytes)
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        ),
+        Some(1) => Some(std::collections::HashSet::new()),
+        _ => None,
     }
-    ignored.extend(
-        String::from_utf8_lossy(&out.stdout)
-            .split('\0')
-            .filter(|path| !path.is_empty())
-            .map(str::to_owned),
-    );
-    ignored
 }
 
-/// The subset of `paths` that `head` carries as a symlink (tree mode
-/// `120000`). Paths are passed literally so glob characters and pathspec
-/// magic in a file name cannot widen the lookup.
-fn symlink_paths(cwd: &Path, head: &str, paths: &[&str]) -> std::collections::HashSet<String> {
-    let mut symlinks = std::collections::HashSet::new();
-    let out = Command::new("git")
-        .args(["--literal-pathspecs", "ls-tree", "-r", "-z", head, "--"])
-        .args(paths)
-        .current_dir(cwd)
-        .stderr(std::process::Stdio::null())
-        .output();
-    let Ok(out) = out else {
-        return symlinks;
-    };
-    if !out.status.success() {
-        return symlinks;
-    }
-    // `<mode> SP <type> SP <oid> TAB <path>` per record.
-    symlinks.extend(
-        String::from_utf8_lossy(&out.stdout)
+fn symlink_paths(
+    cwd: &Path,
+    head: &str,
+    paths: &[&str],
+    deadline: Instant,
+) -> Option<std::collections::HashSet<String>> {
+    let mut args = vec!["--literal-pathspecs", "ls-tree", "-r", "-z", head, "--"];
+    args.extend(paths.iter().copied());
+    let bytes = git_output(cwd, &args, deadline)?;
+    Some(
+        String::from_utf8_lossy(&bytes)
             .split('\0')
             .filter_map(|record| {
                 let (meta, path) = record.split_once('\t')?;
                 meta.starts_with("120000 ").then(|| path.to_owned())
-            }),
-    );
-    symlinks
+            })
+            .collect(),
+    )
 }
 
-/// Paths changed between two commits, relative to `cwd` and restricted to it,
-/// so a project root below the repository root measures only its own subtree.
-/// `--no-renames` keeps both endpoints of a rename in the candidate set.
-fn changed_paths(cwd: &Path, stored: &str, head: &str) -> Option<Vec<String>> {
+fn changed_paths(cwd: &Path, stored: &str, head: &str, deadline: Instant) -> Option<Vec<String>> {
     if !is_object_name(stored) || !is_object_name(head) {
         return None;
     }
     let range = format!("{stored}..{head}");
-    let out = Command::new("git")
-        .args([
+    let bytes = git_output(
+        cwd,
+        &[
             "diff",
             "--name-only",
             "-z",
@@ -570,17 +763,11 @@ fn changed_paths(cwd: &Path, stored: &str, head: &str) -> Option<Vec<String>> {
             "--relative",
             &range,
             "--",
-        ])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    // A path git cannot spell in UTF-8 cannot be in the index either, so the
-    // lossy replacement simply fails to intersect.
+        ],
+        deadline,
+    )?;
     Some(
-        String::from_utf8_lossy(&out.stdout)
+        String::from_utf8_lossy(&bytes)
             .split('\0')
             .filter(|path| !path.is_empty())
             .map(str::to_owned)
@@ -588,19 +775,12 @@ fn changed_paths(cwd: &Path, stored: &str, head: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Reject anything that could be read as an option or a pathspec; the stored
-/// SHA comes out of the database and reaches git ahead of `--`.
 fn is_object_name(sha: &str) -> bool {
     !sha.is_empty() && sha.len() <= 64 && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// A touched path paired with the content hash the index holds for it;
-/// `None` marks a path the index does not hold, behind only if HEAD carries
-/// an indexable blob at it.
 type Candidate<'a> = &'a (String, Option<String>);
 
-/// Hash every candidate's HEAD blob and count the ones that differ from the
-/// indexed content. One `git cat-file --batch` serves the whole set.
 fn compare_head_blobs(
     cwd: &Path,
     head: &str,
@@ -608,13 +788,7 @@ fn compare_head_blobs(
     deadline: Instant,
     out: &mut FilesBehind,
 ) -> Option<()> {
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::process::Stdio;
-
-    // `git cat-file --batch` reads newline-terminated requests and its `-z`
-    // input mode only exists from Git 2.36, so a path holding a newline cannot
-    // be asked for. Counting it affected keeps the unverifiable case on the
-    // side that recommends a reindex.
+    use std::io::{BufRead, BufReader, Write};
     let (askable, unaskable): (Vec<Candidate<'_>>, Vec<Candidate<'_>>) = candidates
         .iter()
         .partition(|(path, _)| !path.contains('\n'));
@@ -624,30 +798,53 @@ fn compare_head_blobs(
     if askable.is_empty() {
         return Some(());
     }
-
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["cat-file", "--batch"])
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
-    // `./` makes git resolve the path against the working directory, matching
-    // the `--relative` spelling the candidates arrived in.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = Arc::new(Mutex::new(command.spawn().ok()?));
+    #[cfg(unix)]
+    let child_pid = child.lock().ok()?.id();
+    let (mut stdin, stdout) = {
+        let mut child = child.lock().ok()?;
+        (child.stdin.take()?, child.stdout.take()?)
+    };
+    let finished = Arc::new(AtomicBool::new(false));
+    let watchdog_finished = Arc::clone(&finished);
+    let watchdog_child = Arc::clone(&child);
+    let watchdog = std::thread::spawn(move || {
+        while !watchdog_finished.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if !watchdog_finished.load(Ordering::Acquire) {
+            #[cfg(unix)]
+            // SAFETY: the child was placed in its own process group above.
+            let _ = unsafe { libc::killpg(child_pid as libc::pid_t, libc::SIGKILL) };
+            if let Ok(mut child) = watchdog_child.lock() {
+                let _ = child.kill();
+            }
+        }
+    });
     let requests: String = askable
         .iter()
         .map(|(path, _)| format!("{head}:./{path}\n"))
         .collect();
-    // git blocks writing output once its pipe fills, so the request side needs
-    // its own thread or the two processes deadlock on each other.
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(requests.as_bytes());
         let _ = stdin.flush();
     });
-    let mut reader = BufReader::new(child.stdout.take()?);
-
+    let mut reader = BufReader::new(stdout);
     let mut incomplete = false;
     for (path, stored_hash) in askable.iter().copied() {
         if Instant::now() >= deadline {
@@ -663,10 +860,7 @@ fn compare_head_blobs(
             parse_batch_header(header.trim_end_matches('\n')),
             stored_hash,
         ) {
-            // `missing` / `ambiguous`: HEAD no longer carries this path's
-            // content, which is exactly what a deletion looks like.
             (None, Some(_)) => out.record(path),
-            // Touched but absent at HEAD and never indexed: nothing to index.
             (None, None) => {}
             (Some((is_blob, size)), Some(_)) if !is_blob || size > MAX_DRIFT_BLOB_BYTES => {
                 out.record(path);
@@ -688,9 +882,6 @@ fn compare_head_blobs(
                     out.record(path);
                 }
             }
-            // An added file: discovery would index a blob under its size cap,
-            // so its bytes need not be read. A gitlink or an oversized blob is
-            // skipped by the indexer too.
             (Some((is_blob, size)), None) => {
                 if is_blob && size <= MAX_INDEXABLE_FILE_BYTES {
                     out.record(path);
@@ -705,18 +896,18 @@ fn compare_head_blobs(
     if incomplete {
         out.bounded = true;
     }
-    // Kill first: an early exit leaves the writer parked on a full pipe until
-    // git's read end goes away.
+    finished.store(true, Ordering::Release);
+    let _ = watchdog.join();
+    let mut child = child.lock().ok()?;
+    #[cfg(unix)]
+    // SAFETY: process_group(0) above created a group owned by this child.
+    let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
     let _ = child.kill();
     let _ = writer.join();
     let _ = child.wait();
     Some(())
 }
 
-/// `<oid> SP <type> SP <size>` from `git cat-file --batch`, as
-/// `(type == "blob", size)`. `None` for a `missing` / `ambiguous` line, which
-/// carries no payload. The object-id shape is checked so a path whose own
-/// bytes mimic a record header cannot desynchronize the stream.
 fn parse_batch_header(header: &str) -> Option<(bool, u64)> {
     let fields: Vec<&str> = header.split(' ').collect();
     if fields.len() != 3
@@ -742,52 +933,96 @@ fn skip_exactly(reader: &mut impl std::io::Read, mut remaining: u64) -> bool {
     }
     true
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeadLookup {
+    Found(String),
+    Missing,
+    Indeterminate,
+}
 
-/// `git rev-parse HEAD`, returning the full SHA string. `None` when git fails
-/// or the repo has no HEAD (fresh `git init`, for example).
-pub fn git_head_sha(cwd: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .arg("rev-parse")
-        .arg("HEAD")
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+fn git_head_lookup(cwd: &Path) -> HeadLookup {
+    git_head_lookup_with_deadline(cwd, Instant::now() + GIT_COMMAND_BUDGET)
+}
+
+fn git_head_lookup_with_deadline(cwd: &Path, deadline: Instant) -> HeadLookup {
+    match git_succeeded(cwd, &["rev-parse", "HEAD"], deadline) {
+        Some(true) => {}
+        Some(false) => return HeadLookup::Missing,
+        None => return HeadLookup::Indeterminate,
     }
-    let sha = String::from_utf8(out.stdout).ok()?;
+    let output_deadline = Instant::now() + GIT_COMMAND_BUDGET;
+    let Some(bytes) = git_output(cwd, &["rev-parse", "HEAD"], output_deadline) else {
+        return HeadLookup::Indeterminate;
+    };
+    let Ok(sha) = String::from_utf8(bytes) else {
+        return HeadLookup::Indeterminate;
+    };
     let sha = sha.trim();
     if sha.is_empty() {
-        None
+        HeadLookup::Missing
     } else {
-        Some(sha.to_string())
+        HeadLookup::Found(sha.to_string())
     }
 }
 
-/// Resolve the canonical git common directory (the actual `.git`, even from
-/// inside a worktree) for `cwd`. Returns `None` when not a git repo or git is
-/// unavailable. Result paths are absolute.
-pub fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .arg("rev-parse")
-        .arg("--git-common-dir")
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+pub fn git_head_sha(cwd: &Path) -> Option<String> {
+    match git_head_lookup(cwd) {
+        HeadLookup::Found(sha) => Some(sha),
+        HeadLookup::Missing | HeadLookup::Indeterminate => None,
     }
-    let dir = String::from_utf8(out.stdout).ok()?;
+}
+
+pub fn git_head_sha_for_attestation(cwd: &Path) -> anyhow::Result<Option<String>> {
+    match git_head_lookup(cwd) {
+        HeadLookup::Found(sha) => Ok(Some(sha)),
+        HeadLookup::Missing => Ok(None),
+        HeadLookup::Indeterminate => {
+            anyhow::bail!("could not determine Git HEAD for index attestation")
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommonDirLookup {
+    Found(PathBuf),
+    NotGit,
+    Indeterminate,
+}
+
+fn git_common_dir_lookup(cwd: &Path) -> CommonDirLookup {
+    git_common_dir_lookup_with_deadline(cwd, Instant::now() + GIT_COMMAND_BUDGET)
+}
+
+fn git_common_dir_lookup_with_deadline(cwd: &Path, deadline: Instant) -> CommonDirLookup {
+    match git_succeeded(cwd, &["rev-parse", "--git-common-dir"], deadline) {
+        Some(true) => {}
+        Some(false) => return CommonDirLookup::NotGit,
+        None => return CommonDirLookup::Indeterminate,
+    }
+    let output_deadline = Instant::now() + GIT_COMMAND_BUDGET;
+    let Some(bytes) = git_output(cwd, &["rev-parse", "--git-common-dir"], output_deadline) else {
+        return CommonDirLookup::Indeterminate;
+    };
+    let Ok(dir) = String::from_utf8(bytes) else {
+        return CommonDirLookup::Indeterminate;
+    };
     let dir = dir.trim();
     if dir.is_empty() {
-        return None;
+        return CommonDirLookup::Indeterminate;
     }
     let path = Path::new(dir);
-    Some(if path.is_absolute() {
+    CommonDirLookup::Found(if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
     })
+}
+
+pub fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
+    match git_common_dir_lookup(cwd) {
+        CommonDirLookup::Found(path) => Some(path),
+        CommonDirLookup::NotGit | CommonDirLookup::Indeterminate => None,
+    }
 }
 
 enum CommitsBetween {
@@ -796,31 +1031,22 @@ enum CommitsBetween {
     Unknown,
 }
 
-/// `git rev-list --count a..b`. Returns `NotAncestor` when the stored SHA is
-/// not an ancestor of HEAD (git prints 0 in that case too, so we explicitly
-/// test ancestry first to avoid conflating rebases with freshness).
-fn commits_between(cwd: &Path, a: &str, b: &str) -> CommitsBetween {
-    let ancestor = Command::new("git")
-        .args(["merge-base", "--is-ancestor", a, b])
-        .current_dir(cwd)
-        .status();
-    match ancestor {
-        Ok(s) if s.success() => {}
-        Ok(_) => return CommitsBetween::NotAncestor,
-        Err(_) => return CommitsBetween::Unknown,
+fn commits_between(cwd: &Path, a: &str, b: &str, deadline: Instant) -> CommitsBetween {
+    match git_succeeded(cwd, &["merge-base", "--is-ancestor", a, b], deadline) {
+        Some(true) => {}
+        Some(false) => return CommitsBetween::NotAncestor,
+        None => return CommitsBetween::Unknown,
     }
-    let out = Command::new("git")
-        .args(["rev-list", "--count", &format!("{a}..{b}")])
-        .current_dir(cwd)
-        .output();
-    let Ok(out) = out else {
+    let output_deadline = Instant::now() + GIT_COMMAND_BUDGET;
+    let Some(bytes) = git_output(
+        cwd,
+        &["rev-list", "--count", &format!("{a}..{b}")],
+        output_deadline,
+    ) else {
         return CommitsBetween::Unknown;
     };
-    if !out.status.success() {
-        return CommitsBetween::Unknown;
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    raw.trim()
+    String::from_utf8_lossy(&bytes)
+        .trim()
         .parse::<u32>()
         .map(CommitsBetween::Count)
         .unwrap_or(CommitsBetween::Unknown)
@@ -945,6 +1171,64 @@ pub fn drift_log_path(project_root: &Path, project_dir_name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incomplete_discoverability_metadata_keeps_candidates_and_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut candidates = vec![("new.rs".to_string(), None)];
+        assert!(!retain_discoverable(
+            dir.path(),
+            "not-a-sha",
+            &mut candidates,
+            Instant::now() + Duration::from_millis(100),
+        ));
+        assert_eq!(candidates, vec![("new.rs".to_string(), None)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_git_child_is_killed_at_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let fifo = root.join("stall.config");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let config_path = root.join(".git/config");
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str(&format!("\n[include]\n\tpath = {}\n", fifo.display()));
+        std::fs::write(&config_path, config).unwrap();
+
+        let started = Instant::now();
+        assert_eq!(
+            git_succeeded(
+                root,
+                &["rev-parse", "HEAD"],
+                started + Duration::from_millis(100)
+            ),
+            None
+        );
+        assert_eq!(
+            git_head_lookup_with_deadline(root, started + Duration::from_millis(100)),
+            HeadLookup::Indeterminate
+        );
+        assert_eq!(
+            git_common_dir_lookup_with_deadline(root, started + Duration::from_millis(100)),
+            CommonDirLookup::Indeterminate
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn drift_append_preserves_valid_records_around_an_interrupted_tail() {
@@ -1477,7 +1761,15 @@ mod tests {
         let head = write_and_commit(root, &[("src/a.rs", "fn a() {}\n")], "base");
         let db = Database::open_in_memory().unwrap();
 
-        assert!(changed_paths(root, "--output=/tmp/pwned", &head).is_none());
+        assert!(
+            changed_paths(
+                root,
+                "--output=/tmp/pwned",
+                &head,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .is_none()
+        );
         assert!(
             measure_indexed_files_behind(
                 root,

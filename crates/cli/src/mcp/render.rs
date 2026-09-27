@@ -1,6 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
+use codesage_storage::Database;
 use rmcp::model::{CallToolResult, ContentBlock};
 
 use super::CodeSageServer;
@@ -203,14 +204,14 @@ impl CodeSageServer {
     fn compute_stale_files(&self, project: &str, rel_paths: &[String]) -> Result<Vec<String>> {
         // `resolve_project_inner` keeps the check free of watcher side effects,
         // so `edit_check` can be annotated without starting one.
-        let state = self.resolve_project_inner(project)?;
+        let state = self.resolve_project_read_only(project)?;
         let root = state
             .db_path
             .parent()
             .and_then(|p| p.parent())
             .ok_or_else(|| anyhow::anyhow!("could not derive project root from db path"))?
             .to_path_buf();
-        let db = self.open_structural_db_for(&state)?;
+        let db = Database::open_read_only(&state.db_path)?;
         let mut stale = Vec::new();
         for rel in rel_paths {
             let Some(expected) = db.get_file_hash(rel)? else {

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -297,6 +297,8 @@ pub(crate) struct CodeSageServerState {
     /// envelope key for the daemon's whole lifetime, like `RUST_LOG`.
     pub(super) envelope_enabled: bool,
     project_cache: Mutex<ProjectCache>,
+    pending_drift_logs: Mutex<HashSet<PathBuf>>,
+    drift_log_in_progress: Mutex<HashSet<PathBuf>>,
     embedders: ModelMap<Embedder>,
     rerankers: ModelMap<Reranker>,
     /// One watcher per canonical project root, started lazily and reaped on shutdown.
@@ -599,6 +601,7 @@ fn model_error(context: &str, error: anyhow::Error) -> anyhow::Error {
 /// [`embedder_pool_key`] over the model files a load would open, resolving
 /// them (downloading on a cache miss) exactly as `Embedder::new` is about to.
 fn resolved_embedder_pool_key(config: &EmbeddingConfig) -> Result<String> {
+    config.effective_batch_size()?;
     let artifacts = codesage_embed::model::resolve_model_artifacts(&config.model)
         .with_context(|| format!("resolving model files for {:?}", config.model))?;
     let digest = codesage_embed::fingerprint::model_artifact_digest(&artifacts)?;
@@ -661,6 +664,8 @@ impl CodeSageServerState {
                 std::env::var("CODESAGE_ENVELOPE").ok().as_deref(),
             ),
             project_cache: Mutex::new(ProjectCache::default()),
+            pending_drift_logs: Mutex::new(HashSet::new()),
+            drift_log_in_progress: Mutex::new(HashSet::new()),
             embedders: Mutex::new(HashMap::new()),
             rerankers: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
@@ -729,6 +734,24 @@ impl CodeSageServer {
         let state = self.resolve_project_inner(project)?;
         self.maybe_start_watcher(&state, false);
         Ok(state)
+    }
+    fn flush_pending_drift_log(&self, state: &ProjectState) {
+        let Some(root) = state.db_path.parent().and_then(|p| p.parent()) else {
+            return;
+        };
+        let root = root.to_path_buf();
+        if !self.state.pending_drift_logs.lock().contains(&root)
+            || !self.state.drift_log_in_progress.lock().insert(root.clone())
+        {
+            return;
+        }
+        self.state.pending_drift_logs.lock().remove(&root);
+        let result = write_drift_log_for_project(&root, &state.db_path);
+        self.state.drift_log_in_progress.lock().remove(&root);
+        if let Err(error) = result {
+            tracing::debug!(error = %error, "pending drift log append failed");
+            self.state.pending_drift_logs.lock().insert(root);
+        }
     }
 
     fn maybe_start_watcher(&self, state: &ProjectState, semantic_query: bool) {
@@ -810,9 +833,24 @@ impl CodeSageServer {
         }
     }
 
+    pub(super) fn resolve_project_read_only(&self, project: &str) -> Result<ProjectState> {
+        self.resolve_project_inner_with_drift(project, false)
+    }
+
     pub(super) fn resolve_project_inner(&self, project: &str) -> Result<ProjectState> {
+        self.resolve_project_inner_with_drift(project, true)
+    }
+
+    fn resolve_project_inner_with_drift(
+        &self,
+        project: &str,
+        log_drift: bool,
+    ) -> Result<ProjectState> {
         // Cached roots still need config-mtime and index-existence checks after edits or resets.
         if let Some(state) = self.state.project_cache.lock().raw(project) {
+            if log_drift {
+                self.flush_pending_drift_log(&state);
+            }
             return Ok(state);
         }
         let path = PathBuf::from(project);
@@ -835,6 +873,9 @@ impl CodeSageServer {
             let state = self.state.project_cache.lock().canonical(&canonical);
             if let Some(state) = state {
                 self.state.cache_project(project, &canonical, &state);
+                if log_drift {
+                    self.flush_pending_drift_log(&state);
+                }
                 return Ok(state);
             }
         }
@@ -881,9 +922,38 @@ impl CodeSageServer {
             return Ok(state);
         }
         // Reloads replace stale state; admission after an eviction registers it again.
-        let newly_registered = self.state.cache_project(project, &canonical, &state);
-        if newly_registered && let Err(e) = write_drift_log_for_project(&canonical, &db_path) {
-            tracing::debug!(error = %e, "drift log append failed");
+        let was_pending = self.state.pending_drift_logs.lock().contains(&canonical);
+        if !log_drift {
+            self.state
+                .pending_drift_logs
+                .lock()
+                .insert(canonical.clone());
+        }
+        let admitted = self.state.cache_project(project, &canonical, &state);
+        if !admitted {
+            self.state.pending_drift_logs.lock().remove(&canonical);
+            return Ok(state);
+        }
+        if log_drift {
+            if was_pending {
+                self.flush_pending_drift_log(&state);
+            } else if self
+                .state
+                .drift_log_in_progress
+                .lock()
+                .insert(canonical.clone())
+            {
+                let result = write_drift_log_for_project(&canonical, &db_path);
+                self.state.drift_log_in_progress.lock().remove(&canonical);
+                if result.is_ok() {
+                    self.state.pending_drift_logs.lock().remove(&canonical);
+                } else {
+                    self.state
+                        .pending_drift_logs
+                        .lock()
+                        .insert(canonical.clone());
+                }
+            }
         }
         Ok(state)
     }
@@ -1219,6 +1289,23 @@ impl CodeSageServer {
     {
         let state = self.resolve_project(project)?;
         let db = self.open_structural_db_for(&state)?;
+        let root = state
+            .db_path
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| anyhow::anyhow!("could not derive project root from db path"))?;
+        f(root, &db)
+    }
+
+    /// Read project state without running schema migrations. Overview must
+    /// observe a damaged/legacy semantic schema instead of repairing it first.
+    pub(super) fn with_project_root_db_read_only<F, R>(&self, project: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&Path, &Database) -> Result<R>,
+    {
+        let state = self.resolve_project_read_only(project)?;
+        self.maybe_start_watcher(&state, false);
+        let db = Database::open_existing_for_overview(&state.db_path)?;
         let root = state
             .db_path
             .parent()
@@ -1682,6 +1769,22 @@ mod tests {
             embedder_pool_key(&config, "digest-b").unwrap(),
             mean,
             "a same-name model whose files changed must not share a session"
+        );
+    }
+    #[test]
+    fn resolved_pool_key_rejects_batch_before_model_resolution() {
+        use std::num::NonZeroUsize;
+
+        let mut config = EmbeddingConfig {
+            model: "not-a-real-model".into(),
+            ..EmbeddingConfig::default()
+        };
+        config.batch_size_override = NonZeroUsize::new(257);
+        let error = resolved_embedder_pool_key(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds max supported batch size")
         );
     }
 
@@ -3164,5 +3267,25 @@ mod tests {
         db.record_semantic_fingerprint(expected.as_str()).unwrap();
         CodeSageServer::enforce_test_override_freshness(&db, Some(&expected))
             .expect("current table must pass the override gate");
+    }
+    #[test]
+    fn read_only_project_resolution_does_not_migrate_or_log_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let db_path = root.join(".codesage/index.db");
+        let db = Database::open(&db_path).unwrap();
+        db.execute_raw_for_tests("DROP TABLE semantic_files")
+            .unwrap();
+        drop(db);
+        let server = CodeSageServer::new();
+        server
+            .resolve_project_read_only(root.to_str().unwrap())
+            .unwrap();
+        assert!(!root.join(".codesage/drift.log").exists());
+        let read = Database::open_read_only(&db_path).unwrap();
+        assert!(read.semantic_file_count().is_err());
+        server.resolve_project(root.to_str().unwrap()).unwrap();
+        assert!(root.join(".codesage/drift.log").exists());
     }
 }

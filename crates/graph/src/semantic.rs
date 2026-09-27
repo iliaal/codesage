@@ -530,8 +530,10 @@ impl std::fmt::Display for StaleSemanticTable {
             SemanticTableState::Current => write!(f, "semantic index is current"),
             SemanticTableState::Unrecorded => write!(
                 f,
-                "semantic index records no fingerprint (never fully embedded under this \
-                 CodeSage version, or a rebuild did not complete); run `codesage index --full`"
+                "semantic index is unavailable ({}) or records no fingerprint (never fully \
+                 embedded under this CodeSage version, or a rebuild did not complete); run \
+                 `codesage index --full`",
+                self.current
             ),
             SemanticTableState::Mismatch { stored } => write!(
                 f,

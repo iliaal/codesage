@@ -1601,6 +1601,10 @@ pub struct Embedder {
 
 impl Embedder {
     pub fn new(config: &EmbeddingConfig) -> Result<Self> {
+        // Reject an invalid override before resolving artifacts or creating a
+        // native session. This is the private-query constructor as well as the
+        // indexing constructor, so cache state cannot change the error.
+        let batch_size = config.effective_batch_size()?;
         tracing::info!(model = %config.model, "loading embedding model");
         let LoadedSession {
             session,
@@ -1610,7 +1614,6 @@ impl Embedder {
         } = load_onnx_session_with_provider(&config.model, &config.device)?;
         let dim = detect_dim(&session)?;
         let pooling = config.pooling_strategy();
-        let batch_size = config.effective_batch_size()?;
 
         tracing::info!(
             dim,
@@ -1783,6 +1786,29 @@ fn detect_dim(session: &Session) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embedder_rejects_oversized_batch_before_model_access() {
+        use std::num::NonZeroUsize;
+
+        use crate::config::{EmbeddingConfig, MAX_BATCH_SIZE};
+
+        let mut config = EmbeddingConfig {
+            model: "not-a-real-model".into(),
+            device: "cpu".into(),
+            ..EmbeddingConfig::default()
+        };
+        config.batch_size_override = NonZeroUsize::new(MAX_BATCH_SIZE + 1);
+        let error = match super::Embedder::new(&config) {
+            Ok(_) => panic!("oversized batch unexpectedly constructed an embedder"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds max supported batch size")
+        );
+    }
+
     #[test]
     fn hf_cancelled_caller_retains_nested_worker_lease() {
         use codesage_protocol::work::{StopReason, WorkControl, WorkStopped};

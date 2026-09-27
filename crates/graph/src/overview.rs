@@ -62,7 +62,7 @@ pub fn build_project_overview_with_top_risk(
             .then_with(|| a.language.as_str().cmp(b.language.as_str()))
     });
 
-    let freshness = build_freshness(root, db);
+    let freshness = build_freshness(root, db)?;
 
     let features = db.list_features(None, None, None, 0)?;
     let feature_count = features.len();
@@ -135,7 +135,7 @@ pub fn build_project_overview_with_top_risk(
     })
 }
 
-fn build_freshness(root: &Path, db: &Database) -> FreshnessInfo {
+fn build_freshness(root: &Path, db: &Database) -> Result<FreshnessInfo> {
     let report = drift::check_drift(root, db);
     let structural_kind = match report.kind {
         DriftKind::NotGit => "not_git",
@@ -146,8 +146,17 @@ fn build_freshness(root: &Path, db: &Database) -> FreshnessInfo {
         DriftKind::Unknown => "unknown",
     }
     .to_string();
-    let semantic_indexed_files = db.semantic_file_count().unwrap_or(0);
-    FreshnessInfo {
+    // A missing/legacy semantic table is an error, not an empty index. Keep
+    // the result truthful so overview callers can show recovery guidance.
+    if !db.semantic_file_schema_is_current()? {
+        return Err(crate::semantic::StaleSemanticTable {
+            state: crate::semantic::SemanticTableState::Unrecorded,
+            current: "semantic_files schema is missing required columns".into(),
+        }
+        .into());
+    }
+    let semantic_indexed_files = db.semantic_file_count()?;
+    Ok(FreshnessInfo {
         structural_kind,
         structural_summary: report.summary(),
         commits_behind: report.commits_between,
@@ -157,7 +166,7 @@ fn build_freshness(root: &Path, db: &Database) -> FreshnessInfo {
         head_sha: report.head_sha,
         semantic_indexed_files,
         semantic_indexed: semantic_indexed_files > 0,
-    }
+    })
 }
 
 // Keep these hints aligned with `recommend_tests` sibling conventions.
@@ -329,6 +338,56 @@ mod tests {
         assert!(
             overview.hook_health.is_none(),
             "a non-git temp dir has no hooks to report"
+        );
+    }
+    #[test]
+    fn missing_semantic_table_is_reported_as_error_not_empty_index() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute_raw_for_tests("DROP TABLE semantic_files")
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let error = build_project_overview(dir.path(), &db).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::semantic::StaleSemanticTable>()
+                .is_some()
+        );
+        assert!(
+            error.to_string().contains("codesage index --full"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn legacy_path_only_semantic_table_is_rejected() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute_raw_for_tests("ALTER TABLE semantic_files RENAME COLUMN path TO legacy_path")
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let error = build_project_overview(dir.path(), &db).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::semantic::StaleSemanticTable>()
+                .is_some()
+        );
+        assert!(
+            error.to_string().contains("codesage index --full"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn malformed_semantic_primary_key_is_rejected() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute_raw_for_tests(
+            "DROP TABLE semantic_files;
+             CREATE TABLE semantic_files(chunk_table TEXT, path TEXT, content_hash TEXT, indexed_at INTEGER)",
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let error = build_project_overview(dir.path(), &db).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::semantic::StaleSemanticTable>()
+                .is_some()
         );
     }
 

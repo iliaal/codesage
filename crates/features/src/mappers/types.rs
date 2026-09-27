@@ -28,7 +28,29 @@ impl<'a> MapperContext<'a> {
     /// Test the supplied repo-relative path against the configured
     /// excludes. Returns `false` when no excludes are set.
     pub fn excluded(&self, rel: &str) -> bool {
-        self.excludes.is_some_and(|g| g.is_match(rel))
+        let Some(globs) = self.excludes else {
+            return false;
+        };
+        if globs.is_match(rel) {
+            return true;
+        }
+        let mut prefix = String::new();
+        for segment in rel
+            .split('/')
+            .take(rel.split('/').count().saturating_sub(1))
+        {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            if globs.is_match(&prefix)
+                || globs.is_match(format!("{prefix}/"))
+                || globs.is_match(format!("{prefix}/_"))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Inverse of [`excluded`]. Empty paths pass here; blank entry paths

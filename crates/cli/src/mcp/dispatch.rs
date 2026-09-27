@@ -512,7 +512,11 @@ impl CodeSageServer {
         let path = request.project.join(".codesage/index.db");
         let before = self.snapshot_generation(&request.project, &path, &request.control)?;
         hooks.reached(SnapshotStage::BeforeOpen);
-        let state = self.resolve_project(&request.project.to_string_lossy())?;
+        let state = if request.tool == "project_overview" {
+            self.resolve_project_read_only(&request.project.to_string_lossy())?
+        } else {
+            self.resolve_project(&request.project.to_string_lossy())?
+        };
         let root = state
             .db_path
             .parent()
@@ -729,7 +733,10 @@ impl CodeSageServer {
         self.controlled_blocking(request, move |server| {
             server.render(
                 &project,
-                server.with_project_root_db(&canonical, codesage_graph::build_project_overview),
+                server.with_project_root_db_read_only(
+                    &canonical,
+                    codesage_graph::build_project_overview,
+                ),
                 "project_overview",
             )
         })
@@ -747,7 +754,7 @@ impl CodeSageServer {
         self.controlled_blocking(request, move |server| {
             server.render(
                 &project,
-                server.with_project_root_db(&canonical, |root, db| {
+                server.with_project_root_db_read_only(&canonical, |root, db| {
                     codesage_graph::build_project_overview_with_options(root, db, true)
                 }),
                 "project_overview",
@@ -864,12 +871,21 @@ impl CodeSageServer {
                 });
                 let server = self.clone();
                 let evidence_only = matches!(tool.as_str(), "edit_check" | "review_rehearsal");
+                let overview_preflight = tool == "project_overview";
                 let project = self
                     .run_controlled(
                         preflight,
                         move || {
                             if evidence_only {
                                 crate::evidence_root(Path::new(&raw_project))
+                            } else if overview_preflight {
+                                let state = server.resolve_project_read_only(&raw_project)?;
+                                state
+                                    .db_path
+                                    .parent()
+                                    .and_then(Path::parent)
+                                    .map(Path::to_path_buf)
+                                    .ok_or_else(|| anyhow::anyhow!("invalid project database path"))
                             } else {
                                 let state = server.resolve_project_inner(&raw_project)?;
                                 state

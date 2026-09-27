@@ -728,6 +728,20 @@ impl Database {
         })
     }
 
+    /// Open an existing index for overview reads that require compatible
+    /// structural columns. This deliberately applies only non-semantic
+    /// migrations: missing or legacy semantic bookkeeping must remain visible
+    /// to the overview rather than being silently created or rewritten.
+    pub fn open_existing_for_overview(path: &Path) -> Result<Self> {
+        let conn = open_connection_no_migrations(path)?;
+        crate::schema::init_db_for_overview(&conn)?;
+        Ok(Database {
+            conn,
+            chunk_table: String::new(),
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+
     /// Migration-free structural reads tolerate the schema on disk, including
     /// newer or damaged schemas. The handle is read/write for WAL support;
     /// writers must use open_existing/open_for_model_existing to migrate first.

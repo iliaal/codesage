@@ -637,6 +637,13 @@ pub(crate) fn open_db_read_only(root: &Path) -> Result<Database> {
     Database::open_read_only(&db_path(root)).context("failed to open index database read-only")
 }
 
+/// Existing index for overview reads: structural compatibility migrations may
+/// run, but semantic-schema damage remains visible instead of being repaired.
+pub(crate) fn open_db_for_overview(root: &Path) -> Result<Database> {
+    Database::open_existing_for_overview(&db_path(root))
+        .context("failed to prepare index database for overview")
+}
+
 pub(crate) fn open_db_for_model(root: &Path, model: &str, dim: usize) -> Result<Database> {
     Database::open_for_model(&db_path(root), model, dim).context("failed to open index database")
 }

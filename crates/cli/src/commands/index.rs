@@ -572,11 +572,18 @@ fn run_index_passes(
 
     // Partial structural writes are durable but do not attest the whole tree.
     // Semantic or mapper failures do not invalidate a complete structural pass.
-    if stats.files_failed == 0
-        && let Some(sha) = codesage_graph::drift::git_head_sha(&root)
-        && let Err(e) = db.set_structural_index_state(&sha)
-    {
-        tracing::warn!(error = %e, "failed to stamp structural_index_state");
+    if stats.files_failed == 0 {
+        match codesage_graph::drift::git_head_sha_for_attestation(&root) {
+            Ok(Some(sha)) => {
+                if let Err(e) = db.set_structural_index_state(&sha) {
+                    tracing::warn!(error = %e, "failed to stamp structural_index_state");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Git HEAD indeterminate; structural state not attested")
+            }
+        }
     }
 
     ensure!(

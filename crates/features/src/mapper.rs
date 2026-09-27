@@ -106,10 +106,12 @@ pub fn map_features_detailed(
         db.delete_references_of_kind(ReferenceKind::RouteHandler)?;
         let mut by_file: BTreeMap<&str, Vec<Reference>> = BTreeMap::new();
         for r in &route_refs {
-            by_file
-                .entry(r.from_file.as_str())
-                .or_default()
-                .push(r.clone());
+            if ctx.allowed(&r.from_file) {
+                by_file
+                    .entry(r.from_file.as_str())
+                    .or_default()
+                    .push(r.clone());
+            }
         }
         for (path, refs) in by_file {
             if let Some(file_id) = db.file_id_for_path(path)? {
@@ -601,6 +603,33 @@ mod tests {
             .find_references("App\\Http\\Controllers\\UserController\\index", None)
             .unwrap();
         assert_eq!(after.len(), 1, "remap duplicated the route edge: {after:?}");
+    }
+    #[test]
+    fn laravel_route_edges_respect_mapper_exclusions() {
+        use codesage_protocol::{FileInfo, Language, ReferenceKind};
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "routes/web.php",
+            "<?php\nuse App\\Http\\Controllers\\UserController;\n\
+             Route::get('/users', [UserController::class, 'index']);\n",
+        );
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_file(&FileInfo {
+            path: "routes/web.php".into(),
+            language: Language::Php,
+            content_hash: "h".into(),
+            is_test: false,
+        })
+        .unwrap();
+        map_features(root, &db, &["routes".to_string()]).unwrap();
+        assert!(
+            db.find_references("App\\Http\\Controllers\\UserController\\index", None)
+                .unwrap()
+                .iter()
+                .all(|reference| reference.kind != ReferenceKind::RouteHandler)
+        );
     }
 
     #[test]

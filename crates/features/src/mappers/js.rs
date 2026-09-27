@@ -833,6 +833,208 @@ fn is_reviewable_node_source(path: &str) -> bool {
     true
 }
 
+/// Resolve App Router directories to their public path. Organizational groups
+/// and parallel slots are omitted; interception markers pop the corresponding
+/// number of already-emitted ancestors before the target segment is added.
+fn next_app_public_segments(segments: &[&str]) -> Vec<String> {
+    let mut public = Vec::new();
+    for segment in segments {
+        if segment.starts_with('@') {
+            continue;
+        }
+        let mut rest = *segment;
+        // `(...)` roots at the app root, so it discards every emitted ancestor.
+        // A flag, not a `usize::MAX` sentinel: `(...)(..)photo` would then
+        // overflow on the following `(..)` (a debug-build panic) or wrap to
+        // zero in release and emit the wrong public path.
+        let mut levels = 0usize;
+        let mut rooted = false;
+        loop {
+            if let Some(stripped) = rest.strip_prefix("(...)") {
+                rest = stripped;
+                rooted = true;
+            } else if let Some(stripped) = rest.strip_prefix("(..)") {
+                rest = stripped;
+                levels += 1;
+            } else if let Some(stripped) = rest.strip_prefix("(.)") {
+                rest = stripped;
+            } else {
+                break;
+            }
+        }
+        if !rooted && levels == 0 && rest.starts_with('(') && rest.ends_with(')') {
+            continue;
+        }
+        if rooted {
+            public.clear();
+        } else {
+            for _ in 0..levels {
+                public.pop();
+            }
+        }
+        if !rest.is_empty() {
+            public.push(rest.to_string());
+        }
+    }
+    public
+}
+
+fn next_http_method(name: &str) -> bool {
+    matches!(
+        name,
+        "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "CONNECT" | "TRACE"
+    )
+}
+
+/// Names bound by `export const` declarations, one declaration at a time.
+///
+/// A negated character class also matches newlines, so a semicolon-terminated
+/// scan of `export const GET = () => {}\nexport const POST = () => {}` would
+/// capture the whole remainder of the file and read the first declarator's
+/// name only — hiding the later mutation. This scan therefore stops each
+/// declaration at its semicolon, at the end of its initializer, or at the
+/// statement keyword that starts the next one, whichever comes first.
+fn next_route_const_export_names(source: &str) -> Vec<String> {
+    let decl = Regex::new(r"export\s+const\s+").expect("valid Next route const pattern");
+    let mut names = Vec::new();
+    for start in decl.find_iter(source).map(|m| m.end()) {
+        let Some(statement) = next_route_declaration(source, start) else {
+            continue;
+        };
+        for declarator in split_top_level(statement, ',') {
+            let name = declarator
+                .split([':', '='])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches("async")
+                .trim();
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// The source slice holding one `export const` declaration, starting just
+/// after its keyword. Stops at the terminating `;`, at the start of the next
+/// top-level statement, or at end of input.
+fn next_route_declaration(source: &str, start: usize) -> Option<&str> {
+    let bytes = source.as_bytes();
+    let mut depth = 0i32;
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b';' if depth <= 0 => return Some(&source[start..index]),
+            b'\n' if depth <= 0 => {
+                let rest = source[index..].trim_start();
+                if starts_statement(rest) {
+                    return Some(&source[start..index]);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Some(&source[start..])
+}
+
+/// Whether `rest` begins a new top-level statement rather than continuing the
+/// declaration above it.
+fn starts_statement(rest: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "export",
+        "import",
+        "const",
+        "let",
+        "var",
+        "function",
+        "class",
+        "type",
+        "interface",
+        "async",
+        "return",
+    ];
+    KEYWORDS.iter().any(|keyword| {
+        rest.strip_prefix(keyword)
+            .is_some_and(|tail| tail.starts_with(char::is_whitespace) || tail.is_empty())
+    })
+}
+
+/// Split on `separator` occurrences that sit outside every bracket pair, so a
+/// comma inside a call argument or an object literal stays with its declarator.
+fn split_top_level(source: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (index, c) in source.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ if c == separator && depth <= 0 => {
+                parts.push(&source[start..index]);
+                start = index + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&source[start..]);
+    parts
+}
+
+fn next_route_exports_mutation(source: &str) -> bool {
+    let source = strip_comments(
+        source,
+        CommentSyntax {
+            hash_line_comments: false,
+            strings: StringMode::BlankContents,
+            template_literals: true,
+        },
+    );
+    let direct = Regex::new(r"export\s+(?:async\s+)?function\s+([A-Z]+)")
+        .expect("valid Next route function pattern");
+    let export_list =
+        Regex::new(r"export\s*\{([^}]*)\}").expect("valid Next route export list pattern");
+    let direct_mutation = direct.captures_iter(&source).any(|caps| {
+        caps.get(1)
+            .map(|m| m.as_str())
+            .is_some_and(|method| next_http_method(method) && !matches!(method, "GET" | "HEAD"))
+    });
+    let const_mutation = next_route_const_export_names(&source)
+        .iter()
+        .any(|name| next_http_method(name) && !matches!(name.as_str(), "GET" | "HEAD"));
+    let reexport_mutation = export_list.captures_iter(&source).any(|caps| {
+        caps.get(1).is_some_and(|list| {
+            list.as_str().split(',').any(|specifier| {
+                let specifier = specifier.trim();
+                if specifier.starts_with("type ") {
+                    return false;
+                }
+                if specifier.is_empty() {
+                    return false;
+                }
+                let tokens: Vec<&str> = specifier.split_whitespace().collect();
+                let exported = tokens
+                    .iter()
+                    .position(|token| *token == "as")
+                    .and_then(|index| tokens.get(index + 1))
+                    .copied()
+                    .or_else(|| tokens.first().copied())
+                    .unwrap_or("");
+                next_http_method(exported) && !matches!(exported, "GET" | "HEAD")
+            })
+        })
+    });
+    direct_mutation || const_mutation || reexport_mutation
+}
+
 fn next_app_routes_at(ctx: &MapperContext, package_rel: &str) -> Result<Vec<FeatureSeed>> {
     let root = ctx.root;
     let mut out = Vec::new();
@@ -860,9 +1062,10 @@ fn next_app_routes_at(ctx: &MapperContext, package_rel: &str) -> Result<Vec<Feat
             continue;
         }
         let inside_app = rel.strip_prefix(&pkg_path_prefix).unwrap_or(&rel);
-        let segments: Vec<&str> = inside_app
+
+        let segments: Vec<String> = inside_app
             .rsplit_once('/')
-            .map(|(head, _)| head.split('/').collect())
+            .map(|(head, _)| next_app_public_segments(&head.split('/').collect::<Vec<_>>()))
             .unwrap_or_default();
         let url = if segments.is_empty() {
             "/".to_string()
@@ -880,6 +1083,14 @@ fn next_app_routes_at(ctx: &MapperContext, package_rel: &str) -> Result<Vec<Feat
             "framework:next".to_string(),
             "route".to_string(),
         ];
+        let mutating_route = is_route
+            && read_to_string_bounded(&root.join(&rel))
+                .ok()
+                .flatten()
+                .is_some_and(|source| next_route_exports_mutation(&source));
+        if mutating_route || route_is_auth_sensitive("", &url) {
+            tags.push(AUTH_SENSITIVE_TAG.to_string());
+        }
         if !package_rel.is_empty() {
             tags.push("workspace".to_string());
         }
@@ -958,6 +1169,9 @@ fn next_pages_routes_at(ctx: &MapperContext, package_rel: &str) -> Result<Vec<Fe
             "framework:next".to_string(),
             "route".to_string(),
         ];
+        if route_is_auth_sensitive("", &url) {
+            tags.push(AUTH_SENSITIVE_TAG.to_string());
+        }
         if !package_rel.is_empty() {
             tags.push("workspace".to_string());
         }
@@ -1676,6 +1890,210 @@ const App = () => (
             .expect("next app page");
         assert_eq!(s.entry_route.as_deref(), Some("/dashboard"));
         assert_eq!(s.language, Language::TypeScript);
+    }
+    #[test]
+    fn next_routes_tag_auth_sensitive_paths() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "app/admin/page.tsx",
+            "export default function Page() { return null }",
+        );
+        write(
+            dir.path(),
+            "pages/auth.tsx",
+            "export default function Page() { return null }",
+        );
+        write(
+            dir.path(),
+            "pages/authors.tsx",
+            "export default function Page() { return null }",
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let app = seeds
+            .iter()
+            .find(|s| s.entry_route.as_deref() == Some("/admin"))
+            .unwrap();
+        let pages_auth = seeds
+            .iter()
+            .find(|s| s.entry_route.as_deref() == Some("/auth"))
+            .unwrap();
+        let ordinary = seeds
+            .iter()
+            .find(|s| s.entry_route.as_deref() == Some("/authors"))
+            .unwrap();
+        assert!(app.tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+        assert!(pages_auth.tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+        assert!(!ordinary.tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+    }
+    #[test]
+    fn next_group_segments_are_removed_from_public_path() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "app/(admin)/users/page.tsx",
+            "export default function Page() { return null }",
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let route = seeds
+            .iter()
+            .find(|seed| seed.source == "next-app-page")
+            .unwrap();
+        assert_eq!(route.entry_route.as_deref(), Some("/users"));
+        assert!(!route.tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+    }
+    #[test]
+    fn next_app_groups_intercepts_and_slots_resolve_public_paths() {
+        for (path, expected) in [
+            ("app/(admin)/users/page.tsx", "/users"),
+            ("app/(.)photo/page.tsx", "/photo"),
+            ("app/a/b/c/d/@modal/(...)photo/page.tsx", "/photo"),
+            ("app/(..)photo/page.tsx", "/photo"),
+            ("app/(..)(..)photo/page.tsx", "/photo"),
+            ("app/(...)photo/page.tsx", "/photo"),
+            ("app/@modal/photo/page.tsx", "/photo"),
+            ("app/feed/@modal/(..)photo/[id]/page.tsx", "/photo/[id]"),
+            ("app/feed/@modal/(..)(..)root/page.tsx", "/root"),
+            ("app/feed/@modal/(.)photo/page.tsx", "/feed/photo"),
+            ("app/a/b/(...)(..)photo/page.tsx", "/photo"),
+            ("app/a/b/(..)(...)photo/page.tsx", "/photo"),
+            ("app/a/b/(...)(..)(..)photo/page.tsx", "/photo"),
+            ("app/a/(...)(.)photo/page.tsx", "/photo"),
+        ] {
+            let dir = tempdir().unwrap();
+            write(
+                dir.path(),
+                path,
+                "export default function Page() { return null }",
+            );
+            let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+            let route = seeds
+                .iter()
+                .find(|seed| seed.source == "next-app-page")
+                .unwrap_or_else(|| panic!("missing route for {path}"));
+            assert_eq!(route.entry_route.as_deref(), Some(expected), "{path}");
+        }
+    }
+
+    #[test]
+    fn next_app_route_methods_drive_auth_tags() {
+        for (path, source, sensitive) in [
+            ("app/read/route.ts", "export async function GET() {}", false),
+            (
+                "app/write/route.ts",
+                "export async function POST() {}",
+                true,
+            ),
+            (
+                "app/consts/route.ts",
+                "export const GET=()=>{}, POST=()=>{};",
+                true,
+            ),
+            (
+                "app/type/route.ts",
+                "export type { POST }; export function GET() {}",
+                false,
+            ),
+            (
+                "app/custom/route.ts",
+                "export const DELETE = () => {}",
+                true,
+            ),
+            (
+                "app/string/route.ts",
+                "const docs = 'export async function POST() {}'; export function GET() {}",
+                false,
+            ),
+            (
+                "app/commented/route.ts",
+                "// export async function POST() {}\nexport function GET() {}",
+                false,
+            ),
+            (
+                "app/mixed/route.ts",
+                "export { GET, POST } from './handler';",
+                true,
+            ),
+            (
+                "app/from/route.ts",
+                "export { POST } from './handler';",
+                true,
+            ),
+            ("app/head/route.ts", "export function HEAD() {}", false),
+            (
+                "app/reexport/route.ts",
+                "const handler = () => {}; export { handler as POST };",
+                true,
+            ),
+        ] {
+            let dir = tempdir().unwrap();
+            write(dir.path(), path, source);
+            let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+            let route = seeds
+                .iter()
+                .find(|seed| seed.source == "next-app-route")
+                .unwrap();
+            assert_eq!(
+                route.tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG),
+                sensitive,
+                "{path}"
+            );
+        }
+    }
+
+    /// A semicolon-free handler must not swallow the next export: with the
+    /// unbounded `[^;]+` capture the whole remainder of the file read as one
+    /// declarator named `GET`, and the POST handler lost its auth tag.
+    #[test]
+    fn next_app_route_semicolon_free_exports_are_scanned_independently() {
+        for (path, source, sensitive) in [
+            (
+                "app/plain/route.ts",
+                "export const GET = () => {}\nexport const POST = () => {}\n",
+                true,
+            ),
+            (
+                "app/typed/route.ts",
+                "export const GET: RouteHandler = () => {}\n\
+                 export const POST: RouteHandler = () => {}\n",
+                true,
+            ),
+            (
+                "app/config/route.ts",
+                "export const config = { runtime: \"nodejs\" }\n\
+                 export const GET = () => {}\nexport const POST = () => {}\n",
+                true,
+            ),
+            (
+                "app/types/route.ts",
+                "export type { RouteConfig }\n\
+                 export const GET = () => {}\nexport const POST = () => {}\n",
+                true,
+            ),
+            (
+                "app/readonly/route.ts",
+                "export const GET = () => {}\nexport const HEAD = () => {}\n",
+                false,
+            ),
+            (
+                "app/bodiless/route.ts",
+                "export const GET = () => {}\nexport const runtime = \"edge\"\n",
+                false,
+            ),
+        ] {
+            let dir = tempdir().unwrap();
+            write(dir.path(), path, source);
+            let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+            let route = seeds
+                .iter()
+                .find(|seed| seed.source == "next-app-route")
+                .unwrap_or_else(|| panic!("missing route for {path}"));
+            assert_eq!(
+                route.tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG),
+                sensitive,
+                "{path}"
+            );
+        }
     }
 
     #[test]

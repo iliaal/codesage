@@ -42,7 +42,7 @@
 //! that true if either constant moves. Incremental passes keep bits older
 //! than the history window until the next `--full` rebaselines the row.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -223,9 +223,10 @@ pub fn history_predates_wall_clock_window(newest_commit_at: i64, now: i64) -> bo
 /// Time references for one pass: where this pass measures from, and the anchor
 /// the already-stored rows were last decayed to.
 #[derive(Debug, Clone, Copy)]
-struct PassAnchors {
+struct PassAnchors<'a> {
     current: HistoryAnchor,
     previous: i64,
+    exclusion_fingerprint: &'a str,
 }
 
 type CommitEpochKey = (PathBuf, String);
@@ -331,6 +332,12 @@ pub fn git_history_index_with_options(
     mode: IndexMode,
 ) -> Result<GitIndexStats> {
     let (exclude_set, test_like_set) = compile_excludes(extra_excludes)?;
+    let exclusion_fingerprint = effective_exclusion_fingerprint(extra_excludes);
+    // `None` is an index written before 0025 (or by a pre-0025 binary, whose
+    // state upsert clears the column): its rows carry no exclusion provenance,
+    // so they cannot be trusted to match the current policy either.
+    let stored_exclusion = db.git_index_exclusion_fingerprint()?;
+    let policy_changed = stored_exclusion.as_deref() != Some(exclusion_fingerprint.as_str());
     let head_sha = resolve_head_sha(root)?;
     let anchor = anchor_at_commit(root, &head_sha)?;
     log_anchor(root, anchor);
@@ -338,6 +345,8 @@ pub fn git_history_index_with_options(
     let effective_mode = match mode {
         IndexMode::Full => IndexMode::Full,
         IndexMode::Incremental | IndexMode::Auto => match db.get_git_index_state()? {
+            // Rows built under another exclusion policy cannot be composed.
+            Some(_) if policy_changed => IndexMode::Full,
             Some((last_sha, last_indexed_at)) if last_sha == head_sha => {
                 // HEAD is unchanged, so the anchor is too: the decay below is a
                 // no-op unless the last pass measured from a different clock.
@@ -345,7 +354,8 @@ pub fn git_history_index_with_options(
                 db.execute_batch(|db| {
                     decay_git_history_between(db, previous, anchor.epoch)?;
                     db.prune_git_author_events(anchor.cutoff())?;
-                    anchor.persist(db, &head_sha, false)
+                    anchor.persist(db, &head_sha, false)?;
+                    db.set_git_index_exclusion_fingerprint(&exclusion_fingerprint)
                 })?;
                 return Ok(GitIndexStats {
                     commits_scanned: 0,
@@ -365,7 +375,15 @@ pub fn git_history_index_with_options(
     };
 
     match effective_mode {
-        IndexMode::Full => run_full(db, root, &exclude_set, &test_like_set, &head_sha, anchor),
+        IndexMode::Full => run_full(
+            db,
+            root,
+            &exclude_set,
+            &test_like_set,
+            &head_sha,
+            anchor,
+            &exclusion_fingerprint,
+        ),
         IndexMode::Incremental => {
             let (last_sha, last_at) = db
                 .get_git_index_state()?
@@ -373,6 +391,7 @@ pub fn git_history_index_with_options(
             let anchors = PassAnchors {
                 current: anchor,
                 previous: previous_anchor(root, &last_sha, last_at, anchor)?,
+                exclusion_fingerprint: &exclusion_fingerprint,
             };
             run_incremental(
                 db,
@@ -451,6 +470,25 @@ fn compile_excludes(extra: &[String]) -> Result<(GlobSet, GlobSet)> {
     Ok((hard_set, test_set))
 }
 
+/// Canonical, order-independent identity for the effective hard-exclusion
+/// policy. An empty list is still a valid fingerprint so legacy NULL state
+/// cannot silently reuse rows built under another policy.
+fn effective_exclusion_fingerprint(extra_excludes: &[String]) -> String {
+    let mut encoded = String::new();
+    for pattern in DEFAULT_EXCLUDE_PATTERNS
+        .iter()
+        .copied()
+        .chain(extra_excludes.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>()
+    {
+        encoded.push_str(&pattern.len().to_string());
+        encoded.push(':');
+        encoded.push_str(pattern);
+        encoded.push('\0');
+    }
+    encoded
+}
+
 fn run_full(
     db: &Database,
     root: &Path,
@@ -458,6 +496,7 @@ fn run_full(
     test_like_set: &GlobSet,
     head_sha: &str,
     anchor: HistoryAnchor,
+    exclusion_fingerprint: &str,
 ) -> Result<GitIndexStats> {
     let raw = run_git_log(root, None, anchor.cutoff())?;
     let mut commits = parse_log(&raw)?;
@@ -505,6 +544,7 @@ fn run_full(
             }
         }
         anchor.persist(db, head_sha, true)?;
+        db.set_git_index_exclusion_fingerprint(exclusion_fingerprint)?;
         Ok(())
     })?;
 
@@ -522,7 +562,7 @@ fn run_incremental(
     test_like_set: &GlobSet,
     head_sha: &str,
     last_sha: &str,
-    anchors: PassAnchors,
+    anchors: PassAnchors<'_>,
 ) -> Result<GitIndexStats> {
     let anchor = anchors.current;
     let range = format!("{last_sha}..{head_sha}");
@@ -544,7 +584,15 @@ fn run_incremental(
             root = %root.display(),
             "a rename in the incremental range cannot be re-keyed exactly; rescanning in full"
         );
-        return run_full(db, root, exclude_set, test_like_set, head_sha, anchor);
+        return run_full(
+            db,
+            root,
+            exclude_set,
+            test_like_set,
+            head_sha,
+            anchor,
+            anchors.exclusion_fingerprint,
+        );
     }
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
@@ -589,6 +637,7 @@ fn run_incremental(
             }
         }
         anchor.persist(db, head_sha, false)?;
+        db.set_git_index_exclusion_fingerprint(anchors.exclusion_fingerprint)?;
         Ok(())
     })?;
 
@@ -1182,6 +1231,180 @@ fn is_excluded(set: &GlobSet, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_exclusions_rebuild_same_head_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("ignored.rs"), "fn ignored() {}\n").unwrap();
+        run(&["add", "ignored.rs"]);
+        run(&["commit", "-qm", "initial"]);
+
+        let db = Database::open_in_memory().unwrap();
+        git_history_index_with_options(&db, root, &[], IndexMode::Auto).unwrap();
+        assert!(db.git_file("ignored.rs").unwrap().is_some());
+        assert!(db.git_index_exclusion_fingerprint().unwrap().is_some());
+
+        git_history_index_with_options(&db, root, &["ignored.rs".to_string()], IndexMode::Auto)
+            .unwrap();
+        assert!(db.git_file("ignored.rs").unwrap().is_none());
+        assert_eq!(
+            db.git_index_exclusion_fingerprint().unwrap().as_deref(),
+            Some(effective_exclusion_fingerprint(&["ignored.rs".to_string()]).as_str())
+        );
+    }
+
+    #[test]
+    fn exclusion_fingerprint_is_order_independent() {
+        assert_eq!(
+            effective_exclusion_fingerprint(&["b".into(), "a".into(), "b".into()]),
+            effective_exclusion_fingerprint(&["a".into(), "b".into()])
+        );
+        assert_ne!(
+            effective_exclusion_fingerprint(&["a\nb".into()]),
+            effective_exclusion_fingerprint(&["a".into(), "b".into()])
+        );
+    }
+
+    fn policy_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..3 {
+            std::fs::write(dir.path().join("a.rs"), format!("fn a() {{ {round} }}\n")).unwrap();
+            std::fs::write(
+                dir.path().join("skip.rs"),
+                format!("fn s() {{ {round} }}\n"),
+            )
+            .unwrap();
+            if round == 0 {
+                policy_git(dir.path(), &["init", "-q"]);
+                policy_git(dir.path(), &["config", "user.email", "test@example.com"]);
+                policy_git(dir.path(), &["config", "user.name", "Test"]);
+            }
+            policy_git(dir.path(), &["add", "-A"]);
+            policy_git(dir.path(), &["commit", "-qm", &format!("round {round}")]);
+        }
+        dir
+    }
+
+    fn policy_git(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn skip_rows_present(db: &Database) -> (bool, bool, bool) {
+        (
+            db.git_file("skip.rs").unwrap().is_some(),
+            db.co_change_pair_exists("a.rs", "skip.rs").unwrap(),
+            !db.git_author_events("skip.rs").unwrap().is_empty(),
+        )
+    }
+
+    /// A pre-0025 index (or one last written by a pre-0025 binary, whose state
+    /// upsert clears the column) records no exclusion provenance, so its rows
+    /// may predate the current policy. Both explicit `--incremental` (what
+    /// installed hooks pass) and Auto rebuild once, then compose again.
+    #[test]
+    fn unattributed_index_rebuilds_under_the_current_policy() {
+        for mode in [IndexMode::Incremental, IndexMode::Auto] {
+            let dir = policy_repo();
+            let root = dir.path();
+            let db = Database::open_in_memory().unwrap();
+            git_history_index_with_options(&db, root, &[], IndexMode::Full).unwrap();
+            assert_eq!(skip_rows_present(&db), (true, true, true));
+            let (sha, _) = db.get_git_index_state().unwrap().unwrap();
+            db.set_git_index_state(&sha).unwrap();
+            assert_eq!(db.git_index_exclusion_fingerprint().unwrap(), None);
+
+            let excludes = ["skip.rs".to_string()];
+            let stats = git_history_index_with_options(&db, root, &excludes, mode).unwrap();
+            assert_eq!(stats.commits_scanned, 3, "{mode:?} must rescan in full");
+            assert_eq!(skip_rows_present(&db), (false, false, false), "{mode:?}");
+            assert_eq!(
+                db.git_index_exclusion_fingerprint().unwrap().as_deref(),
+                Some(effective_exclusion_fingerprint(&excludes).as_str())
+            );
+
+            let again = git_history_index_with_options(&db, root, &excludes, mode).unwrap();
+            assert_eq!(
+                again.commits_scanned, 0,
+                "{mode:?} must compose once attributed"
+            );
+        }
+    }
+
+    /// A recorded, different policy rebuilds in every non-full mode, whether
+    /// or not HEAD moved since the last pass.
+    #[test]
+    fn recorded_policy_change_rebuilds_with_and_without_new_commits() {
+        for (mode, move_head) in [
+            (IndexMode::Incremental, false),
+            (IndexMode::Incremental, true),
+            (IndexMode::Auto, false),
+            (IndexMode::Auto, true),
+        ] {
+            let dir = policy_repo();
+            let root = dir.path();
+            let db = Database::open_in_memory().unwrap();
+            git_history_index_with_options(&db, root, &[], IndexMode::Full).unwrap();
+            assert_eq!(skip_rows_present(&db), (true, true, true));
+            if move_head {
+                std::fs::write(root.join("a.rs"), "fn a() { 9 }\n").unwrap();
+                policy_git(root, &["commit", "-qam", "moves head"]);
+            }
+
+            let excludes = ["skip.rs".to_string()];
+            git_history_index_with_options(&db, root, &excludes, mode).unwrap();
+            assert_eq!(
+                skip_rows_present(&db),
+                (false, false, false),
+                "{mode:?} move_head={move_head}"
+            );
+            assert!(db.git_file("a.rs").unwrap().is_some());
+            assert_eq!(
+                db.git_index_exclusion_fingerprint().unwrap().as_deref(),
+                Some(effective_exclusion_fingerprint(&excludes).as_str())
+            );
+        }
+    }
+
+    /// An unchanged policy, spelled in another order, keeps composing.
+    #[test]
+    fn unchanged_policy_is_a_no_op() {
+        let dir = policy_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        let excludes = ["skip.rs".to_string(), "other.rs".to_string()];
+        git_history_index_with_options(&db, root, &excludes, IndexMode::Full).unwrap();
+        let reordered = [
+            "other.rs".to_string(),
+            "skip.rs".to_string(),
+            "skip.rs".to_string(),
+        ];
+        for mode in [IndexMode::Incremental, IndexMode::Auto] {
+            let stats = git_history_index_with_options(&db, root, &reordered, mode).unwrap();
+            assert_eq!(stats.commits_scanned, 0, "{mode:?}");
+        }
+        assert!(db.git_file("a.rs").unwrap().is_some());
+    }
 
     #[test]
     fn changed_files_since_rejects_dash_prefixed_ref() {
