@@ -199,13 +199,21 @@ fn record_feature_map_state(
         }
         return;
     }
+    invalidate_feature_map_state(root);
+    for err in mapper_errors {
+        tracing::warn!(error = %err, "feature mapper failed; skip marker not advanced");
+    }
+}
+
+/// Force the next `codesage index` to map features. The watcher calls this
+/// after it purges files: removing an entry file deletes its feature, and a
+/// byte-identical restore leaves the file-hash fingerprint unchanged, so the
+/// skip marker alone would never bring the feature back.
+pub(crate) fn invalidate_feature_map_state(root: &Path) {
     if let Err(error) = std::fs::remove_file(feature_map_state_path(root))
         && error.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!(%error, "failed to invalidate feature-map marker");
-    }
-    for err in mapper_errors {
-        tracing::warn!(error = %err, "feature mapper failed; skip marker not advanced");
     }
 }
 

@@ -1251,6 +1251,7 @@ fn purge_index_rows(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcom
         Ok(n) => {
             if n > 0 {
                 tracing::info!(removed = n, paths = ?paths, "files removed from index");
+                crate::commands::index::invalidate_feature_map_state(&config.project_root);
             }
         }
         Err(e) if is_retryable_db_error(&e) => {
@@ -4346,6 +4347,7 @@ mod tests {
         .unwrap();
         assert!(db.get_file_hash("foo.rs").unwrap().is_some());
         drop(db);
+        std::fs::write(root.join(".codesage/feature-map.state"), "1\n").unwrap();
 
         std::fs::remove_file(root.join("foo.rs")).unwrap();
 
@@ -4357,6 +4359,10 @@ mod tests {
         assert!(
             db.get_file_hash("foo.rs").unwrap().is_none(),
             "vanished file must have its index rows purged"
+        );
+        assert!(
+            !root.join(".codesage/feature-map.state").exists(),
+            "a purge must force the next index to remap features"
         );
     }
 
