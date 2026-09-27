@@ -3,7 +3,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -20,25 +20,35 @@ use serde::Serialize;
 /// bound and `indexed_files_behind_bounded` says so.
 const MAX_DRIFT_CANDIDATES: usize = 2_000;
 
-/// Wall-clock budget for the HEAD-blob comparison. It is checked between
-/// records, so it bounds the comparison loop, not a `git` child that never
-/// answers.
+/// Wall-clock budget for the content comparison: the `git diff`, the
+/// `.gitignore` and symlink lookups, and the HEAD-blob stream share it, and a
+/// `git` child still running when it expires is killed.
 const DRIFT_CONTENT_BUDGET: Duration = Duration::from_millis(500);
 
 /// A blob past this size is reported affected instead of read. It already
 /// changed between the two commits, so a revert back to the indexed bytes is
 /// the rare case, and reading it would blow the budget.
 const MAX_DRIFT_BLOB_BYTES: u64 = 16 << 20;
-/// Hard upper bound for one metadata Git child. Content hashing gets a
-/// separate, shorter budget below; startup/configuration hangs must not pin
-/// status, overview, or rehearsal callers.
+/// Hard upper bound for one metadata Git child. Content hashing gets the
+/// separate, shorter [`DRIFT_CONTENT_BUDGET`]; startup/configuration hangs
+/// must not pin status, overview, or rehearsal callers.
 const GIT_COMMAND_BUDGET: Duration = Duration::from_secs(2);
 const MAX_GIT_OUTPUT_BYTES: usize = 4 << 20;
 
-fn git_output(cwd: &Path, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
-    if Instant::now() >= deadline {
-        return None;
-    }
+/// How one Git child ended.
+#[derive(Debug)]
+enum GitRun {
+    /// The child exited on its own; `code` is `None` when a signal ended it.
+    Exited { code: Option<i32>, stdout: Vec<u8> },
+    /// No `git` executable could be spawned.
+    NotFound,
+    /// The child was killed at its deadline.
+    TimedOut,
+    /// Spawn or pipe failure, or output past [`MAX_GIT_OUTPUT_BYTES`].
+    Failed,
+}
+
+fn git_command(cwd: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
     command
         .args(args)
@@ -48,16 +58,80 @@ fn git_output(cwd: &Path, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn().ok()?;
-    let stdout = child.stdout.take()?;
+    command
+}
+
+fn kill_git(child: &mut Child) {
+    #[cfg(unix)]
+    // SAFETY: the child was placed in its own process group at spawn and has
+    // not been reaped yet, so the group id still names it.
+    let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+    let _ = child.kill();
+}
+
+/// Name a Git child killed at its deadline, so an `Unknown` drift summary's
+/// "see logs" has something to point at. Long path lists are elided.
+fn log_git_timeout(cwd: &Path, args: &[&str]) {
+    const SHOWN_ARGS: usize = 8;
+    let mut command = format!(
+        "git {}",
+        args.iter()
+            .take(SHOWN_ARGS)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    if args.len() > SHOWN_ARGS {
+        command.push_str(&format!(" (+{} more args)", args.len() - SHOWN_ARGS));
+    }
+    tracing::warn!(cwd = %cwd.display(), %command, "git child killed at its deadline");
+}
+
+/// Run one Git child to completion or to `deadline`, whichever comes first.
+/// `input`, when given, is written to the child's stdin.
+fn run_git(cwd: &Path, args: &[&str], input: Option<&[u8]>, deadline: Instant) -> GitRun {
+    if Instant::now() >= deadline {
+        return GitRun::TimedOut;
+    }
+    let mut command = git_command(cwd, args);
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return GitRun::NotFound,
+        Err(_) => return GitRun::Failed,
+    };
+    // git writes output as it reads requests, so the request side needs its
+    // own thread or the two processes deadlock on full pipes.
+    let writer = match (input, child.stdin.take()) {
+        (Some(input), Some(mut stdin)) => {
+            let input = input.to_vec();
+            Some(std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+                let _ = stdin.flush();
+            }))
+        }
+        _ => None,
+    };
+    let Some(stdout) = child.stdout.take() else {
+        kill_git(&mut child);
+        let _ = child.wait();
+        if let Some(writer) = writer {
+            let _ = writer.join();
+        }
+        return GitRun::Failed;
+    };
     let (tx, rx) = mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -67,153 +141,69 @@ fn git_output(cwd: &Path, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
             .map(|_| bytes);
         let _ = tx.send(result);
     });
-    let mut reaped = false;
-    let result = rx
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .ok()
-        .and_then(Result::ok)
-        .filter(|bytes| bytes.len() <= MAX_GIT_OUTPUT_BYTES)
-        .and_then(|bytes| {
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        reaped = true;
-                        break if status.success() { Some(bytes) } else { None };
-                    }
-                    Err(_) => break None,
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Ok(None) => break None,
+    let outcome = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(bytes)) if bytes.len() <= MAX_GIT_OUTPUT_BYTES => loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    break GitRun::Exited {
+                        code: status.code(),
+                        stdout: bytes,
+                    };
                 }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(None) => break GitRun::TimedOut,
+                Err(_) => break GitRun::Failed,
             }
-        });
-    if result.is_none() && !reaped {
-        #[cfg(unix)]
-        // SAFETY: the child was placed in its own process group above.
-        let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
-
-        let _ = child.kill();
+        },
+        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => GitRun::Failed,
+        Err(mpsc::RecvTimeoutError::Timeout) => GitRun::TimedOut,
+    };
+    if !matches!(outcome, GitRun::Exited { .. }) {
+        if matches!(outcome, GitRun::TimedOut) {
+            log_git_timeout(cwd, args);
+        }
+        kill_git(&mut child);
     }
     let _ = child.wait();
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
     let _ = reader.join();
-    result
+    outcome
 }
 
+/// Stdout of a Git child that exited 0.
+fn git_output(cwd: &Path, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
+    match run_git(cwd, args, None, deadline) {
+        GitRun::Exited {
+            code: Some(0),
+            stdout,
+        } => Some(stdout),
+        _ => None,
+    }
+}
+
+/// Exit code and stdout of a Git child fed `input`, whatever the exit code.
 fn git_output_with_stdin(
     cwd: &Path,
     args: &[&str],
     input: &[u8],
     deadline: Instant,
 ) -> Option<(Option<i32>, Vec<u8>)> {
-    if Instant::now() >= deadline {
-        return None;
+    match run_git(cwd, args, Some(input), deadline) {
+        GitRun::Exited { code, stdout } => Some((code, stdout)),
+        _ => None,
     }
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command.spawn().ok()?;
-    let mut stdin = child.stdin.take()?;
-    let input = input.to_vec();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-        let _ = stdin.flush();
-    });
-    let stdout = child.stdout.take()?;
-    let (tx, rx) = mpsc::sync_channel(1);
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout
-            .take((MAX_GIT_OUTPUT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        let _ = tx.send(result);
-    });
-    let mut reaped = false;
-    let result = rx
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .ok()
-        .and_then(Result::ok)
-        .filter(|bytes| bytes.len() <= MAX_GIT_OUTPUT_BYTES)
-        .and_then(|bytes| {
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        reaped = true;
-                        break Some((status.code(), bytes));
-                    }
-                    Err(_) => break None,
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Ok(None) => break None,
-                }
-            }
-        });
-    if result.is_none() && !reaped {
-        #[cfg(unix)]
-        // SAFETY: the child was placed in its own process group above.
-        let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-    let _ = writer.join();
-    let _ = reader.join();
-    result
 }
 
+/// Whether a Git child exited 0; `None` when it did not exit on its own.
 fn git_succeeded(cwd: &Path, args: &[&str], deadline: Instant) -> Option<bool> {
-    if Instant::now() >= deadline {
-        return None;
+    match run_git(cwd, args, None, deadline) {
+        GitRun::Exited { code, .. } => Some(code == Some(0)),
+        _ => None,
     }
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command.spawn().ok()?;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status.success()),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Ok(None) => break,
-            Err(_) => return None,
-        }
-    }
-    #[cfg(unix)]
-    // SAFETY: process_group(0) above created a group owned by this child.
-    let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
-    let _ = child.kill();
-    let _ = child.wait();
-    None
 }
 
 /// Affected paths named in the drift summary.
@@ -268,8 +258,9 @@ pub enum DriftKind {
     /// Stored SHA is not an ancestor of HEAD. Rebase, branch switch, or force
     /// update. Content divergence is ambiguous by commit count alone.
     UnrelatedAncestor,
-    /// Any structured failure (git not on PATH, shallow clone, etc.). Recorded
-    /// rather than hidden so the log keeps a signal.
+    /// Any structured failure (a git child that failed or was killed at its
+    /// deadline, shallow clone, etc.). Recorded rather than hidden so the log
+    /// keeps a signal.
     Unknown,
 }
 
@@ -428,6 +419,15 @@ fn fmt_ts(unix: i64) -> String {
 
 /// Compare the recorded structural-index commit with the current HEAD.
 pub fn check_drift(project_root: &Path, db: &Database) -> DriftReport {
+    check_drift_within(project_root, db, GIT_COMMAND_BUDGET, DRIFT_CONTENT_BUDGET)
+}
+
+fn check_drift_within(
+    project_root: &Path,
+    db: &Database,
+    metadata_budget: Duration,
+    content_budget: Duration,
+) -> DriftReport {
     let (stored_sha, stored_at) = match db.get_structural_index_state() {
         Ok(Some((sha, at))) => (Some(sha), Some(at)),
         Ok(None) => (None, None),
@@ -437,7 +437,7 @@ pub fn check_drift(project_root: &Path, db: &Database) -> DriftReport {
         }
     };
 
-    let metadata_deadline = Instant::now() + GIT_COMMAND_BUDGET;
+    let metadata_deadline = Instant::now() + metadata_budget;
     let head_lookup = git_head_lookup_with_deadline(project_root, metadata_deadline);
     let head_sha = match &head_lookup {
         HeadLookup::Found(sha) => Some(sha.clone()),
@@ -446,12 +446,10 @@ pub fn check_drift(project_root: &Path, db: &Database) -> DriftReport {
 
     let (kind, commits_between) = match (&stored_sha, &head_lookup) {
         (_, HeadLookup::Indeterminate) => (DriftKind::Unknown, None),
+        // An unborn HEAD is still a Git repository.
         (_, HeadLookup::Missing) => {
             match git_common_dir_lookup_with_deadline(project_root, metadata_deadline) {
-                CommonDirLookup::Found(_) if stored_sha.is_none() => {
-                    (DriftKind::NeverIndexed, None)
-                }
-                CommonDirLookup::Found(_) => (DriftKind::Unknown, None),
+                CommonDirLookup::Found(_) => (DriftKind::NeverIndexed, None),
                 CommonDirLookup::NotGit => (DriftKind::NotGit, None),
                 CommonDirLookup::Indeterminate => (DriftKind::Unknown, None),
             }
@@ -482,7 +480,7 @@ pub fn check_drift(project_root: &Path, db: &Database) -> DriftReport {
             stored,
             head,
             MAX_DRIFT_CANDIDATES,
-            DRIFT_CONTENT_BUDGET,
+            content_budget,
         ),
         _ => None,
     };
@@ -610,10 +608,11 @@ fn path_or_ancestor_excluded(excludes: &GlobSet, rel_path: &str) -> bool {
 /// admits it: a source file added after indexing. `None` when git could not
 /// answer; the caller then falls back to the SHA-level classification.
 ///
-/// `budget` starts once the candidate set is known and is consulted between
-/// records of the `cat-file` stream, so the `.gitignore` and symlink lookups
-/// eat into the comparison loop's time; `git diff` and a `git` child that
-/// never writes are not interrupted by it.
+/// `budget` starts before `git diff` and is shared by it, the `.gitignore` and
+/// symlink lookups, and the `cat-file` stream; a `git` child still running
+/// when it expires is killed, and the result is marked bounded rather than
+/// `None`. The candidate cap limits how many paths reach those lookups and
+/// the stream.
 fn measure_indexed_files_behind(
     cwd: &Path,
     db: &Database,
@@ -671,7 +670,7 @@ fn measure_indexed_files_behind(
 
 /// Drop the never-indexed candidates discovery would skip even though HEAD
 /// carries them: paths `.gitignore` matches (the walker honors it, `git add
-/// `-f` does not) and symlinks (the walker takes regular files only, while
+/// -f` does not) and symlinks (the walker takes regular files only, while
 /// `cat-file` types a symlink as `blob`). Indexed candidates are kept as they
 /// are. A git failure drops nothing, which keeps the unverifiable case on the
 /// side that recommends a reindex.
@@ -700,6 +699,10 @@ fn retain_discoverable(
     complete
 }
 
+/// The subset of `paths` that `.gitignore`, `.git/info/exclude`, or the global
+/// excludes file matches. `--no-index` is required: without it git reports
+/// nothing for a tracked path, and every candidate here is tracked at HEAD.
+/// `None` when git failed or timed out.
 fn gitignored_paths(
     cwd: &Path,
     paths: &[&str],
@@ -715,6 +718,7 @@ fn gitignored_paths(
         &requests,
         deadline,
     )?;
+    // Exit 1 means no path is ignored; anything else past 0 is a failure.
     match status {
         Some(0) => Some(
             String::from_utf8_lossy(&bytes)
@@ -728,6 +732,10 @@ fn gitignored_paths(
     }
 }
 
+/// The subset of `paths` that `head` carries as a symlink (tree mode
+/// `120000`). Paths are passed literally so glob characters and pathspec
+/// magic in a file name cannot widen the lookup. `None` when git failed or
+/// timed out.
 fn symlink_paths(
     cwd: &Path,
     head: &str,
@@ -737,6 +745,7 @@ fn symlink_paths(
     let mut args = vec!["--literal-pathspecs", "ls-tree", "-r", "-z", head, "--"];
     args.extend(paths.iter().copied());
     let bytes = git_output(cwd, &args, deadline)?;
+    // `<mode> SP <type> SP <oid> TAB <path>` per record.
     Some(
         String::from_utf8_lossy(&bytes)
             .split('\0')
@@ -748,6 +757,9 @@ fn symlink_paths(
     )
 }
 
+/// Paths changed between two commits, relative to `cwd` and restricted to it,
+/// so a project root below the repository root measures only its own subtree.
+/// `--no-renames` keeps both endpoints of a rename in the candidate set.
 fn changed_paths(cwd: &Path, stored: &str, head: &str, deadline: Instant) -> Option<Vec<String>> {
     if !is_object_name(stored) || !is_object_name(head) {
         return None;
@@ -766,6 +778,8 @@ fn changed_paths(cwd: &Path, stored: &str, head: &str, deadline: Instant) -> Opt
         ],
         deadline,
     )?;
+    // A path git cannot spell in UTF-8 cannot be in the index either, so the
+    // lossy replacement simply fails to intersect.
     Some(
         String::from_utf8_lossy(&bytes)
             .split('\0')
@@ -775,12 +789,19 @@ fn changed_paths(cwd: &Path, stored: &str, head: &str, deadline: Instant) -> Opt
     )
 }
 
+/// Reject anything that could be read as an option or a pathspec; the stored
+/// SHA comes out of the database and reaches git ahead of `--`.
 fn is_object_name(sha: &str) -> bool {
     !sha.is_empty() && sha.len() <= 64 && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// A touched path paired with the content hash the index holds for it;
+/// `None` marks a path the index does not hold, behind only if HEAD carries
+/// an indexable blob at it.
 type Candidate<'a> = &'a (String, Option<String>);
 
+/// Hash every candidate's HEAD blob and count the ones that differ from the
+/// indexed content. One `git cat-file --batch` serves the whole set.
 fn compare_head_blobs(
     cwd: &Path,
     head: &str,
@@ -789,6 +810,11 @@ fn compare_head_blobs(
     out: &mut FilesBehind,
 ) -> Option<()> {
     use std::io::{BufRead, BufReader, Write};
+
+    // `git cat-file --batch` reads newline-terminated requests and its `-z`
+    // input mode only exists from Git 2.36, so a path holding a newline cannot
+    // be asked for. Counting it affected keeps the unverifiable case on the
+    // side that recommends a reindex.
     let (askable, unaskable): (Vec<Candidate<'_>>, Vec<Candidate<'_>>) = candidates
         .iter()
         .partition(|(path, _)| !path.contains('\n'));
@@ -798,28 +824,15 @@ fn compare_head_blobs(
     if askable.is_empty() {
         return Some(());
     }
-    let mut command = Command::new("git");
-    command
-        .args(["cat-file", "--batch"])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let child = Arc::new(Mutex::new(command.spawn().ok()?));
-    #[cfg(unix)]
-    let child_pid = child.lock().ok()?.id();
-    let (mut stdin, stdout) = {
-        let mut child = child.lock().ok()?;
-        (child.stdin.take()?, child.stdout.take()?)
+    let mut command = git_command(cwd, &["cat-file", "--batch"]);
+    command.stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        kill_git(&mut child);
+        let _ = child.wait();
+        return None;
     };
+    let child = Arc::new(Mutex::new(child));
     let finished = Arc::new(AtomicBool::new(false));
     let watchdog_finished = Arc::clone(&finished);
     let watchdog_child = Arc::clone(&child);
@@ -827,19 +840,23 @@ fn compare_head_blobs(
         while !watchdog_finished.load(Ordering::Acquire) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
-        if !watchdog_finished.load(Ordering::Acquire) {
-            #[cfg(unix)]
-            // SAFETY: the child was placed in its own process group above.
-            let _ = unsafe { libc::killpg(child_pid as libc::pid_t, libc::SIGKILL) };
-            if let Ok(mut child) = watchdog_child.lock() {
-                let _ = child.kill();
-            }
+        if !watchdog_finished.load(Ordering::Acquire)
+            && let Ok(mut child) = watchdog_child.lock()
+        {
+            // Expiring mid-stream is the routine end of a long comparison and
+            // is disclosed as a bounded count, so this is not a warning.
+            tracing::debug!("git cat-file --batch killed at the content budget");
+            kill_git(&mut child);
         }
     });
+    // `./` makes git resolve the path against the working directory, matching
+    // the `--relative` spelling the candidates arrived in.
     let requests: String = askable
         .iter()
         .map(|(path, _)| format!("{head}:./{path}\n"))
         .collect();
+    // git blocks writing output once its pipe fills, so the request side needs
+    // its own thread or the two processes deadlock on each other.
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(requests.as_bytes());
         let _ = stdin.flush();
@@ -860,7 +877,10 @@ fn compare_head_blobs(
             parse_batch_header(header.trim_end_matches('\n')),
             stored_hash,
         ) {
+            // `missing` / `ambiguous`: HEAD no longer carries this path's
+            // content, which is exactly what a deletion looks like.
             (None, Some(_)) => out.record(path),
+            // Touched but absent at HEAD and never indexed: nothing to index.
             (None, None) => {}
             (Some((is_blob, size)), Some(_)) if !is_blob || size > MAX_DRIFT_BLOB_BYTES => {
                 out.record(path);
@@ -882,6 +902,9 @@ fn compare_head_blobs(
                     out.record(path);
                 }
             }
+            // An added file: discovery would index a blob under its size cap,
+            // so its bytes need not be read. A gitlink or an oversized blob is
+            // skipped by the indexer too.
             (Some((is_blob, size)), None) => {
                 if is_blob && size <= MAX_INDEXABLE_FILE_BYTES {
                     out.record(path);
@@ -898,16 +921,21 @@ fn compare_head_blobs(
     }
     finished.store(true, Ordering::Release);
     let _ = watchdog.join();
-    let mut child = child.lock().ok()?;
-    #[cfg(unix)]
-    // SAFETY: process_group(0) above created a group owned by this child.
-    let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
-    let _ = child.kill();
+    // Kill first: an early exit leaves the writer parked on a full pipe until
+    // git's read end goes away.
+    let mut child = child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    kill_git(&mut child);
     let _ = writer.join();
     let _ = child.wait();
     Some(())
 }
 
+/// `<oid> SP <type> SP <size>` from `git cat-file --batch`, as
+/// `(type == "blob", size)`. `None` for a `missing` / `ambiguous` line, which
+/// carries no payload. The object-id shape is checked so a path whose own
+/// bytes mimic a record header cannot desynchronize the stream.
 fn parse_batch_header(header: &str) -> Option<(bool, u64)> {
     let fields: Vec<&str> = header.split(' ').collect();
     if fields.len() != 3
@@ -944,15 +972,17 @@ fn git_head_lookup(cwd: &Path) -> HeadLookup {
     git_head_lookup_with_deadline(cwd, Instant::now() + GIT_COMMAND_BUDGET)
 }
 
+/// A failed `rev-parse HEAD` (unborn HEAD, not a repository) and a missing
+/// `git` both read as `Missing`; the caller tells them apart through
+/// [`git_common_dir_lookup_with_deadline`].
 fn git_head_lookup_with_deadline(cwd: &Path, deadline: Instant) -> HeadLookup {
-    match git_succeeded(cwd, &["rev-parse", "HEAD"], deadline) {
-        Some(true) => {}
-        Some(false) => return HeadLookup::Missing,
-        None => return HeadLookup::Indeterminate,
-    }
-    let output_deadline = Instant::now() + GIT_COMMAND_BUDGET;
-    let Some(bytes) = git_output(cwd, &["rev-parse", "HEAD"], output_deadline) else {
-        return HeadLookup::Indeterminate;
+    let bytes = match run_git(cwd, &["rev-parse", "HEAD"], None, deadline) {
+        GitRun::Exited {
+            code: Some(0),
+            stdout,
+        } => stdout,
+        GitRun::Exited { .. } | GitRun::NotFound => return HeadLookup::Missing,
+        GitRun::TimedOut | GitRun::Failed => return HeadLookup::Indeterminate,
     };
     let Ok(sha) = String::from_utf8(bytes) else {
         return HeadLookup::Indeterminate;
@@ -965,6 +995,8 @@ fn git_head_lookup_with_deadline(cwd: &Path, deadline: Instant) -> HeadLookup {
     }
 }
 
+/// `git rev-parse HEAD`, returning the full SHA string. `None` when git fails,
+/// times out, or the repo has no HEAD (fresh `git init`, for example).
 pub fn git_head_sha(cwd: &Path) -> Option<String> {
     match git_head_lookup(cwd) {
         HeadLookup::Found(sha) => Some(sha),
@@ -994,14 +1026,13 @@ fn git_common_dir_lookup(cwd: &Path) -> CommonDirLookup {
 }
 
 fn git_common_dir_lookup_with_deadline(cwd: &Path, deadline: Instant) -> CommonDirLookup {
-    match git_succeeded(cwd, &["rev-parse", "--git-common-dir"], deadline) {
-        Some(true) => {}
-        Some(false) => return CommonDirLookup::NotGit,
-        None => return CommonDirLookup::Indeterminate,
-    }
-    let output_deadline = Instant::now() + GIT_COMMAND_BUDGET;
-    let Some(bytes) = git_output(cwd, &["rev-parse", "--git-common-dir"], output_deadline) else {
-        return CommonDirLookup::Indeterminate;
+    let bytes = match run_git(cwd, &["rev-parse", "--git-common-dir"], None, deadline) {
+        GitRun::Exited {
+            code: Some(0),
+            stdout,
+        } => stdout,
+        GitRun::Exited { .. } | GitRun::NotFound => return CommonDirLookup::NotGit,
+        GitRun::TimedOut | GitRun::Failed => return CommonDirLookup::Indeterminate,
     };
     let Ok(dir) = String::from_utf8(bytes) else {
         return CommonDirLookup::Indeterminate;
@@ -1018,6 +1049,9 @@ fn git_common_dir_lookup_with_deadline(cwd: &Path, deadline: Instant) -> CommonD
     })
 }
 
+/// Resolve the canonical git common directory (the actual `.git`, even from
+/// inside a worktree) for `cwd`. Returns `None` when not a git repo, git is
+/// unavailable, or git times out. Result paths are absolute.
 pub fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
     match git_common_dir_lookup(cwd) {
         CommonDirLookup::Found(path) => Some(path),
@@ -1031,7 +1065,15 @@ enum CommitsBetween {
     Unknown,
 }
 
+/// `git rev-list --count a..b`. Returns `NotAncestor` when the stored SHA is
+/// not an ancestor of HEAD (git prints 0 in that case too, so we explicitly
+/// test ancestry first to avoid conflating rebases with freshness).
 fn commits_between(cwd: &Path, a: &str, b: &str, deadline: Instant) -> CommitsBetween {
+    // The stored SHA comes from the database; an option-shaped value must
+    // never reach `rev-list` (`--output=<path>` writes a file).
+    if !is_object_name(a) || !is_object_name(b) {
+        return CommitsBetween::Unknown;
+    }
     match git_succeeded(cwd, &["merge-base", "--is-ancestor", a, b], deadline) {
         Some(true) => {}
         Some(false) => return CommitsBetween::NotAncestor,
@@ -1184,12 +1226,14 @@ mod tests {
         assert_eq!(candidates, vec![("new.rs".to_string(), None)]);
     }
 
+    /// A repository whose config includes a FIFO nobody writes, so every git
+    /// child that reads the repository config blocks until it is killed.
+    /// `None` when `mkfifo` is unavailable.
     #[cfg(unix)]
-    #[test]
-    fn stalled_git_child_is_killed_at_deadline() {
+    fn stalled_repo() -> Option<tempfile::TempDir> {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let init = std::process::Command::new("git")
+        let init = Command::new("git")
             .args(["init", "-q"])
             .current_dir(root)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1198,36 +1242,157 @@ mod tests {
             .unwrap();
         assert!(init.success());
         let fifo = root.join("stall.config");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success()
-        );
+        let made = Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|status| status.success()) {
+            eprintln!("skipping: mkfifo unavailable");
+            return None;
+        }
         let config_path = root.join(".git/config");
         let mut config = std::fs::read_to_string(&config_path).unwrap();
         config.push_str(&format!("\n[include]\n\tpath = {}\n", fifo.display()));
         std::fs::write(&config_path, config).unwrap();
+        Some(dir)
+    }
 
+    #[cfg(unix)]
+    const STALL_DEADLINE: Duration = Duration::from_millis(200);
+    #[cfg(unix)]
+    const STALL_CEILING: Duration = Duration::from_secs(5);
+
+    /// Run `call` under a fresh [`STALL_DEADLINE`] and assert it returned only
+    /// once that deadline had passed (so a git child was spawned and waited
+    /// on) and well before [`STALL_CEILING`] (so the child was killed).
+    #[cfg(unix)]
+    fn assert_killed_at_deadline<T>(what: &str, call: impl FnOnce(Instant) -> T) -> T {
         let started = Instant::now();
+        let result = call(started + STALL_DEADLINE);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= STALL_DEADLINE,
+            "{what} returned after {elapsed:?}, before its deadline: no git child was waited on"
+        );
+        assert!(
+            elapsed < STALL_CEILING,
+            "{what} returned after {elapsed:?}: the stalled child was not killed"
+        );
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_git_child_is_killed_at_deadline() {
+        let Some(dir) = stalled_repo() else {
+            return;
+        };
+        let root = dir.path();
         assert_eq!(
-            git_succeeded(
-                root,
-                &["rev-parse", "HEAD"],
-                started + Duration::from_millis(100)
-            ),
+            assert_killed_at_deadline("git_succeeded", |deadline| {
+                git_succeeded(root, &["rev-parse", "HEAD"], deadline)
+            }),
             None
         );
         assert_eq!(
-            git_head_lookup_with_deadline(root, started + Duration::from_millis(100)),
+            assert_killed_at_deadline("git_head_lookup_with_deadline", |deadline| {
+                git_head_lookup_with_deadline(root, deadline)
+            }),
             HeadLookup::Indeterminate
         );
         assert_eq!(
-            git_common_dir_lookup_with_deadline(root, started + Duration::from_millis(100)),
+            assert_killed_at_deadline("git_common_dir_lookup_with_deadline", |deadline| {
+                git_common_dir_lookup_with_deadline(root, deadline)
+            }),
             CommonDirLookup::Indeterminate
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            assert_killed_at_deadline("git_output", |deadline| {
+                git_output(root, &["rev-parse", "--git-dir"], deadline)
+            }),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_git_child_fed_stdin_is_killed_at_deadline() {
+        let Some(dir) = stalled_repo() else {
+            return;
+        };
+        // More than a pipe buffer, so the writer thread is parked on a full
+        // pipe when the child is killed.
+        let requests: Vec<u8> = (0..100_000)
+            .flat_map(|i| format!("src/f{i}.rs\0").into_bytes())
+            .collect();
+        let result = assert_killed_at_deadline("git_output_with_stdin", |deadline| {
+            git_output_with_stdin(
+                dir.path(),
+                &["check-ignore", "-z", "--stdin", "--no-index"],
+                &requests,
+                deadline,
+            )
+        });
+        assert_eq!(result, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_cat_file_batch_is_killed_by_the_watchdog() {
+        let Some(dir) = stalled_repo() else {
+            return;
+        };
+        let candidates = vec![("src/a.rs".to_string(), Some("indexed-hash".to_string()))];
+        let mut behind = FilesBehind::default();
+        let result = assert_killed_at_deadline("compare_head_blobs", |deadline| {
+            compare_head_blobs(
+                dir.path(),
+                "0000000000000000000000000000000000000000",
+                &candidates,
+                deadline,
+                &mut behind,
+            )
+        });
+        assert_eq!(result, Some(()));
+        assert!(behind.bounded, "a killed stream must read as a lower bound");
+        assert_eq!(behind.count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_drift_under_a_stalled_git_returns_unknown_within_its_budget() {
+        let Some(dir) = stalled_repo() else {
+            return;
+        };
+        let db = Database::open_in_memory().unwrap();
+        db.set_structural_index_state("0123456789abcdef0123456789abcdef01234567")
+            .unwrap();
+        let report = assert_killed_at_deadline("check_drift", |deadline| {
+            let budget = deadline.saturating_duration_since(Instant::now());
+            check_drift_within(dir.path(), &db, budget, budget)
+        });
+        assert_eq!(report.kind, DriftKind::Unknown);
+        assert_eq!(report.head_sha, None);
+        assert_eq!(report.indexed_files_behind, None);
+        assert!(!report.recommends_reindex());
+    }
+
+    #[test]
+    fn an_unspawnable_git_is_classified_notgit() {
+        let dir = tempfile::tempdir().unwrap();
+        // Spawning into a missing working directory fails with the same
+        // `NotFound` a missing `git` binary does.
+        let missing = dir.path().join("gone");
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(check_drift(&missing, &db).kind, DriftKind::NotGit);
+        assert_eq!(git_head_sha_for_attestation(&missing).unwrap(), None);
+    }
+
+    #[test]
+    fn a_stamped_index_on_an_unborn_head_is_never_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path());
+        let db = Database::open_in_memory().unwrap();
+        db.set_structural_index_state("0123456789abcdef0123456789abcdef01234567")
+            .unwrap();
+        assert_eq!(check_drift(dir.path(), &db).kind, DriftKind::NeverIndexed);
     }
 
     #[test]
