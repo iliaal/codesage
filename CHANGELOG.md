@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.37.0] - 2026-09-27
+
 ### Changed
 
 - Next.js App Router features under route groups, parallel slots, or interception folders take the public URL as their route (`app/(admin)/users` is `/users`) and get new feature ids; `route:` targets naming the old folder path stop resolving, and an interception or slot page shares its target's route.
@@ -1171,5 +1173,7 @@ Initial public release.
 
 [0.35.0]: https://github.com/iliaal/codesage/releases/tag/v0.35.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.36.0...HEAD
 [0.36.0]: https://github.com/iliaal/codesage/releases/tag/v0.36.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.37.0...HEAD
+[0.37.0]: https://github.com/iliaal/codesage/releases/tag/v0.37.0
