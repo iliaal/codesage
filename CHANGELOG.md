@@ -12,9 +12,9 @@
 - `project_overview` and `codesage overview` report `freshness.semantic_unavailable` instead of zero semantic files when the semantic table cannot be read.
 - `codesage index` recreates a malformed `semantic_files` table and re-embeds instead of failing every semantic write.
 - BM25 fusion no longer returns deleted chunks from an FTS sidecar whose row count and highest rowid match the chunk table but whose rows differ; the next write-path open rebuilds it.
-- `list_features` and `feature_bundle` no longer return an empty feature after its entry file is deleted.
+- `list_features` and `feature_bundle` no longer return an empty feature after its entry file is deleted, and the next `codesage index` remaps it if the file comes back.
 - `codesage map` drops Laravel route-handler references from files matched by `[index] exclude_patterns`, and mapper exclusions match whole directories as discovery does.
-- Laravel and Next.js route features carry the `auth-sensitive` tag for state-changing methods and `admin` / `auth` / `login` / `token` paths.
+- Laravel route features carry the `auth-sensitive` tag for state-changing methods and `admin` / `auth` / `login` / `token` paths; Next.js route features carry it for those paths.
 - An oversized `CODESAGE_BATCH_SIZE` fails before any model file is resolved or downloaded.
 
 ## [0.36.0] - 2026-09-26
