@@ -313,7 +313,9 @@ pub enum IndexMode {
     /// Re-scan the whole history. Drops existing git_files/git_co_changes first.
     Full,
     /// Only scan commits after the last recorded SHA. Falls back to Full if state
-    /// is missing, corrupted, or the prior SHA isn't an ancestor of HEAD.
+    /// is missing, corrupted, or the prior SHA isn't an ancestor of HEAD, or if
+    /// the recorded exclusion fingerprint is missing or differs from the
+    /// effective one.
     Incremental,
     /// Incremental if state is valid, else full. Default for hooks and CLI.
     Auto,

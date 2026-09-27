@@ -195,8 +195,11 @@ fn filtered_author_history_names_the_actual_anchor_without_changing_risk() {
     assert_eq!(absent.score, filtered.score);
 }
 
+/// Legacy state carries no exclusion fingerprint, so provenance stays unknown
+/// only until the next pass of any mode, which rebuilds in full; the same
+/// holds after an older binary rewrites the state row.
 #[test]
-fn legacy_history_window_remains_unknown_until_full_rebuild() {
+fn legacy_history_window_is_rebuilt_by_the_next_pass() {
     let root = tempfile::tempdir().unwrap();
     git(root.path(), &["init", "-q"]);
     let old = 1_500_000_000;
@@ -212,45 +215,47 @@ fn legacy_history_window_remains_unknown_until_full_rebuild() {
         .unwrap();
     db.upsert_git_file("feature.rs", 1.0, 0, 1, Some(old))
         .unwrap();
-    let unknown = || {
-        let note = codesage_graph::find_coupling(&db, "feature.rs", 5)
+    let note = || {
+        codesage_graph::find_coupling(&db, "feature.rs", 5)
             .unwrap()
             .note
-            .unwrap();
+            .unwrap()
+    };
+    let unknown = |note: String| {
         assert!(note.contains("window provenance is unknown"), "{note}");
         assert!(note.contains("git-index --full"), "{note}");
         assert!(!note.contains("730d@HEAD"), "{note}");
     };
-    unknown();
-    git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
-    unknown();
+    let rebuilt = |note: String| {
+        assert!(note.contains("730d@HEAD"), "{note}");
+        assert!(note.contains("730 days before HEAD"), "{note}");
+    };
+    unknown(note());
+    let stats =
+        git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
+    assert_eq!(stats.commits_scanned, 1, "legacy state must rescan in full");
+    rebuilt(note());
     commit(root.path(), "b@example.com", old + DAY, "fn second() {}\n");
-    git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
-    unknown();
-    git_history_index_with_options(&db, root.path(), &[], IndexMode::Full).unwrap();
-    let note = codesage_graph::find_coupling(&db, "feature.rs", 5)
-        .unwrap()
-        .note
-        .unwrap();
-    assert!(note.contains("730d@HEAD"), "{note}");
-    assert!(note.contains("730 days before HEAD"), "{note}");
-    git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
-    let note = codesage_graph::find_coupling(&db, "feature.rs", 5)
-        .unwrap()
-        .note
-        .unwrap();
-    assert!(note.contains("730d@HEAD"), "{note}");
+    let stats =
+        git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
+    assert_eq!(stats.commits_scanned, 1, "attributed state composes");
+    rebuilt(note());
     db.execute_raw_for_tests(
         "UPDATE git_index_state SET last_sha = last_sha, last_indexed_at = last_indexed_at",
     )
     .unwrap();
-    unknown();
-    git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
-    unknown();
+    unknown(note());
+    let stats =
+        git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
+    assert_eq!(
+        stats.commits_scanned, 2,
+        "an older writer's state must rescan in full"
+    );
+    rebuilt(note());
 }
 
 #[test]
-fn legacy_incremental_requires_full_rebuild_before_claiming_complete_history() {
+fn legacy_incremental_rebuilds_before_claiming_complete_history() {
     let root = tempfile::tempdir().unwrap();
     git(root.path(), &["init", "-q"]);
     let now = std::time::SystemTime::now()
@@ -275,8 +280,6 @@ fn legacy_incremental_requires_full_rebuild_before_claiming_complete_history() {
     db.upsert_git_file("feature.rs", 1.0, 0, 1, Some(now - DAY))
         .unwrap();
     commit(root.path(), "bob@example.com", now, "fn second() {}\n");
-    git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
-    assert_eq!(db.git_author_events("feature.rs").unwrap().len(), 1);
     assert!(!db.git_authors_complete().unwrap());
     assert!(
         assess_risk(&db, "feature.rs")
@@ -284,7 +287,11 @@ fn legacy_incremental_requires_full_rebuild_before_claiming_complete_history() {
             .author_concentration
             .is_none()
     );
-    git_history_index_with_options(&db, root.path(), &[], IndexMode::Full).unwrap();
+    // Unattributed legacy rows cannot be composed, so this incremental pass
+    // rebuilds in full and only then claims complete author history.
+    git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
+    assert_eq!(db.git_author_events("feature.rs").unwrap().len(), 2);
+    assert!(db.git_authors_complete().unwrap());
     assert_eq!(
         assess_risk(&db, "feature.rs")
             .unwrap()
