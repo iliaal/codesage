@@ -55,9 +55,13 @@ fn git_command(cwd: &Path, args: &[&str]) -> Command {
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .stderr(Stdio::null());
     #[cfg(unix)]
     {
@@ -75,9 +79,13 @@ fn kill_git(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// Name a Git child killed at its deadline, so an `Unknown` drift summary's
-/// "see logs" has something to point at. Long path lists are elided.
-fn log_git_timeout(cwd: &Path, args: &[&str]) {
+/// Name a Git child that ended without an answer, so an `Unknown` drift
+/// summary's "see logs" has something to point at. Metadata lookups warn;
+/// content-comparison children (`diff`, `check-ignore`, `ls-tree`,
+/// `cat-file`) log at debug, since running out of their 500 ms budget is the
+/// routine end of a long comparison and already reads as bounded. Long path
+/// lists are elided.
+fn log_git_failure(cwd: &Path, args: &[&str], what: &str) {
     const SHOWN_ARGS: usize = 8;
     let mut command = format!(
         "git {}",
@@ -90,7 +98,15 @@ fn log_git_timeout(cwd: &Path, args: &[&str]) {
     if args.len() > SHOWN_ARGS {
         command.push_str(&format!(" (+{} more args)", args.len() - SHOWN_ARGS));
     }
-    tracing::warn!(cwd = %cwd.display(), %command, "git child killed at its deadline");
+    let metadata = matches!(
+        args.first().copied(),
+        Some("rev-parse" | "merge-base" | "rev-list")
+    );
+    if metadata {
+        tracing::warn!(cwd = %cwd.display(), %command, "git child {what}");
+    } else {
+        tracing::debug!(cwd = %cwd.display(), %command, "git child {what}");
+    }
 }
 
 /// Run one Git child to completion or to `deadline`, whichever comes first.
@@ -99,7 +115,19 @@ fn run_git(cwd: &Path, args: &[&str], input: Option<&[u8]>, deadline: Instant) -
     if Instant::now() >= deadline {
         return GitRun::TimedOut;
     }
-    let mut command = git_command(cwd, args);
+    let outcome = run_child(git_command(cwd, args), input, deadline);
+    match &outcome {
+        GitRun::TimedOut => log_git_failure(cwd, args, "killed at its deadline"),
+        GitRun::Failed => log_git_failure(cwd, args, "failed to run or overflowed its output cap"),
+        GitRun::Exited { .. } | GitRun::NotFound => {}
+    }
+    outcome
+}
+
+/// Spawn `command` in its own process group and collect its stdout until it
+/// exits or `deadline` passes; on timeout or failure the whole group is
+/// killed and the child reaped.
+fn run_child(mut command: Command, input: Option<&[u8]>, deadline: Instant) -> GitRun {
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -161,9 +189,6 @@ fn run_git(cwd: &Path, args: &[&str], input: Option<&[u8]>, deadline: Instant) -
         Err(mpsc::RecvTimeoutError::Timeout) => GitRun::TimedOut,
     };
     if !matches!(outcome, GitRun::Exited { .. }) {
-        if matches!(outcome, GitRun::TimedOut) {
-            log_git_timeout(cwd, args);
-        }
         kill_git(&mut child);
     }
     let _ = child.wait();
@@ -1070,9 +1095,10 @@ enum CommitsBetween {
 /// test ancestry first to avoid conflating rebases with freshness).
 fn commits_between(cwd: &Path, a: &str, b: &str, deadline: Instant) -> CommitsBetween {
     // The stored SHA comes from the database; an option-shaped value must
-    // never reach `rev-list` (`--output=<path>` writes a file).
+    // never reach git. A stamp that names no commit is not an ancestor, as
+    // `merge-base --is-ancestor` itself would report.
     if !is_object_name(a) || !is_object_name(b) {
-        return CommitsBetween::Unknown;
+        return CommitsBetween::NotAncestor;
     }
     match git_succeeded(cwd, &["merge-base", "--is-ancestor", a, b], deadline) {
         Some(true) => {}
@@ -1393,6 +1419,46 @@ mod tests {
         db.set_structural_index_state("0123456789abcdef0123456789abcdef01234567")
             .unwrap();
         assert_eq!(check_drift(dir.path(), &db).kind, DriftKind::NeverIndexed);
+    }
+
+    #[test]
+    fn a_stamp_that_names_no_commit_is_an_unrelated_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        hermetic_repo(dir.path());
+        write_and_commit(dir.path(), &[("a.rs", "fn a() {}\n")], "one");
+        let db = Database::open_in_memory().unwrap();
+        for stamp in ["not-a-sha", "--output=/tmp/codesage-drift-probe"] {
+            db.set_structural_index_state(stamp).unwrap();
+            let report = check_drift(dir.path(), &db);
+            assert_eq!(report.kind, DriftKind::UnrelatedAncestor, "{stamp}");
+            assert!(report.recommends_reindex(), "{stamp}");
+        }
+    }
+
+    /// A child that forks a grandchild holding stdout must not outlive the
+    /// deadline: only a process-group kill closes the pipe the reader waits on.
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_kills_grandchildren_holding_stdout() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "sleep 30 & wait"])
+                .stderr(Stdio::null());
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            let started = Instant::now();
+            let outcome = run_child(command, None, started + Duration::from_millis(200));
+            let _ = tx.send((outcome, started.elapsed()));
+        });
+        let (outcome, elapsed) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("run_child must return once the process group is killed");
+        assert!(matches!(outcome, GitRun::TimedOut), "{outcome:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     }
 
     #[test]
