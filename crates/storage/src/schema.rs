@@ -471,8 +471,12 @@ pub(crate) fn semantic_files_shape_is_current(conn: &Connection) -> rusqlite::Re
 /// The table is only freshness bookkeeping: recreating it empty makes the
 /// next semantic pass re-embed, which is the repair the overview advises. A
 /// pre-0004 path-only table is recreated here too, which is what 0004 itself
-/// would do. An absent table is left for SCHEMA to create.
+/// would do. An absent table is left for SCHEMA to create, and an index a
+/// newer binary migrated is never touched: its shape may be that binary's.
 fn rebuild_malformed_semantic_files(conn: &Connection) -> rusqlite::Result<()> {
+    if migrated_by_newer_binary(conn)? {
+        return Ok(());
+    }
     let malformed = |conn: &Connection| -> rusqlite::Result<bool> {
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'semantic_files')",
@@ -491,7 +495,11 @@ fn rebuild_malformed_semantic_files(conn: &Connection) -> rusqlite::Result<()> {
         if !malformed(conn)? {
             return Ok(());
         }
-        tracing::warn!("semantic_files has an unexpected shape; recreating it empty");
+        if migration_applied(conn, "0004_semantic_files_chunk_table")? {
+            tracing::warn!("semantic_files has an unexpected shape; recreating it empty");
+        } else {
+            tracing::info!("replacing pre-0004 semantic_files; semantic content will re-embed");
+        }
         conn.execute_batch(
             "DROP TABLE semantic_files;
              CREATE TABLE semantic_files (
@@ -504,13 +512,52 @@ fn rebuild_malformed_semantic_files(conn: &Connection) -> rusqlite::Result<()> {
              CREATE INDEX IF NOT EXISTS idx_semantic_files_path ON semantic_files(path);",
         )
     })();
-    match result {
-        Ok(()) => conn.execute_batch("COMMIT"),
+    match result.and_then(|()| conn.execute_batch("COMMIT")) {
+        Ok(()) => Ok(()),
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)
         }
     }
+}
+
+/// Whether `schema_migrations` records a migration this binary does not know
+/// (development-build names it supersedes aside). `check_unknown_migrations`
+/// decides whether to open such an index; repairs that run before it must not
+/// rewrite a table the newer binary may have reshaped.
+fn migrated_by_newer_binary(conn: &Connection) -> rusqlite::Result<bool> {
+    let registry: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !registry {
+        return Ok(false);
+    }
+    let mut stmt = conn.prepare("SELECT name FROM schema_migrations")?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|name| {
+        !MIGRATIONS.iter().any(|(known, _)| known == name)
+            && !SUPERSEDED_MIGRATIONS.contains(&name.as_str())
+    }))
+}
+
+fn migration_applied(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    let registry: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !registry {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = ?1)",
+        [name],
+        |row| row.get(0),
+    )
 }
 
 /// Migration bodies must be safe on an already-current schema: init_db creates
@@ -1403,6 +1450,37 @@ mod tests {
                 [],
             )
             .unwrap_or_else(|e| panic!("writer upsert after repair of {damage:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn init_db_leaves_a_newer_binarys_semantic_files_alone() {
+        for newer in [
+            "breaking_0099_semantic_files_rev",
+            "0099_semantic_files_rev",
+        ] {
+            let conn = open_initialized();
+            conn.execute_batch(
+                "DROP TABLE semantic_files;
+                 CREATE TABLE semantic_files(chunk_table TEXT NOT NULL, path TEXT NOT NULL,
+                     model_rev TEXT NOT NULL, content_hash TEXT NOT NULL,
+                     indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                     PRIMARY KEY (chunk_table, path, model_rev));
+                 INSERT INTO semantic_files(chunk_table, path, model_rev, content_hash)
+                     VALUES ('t', 'newer.rs', 'r', 'h');",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO schema_migrations(name) VALUES (?1)", [newer])
+                .unwrap();
+            let _ = init_db(&conn);
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM semantic_files WHERE model_rev = 'r'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("{newer}: newer table was rewritten: {e}"));
+            assert_eq!(rows, 1, "{newer}");
         }
     }
 
