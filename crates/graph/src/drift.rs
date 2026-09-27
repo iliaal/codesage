@@ -81,8 +81,8 @@ fn kill_git(child: &mut Child) {
 
 /// Name a Git child that ended without an answer, so an `Unknown` drift
 /// summary's "see logs" has something to point at. Metadata lookups warn;
-/// content-comparison children (`diff`, `check-ignore`, `ls-tree`,
-/// `cat-file`) log at debug, since running out of their 500 ms budget is the
+/// content-comparison children (`diff`, `check-ignore`, `ls-tree`) log at
+/// debug, since running out of their 500 ms budget is the
 /// routine end of a long comparison and already reads as bounded. Long path
 /// lists are elided.
 fn log_git_failure(cwd: &Path, args: &[&str], what: &str) {
