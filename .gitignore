@@ -50,3 +50,4 @@ __pycache__/
 # intent; listed here so `git add -A` can't sweep them into a commit.
 /TODO.md
 /docs/spikes/cbm-ideas.md
+.worktrees
