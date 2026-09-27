@@ -304,8 +304,9 @@ fn fts_sidecar_counts(
 }
 
 /// Read-path probe: does the FTS5 sidecar mirror `chunk_table`? Two counts
-/// plus, when they agree, one chunk-to-FTS rowid anti-join; never a rewrite, so it is safe on every open, including read-only
-/// and migration-free handles.
+/// plus, when they agree, one chunk-to-FTS rowid anti-join; never a rewrite,
+/// so it is safe on every open, including read-only and migration-free
+/// handles.
 pub(crate) fn fts_sidecar_health(
     conn: &Connection,
     chunk_table: &str,

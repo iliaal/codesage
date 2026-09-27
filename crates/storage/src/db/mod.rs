@@ -1078,9 +1078,9 @@ impl Database {
     }
 
     /// Whether this handle's FTS5 sidecar mirrors its chunk table: row counts
-    /// plus one rowid anti-join, never a rewrite. This is the read-path health signal for a
-    /// sidecar the open deliberately did not repair. Fails on a handle without a
-    /// chunk table.
+    /// plus one rowid anti-join, never a rewrite. This is the read-path health
+    /// signal for a sidecar the open deliberately did not repair. Fails on a
+    /// handle without a chunk table.
     pub fn fts_health(&self) -> Result<FtsSidecarHealth> {
         anyhow::ensure!(
             !self.chunk_table.is_empty(),
