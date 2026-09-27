@@ -1,5 +1,22 @@
 ## [Unreleased]
 
+### Changed
+
+- Next.js App Router features under route groups, parallel slots, or interception folders take the public URL as their route (`app/(admin)/users` is `/users`) and get new feature ids; `route:` targets naming the old folder path stop resolving, and an interception or slot page shares its target's route.
+- The first `codesage git-index` after upgrading rescans history in full, and the first `codesage index` re-runs feature mapping even when no file changed.
+
+### Fixed
+
+- `codesage git-index` drops history for paths newly matched by `[index] exclude_patterns`, whether or not HEAD moved, without `--full`.
+- Drift checks behind the MCP `index` envelope, `project_overview`, `codesage status`, `rehearse`, and `doctor` no longer hang on a stalled `git`; each git call stops at a deadline and freshness reads `unknown` or bounded.
+- `project_overview` and `codesage overview` report `freshness.semantic_unavailable` instead of zero semantic files when the semantic table cannot be read.
+- `codesage index` recreates a malformed `semantic_files` table and re-embeds instead of failing every semantic write.
+- BM25 fusion no longer returns deleted chunks from an FTS sidecar whose row count and highest rowid match the chunk table but whose rows differ; the next write-path open rebuilds it.
+- `list_features` and `feature_bundle` no longer return an empty feature after its entry file is deleted.
+- `codesage map` drops Laravel route-handler references from files matched by `[index] exclude_patterns`, and mapper exclusions match whole directories as discovery does.
+- Laravel and Next.js route features carry the `auth-sensitive` tag for state-changing methods and `admin` / `auth` / `login` / `token` paths.
+- An oversized `CODESAGE_BATCH_SIZE` fails before any model file is resolved or downloaded.
+
 ## [0.36.0] - 2026-09-26
 
 ### Changed
