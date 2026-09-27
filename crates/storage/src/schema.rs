@@ -244,42 +244,19 @@ fn fts_rowids_match(
     chunk_table: &str,
     fts_table: &str,
 ) -> rusqlite::Result<bool> {
+    // Only called once the counts are equal. Both rowid sets are unique, so
+    // every chunk id having an FTS row proves the sets are equal; the reverse
+    // anti-join would probe the vec0 table once per FTS row (tens of seconds
+    // on a large index) and adds nothing.
     let chunk = quote_ident(chunk_table);
     let fts = quote_ident(fts_table);
     let sql = format!(
-        "SELECT
-            (SELECT COUNT(*) FROM \"{chunk}\" AS c
-             LEFT JOIN \"{fts}\" AS f ON f.rowid = c.id
-             WHERE f.rowid IS NULL) +
-            (SELECT COUNT(*) FROM \"{fts}\" AS f
-             LEFT JOIN \"{chunk}\" AS c ON c.id = f.rowid
-             WHERE c.id IS NULL)",
+        "SELECT NOT EXISTS (
+            SELECT 1 FROM \"{chunk}\" AS c
+            WHERE NOT EXISTS (SELECT 1 FROM \"{fts}\" AS f WHERE f.rowid = c.id)
+         )",
     );
-    Ok(conn.query_row(&sql, [], |row| row.get::<_, i64>(0))? == 0)
-}
-#[cfg(test)]
-fn fts_rows_match_exact(
-    conn: &Connection,
-    chunk_table: &str,
-    fts_table: &str,
-) -> rusqlite::Result<bool> {
-    let chunk = quote_ident(chunk_table);
-    let fts = quote_ident(fts_table);
-    let sql = format!(
-        "SELECT
-            (SELECT COUNT(*) FROM \"{chunk}\" AS c
-             LEFT JOIN \"{fts}\" AS f ON f.rowid = c.id
-             WHERE f.rowid IS NULL
-                OR f.content IS NOT c.content
-                OR f.file_path IS NOT c.file_path
-                OR f.language IS NOT c.language
-                OR f.start_line IS NOT c.start_line
-                OR f.end_line IS NOT c.end_line) +
-            (SELECT COUNT(*) FROM \"{fts}\" AS f
-             LEFT JOIN \"{chunk}\" AS c ON c.id = f.rowid
-             WHERE c.id IS NULL)",
-    );
-    Ok(conn.query_row(&sql, [], |row| row.get::<_, i64>(0))? == 0)
+    conn.query_row(&sql, [], |row| row.get::<_, bool>(0))
 }
 
 /// Whether the FTS5 sidecar mirrors its chunk table. Returned by the
@@ -326,8 +303,8 @@ fn fts_sidecar_counts(
     Ok((chunk_count, fts_count, in_sync))
 }
 
-/// Read-path probe: does the FTS5 sidecar mirror `chunk_table`? Two cheap
-/// queries, never a rewrite, so it is safe on every open, including read-only
+/// Read-path probe: does the FTS5 sidecar mirror `chunk_table`? Two counts
+/// plus, when they agree, one chunk-to-FTS rowid anti-join; never a rewrite, so it is safe on every open, including read-only
 /// and migration-free handles.
 pub(crate) fn fts_sidecar_health(
     conn: &Connection,
@@ -335,24 +312,6 @@ pub(crate) fn fts_sidecar_health(
     fts_table: &str,
 ) -> rusqlite::Result<FtsSidecarHealth> {
     let (chunk_count, fts_count, in_sync) = fts_sidecar_counts(conn, chunk_table, fts_table)?;
-    Ok(if in_sync {
-        FtsSidecarHealth::InSync
-    } else {
-        FtsSidecarHealth::Diverged {
-            chunk_rows: chunk_count,
-            fts_rows: fts_count,
-        }
-    })
-}
-
-#[cfg(test)]
-fn fts_sidecar_health_exact(
-    conn: &Connection,
-    chunk_table: &str,
-    fts_table: &str,
-) -> rusqlite::Result<FtsSidecarHealth> {
-    let (chunk_count, fts_count, in_sync) = fts_sidecar_counts(conn, chunk_table, fts_table)?;
-    let in_sync = in_sync && fts_rows_match_exact(conn, chunk_table, fts_table)?;
     Ok(if in_sync {
         FtsSidecarHealth::InSync
     } else {
@@ -1633,13 +1592,24 @@ mod tests {
                 fts_rows: 2
             }
         );
-        assert!(matches!(
-            fts_sidecar_health_exact(&conn, table, &fts).unwrap(),
-            FtsSidecarHealth::Diverged { .. }
-        ));
         assert_eq!(
             repair_fts_sidecar_capped(&conn, table, &fts, FTS_REPAIR_ROW_CAP).unwrap(),
             FtsRepairOutcome::Repaired { rows: 2 }
+        );
+        assert_eq!(
+            fts_sidecar_health(&conn, table, &fts).unwrap(),
+            FtsSidecarHealth::InSync
+        );
+        let stale: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM \"{fts}\" WHERE \"{fts}\" MATCH 'stale'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale, 0,
+            "the repaired sidecar must not keep the deleted row"
         );
     }
 

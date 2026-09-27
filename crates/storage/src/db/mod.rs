@@ -1091,8 +1091,8 @@ impl Database {
         ensure_semantic_fingerprint_compatible(&self.conn, &self.chunk_table, expected)
     }
 
-    /// Whether this handle's FTS5 sidecar mirrors its chunk table. Two cheap
-    /// queries, never a rewrite. This is the read-path health signal for a
+    /// Whether this handle's FTS5 sidecar mirrors its chunk table: row counts
+    /// plus one rowid anti-join, never a rewrite. This is the read-path health signal for a
     /// sidecar the open deliberately did not repair. Fails on a handle without a
     /// chunk table.
     pub fn fts_health(&self) -> Result<FtsSidecarHealth> {
