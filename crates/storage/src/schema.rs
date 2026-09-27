@@ -443,6 +443,9 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     conn.execute_batch("PRAGMA mmap_size=268435456;")?;
     conn.execute_batch("PRAGMA cache_size=-65536;")?;
+    // A newer binary's breaking migration refuses the open before SCHEMA or
+    // any repair can touch tables that binary may have reshaped.
+    refuse_breaking_unknown_migrations(&unknown_migrations(conn)?)?;
     // Before SCHEMA: its `idx_semantic_files_path` statement fails on a table
     // that lost its `path` column, which would block the open itself.
     rebuild_malformed_semantic_files(conn)?;
@@ -490,9 +493,9 @@ fn rebuild_malformed_semantic_files(conn: &Connection) -> rusqlite::Result<()> {
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
-        // Another opener may have repaired it since the unlocked probe; a
-        // second DROP would discard rows written in between.
-        if !malformed(conn)? {
+        // Another opener may have repaired it, or a newer binary migrated it,
+        // since the unlocked probe; a second DROP would discard its rows.
+        if migrated_by_newer_binary(conn)? || !malformed(conn)? {
             return Ok(());
         }
         if migration_applied(conn, "0004_semantic_files_chunk_table")? {
@@ -526,22 +529,31 @@ fn rebuild_malformed_semantic_files(conn: &Connection) -> rusqlite::Result<()> {
 /// decides whether to open such an index; repairs that run before it must not
 /// rewrite a table the newer binary may have reshaped.
 fn migrated_by_newer_binary(conn: &Connection) -> rusqlite::Result<bool> {
+    Ok(!unknown_migrations(conn)?.is_empty())
+}
+
+/// `schema_migrations` names this binary does not know, development-build
+/// names it supersedes aside; empty before the registry exists.
+fn unknown_migrations(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let registry: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
         [],
         |row| row.get(0),
     )?;
     if !registry {
-        return Ok(false);
+        return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare("SELECT name FROM schema_migrations")?;
+    let mut stmt = conn.prepare("SELECT name FROM schema_migrations ORDER BY name")?;
     let names = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(names.iter().any(|name| {
-        !MIGRATIONS.iter().any(|(known, _)| known == name)
-            && !SUPERSEDED_MIGRATIONS.contains(&name.as_str())
-    }))
+    Ok(names
+        .into_iter()
+        .filter(|name| {
+            !MIGRATIONS.iter().any(|(known, _)| known == name)
+                && !SUPERSEDED_MIGRATIONS.contains(&name.as_str())
+        })
+        .collect())
 }
 
 fn migration_applied(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -927,16 +939,19 @@ fn forget_superseded_migrations(conn: &Connection) -> rusqlite::Result<()> {
 /// [`BREAKING_MIGRATION_PREFIX`] row hard-errors, because that name is the
 /// newer binary's declaration that older code must not proceed.
 fn check_unknown_migrations(conn: &Connection) -> rusqlite::Result<()> {
-    let known: std::collections::HashSet<&str> = MIGRATIONS.iter().map(|(name, _)| *name).collect();
-    let unknown: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT name FROM schema_migrations ORDER BY name")?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter()
-            .filter(|name| !known.contains(name.as_str()))
-            .collect()
-    };
+    let unknown = unknown_migrations(conn)?;
+    refuse_breaking_unknown_migrations(&unknown)?;
+    if !unknown.is_empty() {
+        tracing::warn!(
+            migrations = ?unknown,
+            "schema_migrations has entries unknown to this binary — the index was \
+             migrated by a newer codesage; proceeding (additive migrations only)"
+        );
+    }
+    Ok(())
+}
+
+fn refuse_breaking_unknown_migrations(unknown: &[String]) -> rusqlite::Result<()> {
     if let Some(breaking) = unknown
         .iter()
         .find(|name| name.starts_with(BREAKING_MIGRATION_PREFIX))
@@ -948,13 +963,6 @@ fn check_unknown_migrations(conn: &Connection) -> rusqlite::Result<()> {
                  this binary is too old to open it safely — upgrade codesage or rebuild the index"
             )),
         ));
-    }
-    if !unknown.is_empty() {
-        tracing::warn!(
-            migrations = ?unknown,
-            "schema_migrations has entries unknown to this binary — the index was \
-             migrated by a newer codesage; proceeding (additive migrations only)"
-        );
     }
     Ok(())
 }
