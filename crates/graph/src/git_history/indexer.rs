@@ -472,11 +472,19 @@ fn compile_excludes(extra: &[String]) -> Result<(GlobSet, GlobSet)> {
     Ok((hard_set, test_set))
 }
 
-/// Canonical, order-independent identity for the effective hard-exclusion
-/// policy. An empty list is still a valid fingerprint so legacy NULL state
-/// cannot silently reuse rows built under another policy.
+/// Canonical, order-independent identity for the effective exclusion policy:
+/// the hard exclusions plus the test-like set that decides which co-change
+/// pairs are stored. An empty user list is still a valid fingerprint so
+/// legacy NULL state cannot silently reuse rows built under another policy.
 fn effective_exclusion_fingerprint(extra_excludes: &[String]) -> String {
     let mut encoded = String::new();
+    for pattern in TEST_LIKE_EXCLUDE_PATTERNS {
+        encoded.push_str("test:");
+        encoded.push_str(&pattern.len().to_string());
+        encoded.push(':');
+        encoded.push_str(pattern);
+        encoded.push('\0');
+    }
     for pattern in DEFAULT_EXCLUDE_PATTERNS
         .iter()
         .copied()
