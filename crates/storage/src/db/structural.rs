@@ -177,28 +177,10 @@ impl Database {
         Ok(())
     }
 
-    /// Whether `semantic_files` has the columns the freshness read path
+    /// Whether `semantic_files` has the shape the freshness read path
     /// requires. A path-only legacy table is not valid coverage evidence.
     pub fn semantic_file_schema_is_current(&self) -> Result<bool> {
-        let required: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('semantic_files')
-             WHERE name IN ('chunk_table', 'path', 'content_hash', 'indexed_at')",
-            [],
-            |row| row.get(0),
-        )?;
-        let pk_columns: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('semantic_files') WHERE pk > 0",
-            [],
-            |row| row.get(0),
-        )?;
-        let pk_order: Option<String> = self.conn.query_row(
-            "SELECT group_concat(name, ',') FROM (
-                SELECT name FROM pragma_table_info('semantic_files')
-                WHERE pk > 0 ORDER BY pk)",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(required == 4 && pk_columns == 2 && pk_order.as_deref() == Some("chunk_table,path"))
+        Ok(crate::schema::semantic_files_shape_is_current(&self.conn)?)
     }
 
     pub fn all_file_interpretations(&self) -> Result<HashMap<String, Option<String>>> {
@@ -1051,12 +1033,12 @@ impl Database {
     /// Remove one file from every per-path store: `files` (FK cascades cover
     /// symbols / refs / fingerprints / trust boundaries), semantic freshness,
     /// git history, feature membership, and EVERY model's chunk table plus
-    /// its FTS sidecar. An entry-file deletion also removes its feature head;
-    /// ordinary owned-file deletions retain a feature with remaining files.
     /// its FTS sidecar. Sweeping all chunk tables, not just the active one,
     /// matters because a structural-only pass (`codesage index --no-semantic`)
     /// opens without a model, and a per-model delete would leave the removed
-    /// file searchable until the next semantic sweep. Savepoint-wrapped so a
+    /// file searchable until the next semantic sweep. Deleting a feature's
+    /// entry file also removes the feature, since a feature without its entry
+    /// is no slice at all. Savepoint-wrapped so a
     /// mid-delete failure can't leave the removal half-applied; a savepoint
     /// (not a bare BEGIN) composes with a caller's outer transaction.
     pub fn remove_file(&self, path: &str) -> Result<()> {

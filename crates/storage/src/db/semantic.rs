@@ -376,7 +376,7 @@ impl Database {
     /// Distinct semantic files across all models; works on structural-only handles.
     pub fn semantic_file_count(&self) -> Result<usize> {
         if !self.semantic_file_schema_is_current()? {
-            anyhow::bail!("semantic_files schema is missing required columns");
+            anyhow::bail!("semantic_files table is missing or malformed");
         }
         let n: i64 =
             self.conn
@@ -389,7 +389,7 @@ impl Database {
     /// Count only this model's semantic files; old models remain until cleanup.
     pub fn semantic_file_count_for_model(&self, model: &str) -> Result<usize> {
         if !self.semantic_file_schema_is_current()? {
-            anyhow::bail!("semantic_files schema is missing required columns");
+            anyhow::bail!("semantic_files table is missing or malformed");
         }
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(DISTINCT sf.path) FROM semantic_files sf

@@ -372,8 +372,12 @@ mod tests {
     #[test]
     fn legacy_path_only_semantic_table_is_unknown() {
         let db = Database::open_in_memory().unwrap();
-        db.execute_raw_for_tests("ALTER TABLE semantic_files RENAME COLUMN path TO legacy_path")
-            .unwrap();
+        db.execute_raw_for_tests(
+            "DROP TABLE semantic_files;
+             CREATE TABLE semantic_files(path TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+                 indexed_at INTEGER NOT NULL DEFAULT (unixepoch()))",
+        )
+        .unwrap();
         assert_semantic_unknown(&db);
     }
 

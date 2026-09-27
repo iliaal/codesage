@@ -445,7 +445,50 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA cache_size=-65536;")?;
     conn.execute_batch(SCHEMA)?;
     run_migrations(conn)?;
-    Ok(())
+    rebuild_malformed_semantic_files(conn)
+}
+
+/// Whether `semantic_files` exists with the four freshness columns and the
+/// `(chunk_table, path)` primary key every writer's upsert relies on.
+pub(crate) fn semantic_files_shape_is_current(conn: &Connection) -> rusqlite::Result<bool> {
+    let (required, pk_order): (i64, Option<String>) = conn.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM pragma_table_info('semantic_files')
+              WHERE name IN ('chunk_table', 'path', 'content_hash', 'indexed_at')),
+             (SELECT group_concat(name, ',') FROM (
+                 SELECT name FROM pragma_table_info('semantic_files')
+                 WHERE pk > 0 ORDER BY pk))",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(required == 4 && pk_order.as_deref() == Some("chunk_table,path"))
+}
+
+/// Migrations 0003/0004 run once, so a `semantic_files` table damaged or
+/// reshaped after they were stamped would make every semantic write fail.
+/// The table is only freshness bookkeeping: recreating it empty makes the
+/// next semantic pass re-embed, which is the repair the overview advises.
+fn rebuild_malformed_semantic_files(conn: &Connection) -> rusqlite::Result<()> {
+    if semantic_files_shape_is_current(conn)? {
+        return Ok(());
+    }
+    tracing::warn!("semantic_files has an unexpected shape; recreating it empty");
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         DROP TABLE IF EXISTS semantic_files;
+         CREATE TABLE semantic_files (
+             chunk_table TEXT NOT NULL,
+             path TEXT NOT NULL,
+             content_hash TEXT NOT NULL,
+             indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             PRIMARY KEY (chunk_table, path)
+         );
+         CREATE INDEX IF NOT EXISTS idx_semantic_files_path ON semantic_files(path);
+         COMMIT;",
+    )
+    .inspect_err(|_| {
+        let _ = conn.execute_batch("ROLLBACK");
+    })
 }
 
 /// Migration bodies must be safe on an already-current schema: init_db creates
@@ -1313,6 +1356,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn init_db_recreates_a_malformed_semantic_files_table() {
+        for damage in [
+            "DROP TABLE semantic_files",
+            "ALTER TABLE semantic_files RENAME COLUMN path TO legacy_path",
+            "DROP TABLE semantic_files;
+             CREATE TABLE semantic_files(chunk_table TEXT, path TEXT, content_hash TEXT, indexed_at INTEGER)",
+            "DROP TABLE semantic_files;
+             CREATE TABLE semantic_files(path TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+                 indexed_at INTEGER NOT NULL DEFAULT (unixepoch()))",
+        ] {
+            let conn = open_initialized();
+            conn.execute_batch(damage).unwrap();
+            assert!(!semantic_files_shape_is_current(&conn).unwrap(), "{damage}");
+            init_db(&conn).unwrap();
+            assert!(semantic_files_shape_is_current(&conn).unwrap(), "{damage}");
+            conn.execute(
+                "INSERT INTO semantic_files(chunk_table, path, content_hash) VALUES ('t', 'a', 'h')
+                 ON CONFLICT(chunk_table, path) DO UPDATE SET content_hash = excluded.content_hash",
+                [],
+            )
+            .unwrap_or_else(|e| panic!("writer upsert after repair of {damage:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn init_db_keeps_a_current_semantic_files_table() {
+        let conn = open_initialized();
+        conn.execute(
+            "INSERT INTO semantic_files(chunk_table, path, content_hash) VALUES ('t', 'a', 'h')",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM semantic_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     fn open_initialized() -> Connection {
