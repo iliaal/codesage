@@ -618,6 +618,66 @@ fn breaking_migration_marker_from_newer_binary_refuses_open() {
     );
 }
 
+/// A newer binary may have reshaped tables SCHEMA indexes; the refusal must
+/// come before SCHEMA or any repair touches them.
+#[test]
+fn breaking_marker_refuses_before_schema_touches_a_reshaped_table() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).expect("first init_db");
+    let marker = format!("{BREAKING_MIGRATION_PREFIX}9999_semantic_files_rev");
+    conn.execute_batch(
+        "DROP TABLE semantic_files;
+         CREATE TABLE semantic_files(chunk_table TEXT NOT NULL, rev TEXT NOT NULL,
+             content_hash TEXT NOT NULL, PRIMARY KEY (chunk_table, rev));
+         INSERT INTO semantic_files(chunk_table, rev, content_hash) VALUES ('t', 'r', 'h');",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO schema_migrations (name) VALUES (?1)",
+        rusqlite::params![marker],
+    )
+    .unwrap();
+
+    let msg = init_db(&conn)
+        .expect_err("breaking marker must refuse open")
+        .to_string();
+    assert!(msg.contains(&marker), "refusal, not a raw SQL error: {msg}");
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM semantic_files WHERE rev = 'r'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "the newer binary's table must be left alone");
+}
+
+/// Refusing a newer index must not first apply this binary's own pending
+/// migrations to it.
+#[test]
+fn breaking_marker_refuses_before_known_migrations_run() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).expect("first init_db");
+    let marker = format!("{BREAKING_MIGRATION_PREFIX}9999_drop_everything");
+    conn.execute_batch("DELETE FROM schema_migrations WHERE name = '0024_is_test'")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO schema_migrations (name) VALUES (?1)",
+        rusqlite::params![marker],
+    )
+    .unwrap();
+
+    init_db(&conn).expect_err("breaking marker must refuse open");
+    let stamped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = '0024_is_test'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stamped, 0, "no known migration may run before the refusal");
+}
+
 #[test]
 fn unique_key_migration_dedupes_existing_duplicates() {
     let conn = Connection::open_in_memory().unwrap();
