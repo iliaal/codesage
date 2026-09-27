@@ -724,6 +724,9 @@ fn detect_root_extension_name(root: &Path) -> Option<String> {
 struct LaravelRoute {
     file: String,
     verb: String,
+    /// Method the auth-sensitive heuristic classifies: `GET` for a
+    /// `Route::match` whose declared methods are all safe, otherwise `verb`.
+    auth_method: String,
     pattern: String,
     /// Normalized FQCN or unresolved short name; controllers fall back to basename.
     controller_class: Option<String>,
@@ -736,15 +739,6 @@ struct LaravelRoute {
 fn line_at(text: &str, byte_off: usize) -> u32 {
     let off = byte_off.min(text.len());
     (text[..off].bytes().filter(|&b| b == b'\n').count() as u32) + 1
-}
-
-fn laravel_match_identity(registration: &str, verb_offset: usize) -> String {
-    let methods = laravel_match_methods(registration, verb_offset);
-    if methods.is_empty() {
-        "MATCH".to_string()
-    } else {
-        format!("MATCH[{}]", methods.join(","))
-    }
 }
 
 fn laravel_match_methods(registration: &str, verb_offset: usize) -> Vec<String> {
@@ -775,20 +769,21 @@ fn laravel_match_methods(registration: &str, verb_offset: usize) -> Vec<String> 
         .collect()
 }
 
-fn laravel_auth_method(verb: &str) -> &str {
-    let Some(methods) = verb
-        .strip_prefix("MATCH[")
-        .and_then(|v| v.strip_suffix(']'))
-    else {
-        return verb;
-    };
-    if methods
-        .split(',')
-        .all(|method| matches!(method, "GET" | "HEAD"))
+fn laravel_auth_method(verb: &str, registration: &str, verb_offset: usize) -> String {
+    if verb != "MATCH" {
+        return verb.to_string();
+    }
+    let methods = laravel_match_methods(registration, verb_offset);
+    // An unparseable method list stays `MATCH`, which the heuristic treats as
+    // state-changing: unknown fails closed.
+    if !methods.is_empty()
+        && methods
+            .iter()
+            .all(|method| matches!(method.as_str(), "GET" | "HEAD"))
     {
-        "GET"
+        "GET".to_string()
     } else {
-        "MATCH"
+        verb.to_string()
     }
 }
 
@@ -1038,18 +1033,15 @@ fn scan_route_region(
         {
             continue;
         }
-        let raw_verb = cap
+        let verb = cap
             .get(2)
             .map(|m| m.as_str().to_uppercase())
             .unwrap_or_default();
-        let verb = if raw_verb == "MATCH" {
-            laravel_match_identity(
-                whole.as_str(),
-                cap.get(2).map(|m| m.start() - whole.start()).unwrap_or(0),
-            )
-        } else {
-            raw_verb
-        };
+        let auth_method = laravel_auth_method(
+            &verb,
+            whole.as_str(),
+            cap.get(2).map(|m| m.start() - whole.start()).unwrap_or(0),
+        );
         let pattern = cap.get(3).map(|m| m.as_str()).unwrap_or("");
         if verb.is_empty() || pattern.is_empty() {
             continue;
@@ -1081,6 +1073,7 @@ fn scan_route_region(
         out.push(LaravelRoute {
             file: scan.rel.to_string(),
             verb,
+            auth_method,
             pattern: route_uri_with_prefixes(&full, pattern),
             controller_class,
             action,
@@ -1236,7 +1229,7 @@ fn laravel_route_seeds(routes: &[LaravelRoute]) -> Vec<FeatureSeed> {
                         "framework:laravel".to_string(),
                         "route".to_string(),
                     ];
-                    if route_is_auth_sensitive(laravel_auth_method(&r.verb), &r.pattern) {
+                    if route_is_auth_sensitive(&r.auth_method, &r.pattern) {
                         tags.push(AUTH_SENSITIVE_TAG.to_string());
                     }
                     tags
@@ -1841,6 +1834,7 @@ mod tests {
         let route = |verb: &str, pattern: &str| LaravelRoute {
             file: "routes/web.php".into(),
             verb: verb.into(),
+            auth_method: verb.into(),
             pattern: pattern.into(),
             controller_class: None,
             action: None,
@@ -1912,7 +1906,6 @@ mod tests {
             .iter()
             .find(|s| s.source == "php-ext")
             .expect("php-ext seed");
-
         assert!(s.title.contains("iconv"));
         assert!(s.tests.iter().any(|t| t.path.contains("bug001.phpt")));
         assert_eq!(s.entry_path, "ext/iconv/config.m4");
@@ -1924,14 +1917,22 @@ mod tests {
             dir.path(),
             "routes/web.php",
             "<?php\nRoute::match(['GET', 'HEAD'], '/safe', fn () => null);\n\
-             Route::middleware(['auth'])->match(['POST'], '/write', fn () => null);\n",
+             Route::middleware(['auth'])->match(['POST'], '/write', fn () => null);\n\
+             Route::match([Request::METHOD_GET], '/constant', fn () => null);\n",
         );
         let routes = parse_laravel_routes(dir.path()).unwrap();
-        assert_eq!(routes[0].verb, "MATCH[GET,HEAD]");
-        assert_eq!(routes[1].verb, "MATCH[POST]");
+        assert_eq!(routes[0].verb, "MATCH", "the route identity keeps its verb");
+        assert_eq!(routes[1].verb, "MATCH");
+        assert_eq!(routes[0].auth_method, "GET");
+        assert_eq!(routes[1].auth_method, "MATCH");
         let seeds = laravel_route_seeds(&routes);
         assert!(!seeds[0].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
         assert!(seeds[1].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+        assert_eq!(
+            routes[2].auth_method, "MATCH",
+            "unparsed methods fail closed"
+        );
+        assert!(seeds[2].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
     }
 
     #[test]

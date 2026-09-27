@@ -148,11 +148,18 @@ fn feature_map_fingerprint(db: &Database, root: &Path, exclude_patterns: &[Strin
             return None;
         }
     };
-    Some(manifest_state_fingerprint(
-        structural_state_fingerprint(&hashes),
-        root,
-        exclude_patterns,
+    Some(with_mapper_version(
+        manifest_state_fingerprint(
+            structural_state_fingerprint(&hashes),
+            root,
+            exclude_patterns,
+        ),
+        codesage_features::MAPPER_OUTPUT_VERSION,
     ))
+}
+
+fn with_mapper_version(fingerprint: u64, version: u32) -> u64 {
+    fnv1a(fingerprint, &version.to_le_bytes())
 }
 
 fn feature_map_state_path(root: &Path) -> PathBuf {
@@ -1023,6 +1030,11 @@ mod tests {
             structural_state_fingerprint(&x),
             structural_state_fingerprint(&y)
         );
+    }
+
+    #[test]
+    fn mapper_output_version_defeats_feature_map_skip() {
+        assert_ne!(with_mapper_version(7, 1), with_mapper_version(7, 2));
     }
 
     #[test]
