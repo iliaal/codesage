@@ -62,7 +62,7 @@ pub fn build_project_overview_with_top_risk(
             .then_with(|| a.language.as_str().cmp(b.language.as_str()))
     });
 
-    let freshness = build_freshness(root, db)?;
+    let freshness = build_freshness(root, db);
 
     let features = db.list_features(None, None, None, 0)?;
     let feature_count = features.len();
@@ -135,7 +135,7 @@ pub fn build_project_overview_with_top_risk(
     })
 }
 
-fn build_freshness(root: &Path, db: &Database) -> Result<FreshnessInfo> {
+fn build_freshness(root: &Path, db: &Database) -> FreshnessInfo {
     let report = drift::check_drift(root, db);
     let structural_kind = match report.kind {
         DriftKind::NotGit => "not_git",
@@ -146,17 +146,12 @@ fn build_freshness(root: &Path, db: &Database) -> Result<FreshnessInfo> {
         DriftKind::Unknown => "unknown",
     }
     .to_string();
-    // A missing/legacy semantic table is an error, not an empty index. Keep
-    // the result truthful so overview callers can show recovery guidance.
-    if !db.semantic_file_schema_is_current()? {
-        return Err(crate::semantic::StaleSemanticTable {
-            state: crate::semantic::SemanticTableState::Unrecorded,
-            current: "semantic_files schema is missing required columns".into(),
-        }
-        .into());
-    }
-    let semantic_indexed_files = db.semantic_file_count()?;
-    Ok(FreshnessInfo {
+    // A damaged or legacy semantic table is unknown coverage, not an empty
+    // index; the structural half of the overview stays available either way.
+    let semantic = db.semantic_file_count();
+    let semantic_indexed_files = *semantic.as_ref().unwrap_or(&0);
+    let semantic_unavailable = semantic.err().map(|error| format!("{error:#}"));
+    FreshnessInfo {
         structural_kind,
         structural_summary: report.summary(),
         commits_behind: report.commits_between,
@@ -166,7 +161,8 @@ fn build_freshness(root: &Path, db: &Database) -> Result<FreshnessInfo> {
         head_sha: report.head_sha,
         semantic_indexed_files,
         semantic_indexed: semantic_indexed_files > 0,
-    })
+        semantic_unavailable,
+    }
 }
 
 // Keep these hints aligned with `recommend_tests` sibling conventions.
@@ -217,6 +213,13 @@ fn suggested_next_calls(freshness: &FreshnessInfo) -> Vec<SuggestedCall> {
                 "{} — structural results may not reflect the working tree",
                 freshness.structural_summary
             ),
+        });
+    }
+    if let Some(reason) = &freshness.semantic_unavailable {
+        calls.push(SuggestedCall {
+            intent: "semantic index unreadable".to_string(),
+            tool: "codesage index --full (CLI)".to_string(),
+            why: format!("semantic coverage could not be measured: {reason}"),
         });
     }
     calls.extend([
@@ -273,6 +276,7 @@ mod tests {
             head_sha: None,
             semantic_indexed_files: 0,
             semantic_indexed: false,
+            semantic_unavailable: None,
         }
     }
 
@@ -340,55 +344,58 @@ mod tests {
             "a non-git temp dir has no hooks to report"
         );
     }
+    fn assert_semantic_unknown(db: &Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let overview = build_project_overview(dir.path(), db)
+            .expect("a semantic-schema problem must not fail the structural overview");
+        let reason = overview
+            .freshness
+            .semantic_unavailable
+            .as_deref()
+            .expect("unmeasured semantic coverage must be disclosed");
+        assert!(reason.contains("semantic_files"), "{reason}");
+        assert!(!overview.freshness.semantic_indexed);
+        assert_eq!(
+            overview.suggested_next_calls[0].tool,
+            "codesage index --full (CLI)"
+        );
+    }
+
     #[test]
-    fn missing_semantic_table_is_reported_as_error_not_empty_index() {
+    fn missing_semantic_table_is_unknown_not_empty() {
         let db = Database::open_in_memory().unwrap();
         db.execute_raw_for_tests("DROP TABLE semantic_files")
             .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let error = build_project_overview(dir.path(), &db).unwrap_err();
-        assert!(
-            error
-                .downcast_ref::<crate::semantic::StaleSemanticTable>()
-                .is_some()
-        );
-        assert!(
-            error.to_string().contains("codesage index --full"),
-            "{error}"
-        );
+        assert_semantic_unknown(&db);
     }
+
     #[test]
-    fn legacy_path_only_semantic_table_is_rejected() {
+    fn legacy_path_only_semantic_table_is_unknown() {
         let db = Database::open_in_memory().unwrap();
         db.execute_raw_for_tests("ALTER TABLE semantic_files RENAME COLUMN path TO legacy_path")
             .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let error = build_project_overview(dir.path(), &db).unwrap_err();
-        assert!(
-            error
-                .downcast_ref::<crate::semantic::StaleSemanticTable>()
-                .is_some()
-        );
-        assert!(
-            error.to_string().contains("codesage index --full"),
-            "{error}"
-        );
+        assert_semantic_unknown(&db);
     }
+
     #[test]
-    fn malformed_semantic_primary_key_is_rejected() {
+    fn malformed_semantic_primary_key_is_unknown() {
         let db = Database::open_in_memory().unwrap();
         db.execute_raw_for_tests(
             "DROP TABLE semantic_files;
              CREATE TABLE semantic_files(chunk_table TEXT, path TEXT, content_hash TEXT, indexed_at INTEGER)",
         )
         .unwrap();
+        assert_semantic_unknown(&db);
+    }
+
+    #[test]
+    fn empty_semantic_table_is_measured_as_not_indexed() {
+        let db = Database::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let error = build_project_overview(dir.path(), &db).unwrap_err();
-        assert!(
-            error
-                .downcast_ref::<crate::semantic::StaleSemanticTable>()
-                .is_some()
-        );
+        let overview = build_project_overview(dir.path(), &db).unwrap();
+        assert_eq!(overview.freshness.semantic_unavailable, None);
+        assert_eq!(overview.freshness.semantic_indexed_files, 0);
+        assert!(!overview.freshness.semantic_indexed);
     }
 
     #[test]

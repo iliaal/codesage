@@ -2792,6 +2792,12 @@ pub struct FreshnessInfo {
     /// True when any semantic chunks exist (a model is configured and the
     /// semantic pass has run).
     pub semantic_indexed: bool,
+    /// Why semantic coverage could not be measured (for example a damaged or
+    /// legacy `semantic_files` table). When present, `semantic_indexed_files`
+    /// and `semantic_indexed` are not measurements; `codesage index --full`
+    /// rebuilds the semantic state.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub semantic_unavailable: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]

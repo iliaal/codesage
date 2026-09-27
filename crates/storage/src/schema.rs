@@ -416,22 +416,6 @@ pub(crate) fn set_busy_timeout(conn: &Connection, ordinary_ms: i64) -> rusqlite:
     conn.busy_timeout(std::time::Duration::from_millis(millis))
 }
 
-/// Prepare an existing index for bounded read paths that need current
-/// structural columns but must preserve semantic-schema damage for reporting.
-///
-/// Unlike `init_db`, this does not execute `SCHEMA`: a missing `semantic_files`
-/// table is evidence, not something a read should silently recreate. It also
-/// skips semantic-table migrations so a legacy table is not rewritten before
-/// the caller can classify and report it.
-pub fn init_db_for_overview(conn: &Connection) -> rusqlite::Result<()> {
-    set_busy_timeout(conn, 5000)?;
-    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-    conn.execute_batch("PRAGMA mmap_size=268435456;")?;
-    conn.execute_batch("PRAGMA cache_size=-65536;")?;
-    run_structural_migrations(conn)
-}
-
 /// Connection-local read pragmas; init_db also changes journal mode and migrates.
 pub fn init_db_read_only(conn: &Connection) -> rusqlite::Result<()> {
     set_busy_timeout(conn, READ_BUSY_TIMEOUT_MS)?;
@@ -537,29 +521,6 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         migrate_0025_git_exclusion_fingerprint,
     ),
 ];
-
-/// Migrations that create or reshape semantic bookkeeping. Overview deliberately
-/// leaves these unapplied: their absence/legacy shape is user-visible state,
-/// while structural compatibility migrations are safe prerequisites for reads.
-const SEMANTIC_MIGRATIONS: &[&str] = &[
-    "0003_semantic_files",
-    "0004_semantic_files_chunk_table",
-    "0005_semantic_models",
-    "0015_semantic_models_fingerprint",
-    "0016_semantic_models_artifact_stat_key",
-];
-
-fn run_structural_migrations(conn: &Connection) -> rusqlite::Result<()> {
-    ensure_migration_registry(conn)?;
-    for (name, up) in MIGRATIONS {
-        if SEMANTIC_MIGRATIONS.contains(name) {
-            continue;
-        }
-        run_migration(conn, name, *up)?;
-    }
-    forget_superseded_migrations(conn)?;
-    check_unknown_migrations(conn)
-}
 
 /// Stores the canonical effective git-history exclusion set. A NULL value is
 /// treated as stale by the indexer and forces one safe full rebuild.
@@ -774,72 +735,64 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     run_migration_list(conn, MIGRATIONS)
 }
 
-fn ensure_migration_registry(conn: &Connection) -> rusqlite::Result<()> {
+fn run_migration_list(
+    conn: &Connection,
+    migrations: &[(&str, MigrationUp)],
+) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
              id INTEGER PRIMARY KEY,
              name TEXT NOT NULL UNIQUE,
              applied_at INTEGER NOT NULL DEFAULT (unixepoch())
          );",
-    )
-}
-
-fn run_migration_list(
-    conn: &Connection,
-    migrations: &[(&str, MigrationUp)],
-) -> rusqlite::Result<()> {
-    ensure_migration_registry(conn)?;
-    for (name, up) in migrations {
-        run_migration(conn, name, *up)?;
-    }
-    forget_superseded_migrations(conn)?;
-    check_unknown_migrations(conn)
-}
-
-fn run_migration(conn: &Connection, name: &str, up: MigrationUp) -> rusqlite::Result<()> {
+    )?;
     // BEGIN IMMEDIATE serializes migrations before their first write.
     // Writer commands also hold indexing.lock; lock-bypass opens rely on
     // init_db's 5-second busy timeout and may still fail after that window.
-    let already: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
-        rusqlite::params![name],
-        |r| r.get(0),
-    )?;
-    if already > 0 {
-        return Ok(());
-    }
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    // Another opener may have stamped this migration since the unlocked probe.
-    let stamped_meanwhile: i64 = match conn.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
-        rusqlite::params![name],
-        |r| r.get(0),
-    ) {
-        Ok(n) => n,
-        Err(e) => {
+    for (name, up) in migrations {
+        let already: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+            rusqlite::params![name],
+            |r| r.get(0),
+        )?;
+        if already > 0 {
+            continue;
+        }
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        // Another opener may have stamped this migration since the unlocked probe.
+        let stamped_meanwhile: i64 = match conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+            rusqlite::params![name],
+            |r| r.get(0),
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        };
+        if stamped_meanwhile > 0 {
+            conn.execute_batch("ROLLBACK")?;
+            continue;
+        }
+        if let Err(e) = (|| -> rusqlite::Result<()> {
+            up(conn)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?1)",
+                rusqlite::params![name],
+            )?;
+            Ok(())
+        })() {
             let _ = conn.execute_batch("ROLLBACK");
             return Err(e);
         }
-    };
-    if stamped_meanwhile > 0 {
-        conn.execute_batch("ROLLBACK")?;
-        return Ok(());
+        if let Err(e) = conn.execute_batch("COMMIT") {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
     }
-    if let Err(e) = (|| -> rusqlite::Result<()> {
-        up(conn)?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?1)",
-            rusqlite::params![name],
-        )?;
-        Ok(())
-    })() {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(e);
-    }
-    if let Err(e) = conn.execute_batch("COMMIT") {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(e);
-    }
+    forget_superseded_migrations(conn)?;
+    check_unknown_migrations(conn)?;
     Ok(())
 }
 
@@ -1266,50 +1219,6 @@ mod tests {
                 "{superseded} is listed both as superseded and as a live migration"
             );
         }
-    }
-
-    /// The overview opener must repair structural columns without creating or
-    /// reshaping semantic bookkeeping that callers must report themselves.
-    #[test]
-    fn structural_migrations_skip_semantic_state() {
-        let conn = open_initialized();
-        conn.execute_batch(
-            "ALTER TABLE semantic_files RENAME TO semantic_files_backup;
-             CREATE TABLE semantic_files (
-                 chunk_table TEXT NOT NULL,
-                 legacy_path TEXT NOT NULL,
-                 content_hash TEXT NOT NULL,
-                 indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                 PRIMARY KEY (chunk_table, legacy_path)
-             );
-             DELETE FROM schema_migrations WHERE name IN (
-                 '0004_semantic_files_chunk_table', '0024_is_test'
-             );
-             DROP TABLE semantic_files_backup;",
-        )
-        .unwrap();
-
-        init_db_for_overview(&conn).unwrap();
-
-        let semantic_path_columns: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('semantic_files') WHERE name = 'path'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            semantic_path_columns, 0,
-            "legacy semantic shape was rewritten"
-        );
-        let structural_is_test: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'is_test'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(structural_is_test, 1, "structural migration did not run");
     }
 
     const RACE_NAME: &str = "9998_race_probe";
