@@ -473,11 +473,11 @@ fn compile_excludes(extra: &[String]) -> Result<(GlobSet, GlobSet)> {
 }
 
 /// Canonical, order-independent identity for the effective exclusion policy:
-/// the hard exclusions plus the test-like set that decides which co-change
-/// pairs are stored. An empty user list is still a valid fingerprint so
+/// the hard exclusions plus the test-like set and per-commit file cap that
+/// decide which co-change pairs are stored. An empty user list is still a valid fingerprint so
 /// legacy NULL state cannot silently reuse rows built under another policy.
 fn effective_exclusion_fingerprint(extra_excludes: &[String]) -> String {
-    let mut encoded = String::new();
+    let mut encoded = format!("cap:{MAX_FILES_PER_COMMIT_FOR_COCHANGE}\0");
     for pattern in TEST_LIKE_EXCLUDE_PATTERNS {
         encoded.push_str("test:");
         encoded.push_str(&pattern.len().to_string());
