@@ -762,11 +762,27 @@ fn laravel_match_methods(registration: &str, verb_offset: usize) -> Vec<String> 
     let Some(close) = registration[open..].find(']').map(|i| open + i) else {
         return Vec::new();
     };
-    let method_re = Regex::new(r#"['"]([A-Za-z]+)['"]"#).expect("valid method pattern");
-    method_re
-        .captures_iter(&registration[open..=close])
-        .filter_map(|caps| caps.get(1).map(|m| m.as_str().to_ascii_uppercase()))
-        .collect()
+    // Every element must be a quoted method literal; one constant or
+    // variable leaves the set unknown, and the caller then fails closed.
+    let mut methods = Vec::new();
+    for element in registration[open + 1..close].split(',') {
+        let element = element.trim();
+        if element.is_empty() {
+            continue;
+        }
+        let bytes = element.as_bytes();
+        let quoted = bytes.len() > 2
+            && matches!(bytes[0], b'\'' | b'"')
+            && bytes[bytes.len() - 1] == bytes[0]
+            && bytes[1..bytes.len() - 1]
+                .iter()
+                .all(u8::is_ascii_alphabetic);
+        if !quoted {
+            return Vec::new();
+        }
+        methods.push(element[1..element.len() - 1].to_ascii_uppercase());
+    }
+    methods
 }
 
 fn laravel_auth_method(verb: &str, registration: &str, verb_offset: usize) -> String {
@@ -1918,7 +1934,9 @@ mod tests {
             "routes/web.php",
             "<?php\nRoute::match(['GET', 'HEAD'], '/safe', fn () => null);\n\
              Route::middleware(['auth'])->match(['POST'], '/write', fn () => null);\n\
-             Route::match([Request::METHOD_GET], '/constant', fn () => null);\n",
+             Route::match([Request::METHOD_GET], '/constant', fn () => null);\n\
+             Route::match(['GET', $method], '/mixed', fn () => null);\n\
+             Route::match(['get', \"head\",], '/lower', fn () => null);\n",
         );
         let routes = parse_laravel_routes(dir.path()).unwrap();
         assert_eq!(routes[0].verb, "MATCH", "the route identity keeps its verb");
@@ -1933,6 +1951,13 @@ mod tests {
             "unparsed methods fail closed"
         );
         assert!(seeds[2].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+        assert_eq!(
+            routes[3].auth_method, "MATCH",
+            "a partly parsed list fails closed"
+        );
+        assert!(seeds[3].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
+        assert_eq!(routes[4].auth_method, "GET");
+        assert!(!seeds[4].tags.iter().any(|tag| tag == AUTH_SENSITIVE_TAG));
     }
 
     #[test]

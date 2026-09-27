@@ -1034,7 +1034,36 @@ mod tests {
 
     #[test]
     fn mapper_output_version_defeats_feature_map_skip() {
-        assert_ne!(with_mapper_version(7, 1), with_mapper_version(7, 2));
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        std::fs::create_dir_all(dir.path().join(".codesage")).unwrap();
+        // The marker a binary without the mapper version fold would record.
+        let unversioned = manifest_state_fingerprint(
+            structural_state_fingerprint(&db.all_file_hashes().unwrap()),
+            dir.path(),
+            &[],
+        );
+        write_feature_map_state(dir.path(), unversioned);
+        assert!(!can_skip_feature_mapping(
+            false,
+            0,
+            0,
+            0,
+            read_feature_map_state(dir.path()),
+            || feature_map_fingerprint(&db, dir.path(), &[]),
+        ));
+        write_feature_map_state(
+            dir.path(),
+            feature_map_fingerprint(&db, dir.path(), &[]).unwrap(),
+        );
+        assert!(can_skip_feature_mapping(
+            false,
+            0,
+            0,
+            0,
+            read_feature_map_state(dir.path()),
+            || feature_map_fingerprint(&db, dir.path(), &[]),
+        ));
     }
 
     #[test]
