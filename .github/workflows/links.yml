@@ -28,7 +28,8 @@ jobs:
           persist-credentials: false
       - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
-          args: --verbose --no-progress './**/*.md'
+          # X returns 403 to unauthenticated automated clients.
+          args: --verbose --no-progress --exclude '^https://(x|twitter)\.com/' './**/*.md'
           fail: true
         env:
           # GitHub-hosted URLs hit secondary rate limits anonymously.
