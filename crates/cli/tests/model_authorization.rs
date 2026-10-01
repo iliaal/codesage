@@ -167,7 +167,9 @@ fn scoped_artifact_authorization_and_policy_identity() {
             assert!(allow_any_model_from_env());
             denied.scope(|| {
                 assert!(!allow_any_model_from_env());
-                let error = resolve_model_artifacts(MODEL).unwrap_err().to_string();
+                let error = resolve_model_artifacts(MODEL, "cpu")
+                    .unwrap_err()
+                    .to_string();
                 assert!(error.contains("validated-model allowlist"), "{error}");
             });
             assert!(allow_any_model_from_env());

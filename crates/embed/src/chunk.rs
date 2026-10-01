@@ -10,7 +10,7 @@ pub const DEFAULT_CHUNK_OVERLAP: usize = 200;
 /// Version of the splitting algorithm below. Bump it when a change to
 /// `chunk_text` can produce different chunk texts for the same input; it is
 /// part of the semantic fingerprint that gates stored-vector reuse.
-pub const CHUNKER_VERSION: u32 = 2;
+pub const CHUNKER_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct ChunkConfig {
@@ -75,7 +75,23 @@ pub fn chunk_text(content: &str, config: &ChunkConfig) -> Vec<Chunk> {
                 end_byte: end,
             }
         })
+        .filter(|chunk| !is_literal_data(&chunk.text))
         .collect()
+}
+
+/// Share of digit and comma bytes above which a chunk is a literal data
+/// table (Unicode ranges, timezone blobs, lookup arrays) rather than code.
+const LITERAL_DATA_SHARE: f64 = 0.35;
+
+/// Data tables carry no retrievable meaning, tokenize at about two bytes per
+/// token so they always overflow the embedder's sequence cap, and in vendored
+/// C trees are a quarter of all chunks.
+fn is_literal_data(text: &str) -> bool {
+    let literal = text
+        .bytes()
+        .filter(|b| b.is_ascii_digit() || *b == b',')
+        .count();
+    literal as f64 > LITERAL_DATA_SHARE * text.len() as f64
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +329,29 @@ mod tests {
 
     fn default_config() -> ChunkConfig {
         ChunkConfig::default()
+    }
+
+    #[test]
+    fn literal_data_tables_are_not_chunked() {
+        let table: String = (0..400)
+            .map(|i| format!("0x{:02x}, ", i % 256))
+            .collect::<Vec<_>>()
+            .chunks(12)
+            .map(|row| format!("\t{}\n", row.concat()))
+            .collect();
+        assert!(is_literal_data(&table));
+        assert!(
+            chunk_text(
+                &format!("static const unsigned char t[] = {{\n{table}}};\n"),
+                &default_config()
+            )
+            .iter()
+            .all(|c| !c.text.contains("0x10, 0x11"))
+        );
+
+        let code = "static int clamp(int v) {\n\tif (v > 255) {\n\t\treturn 255;\n\t}\n\treturn v < 0 ? 0 : v;\n}\n";
+        assert!(!is_literal_data(code));
+        assert_eq!(chunk_text(code, &default_config()).len(), 1);
     }
 
     #[test]

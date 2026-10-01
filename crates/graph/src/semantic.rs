@@ -486,11 +486,16 @@ pub fn resolve_semantic_fingerprint(
     dim: usize,
     lookup: ArtifactLookup,
 ) -> Result<Option<SemanticFingerprint>> {
-    let artifacts = match (cached_model_artifacts(&config.model), lookup) {
+    let artifacts = match (
+        cached_model_artifacts(&config.model, &config.device),
+        lookup,
+    ) {
         (Some(artifacts), _) => artifacts,
         (None, ArtifactLookup::CachedOnly) => return Ok(None),
-        (None, ArtifactLookup::Resolve) => resolve_model_artifacts(&config.model)
-            .with_context(|| format!("resolving model files for {:?}", config.model))?,
+        (None, ArtifactLookup::Resolve) => {
+            resolve_model_artifacts(&config.model, &config.device)
+                .with_context(|| format!("resolving model files for {:?}", config.model))?
+        }
     };
     resolve_semantic_fingerprint_for_artifacts(db, config, dim, &artifacts).map(Some)
 }

@@ -6,6 +6,9 @@ use tokenizers::Tokenizer;
 use crate::model::load_onnx_session;
 
 const RERANK_BATCH: usize = 32;
+/// The cross-encoder's position-embedding table length; independent of the
+/// embedder's sequence cap, which may exceed it.
+const RERANK_MAX_SEQ_LENGTH: usize = 512;
 
 pub struct Reranker {
     session: Session,
@@ -17,7 +20,13 @@ pub struct Reranker {
 impl Reranker {
     pub fn new(model: &str, device: &str) -> Result<Self> {
         tracing::info!(%model, "loading reranker model");
-        let (session, tokenizer, has_token_type_ids) = load_onnx_session(model, device)?;
+        let (session, mut tokenizer, has_token_type_ids) = load_onnx_session(model, device)?;
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: RERANK_MAX_SEQ_LENGTH,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         tracing::info!(token_type_ids = has_token_type_ids, "reranker loaded");
 
         Ok(Self {

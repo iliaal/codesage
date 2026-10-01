@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub use codesage_protocol::DEFAULT_EMBEDDING_DIM;
 
 // Paired with DEFAULT_CHUNK_SIZE; see bench/history/cap512-1500-2026-05-04.md.
+// The default cap; a model pin may raise it (`model::max_seq_length`).
 pub const MAX_SEQ_LENGTH: usize = 512;
 #[cfg(not(target_vendor = "apple"))]
 pub const BATCH_SIZE: usize = 64;

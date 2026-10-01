@@ -544,7 +544,7 @@ fn watcher_config_key(state: &ProjectState) -> String {
             if state.embedding_config.model.is_empty() || state.embedding_config_error.is_some() {
                 "structural-only".to_string()
             } else {
-                let identity = cached_artifact_identity(&state.embedding_config.model);
+                let identity = cached_artifact_identity(&state.embedding_config);
                 watcher_key(&state.embedding_config, &identity)
             };
         let policy = codesage_embed::model::ModelAuthorization::current()
@@ -566,8 +566,8 @@ fn watcher_key(config: &EmbeddingConfig, artifact_identity: &str) -> String {
 
 /// Path/size/mtime of the model files already in the local cache; a label
 /// when they are not there or cannot be stat'ed. Never downloads or reads.
-fn cached_artifact_identity(model: &str) -> String {
-    match codesage_embed::model::cached_model_artifacts(model) {
+fn cached_artifact_identity(config: &EmbeddingConfig) -> String {
+    match codesage_embed::model::cached_model_artifacts(&config.model, &config.device) {
         Some(artifacts) => artifacts
             .stat_key()
             .unwrap_or_else(|| "unreadable".to_string()),
@@ -600,7 +600,7 @@ fn model_error(context: &str, error: anyhow::Error) -> anyhow::Error {
 /// them (downloading on a cache miss) exactly as `Embedder::new` is about to.
 fn resolved_embedder_pool_key(config: &EmbeddingConfig) -> Result<String> {
     config.effective_batch_size()?;
-    let artifacts = codesage_embed::model::resolve_model_artifacts(&config.model)
+    let artifacts = codesage_embed::model::resolve_model_artifacts(&config.model, &config.device)
         .with_context(|| format!("resolving model files for {:?}", config.model))?;
     let digest = codesage_embed::fingerprint::model_artifact_digest(&artifacts)?;
     embedder_pool_key(config, &digest)

@@ -11,12 +11,13 @@ use std::sync::{Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use hf_hub::{Repo, RepoType};
-use ort::session::Session;
+use ort::session::{Session, builder::GraphOptimizationLevel};
 use tokenizers::Tokenizer;
 use wait_timeout::ChildExt;
 
+use crate::chunk::DEFAULT_CHUNK_SIZE;
 use crate::config::{EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_coreml, wants_cuda};
 
 #[cfg(not(target_vendor = "apple"))]
@@ -546,6 +547,10 @@ const ALLOWED_MODELS: &[&str] = &[
 
 struct ModelPin {
     model: &'static str,
+    /// Hugging Face repository the artifacts are fetched from. Differs from
+    /// `model` where CodeSage loads graphs derived from the upstream model
+    /// (`scripts/derive-jina-onnx.py`); the config keeps the upstream name.
+    repo: &'static str,
     revision: &'static str,
     tokenizer_sha256: &'static str,
     onnx_sha256: &'static str,
@@ -553,36 +558,77 @@ struct ModelPin {
     /// on-disk sidecar: ORT loads adjacent weights independently of our fetches,
     /// so [`refuse_undeclared_sidecar`] must reject unverified leftovers.
     onnx_data_sha256: Option<&'static str>,
+    /// Graph at the same revision that replaces `onnx/model.onnx` when the
+    /// device selects the CUDA execution provider.
+    cuda_onnx: Option<GraphPin>,
+    /// Tokens an embedding input is truncated to; bounded by the model's
+    /// position embeddings.
+    max_seq_length: usize,
 }
+
+struct GraphPin {
+    file: &'static str,
+    sha256: &'static str,
+}
+
+/// Commit of the derived jina-embeddings-v2-base-code graphs, built from
+/// upstream revision 516f4baf13dec4ddddda8631e019b5737c8bc250.
+const JINA_CODE_DERIVED_REVISION: &str = "732cbcc67d989d08c5ae9bdb04a69c34ecb60cb5";
+
+/// Commit of the ms-marco-MiniLM-L6-v2 graphs (upstream plus a fused fp16
+/// CUDA graph), built from upstream revision
+/// c5ee24cb16019beea0893ab7796b1df96625c6b8.
+const MS_MARCO_DERIVED_REVISION: &str = "3a8dae18b7a92308d7d63b834f3bfa01bab02d32";
 
 const MODEL_PINS: &[ModelPin] = &[
     ModelPin {
         model: "sentence-transformers/all-MiniLM-L6-v2",
+        repo: "sentence-transformers/all-MiniLM-L6-v2",
         revision: "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
         tokenizer_sha256: "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
         onnx_sha256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452",
         onnx_data_sha256: None,
+        cuda_onnx: None,
+        max_seq_length: MAX_SEQ_LENGTH,
     },
     ModelPin {
         model: "cross-encoder/ms-marco-MiniLM-L6-v2",
-        revision: "c5ee24cb16019beea0893ab7796b1df96625c6b8",
+        repo: "IA0x00/ms-marco-MiniLM-L6-v2-codesage",
+        revision: MS_MARCO_DERIVED_REVISION,
         tokenizer_sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
         onnx_sha256: "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a",
         onnx_data_sha256: None,
+        cuda_onnx: Some(GraphPin {
+            file: "onnx/model_cuda_fp16.onnx",
+            sha256: "32eef6d63e978aba96b6c4134b93b252eab2eb6ae3f8b1b5d15c96b4473f7eb2",
+        }),
+        max_seq_length: MAX_SEQ_LENGTH,
     },
     ModelPin {
         model: "jinaai/jina-embeddings-v2-base-code",
-        revision: "516f4baf13dec4ddddda8631e019b5737c8bc250",
+        repo: "IA0x00/jina-embeddings-v2-base-code-codesage",
+        revision: JINA_CODE_DERIVED_REVISION,
         tokenizer_sha256: "b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5",
-        onnx_sha256: "63363fc178428b74620c6f3780cbc7191883fa5c7f84c0945c45eb5c4256733b",
+        onnx_sha256: "98ca3fc0def59e9fea861ca8888f805fd3cd10d429695ff53bd03ab053e8aee4",
         onnx_data_sha256: None,
+        cuda_onnx: Some(GraphPin {
+            file: "onnx/model_cuda_fp16.onnx",
+            sha256: "5d34291e0d44a01924d6709c631b141a875a7e9add7f118dde87050644cfc2ab",
+        }),
+        // ALiBi has no learned positions. Real C code in php-src runs a median
+        // of 611 tokens per 1500-byte chunk; data tables are dropped by the
+        // chunker before they reach the cap.
+        max_seq_length: 1024,
     },
     ModelPin {
         model: "nomic-ai/nomic-embed-text-v1.5",
+        repo: "nomic-ai/nomic-embed-text-v1.5",
         revision: "e9b6763023c676ca8431644204f50c2b100d9aab",
         tokenizer_sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
         onnx_sha256: "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965",
         onnx_data_sha256: None,
+        cuda_onnx: None,
+        max_seq_length: MAX_SEQ_LENGTH,
     },
 ];
 
@@ -688,6 +734,31 @@ fn load_revision(model: &str, allow_any: bool) -> Option<&'static str> {
     load_pin(model, allow_any).map(|pin| pin.revision)
 }
 
+/// The Hugging Face repository a load of `model` fetches from: the pin's for
+/// a validated model, the model name itself under the per-project unpinned
+/// bypass.
+fn load_repo(model: &str, allow_any: bool) -> &str {
+    load_pin(model, allow_any).map_or(model, |pin| pin.repo)
+}
+
+/// The graph file a load of `model` on `device` opens: the pin's CUDA graph
+/// when the device selects CUDA and the pin ships one, `onnx/model.onnx`
+/// otherwise. The fingerprint and the loader both resolve through this, so a
+/// device switch digests the graph that actually runs.
+fn load_graph(model: &str, allow_any: bool, device: &str) -> &'static str {
+    graph_pin(load_pin(model, allow_any), device).map_or(ONNX_ARTIFACT, |graph| graph.file)
+}
+
+/// Tokens an embedding input for `model` is truncated to.
+pub fn max_seq_length(model: &str) -> usize {
+    load_pin(model, allow_any_model_from_env()).map_or(MAX_SEQ_LENGTH, |pin| pin.max_seq_length)
+}
+
+fn graph_pin(pin: Option<&'static ModelPin>, device: &str) -> Option<&'static GraphPin> {
+    pin.and_then(|pin| pin.cuda_onnx.as_ref())
+        .filter(|_| wants_cuda(device))
+}
+
 /// The pin a load verifies against: the entry for a validated model, none
 /// under the per-project unpinned bypass (see [`allow_any_model_from_env`]).
 /// The fingerprint's revision and sidecar expectation and the loader's
@@ -712,12 +783,13 @@ fn sidecar_expectation(model: &str, allow_any: bool) -> SidecarExpectation {
 /// verification: that is the loader's separate gate, and the semantic
 /// fingerprint must reflect the bytes on disk whether or not they match a
 /// pin.
-pub fn resolve_model_artifacts(model: &str) -> Result<ModelArtifacts> {
+pub fn resolve_model_artifacts(model: &str, device: &str) -> Result<ModelArtifacts> {
     let allow_any = allow_any_model_from_env();
     validate_model_allowed(model, allow_any)?;
     resolve_model_artifacts_at(
-        model,
+        load_repo(model, allow_any),
         load_revision(model, allow_any),
+        load_graph(model, allow_any, device),
         sidecar_expectation(model, allow_any),
     )
 }
@@ -727,15 +799,14 @@ pub fn resolve_model_artifacts(model: &str) -> Result<ModelArtifacts> {
 /// the model is not allowlisted or the tokenizer or the graph is not cached
 /// yet. For a caller that must not block on a download (a per-call key, a
 /// status line), where a later load changing the answer is acceptable.
-pub fn cached_model_artifacts(model: &str) -> Option<ModelArtifacts> {
+pub fn cached_model_artifacts(model: &str, device: &str) -> Option<ModelArtifacts> {
     let allow_any = allow_any_model_from_env();
     validate_model_allowed(model, allow_any).ok()?;
     let revision = load_revision(model, allow_any);
+    let repo_id = load_repo(model, allow_any).to_string();
     let repo = match revision {
-        Some(revision) => {
-            Repo::with_revision(model.to_string(), RepoType::Model, revision.to_string())
-        }
-        None => Repo::model(model.to_string()),
+        Some(revision) => Repo::with_revision(repo_id, RepoType::Model, revision.to_string()),
+        None => Repo::model(repo_id),
     };
     let cache = hf_cache_from_env()?.repo(repo);
     let ort_runtime = ort_runtime_dylib().ok()?;
@@ -747,7 +818,7 @@ pub fn cached_model_artifacts(model: &str) -> Option<ModelArtifacts> {
     };
     Some(ModelArtifacts {
         tokenizer: cache.get("tokenizer.json")?,
-        onnx: cache.get("onnx/model.onnx")?,
+        onnx: cache.get(load_graph(model, allow_any, device))?,
         onnx_data,
         ort_runtime,
     })
@@ -769,6 +840,7 @@ fn hf_cache_from_env() -> Option<hf_hub::Cache> {
     Some(hf_hub::Cache::new(root))
 }
 
+const ONNX_ARTIFACT: &str = "onnx/model.onnx";
 const ONNX_DATA_ARTIFACT: &str = "onnx/model.onnx_data";
 
 /// What the pin says about `onnx/model.onnx_data` at the revision being
@@ -816,7 +888,7 @@ type ArtifactPaths = (PathBuf, PathBuf, Option<PathBuf>);
 /// every download and probe goes through [`hf_api`], built from the same
 /// [`hf_cache_from_env`] root this key names, so a custom `HF_HOME` can only
 /// cost an extra fetch under another root, never serve another root's paths.
-type ArtifactKey = (Option<PathBuf>, String, Option<String>);
+type ArtifactKey = (Option<PathBuf>, String, Option<String>, &'static str);
 
 /// One memo entry. `sidecar` is `None` while the sidecar outcome is
 /// unresolved (a pinned sidecar's fetch failed, or an unpinned one's fetch
@@ -878,6 +950,7 @@ fn resolve_hf_artifact_paths(
     hf_home: Option<&Path>,
     model: &str,
     revision: Option<&str>,
+    graph: &'static str,
     expectation: SidecarExpectation,
     mut fetch: impl FnMut(&'static str) -> Result<PathBuf>,
     sidecar_listed: impl FnOnce() -> Result<bool>,
@@ -886,6 +959,7 @@ fn resolve_hf_artifact_paths(
         hf_home.map(Path::to_path_buf),
         model.to_string(),
         revision.map(str::to_string),
+        graph,
     );
     let (tokenizer, onnx) = match memoized_artifacts(&key) {
         Some(ArtifactMemo {
@@ -903,7 +977,7 @@ fn resolve_hf_artifact_paths(
             onnx,
             sidecar: None,
         }) => (tokenizer, onnx),
-        None => (fetch("tokenizer.json")?, fetch("onnx/model.onnx")?),
+        None => (fetch("tokenizer.json")?, fetch(graph)?),
     };
     // Keep fetch diagnostics: ORT's later external-data error omits this cause.
     let sidecar = match expectation {
@@ -992,18 +1066,20 @@ fn refuse_undeclared_sidecar(onnx: &Path) -> Result<()> {
 }
 
 fn resolve_model_artifacts_at(
-    model: &str,
+    repo: &str,
     revision: Option<&str>,
+    graph: &'static str,
     expectation: SidecarExpectation,
 ) -> Result<ModelArtifacts> {
     let hf_home = std::env::var_os("HF_HOME").map(PathBuf::from);
     let (tokenizer, onnx, onnx_data) = resolve_hf_artifact_paths(
         hf_home.as_deref(),
-        model,
+        repo,
         revision,
+        graph,
         expectation,
-        |artifact| hf_get_model_file(model, revision, artifact),
-        || hf_sidecar_listed(model, revision),
+        |artifact| hf_get_model_file(repo, revision, artifact),
+        || hf_sidecar_listed(repo, revision),
     )?;
     Ok(ModelArtifacts {
         tokenizer,
@@ -1326,6 +1402,7 @@ fn blob_within_cache_boundary(link: &Path, blob: &Path) -> Option<bool> {
 
 fn verify_or_refetch_artifact(
     model: &str,
+    repo: &str,
     revision: &str,
     artifact: &'static str,
     cached: PathBuf,
@@ -1343,7 +1420,7 @@ fn verify_or_refetch_artifact(
             );
             evict_cached_artifact(path)
         },
-        || hf_get_model_file(model, Some(revision), artifact),
+        || hf_get_model_file(repo, Some(revision), artifact),
     )
 }
 
@@ -1353,28 +1430,34 @@ fn verify_or_refetch_artifact(
 fn verify_pinned_model_artifacts(
     model: &str,
     pin: &ModelPin,
+    graph: Option<&GraphPin>,
     tokenizer_path: PathBuf,
     model_path: PathBuf,
     onnx_data_path: Option<PathBuf>,
 ) -> Result<(PathBuf, PathBuf)> {
     let tokenizer_path = verify_or_refetch_artifact(
         model,
+        pin.repo,
         pin.revision,
         "tokenizer.json",
         tokenizer_path,
         pin.tokenizer_sha256,
     )?;
+    let (graph_file, graph_sha256) =
+        graph.map_or((ONNX_ARTIFACT, pin.onnx_sha256), |g| (g.file, g.sha256));
     let model_path = verify_or_refetch_artifact(
         model,
+        pin.repo,
         pin.revision,
-        "onnx/model.onnx",
+        graph_file,
         model_path,
-        pin.onnx_sha256,
+        graph_sha256,
     )?;
     match (pin.onnx_data_sha256, onnx_data_path) {
         (Some(expected), Some(path)) => {
             verify_or_refetch_artifact(
                 model,
+                pin.repo,
                 pin.revision,
                 "onnx/model.onnx_data",
                 path,
@@ -1497,14 +1580,16 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
     }
 
     let artifacts = resolve_model_artifacts_at(
-        model,
+        load_repo(model, allow_any),
         pin.map(|pin| pin.revision),
+        load_graph(model, allow_any, device),
         sidecar_expectation(model, allow_any),
     )?;
     let (tokenizer_path, model_path) = if let Some(pin) = pin {
         verify_pinned_model_artifacts(
             model,
             pin,
+            graph_pin(Some(pin), device),
             artifacts.tokenizer,
             artifacts.onnx,
             artifacts.onnx_data,
@@ -1517,16 +1602,28 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
         Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
     tokenizer
         .with_truncation(Some(tokenizers::TruncationParams {
-            max_length: MAX_SEQ_LENGTH,
+            max_length: pin.map_or(MAX_SEQ_LENGTH, |pin| pin.max_seq_length),
             ..Default::default()
         }))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // ONNX Runtime's memory-efficient attention takes an additive bias only
+    // when the sequence length is a multiple of 8 tokens.
     tokenizer.with_padding(Some(tokenizers::PaddingParams {
         strategy: tokenizers::PaddingStrategy::BatchLongest,
+        pad_to_multiple_of: Some(8),
         ..Default::default()
     }));
 
     let mut builder = Session::builder()?;
+
+    if graph_pin(pin, device).is_some() {
+        // ORT_ENABLE_ALL adds CPU layout passes whose LayerNorm fusion fails on
+        // the fp16 graph's inserted casts; CUDA kernels gain nothing from them,
+        // and the CPU fallback must still load the graph.
+        builder = builder
+            .with_optimization_level(GraphOptimizationLevel::Level2)
+            .map_err(|e| anyhow::anyhow!("setting the graph optimization level: {e}"))?;
+    }
 
     if want_cuda {
         #[cfg(feature = "cuda")]
@@ -1594,6 +1691,10 @@ pub struct Embedder {
     tokenizer: Tokenizer,
     dim: usize,
     pooling: PoolingStrategy,
+    /// The graph emits one pooled vector per input ([batch, dim]) rather
+    /// than token-level hidden states, so no host-side pooling runs.
+    pre_pooled: bool,
+    max_seq_length: usize,
     has_token_type_ids: bool,
     batch_size: NonZeroUsize,
     execution_provider: &'static str,
@@ -1614,10 +1715,21 @@ impl Embedder {
         } = load_onnx_session_with_provider(&config.model, &config.device)?;
         let dim = detect_dim(&session)?;
         let pooling = config.pooling_strategy();
+        let pre_pooled = output_rank(&session) == Some(2);
+        // Every derived graph folds in mean pooling; CLS cannot be recovered
+        // from its output.
+        if pre_pooled && pooling != PoolingStrategy::Mean {
+            anyhow::bail!(
+                "model {:?} emits mean-pooled [batch, {dim}] vectors, but pooling {pooling:?} \
+                 is configured; remove [embedding].pooling or set it to \"mean\"",
+                config.model
+            );
+        }
 
         tracing::info!(
             dim,
             pooling = ?pooling,
+            pre_pooled,
             token_type_ids = has_token_type_ids,
             batch_size = batch_size.get(),
             execution_provider,
@@ -1629,6 +1741,8 @@ impl Embedder {
             tokenizer,
             dim,
             pooling,
+            pre_pooled,
+            max_seq_length: max_seq_length(&config.model),
             has_token_type_ids,
             batch_size,
             execution_provider,
@@ -1655,13 +1769,15 @@ impl Embedder {
             return Ok(Vec::new());
         }
 
-        let mut all_embeddings = Vec::with_capacity(texts.len());
-
-        for batch in texts.chunks(self.batch_size.get()) {
-            all_embeddings.extend(self.embed_batch_inner(batch)?);
-        }
-
-        Ok(all_embeddings)
+        let batch_size = self.batch_size.get();
+        let max_text_bytes = self.max_seq_length * BYTES_PER_TOKEN_CEILING;
+        embed_in_length_order(
+            texts,
+            batch_size,
+            max_text_bytes,
+            batch_size * DEFAULT_CHUNK_SIZE,
+            |batch| self.embed_batch_inner(batch),
+        )
     }
 
     fn embed_batch_inner(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -1701,6 +1817,20 @@ impl Embedder {
         };
 
         let (_shape, hidden) = outputs[0].try_extract_tensor::<f32>()?;
+
+        if self.pre_pooled {
+            let expected = batch_size
+                .checked_mul(self.dim)
+                .context("pooled output size overflow")?;
+            ensure!(
+                hidden.len() == expected,
+                "model output has {} values but a pooled [batch={batch_size}, dim={}] tensor \
+                 holds {expected}",
+                hidden.len(),
+                self.dim
+            );
+            return Ok(hidden.chunks_exact(self.dim).map(l2_normalized).collect());
+        }
 
         // detect_dim accepts pre-pooled [batch, dim] outputs, but these loops
         // require token-level [batch, seq, dim] data to avoid out-of-bounds access.
@@ -1752,18 +1882,85 @@ impl Embedder {
                 }
             };
 
-            let norm: f32 = pooled.iter().map(|v| v * v).sum::<f32>().sqrt();
-            let mut normalized = pooled;
-            if norm > 0.0 {
-                for v in &mut normalized {
-                    *v /= norm;
-                }
-            }
-
-            embeddings.push(normalized);
+            embeddings.push(l2_normalized(&pooled));
         }
 
         Ok(embeddings)
+    }
+}
+
+/// Bytes of source text one token covers at most, for bounding how much of a
+/// text the sequence cap can reach.
+const BYTES_PER_TOKEN_CEILING: usize = 3;
+
+/// Embed `texts` in batches ordered by byte length, returning vectors in
+/// input order. Batches pad to their longest member, so grouping similar
+/// lengths cuts padded compute; byte length tracks token count well enough
+/// to order by. A batch holds at most `batch_size` texts and, counting each
+/// at most `max_text_bytes` (what the sequence cap can reach), at most
+/// `max_batch_bytes` of padded input, so batches of long texts shrink
+/// instead of multiplying attention memory.
+fn embed_in_length_order(
+    texts: &[&str],
+    batch_size: usize,
+    max_text_bytes: usize,
+    max_batch_bytes: usize,
+    mut embed: impl FnMut(&[&str]) -> Result<Vec<Vec<f32>>>,
+) -> Result<Vec<Vec<f32>>> {
+    let mut order: Vec<usize> = (0..texts.len()).collect();
+    order.sort_by_key(|&i| texts[i].len());
+
+    // Ascending order makes each candidate the batch's longest member.
+    let mut batches: Vec<&[usize]> = Vec::new();
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() {
+            let rows = end + 1 - start;
+            let longest = texts[order[end]].len().min(max_text_bytes);
+            if rows > batch_size || rows * longest > max_batch_bytes {
+                break;
+            }
+            end += 1;
+        }
+        batches.push(&order[start..end]);
+        start = end;
+    }
+
+    let mut slots: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+    for batch in batches {
+        let batch_texts: Vec<&str> = batch.iter().map(|&i| texts[i]).collect();
+        let embeddings = embed(&batch_texts)?;
+        ensure!(
+            embeddings.len() == batch.len(),
+            "embedder produced {} vectors for {} texts",
+            embeddings.len(),
+            batch.len()
+        );
+        for (&i, embedding) in batch.iter().zip(embeddings) {
+            slots[i] = Some(embedding);
+        }
+    }
+    Ok(slots
+        .into_iter()
+        .map(|v| v.expect("every text belongs to exactly one batch"))
+        .collect())
+}
+
+fn l2_normalized(vector: &[f32]) -> Vec<f32> {
+    let norm: f32 = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        vector.iter().map(|v| v / norm).collect()
+    } else {
+        vector.to_vec()
+    }
+}
+
+/// Rank of the first output tensor when the graph declares it.
+fn output_rank(session: &Session) -> Option<usize> {
+    match session.outputs()[0].dtype() {
+        ort::value::ValueType::Tensor { shape, .. } => Some(shape.len()),
+        _ => None,
     }
 }
 
@@ -1891,6 +2088,128 @@ mod tests {
     }
 
     #[test]
+    fn derived_artifacts_load_from_their_own_repository_only_when_pinned() {
+        let jina = "jinaai/jina-embeddings-v2-base-code";
+        assert_eq!(
+            load_repo(jina, false),
+            "IA0x00/jina-embeddings-v2-base-code-codesage"
+        );
+        assert_eq!(
+            load_repo(jina, true),
+            jina,
+            "the unpinned bypass resolves the name the config gives"
+        );
+        let minilm = "sentence-transformers/all-MiniLM-L6-v2";
+        assert_eq!(load_repo(minilm, false), minilm);
+    }
+
+    #[test]
+    fn cuda_devices_load_the_pinned_cuda_graph_and_others_the_portable_one() {
+        let jina = "jinaai/jina-embeddings-v2-base-code";
+        for device in ["gpu", "cuda", "GPU"] {
+            assert_eq!(load_graph(jina, false, device), "onnx/model_cuda_fp16.onnx");
+        }
+        for device in ["cpu", "coreml"] {
+            assert_eq!(load_graph(jina, false, device), ONNX_ARTIFACT);
+        }
+        assert_eq!(
+            load_graph(jina, true, "gpu"),
+            ONNX_ARTIFACT,
+            "the unpinned bypass knows no derived graphs"
+        );
+        assert_eq!(
+            load_graph("cross-encoder/ms-marco-MiniLM-L6-v2", false, "gpu"),
+            "onnx/model_cuda_fp16.onnx"
+        );
+        assert_eq!(
+            load_graph("sentence-transformers/all-MiniLM-L6-v2", false, "gpu"),
+            ONNX_ARTIFACT
+        );
+    }
+
+    #[test]
+    fn only_alibi_jina_raises_the_sequence_cap() {
+        assert_eq!(max_seq_length("jinaai/jina-embeddings-v2-base-code"), 1024);
+        for model in ALLOWED_MODELS
+            .iter()
+            .filter(|m| **m != "jinaai/jina-embeddings-v2-base-code")
+        {
+            assert_eq!(max_seq_length(model), MAX_SEQ_LENGTH, "{model}");
+        }
+        assert_eq!(max_seq_length("test/unpinned"), MAX_SEQ_LENGTH);
+    }
+
+    #[test]
+    fn artifact_paths_are_memoized_per_graph() {
+        let root = tempfile::tempdir().unwrap();
+        let resolve = |graph: &'static str| {
+            resolve_hf_artifact_paths(
+                Some(root.path()),
+                "test/two-graph-model",
+                Some("rev"),
+                graph,
+                SidecarExpectation::Absent,
+                |artifact| Ok(fake_fetch(root.path(), artifact)),
+                no_pinned_probe,
+            )
+            .unwrap()
+        };
+        let portable = resolve(ONNX_ARTIFACT);
+        let cuda = resolve("onnx/model_cuda_fp16.onnx");
+        assert_eq!(portable.1, root.path().join(ONNX_ARTIFACT));
+        assert_eq!(cuda.1, root.path().join("onnx/model_cuda_fp16.onnx"));
+        assert_eq!(resolve(ONNX_ARTIFACT).1, portable.1);
+    }
+
+    #[test]
+    fn length_ordered_batches_return_vectors_in_input_order() {
+        let texts = ["ccc", "a", "eeeee", "bb", "dddd"];
+        let mut batches = Vec::new();
+        let out = embed_in_length_order(&texts, 2, usize::MAX, usize::MAX, |batch| {
+            batches.push(batch.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+            Ok(batch.iter().map(|t| vec![t.len() as f32]).collect())
+        })
+        .unwrap();
+        assert_eq!(
+            batches,
+            [vec!["a", "bb"], vec!["ccc", "dddd"], vec!["eeeee"]]
+        );
+        assert_eq!(out, [vec![3.0], vec![1.0], vec![5.0], vec![2.0], vec![4.0]]);
+    }
+
+    #[test]
+    fn length_ordered_batches_shrink_to_the_byte_budget() {
+        let long = "x".repeat(40);
+        let texts = ["aaaa", "bbbb", "cccc", "dddd", long.as_str(), long.as_str()];
+        let mut sizes = Vec::new();
+        embed_in_length_order(&texts, 4, 30, 60, |batch| {
+            sizes.push(batch.len());
+            Ok(batch.iter().map(|_| vec![0.0]).collect())
+        })
+        .unwrap();
+        // Short texts fill a batch by count; long ones count at the 30-byte
+        // reach of the cap, so two of them fill the 60-byte budget.
+        assert_eq!(sizes, [4, 2]);
+
+        let mut sizes = Vec::new();
+        embed_in_length_order(&[long.as_str()], 4, 100, 10, |batch| {
+            sizes.push(batch.len());
+            Ok(vec![vec![0.0]])
+        })
+        .unwrap();
+        assert_eq!(sizes, [1], "a text over the budget still embeds alone");
+    }
+
+    #[test]
+    fn length_ordered_batches_reject_a_short_batch() {
+        let err = embed_in_length_order(&["a", "b"], 2, usize::MAX, usize::MAX, |_| {
+            Ok(vec![vec![0.0]])
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("1 vectors for 2 texts"), "{err}");
+    }
+
+    #[test]
     fn allowlisted_models_have_pinned_artifacts() {
         for model in ALLOWED_MODELS {
             let pin = model_pin(model).unwrap_or_else(|| panic!("{model} missing model pin"));
@@ -1909,6 +2228,14 @@ mod tests {
                 64,
                 "{model} ONNX hash should be sha256 hex"
             );
+            if let Some(graph) = &pin.cuda_onnx {
+                assert_eq!(
+                    graph.sha256.len(),
+                    64,
+                    "{model} CUDA graph hash should be sha256 hex"
+                );
+                assert_ne!(graph.file, ONNX_ARTIFACT);
+            }
         }
     }
 
@@ -2291,14 +2618,14 @@ mod tests {
         if allow_any_model_from_env() {
             return;
         }
-        let err = resolve_model_artifacts("evil/backdoored-model")
+        let err = resolve_model_artifacts("evil/backdoored-model", "cpu")
             .expect_err("unallowlisted model must not be resolved");
         assert!(
             err.to_string()
                 .contains("not on CodeSage's validated-model allowlist"),
             "{err:#}"
         );
-        assert_eq!(cached_model_artifacts("evil/backdoored-model"), None);
+        assert_eq!(cached_model_artifacts("evil/backdoored-model", "cpu"), None);
     }
 
     /// Creates `root/<artifact>` so a memo hit's existence check passes,
@@ -2336,6 +2663,7 @@ mod tests {
                 Some(root),
                 "test/memoized-model",
                 Some("rev"),
+                ONNX_ARTIFACT,
                 SidecarExpectation::Unknown,
                 |artifact| {
                     fetches.set(fetches.get() + 1);
@@ -2374,6 +2702,7 @@ mod tests {
                 Some(root.path()),
                 model,
                 Some("rev"),
+                ONNX_ARTIFACT,
                 SidecarExpectation::Unknown,
                 |artifact| {
                     fetches.set(fetches.get() + 1);
@@ -2410,6 +2739,7 @@ mod tests {
                 Some(root.path()),
                 "test/keyed-revision",
                 revision,
+                ONNX_ARTIFACT,
                 SidecarExpectation::Unknown,
                 |artifact| {
                     fetches.set(fetches.get() + 1);
@@ -2450,6 +2780,7 @@ mod tests {
                 Some(root.path()),
                 "test/evicted-model",
                 Some("rev"),
+                ONNX_ARTIFACT,
                 SidecarExpectation::Unknown,
                 |artifact| {
                     fetches.set(fetches.get() + 1);
@@ -2513,6 +2844,7 @@ mod tests {
             Some(root.path().to_path_buf()),
             "test/evicted-model".to_string(),
             Some("rev".to_string()),
+            ONNX_ARTIFACT,
         );
         assert!(
             !artifact_paths_memo()
@@ -2532,6 +2864,7 @@ mod tests {
             Some(root.path()),
             "test/small-model",
             None,
+            ONNX_ARTIFACT,
             SidecarExpectation::Unknown,
             |_| {
                 fetches.set(fetches.get() + 1);
@@ -2548,6 +2881,7 @@ mod tests {
                 Some(root.path()),
                 "test/small-model",
                 None,
+                ONNX_ARTIFACT,
                 SidecarExpectation::Unknown,
                 |artifact| {
                     fetches.set(fetches.get() + 1);
@@ -2596,6 +2930,7 @@ mod tests {
                 Some(root.path()),
                 "test/large-model",
                 Some("rev"),
+                ONNX_ARTIFACT,
                 SidecarExpectation::Unknown,
                 |artifact| {
                     fetches.set(fetches.get() + 1);
@@ -2666,6 +3001,7 @@ mod tests {
                 Some(root.path()),
                 "test/pinned-small-model",
                 Some("rev"),
+                ONNX_ARTIFACT,
                 SidecarExpectation::Absent,
                 |artifact| {
                     assert_ne!(
@@ -2691,6 +3027,7 @@ mod tests {
             Some(root.path().to_path_buf()),
             "test/pinned-small-model".to_string(),
             Some("rev".to_string()),
+            ONNX_ARTIFACT,
         );
         let entry = artifact_paths_memo()
             .lock()
@@ -2734,12 +3071,15 @@ mod tests {
 
         let pinned_with_sidecar = ModelPin {
             model: "test/pinned-large-model",
+            repo: "test/pinned-large-model",
             revision: "rev",
             tokenizer_sha256: "",
             onnx_sha256: "",
             onnx_data_sha256: Some(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             ),
+            cuda_onnx: None,
+            max_seq_length: MAX_SEQ_LENGTH,
         };
         assert_eq!(
             SidecarExpectation::from_pin(Some(&pinned_with_sidecar)),
@@ -2760,6 +3100,7 @@ mod tests {
                 Some(root.path()),
                 model,
                 Some("rev"),
+                ONNX_ARTIFACT,
                 SidecarExpectation::Absent,
                 |artifact| {
                     fetches.set(fetches.get() + 1);
@@ -2807,6 +3148,7 @@ mod tests {
             Some(root.path().to_path_buf()),
             "test/stray-sidecar-first".to_string(),
             Some("rev".to_string()),
+            ONNX_ARTIFACT,
         );
         assert!(
             !artifact_paths_memo()
@@ -2827,6 +3169,7 @@ mod tests {
                 Some(root.path()),
                 "test/pinned-large-model",
                 Some("rev"),
+                ONNX_ARTIFACT,
                 SidecarExpectation::Required,
                 |artifact| {
                     fetches.set(fetches.get() + 1);

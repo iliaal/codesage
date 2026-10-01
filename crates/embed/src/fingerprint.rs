@@ -34,6 +34,14 @@ impl PipelineIdentity {
         max_seq_length: MAX_SEQ_LENGTH,
         normalized: true,
     };
+
+    /// [`Self::CURRENT`] with the sequence cap the loader applies to `model`.
+    pub fn for_model(model: &str) -> Self {
+        Self {
+            max_seq_length: crate::model::max_seq_length(model),
+            ..Self::CURRENT
+        }
+    }
 }
 
 /// Persisted identity compared before vector reuse. Equality uses text alone;
@@ -90,7 +98,7 @@ impl SemanticFingerprint {
     /// `codesage_graph::resolve_semantic_fingerprint`, which compares the
     /// stat key first and reads nothing when it matches.
     pub fn compute(config: &EmbeddingConfig, dim: usize) -> Result<Self> {
-        let artifacts = resolve_model_artifacts(&config.model)
+        let artifacts = resolve_model_artifacts(&config.model, &config.device)
             .with_context(|| format!("resolving model files for {:?}", config.model))?;
         Self::for_artifacts(config, dim, &artifacts)
     }
@@ -115,7 +123,12 @@ impl SemanticFingerprint {
         dim: usize,
         artifact_digest: &str,
     ) -> Self {
-        Self::with_pipeline(config, dim, artifact_digest, &PipelineIdentity::CURRENT)
+        Self::with_pipeline(
+            config,
+            dim,
+            artifact_digest,
+            &PipelineIdentity::for_model(&config.model),
+        )
     }
 
     /// The fingerprint for `config` given an artifact digest a persisted
@@ -379,6 +392,19 @@ mod tests {
         let file = std::fs::File::open(path).unwrap();
         let later = std::fs::metadata(path).unwrap().modified().unwrap() + Duration::from_secs(2);
         file.set_modified(later).unwrap();
+    }
+
+    #[test]
+    fn the_model_sequence_cap_is_part_of_the_identity() {
+        let config = EmbeddingConfig {
+            model: "jinaai/jina-embeddings-v2-base-code".to_string(),
+            ..EmbeddingConfig::default()
+        };
+        let fingerprint = SemanticFingerprint::with_artifact_digest(&config, 768, "d");
+        assert!(
+            fingerprint.as_str().contains(";maxseq=1024;"),
+            "{fingerprint}"
+        );
     }
 
     #[test]
