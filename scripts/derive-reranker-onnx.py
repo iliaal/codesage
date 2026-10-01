@@ -26,7 +26,7 @@ from huggingface_hub import hf_hub_download
 UPSTREAM = "cross-encoder/ms-marco-MiniLM-L6-v2"
 REVISION = "c5ee24cb16019beea0893ab7796b1df96625c6b8"
 UPSTREAM_SHA256 = {
-    "tokenizer.json": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+    "tokenizer.json": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",  # gitleaks:allow (sha256 pin, not a credential)
     "onnx/model.onnx": "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a",
 }
 HEADS = 12

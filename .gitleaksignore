@@ -1,0 +1,3 @@
+# sha256 pins of upstream tokenizer.json files, flagged by generic-api-key
+388f73db09b5e98b00d294f482d3701d16c3488f:scripts/derive-reranker-onnx.py:generic-api-key:29
+388f73db09b5e98b00d294f482d3701d16c3488f:scripts/derive-jina-onnx.py:generic-api-key:39

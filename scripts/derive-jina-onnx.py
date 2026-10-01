@@ -36,7 +36,7 @@ from onnx import TensorProto, helper, numpy_helper
 UPSTREAM = "jinaai/jina-embeddings-v2-base-code"
 REVISION = "516f4baf13dec4ddddda8631e019b5737c8bc250"
 UPSTREAM_SHA256 = {
-    "tokenizer.json": "b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5",
+    "tokenizer.json": "b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5",  # gitleaks:allow (sha256 pin, not a credential)
     "onnx/model.onnx": "63363fc178428b74620c6f3780cbc7191883fa5c7f84c0945c45eb5c4256733b",
 }
 LAYERS = 12
