@@ -373,6 +373,95 @@ pub(crate) fn repair_fts_sidecar_capped(
     Ok(FtsRepairOutcome::Repaired { rows: chunk_count })
 }
 
+/// Plain-table sidecar mapping each vec0 rowid to its `file_path`, so a
+/// per-file delete is an index lookup plus rowid deletes instead of a scan
+/// of the vec0 auxiliary column. Model chunk table names always end in the
+/// embedding dimension, and every chunk-table enumeration requires a vec0
+/// `_info` shadow table, so `<chunk>_paths` can neither collide with a model
+/// table nor be listed as one.
+pub fn path_table_name(chunk_table: &str) -> String {
+    format!("{chunk_table}_paths")
+}
+
+pub(crate) fn path_sidecar_schema(path_table: &str) -> String {
+    let table = quote_ident(path_table);
+    let index = quote_ident(&format!("{path_table}_file_path"));
+    format!(
+        "CREATE TABLE IF NOT EXISTS \"{table}\" (\
+         id INTEGER PRIMARY KEY, \
+         file_path TEXT NOT NULL);
+         CREATE INDEX IF NOT EXISTS \"{index}\" ON \"{table}\"(file_path);"
+    )
+}
+
+/// Whether the path sidecar holds exactly the chunk table's rowids. vec0
+/// allocates rowids from an AUTOINCREMENT shadow table and never updates a
+/// row's `file_path`, so within one table instance an id names one path for
+/// its whole life: equal id sets imply equal (id, path) pairs.
+fn path_sidecar_in_sync(
+    conn: &Connection,
+    chunk_table: &str,
+    path_table: &str,
+) -> rusqlite::Result<bool> {
+    if table_row_count(conn, chunk_table)? != table_row_count(conn, path_table)? {
+        return Ok(false);
+    }
+    // Same one-direction probe as `fts_rowids_match`: both id sets are
+    // unique and equal in size, so chunk ⊆ sidecar proves equality.
+    let chunk = quote_ident(chunk_table);
+    let paths = quote_ident(path_table);
+    let sql = format!(
+        "SELECT NOT EXISTS (
+            SELECT 1 FROM \"{chunk}\" AS c
+            WHERE NOT EXISTS (SELECT 1 FROM \"{paths}\" AS p WHERE p.id = c.id)
+         )",
+    );
+    conn.query_row(&sql, [], |row| row.get::<_, bool>(0))
+}
+
+/// Rebuild the path sidecar from the chunk table's `file_path` column. No
+/// row cap, unlike [`FTS_REPAIR_ROW_CAP`]: the copy tokenizes nothing and
+/// reads one auxiliary column, about the cost of a single legacy per-file
+/// delete scan, and skipping it is not a degraded mode but a delete that
+/// leaves the file's vectors behind.
+pub(crate) fn rebuild_path_sidecar(
+    conn: &Connection,
+    chunk_table: &str,
+    path_table: &str,
+) -> rusqlite::Result<()> {
+    let chunk = quote_ident(chunk_table);
+    let paths = quote_ident(path_table);
+    // `+file_path` is nullable in vec0; a NULL path is unreachable by any
+    // per-path delete either way, and keeping the row keeps the counts equal.
+    let sql = format!(
+        "SAVEPOINT rebuild_path_sidecar;
+         DELETE FROM \"{paths}\";
+         INSERT INTO \"{paths}\"(id, file_path)
+         SELECT id, COALESCE(file_path, '') FROM \"{chunk}\";
+         RELEASE rebuild_path_sidecar;"
+    );
+    if let Err(e) = conn.execute_batch(&sql) {
+        let _ = conn.execute_batch("ROLLBACK TO rebuild_path_sidecar");
+        let _ = conn.execute_batch("RELEASE rebuild_path_sidecar");
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Create the path sidecar when missing and rebuild it when its id set
+/// diverges from the chunk table (an index written before the sidecar
+/// existed, or by a binary that does not maintain it). Returns whether a
+/// rebuild ran.
+pub(crate) fn sync_path_sidecar(conn: &Connection, chunk_table: &str) -> rusqlite::Result<bool> {
+    let path_table = path_table_name(chunk_table);
+    conn.execute_batch(&path_sidecar_schema(&path_table))?;
+    if path_sidecar_in_sync(conn, chunk_table, &path_table)? {
+        return Ok(false);
+    }
+    rebuild_path_sidecar(conn, chunk_table, &path_table)?;
+    Ok(true)
+}
+
 pub fn model_table_name(model: &str, dim: usize) -> String {
     format!("{}{dim}", model_table_prefix(model))
 }
@@ -1312,8 +1401,9 @@ fn migrate_0005_semantic_models(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// DDL only: create missing vec0/FTS/vocab tables without a potentially large rebuild.
-/// Write paths use capped repair; read paths inspect health without rewriting.
+/// DDL only: create missing vec0/FTS/vocab/path tables without a potentially
+/// large rebuild. Write paths use capped FTS repair and path-sidecar sync;
+/// read paths inspect health without rewriting.
 pub(crate) fn ensure_chunk_table(
     conn: &Connection,
     table_name: &str,
@@ -1323,6 +1413,7 @@ pub(crate) fn ensure_chunk_table(
     let fts = fts_table_name(table_name);
     conn.execute_batch(&fts_schema(&fts))?;
     conn.execute_batch(&fts_vocab_schema(&fts))?;
+    conn.execute_batch(&path_sidecar_schema(&path_table_name(table_name)))?;
     Ok(())
 }
 

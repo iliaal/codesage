@@ -5,7 +5,7 @@ use codesage_protocol::{
     Language, Symbol, SymbolKind,
 };
 use codesage_storage::Database;
-use codesage_storage::schema::{fts_table_name, model_table_name};
+use codesage_storage::schema::{fts_table_name, model_table_name, path_table_name};
 
 fn file_info(path: &str) -> FileInfo {
     FileInfo {
@@ -117,6 +117,9 @@ fn remove_file_purges_all_chunk_tables_fts_and_feature_files() {
             [],
         )
         .unwrap();
+        // Model B as a binary without the path sidecar left it.
+        conn.execute(&format!("DROP TABLE \"{}\"", path_table_name(&table_b)), [])
+            .unwrap();
     }
 
     // Structural-only open with no active chunk table: the failure mode under test.
@@ -156,6 +159,12 @@ fn remove_file_purges_all_chunk_tables_fts_and_feature_files() {
             0,
             "fts sidecar {fts} must not retain removed file"
         );
+        let paths = path_table_name(table);
+        assert_eq!(
+            count_for_path(&conn, &paths, "file_path", "a.rs"),
+            0,
+            "path sidecar {paths} must not retain removed file"
+        );
     }
     assert_eq!(
         count_for_path(&conn, &table_a, "file_path", "keep.rs"),
@@ -166,5 +175,10 @@ fn remove_file_purges_all_chunk_tables_fts_and_feature_files() {
         count_for_path(&conn, &fts_table_name(&table_a), "file_path", "keep.rs"),
         1,
         "other files' fts rows must survive"
+    );
+    assert_eq!(
+        count_for_path(&conn, &path_table_name(&table_a), "file_path", "keep.rs"),
+        1,
+        "other files' path sidecar rows must survive"
     );
 }

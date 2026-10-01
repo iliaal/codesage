@@ -988,7 +988,7 @@ impl Database {
     /// sibling check filters out FTS sidecars and vec0's own shadow tables,
     /// which share the prefix. Same identification rule as the open-time
     /// chunk-table discovery in `db/mod.rs`.
-    fn all_chunk_table_names(&self) -> Result<Vec<String>> {
+    pub(super) fn all_chunk_table_names(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT m.name FROM sqlite_master m
              WHERE m.type = 'table' AND m.name GLOB 'chunks_*'
@@ -1004,7 +1004,7 @@ impl Database {
         Ok(rows)
     }
 
-    fn table_exists(&self, name: &str) -> Result<bool> {
+    pub(super) fn table_exists(&self, name: &str) -> Result<bool> {
         let n: i64 = self
             .conn
             .prepare_cached(
@@ -1042,6 +1042,12 @@ impl Database {
     /// mid-delete failure can't leave the removal half-applied; a savepoint
     /// (not a bare BEGIN) composes with a caller's outer transaction.
     pub fn remove_file(&self, path: &str) -> Result<()> {
+        let mut chunk_tables = Vec::new();
+        for table in self.all_chunk_table_names()? {
+            let sync = self.ensure_sidecars(&table, None)?;
+            let has_fts = self.table_exists(&crate::schema::fts_table_name(&table))?;
+            chunk_tables.push((table, has_fts.then_some(sync)));
+        }
         self.conn.execute_batch("SAVEPOINT remove_file")?;
         let result = (|| -> Result<()> {
             self.conn
@@ -1063,20 +1069,8 @@ impl Database {
             self.conn
                 .prepare_cached("DELETE FROM features WHERE entry_path = ?1")?
                 .execute(params![path])?;
-            for table in self.all_chunk_table_names()? {
-                let sql = format!(
-                    "DELETE FROM \"{}\" WHERE file_path = ?1",
-                    crate::schema::quote_ident(&table)
-                );
-                self.conn.prepare_cached(&sql)?.execute(params![path])?;
-                let fts = crate::schema::fts_table_name(&table);
-                if self.table_exists(&fts)? {
-                    let fts_sql = format!(
-                        "DELETE FROM \"{}\" WHERE file_path = ?1",
-                        crate::schema::quote_ident(&fts)
-                    );
-                    self.conn.prepare_cached(&fts_sql)?.execute(params![path])?;
-                }
+            for (table, fts) in &chunk_tables {
+                self.delete_chunk_rows_for_path(table, path, *fts)?;
             }
             Ok(())
         })();

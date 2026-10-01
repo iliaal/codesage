@@ -1,9 +1,32 @@
 //! Chunk table + sqlite-vec KNN + fullscan search.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
 use super::{Database, drop_chunk_table_group, quote_ident};
+use crate::schema::{FtsSidecarHealth, fts_sidecar_health, path_table_name, sync_path_sidecar};
+
+/// Per-handle sidecar verdicts, keyed by chunk table.
+#[derive(Debug, Default)]
+pub(super) struct SidecarMemo {
+    pub(super) tables: HashMap<String, SidecarSync>,
+    /// A sidecar rebuild ran inside a transaction that has not been seen to
+    /// end. Until an autocommit call clears it, no verdict is remembered: a
+    /// rollback would undo the rebuild that made the table look in sync.
+    pub(super) uncommitted_rebuild: bool,
+}
+
+/// What one handle has established about a chunk table's sidecars.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SidecarSync {
+    /// The FTS sidecar mirrors the chunk rowids, so deleting a file's FTS rows
+    /// by those rowids removes all of them. When false (a diverged sidecar
+    /// over the repair cap) FTS deletes keep the `file_path` scan, which also
+    /// removes orphan rows naming the file.
+    fts_by_rowid: bool,
+}
 
 /// Opaque comparison token returned by
 /// [`Database::semantic_files_validity_token`]. Components are
@@ -147,13 +170,119 @@ impl Database {
         crate::schema::fts_table_name(&self.chunk_table)
     }
 
+    /// Bring `chunk_table`'s path sidecar in line with its rowids before this
+    /// handle writes through it, once per handle: a sidecar written by an
+    /// older binary (missing, or diverged by its inserts and deletes) is
+    /// rebuilt, so the rowid deletes below never leave a file's vectors
+    /// behind. `fts_in_sync` carries an FTS verdict the caller already holds;
+    /// `None` probes it.
+    ///
+    /// A verdict is remembered unless a rebuild ran inside a still-open
+    /// transaction. An in-sync verdict reached inside a transaction without
+    /// one holds after a rollback too: every chunk write through this handle
+    /// runs this check first and keeps both sides equal, so the committed
+    /// state the transaction started from was already in sync.
+    pub(super) fn ensure_sidecars(
+        &self,
+        chunk_table: &str,
+        fts_in_sync: Option<bool>,
+    ) -> Result<SidecarSync> {
+        if let Some(sync) = self.verified_sidecars.borrow().tables.get(chunk_table) {
+            return Ok(*sync);
+        }
+        let committed = self.conn.is_autocommit();
+        if committed {
+            self.verified_sidecars.borrow_mut().uncommitted_rebuild = false;
+        }
+        let rebuilt = sync_path_sidecar(&self.conn, chunk_table)?;
+        if rebuilt && !committed {
+            self.verified_sidecars.borrow_mut().uncommitted_rebuild = true;
+        }
+        let fts_by_rowid = match fts_in_sync {
+            Some(in_sync) => in_sync,
+            None => {
+                let fts = crate::schema::fts_table_name(chunk_table);
+                self.table_exists(&fts)?
+                    && fts_sidecar_health(&self.conn, chunk_table, &fts)?
+                        == FtsSidecarHealth::InSync
+            }
+        };
+        if !self.verified_sidecars.borrow().uncommitted_rebuild {
+            self.mark_sidecars_verified(chunk_table, fts_by_rowid);
+        }
+        Ok(SidecarSync { fts_by_rowid })
+    }
+
+    /// Record a sidecar state the caller established outside any transaction.
+    pub(super) fn mark_sidecars_verified(&self, chunk_table: &str, fts_by_rowid: bool) {
+        self.verified_sidecars
+            .borrow_mut()
+            .tables
+            .insert(chunk_table.to_string(), SidecarSync { fts_by_rowid });
+    }
+
+    /// Delete `file_path`'s rows from `chunk_table`, its FTS sidecar, and its
+    /// path sidecar, going by rowid through the path sidecar. The caller owns
+    /// the savepoint and has run [`Database::ensure_sidecars`]; `fts` is
+    /// `None` when the chunk table has no FTS sidecar. Returns the number of
+    /// vec0 rows deleted.
+    pub(super) fn delete_chunk_rows_for_path(
+        &self,
+        chunk_table: &str,
+        file_path: &str,
+        fts: Option<SidecarSync>,
+    ) -> Result<usize> {
+        let paths = quote_ident(&path_table_name(chunk_table));
+        let ids = self
+            .conn
+            .prepare_cached(&format!("SELECT id FROM \"{paths}\" WHERE file_path = ?1"))?
+            .query_map(params![file_path], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut count = 0;
+        if !ids.is_empty() {
+            // `id = ?` is vec0's point-lookup plan; `rowid = ?` would scan.
+            let mut vec_stmt = self.conn.prepare_cached(&format!(
+                "DELETE FROM \"{}\" WHERE id = ?1",
+                quote_ident(chunk_table)
+            ))?;
+            for id in &ids {
+                count += vec_stmt.execute(params![id])?;
+            }
+            self.conn
+                .prepare_cached(&format!("DELETE FROM \"{paths}\" WHERE file_path = ?1"))?
+                .execute(params![file_path])?;
+        }
+        if let Some(sync) = fts {
+            let fts = quote_ident(&crate::schema::fts_table_name(chunk_table));
+            if sync.fts_by_rowid {
+                let mut fts_stmt = self
+                    .conn
+                    .prepare_cached(&format!("DELETE FROM \"{fts}\" WHERE rowid = ?1"))?;
+                for id in &ids {
+                    fts_stmt.execute(params![id])?;
+                }
+            } else {
+                self.conn
+                    .prepare_cached(&format!("DELETE FROM \"{fts}\" WHERE file_path = ?1"))?
+                    .execute(params![file_path])?;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn insert_chunks(
         &self,
         file_path: &str,
         language: &str,
         chunks: &[(&str, u32, u32, &[f32])],
     ) -> Result<()> {
-        // Keep vec0 and FTS5 rowids atomic, including calls inside an outer transaction.
+        anyhow::ensure!(
+            !self.chunk_table.is_empty(),
+            "cannot insert chunks on a handle without a chunk table"
+        );
+        self.ensure_sidecars(&self.chunk_table, None)?;
+        // Keep vec0, FTS5, and path-sidecar rowids atomic, including calls
+        // inside an outer transaction.
         self.conn.execute_batch("SAVEPOINT insert_chunks")?;
         let result = (|| -> Result<()> {
             let sql = format!(
@@ -167,8 +296,13 @@ impl Database {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 quote_ident(&fts)
             );
+            let paths_sql = format!(
+                "INSERT INTO \"{}\"(id, file_path) VALUES (?1, ?2)",
+                quote_ident(&path_table_name(&self.chunk_table))
+            );
             let mut vec_stmt = self.conn.prepare(&sql)?;
             let mut fts_stmt = self.conn.prepare(&fts_sql)?;
+            let mut paths_stmt = self.conn.prepare(&paths_sql)?;
 
             for (content, start_line, end_line, embedding) in chunks {
                 let bytes = embedding_to_bytes(embedding);
@@ -179,6 +313,7 @@ impl Database {
                 fts_stmt.execute(params![
                     rowid, content, file_path, language, start_line, end_line
                 ])?;
+                paths_stmt.execute(params![rowid, file_path])?;
             }
             Ok(())
         })();
@@ -201,18 +336,9 @@ impl Database {
         if self.chunk_table.is_empty() {
             return Ok(0);
         }
+        let sync = self.ensure_sidecars(&self.chunk_table, None)?;
         self.conn.execute_batch("SAVEPOINT delete_chunks")?;
-        let result = (|| -> Result<usize> {
-            let sql = format!(
-                "DELETE FROM \"{}\" WHERE file_path = ?1",
-                quote_ident(&self.chunk_table)
-            );
-            let count = self.conn.execute(&sql, params![file_path])?;
-            let fts = self.fts_table();
-            let fts_sql = format!("DELETE FROM \"{}\" WHERE file_path = ?1", quote_ident(&fts));
-            self.conn.execute(&fts_sql, params![file_path])?;
-            Ok(count)
-        })();
+        let result = self.delete_chunk_rows_for_path(&self.chunk_table, file_path, Some(sync));
         match result {
             Ok(count) => {
                 self.conn.execute_batch("RELEASE delete_chunks")?;
@@ -604,7 +730,12 @@ impl Database {
     }
 
     pub fn drop_vec_table(&self, table_name: &str) -> Result<()> {
-        drop_chunk_table_group(&self.conn, table_name)
+        drop_chunk_table_group(&self.conn, table_name)?;
+        self.verified_sidecars
+            .borrow_mut()
+            .tables
+            .remove(table_name);
+        Ok(())
     }
 
     pub fn vacuum(&self) -> Result<()> {

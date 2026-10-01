@@ -1,5 +1,6 @@
 //! Database connections and shared helpers; storage operations live in submodules.
 
+use std::cell::RefCell;
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -12,7 +13,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::schema::{
     FTS_REPAIR_ROW_CAP, FtsRepairOutcome, FtsSidecarHealth, READ_BUSY_TIMEOUT_MS,
     ensure_chunk_table, fts_sidecar_health, fts_table_name, init_db, init_vec_extension,
-    model_table_name, model_table_prefix, repair_fts_sidecar_capped,
+    model_table_name, model_table_prefix, path_table_name, rebuild_path_sidecar,
+    repair_fts_sidecar_capped,
 };
 
 pub use codesage_protocol::DEFAULT_EMBEDDING_DIM;
@@ -101,6 +103,8 @@ pub struct Database {
     pub(super) conn: Connection,
     pub(super) chunk_table: String,
     cache_id: u64,
+    /// Sidecar verdicts this handle may reuse; see [`Database::ensure_sidecars`].
+    verified_sidecars: RefCell<semantic::SidecarMemo>,
 }
 
 pub struct ReadSnapshot<'a> {
@@ -472,6 +476,11 @@ pub(super) fn drop_chunk_table_group(conn: &Connection, table_name: &str) -> Res
         conn.execute(&vocab_sql, [])?;
         let fts_sql = format!("DROP TABLE IF EXISTS \"{}\"", quote_ident(&fts_table));
         conn.execute(&fts_sql, [])?;
+        let paths_sql = format!(
+            "DROP TABLE IF EXISTS \"{}\"",
+            quote_ident(&path_table_name(table_name))
+        );
+        conn.execute(&paths_sql, [])?;
         conn.execute(
             "DELETE FROM semantic_files WHERE chunk_table = ?1",
             params![table_name],
@@ -714,6 +723,7 @@ impl Database {
             conn,
             chunk_table: String::new(),
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            verified_sidecars: Default::default(),
         })
     }
 
@@ -725,6 +735,7 @@ impl Database {
             conn,
             chunk_table: String::new(),
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            verified_sidecars: Default::default(),
         })
     }
 
@@ -738,6 +749,7 @@ impl Database {
             conn,
             chunk_table: String::new(),
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            verified_sidecars: Default::default(),
         })
     }
 
@@ -789,6 +801,7 @@ impl Database {
             conn,
             chunk_table: String::new(),
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            verified_sidecars: Default::default(),
         })
     }
 
@@ -853,14 +866,14 @@ impl Database {
             existing_chunk_table_name(&conn, &requested_table)?.unwrap_or(requested_table);
         ensure_semantic_model_compatible(&conn, &chunk_table, model, dim, expected_fingerprint)?;
         ensure_chunk_table(&conn, &chunk_table, dim)?;
-        if repair_fts {
+        let fts_in_sync = if repair_fts {
             match repair_fts_sidecar_capped(
                 &conn,
                 &chunk_table,
                 &fts_table_name(&chunk_table),
                 FTS_REPAIR_ROW_CAP,
             )? {
-                FtsRepairOutcome::InSync | FtsRepairOutcome::Repaired { .. } => {}
+                FtsRepairOutcome::InSync | FtsRepairOutcome::Repaired { .. } => Some(true),
                 FtsRepairOutcome::SkippedOverCap { chunk_rows } => {
                     tracing::warn!(
                         chunk_table = chunk_table.as_str(),
@@ -869,16 +882,24 @@ impl Database {
                         "FTS sidecar diverges on a table over the synchronous repair cap; \
                          BM25 search stays degraded until an explicit repair runs"
                     );
+                    Some(false)
                 }
             }
-        }
+        } else {
+            None
+        };
         record_semantic_model_table(&conn, &chunk_table, model, dim, repair_fts)?;
         harden_db_path_permissions(path)?;
-        Ok(Database {
+        let db = Database {
             conn,
             chunk_table,
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
-        })
+            verified_sidecars: Default::default(),
+        };
+        if let Some(fts_in_sync) = fts_in_sync {
+            db.ensure_sidecars(&db.chunk_table, Some(fts_in_sync))?;
+        }
+        Ok(db)
     }
 
     pub fn open_for_model_rebuild(path: &Path, model: &str, dim: usize) -> Result<Self> {
@@ -894,12 +915,13 @@ impl Database {
             }
         }
         ensure_chunk_table(&conn, &chunk_table, dim)?;
-        if let FtsRepairOutcome::SkippedOverCap { chunk_rows } = repair_fts_sidecar_capped(
+        let fts_outcome = repair_fts_sidecar_capped(
             &conn,
             &chunk_table,
             &fts_table_name(&chunk_table),
             FTS_REPAIR_ROW_CAP,
-        )? {
+        )?;
+        if let FtsRepairOutcome::SkippedOverCap { chunk_rows } = fts_outcome {
             tracing::warn!(
                 chunk_table = chunk_table.as_str(),
                 chunk_rows,
@@ -908,15 +930,26 @@ impl Database {
                  the rebuild repopulates both sides row by row, healing it without a rewrite"
             );
         }
+        // Unconditional, unlike the incremental open's id-set check: a sidecar
+        // left behind when an older binary dropped and repopulated the chunk
+        // table can match its rowids while naming other paths, and a full
+        // rebuild is the pass that must not inherit that.
+        rebuild_path_sidecar(&conn, &chunk_table, &path_table_name(&chunk_table))?;
         record_semantic_model_table(&conn, &chunk_table, model, dim, true)?;
         // Interrupted rebuilds must not leave an old attestation over mixed vectors.
         clear_semantic_fingerprint_for(&conn, &chunk_table)?;
         harden_db_path_permissions(path)?;
-        Ok(Database {
+        let db = Database {
             conn,
             chunk_table,
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
-        })
+            verified_sidecars: Default::default(),
+        };
+        db.mark_sidecars_verified(
+            &db.chunk_table,
+            !matches!(fts_outcome, FtsRepairOutcome::SkippedOverCap { .. }),
+        );
+        Ok(db)
     }
 
     /// Open a DB for structural queries plus best-effort chunk reads for an
@@ -975,6 +1008,7 @@ impl Database {
             conn,
             chunk_table,
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            verified_sidecars: Default::default(),
         })
     }
 
@@ -997,6 +1031,7 @@ impl Database {
             conn,
             chunk_table,
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            verified_sidecars: Default::default(),
         })
     }
 
@@ -1107,6 +1142,9 @@ impl Database {
         if fts_sidecar_health(&self.conn, &self.chunk_table, &fts)? == FtsSidecarHealth::InSync {
             return Ok(());
         }
+        if !self.conn.is_autocommit() {
+            self.verified_sidecars.borrow_mut().uncommitted_rebuild = true;
+        }
         Ok(crate::schema::repair_fts_sidecar(
             &self.conn,
             &self.chunk_table,
@@ -1181,7 +1219,11 @@ impl Database {
         self.conn.execute_batch("BEGIN")?;
         match f(self) {
             Ok(()) => match self.conn.execute_batch("COMMIT") {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    // A committed sidecar rebuild can no longer be rolled back.
+                    self.verified_sidecars.borrow_mut().uncommitted_rebuild = false;
+                    Ok(())
+                }
                 // A failed COMMIT can leave the transaction open and block later batches.
                 Err(commit_err) => {
                     let _ = self.conn.execute_batch("ROLLBACK");
@@ -2405,6 +2447,7 @@ mod tests {
             conn,
             chunk_table: table.clone(),
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            verified_sidecars: Default::default(),
         };
         if with_chunk {
             let embedding = make_embedding(0.1);
@@ -2563,8 +2606,13 @@ mod tests {
     #[test]
     fn list_vec_tables_excludes_fts_sidecars() {
         let db = Database::open_in_memory().unwrap();
+        let table = db.chunk_table_name().to_string();
+        for sidecar in [fts_table_name(&table), path_table_name(&table)] {
+            assert!(db.table_exists(&sidecar).unwrap(), "{sidecar} must exist");
+        }
         let tables = db.list_vec_tables().unwrap();
-        assert_eq!(tables, vec![db.chunk_table_name().to_string()]);
+        assert_eq!(tables, vec![table.clone()]);
+        assert_eq!(db.all_chunk_table_names().unwrap(), vec![table]);
     }
 
     #[test]
@@ -2601,9 +2649,12 @@ mod tests {
             .unwrap();
         assert_eq!(vocab_before, 1);
 
+        assert!(db.table_exists(&path_table_name(&table)).unwrap());
+
         db.drop_vec_table(&table).unwrap();
 
         assert!(db.list_vec_tables().unwrap().is_empty());
+        assert!(!db.table_exists(&path_table_name(&table)).unwrap());
         let fts_after: i64 = db
             .conn
             .query_row(
@@ -2622,6 +2673,234 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vocab_after, 0);
+    }
+
+    fn path_rows(db: &Database, table: &str, path: &str) -> [i64; 3] {
+        let count = |t: String| -> i64 {
+            db.conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM \"{}\" WHERE file_path = ?1",
+                        quote_ident(&t)
+                    ),
+                    params![path],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        [
+            count(table.to_string()),
+            count(fts_table_name(table)),
+            count(path_table_name(table)),
+        ]
+    }
+
+    /// Sorted rowids of the chunk table, its FTS sidecar, and its path sidecar.
+    fn sidecar_id_sets(db: &Database, table: &str) -> [Vec<i64>; 3] {
+        let ids = |sql: String| -> Vec<i64> {
+            db.conn
+                .prepare(&sql)
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        [
+            ids(format!(
+                "SELECT id FROM \"{}\" ORDER BY id",
+                quote_ident(table)
+            )),
+            ids(format!(
+                "SELECT rowid FROM \"{}\" ORDER BY rowid",
+                quote_ident(&fts_table_name(table))
+            )),
+            ids(format!(
+                "SELECT id FROM \"{}\" ORDER BY id",
+                quote_ident(&path_table_name(table))
+            )),
+        ]
+    }
+
+    fn assert_sidecars_mirror_chunks(db: &Database, table: &str) {
+        let [chunks, fts, paths] = sidecar_id_sets(db, table);
+        assert_eq!(fts, chunks, "FTS rowids must mirror chunk ids");
+        assert_eq!(paths, chunks, "path sidecar ids must mirror chunk ids");
+    }
+
+    fn insert_two_files(db: &Database) {
+        let embedding = make_embedding(0.1);
+        let e = embedding.as_slice();
+        db.insert_chunks(
+            "src/a.rs",
+            "rust",
+            &[("fn a1() {}", 1, 1, e), ("fn a2() {}", 2, 2, e)],
+        )
+        .unwrap();
+        db.insert_chunks("src/b.rs", "rust", &[("fn b() {}", 1, 1, e)])
+            .unwrap();
+    }
+
+    #[test]
+    fn delete_chunks_for_file_removes_path_from_chunks_fts_and_path_sidecar() {
+        let db = Database::open_in_memory().unwrap();
+        let table = db.chunk_table_name().to_string();
+        insert_two_files(&db);
+        assert_eq!(path_rows(&db, &table, "src/a.rs"), [2, 2, 2]);
+        assert_sidecars_mirror_chunks(&db, &table);
+
+        assert_eq!(db.delete_chunks_for_file("src/a.rs").unwrap(), 2);
+
+        assert_eq!(path_rows(&db, &table, "src/a.rs"), [0, 0, 0]);
+        assert_eq!(path_rows(&db, &table, "src/b.rs"), [1, 1, 1]);
+        assert_sidecars_mirror_chunks(&db, &table);
+        assert_eq!(db.delete_chunks_for_file("src/a.rs").unwrap(), 0);
+    }
+
+    /// An index written before the path sidecar existed, or one an older
+    /// binary kept writing to afterwards: the write-path open rebuilds it, and
+    /// a handle that skipped the open-time repair rebuilds it on first write.
+    #[test]
+    fn stale_or_missing_path_sidecar_is_rebuilt_before_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let table = {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            insert_two_files(&db);
+            db.chunk_table_name().to_string()
+        };
+        let drop_sidecar = || {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "DROP TABLE \"{}\"",
+                quote_ident(&path_table_name(&table))
+            ))
+            .unwrap();
+        };
+
+        drop_sidecar();
+        {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            assert_sidecars_mirror_chunks(&db, &table);
+            assert_eq!(db.delete_chunks_for_file("src/a.rs").unwrap(), 2);
+            assert_eq!(path_rows(&db, &table, "src/a.rs"), [0, 0, 0]);
+            assert_eq!(path_rows(&db, &table, "src/b.rs"), [1, 1, 1]);
+            let embedding = make_embedding(0.2);
+            let e = embedding.as_slice();
+            db.insert_chunks(
+                "src/a.rs",
+                "rust",
+                &[("fn a1() {}", 1, 1, e), ("fn a2() {}", 2, 2, e)],
+            )
+            .unwrap();
+        }
+
+        // Same id count, wrong ids: an older binary deleted one row and
+        // inserted another without touching the sidecar.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                &format!(
+                    "UPDATE \"{}\" SET id = id + 1000 WHERE file_path = 'src/b.rs'",
+                    quote_ident(&path_table_name(&table))
+                ),
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            assert_sidecars_mirror_chunks(&db, &table);
+        }
+
+        // The query-path open never repairs; its first delete must.
+        drop_sidecar();
+        let db = Database::open_for_model_existing(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        assert_eq!(db.delete_chunks_for_file("src/b.rs").unwrap(), 1);
+        assert_eq!(path_rows(&db, &table, "src/b.rs"), [0, 0, 0]);
+        assert_eq!(path_rows(&db, &table, "src/a.rs"), [2, 2, 2]);
+        assert_sidecars_mirror_chunks(&db, &table);
+    }
+
+    /// A rebuild inside a transaction that rolls back is undone with it, so
+    /// the handle must not keep trusting the sidecar afterwards.
+    #[test]
+    fn path_sidecar_rebuild_rolled_back_with_its_transaction_is_redone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let table = {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            insert_two_files(&db);
+            db.chunk_table_name().to_string()
+        };
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!(
+                "DELETE FROM \"{}\"",
+                quote_ident(&path_table_name(&table))
+            ))
+            .unwrap();
+
+        let db = Database::open_for_model_existing(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        let rolled_back = db.execute_batch(|db| {
+            assert_eq!(db.delete_chunks_for_file("src/b.rs")?, 1);
+            assert_eq!(db.delete_chunks_for_file("src/b.rs")?, 0);
+            anyhow::bail!("roll back")
+        });
+        assert!(rolled_back.is_err());
+        assert_eq!(path_rows(&db, &table, "src/a.rs"), [2, 2, 0]);
+        let remembered = |db: &Database| db.verified_sidecars.borrow().tables.contains_key(&table);
+        assert!(!remembered(&db));
+
+        db.execute_batch(|db| {
+            assert_eq!(db.delete_chunks_for_file("src/a.rs")?, 2);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(path_rows(&db, &table, "src/a.rs"), [0, 0, 0]);
+        assert_eq!(path_rows(&db, &table, "src/b.rs"), [1, 1, 1]);
+        assert_sidecars_mirror_chunks(&db, &table);
+        assert!(
+            !remembered(&db),
+            "the rebuild's own transaction proves nothing"
+        );
+
+        // Once that rebuild committed, an in-transaction verdict sticks.
+        db.execute_batch(|db| {
+            assert_eq!(db.delete_chunks_for_file("src/none.rs")?, 0);
+            Ok(())
+        })
+        .unwrap();
+        assert!(remembered(&db));
+    }
+
+    #[test]
+    fn open_for_model_rebuild_rewrites_a_path_sidecar_naming_other_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let table = {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            insert_two_files(&db);
+            db.chunk_table_name().to_string()
+        };
+        // Matching ids, wrong paths: what a sidecar left over from a dropped
+        // and repopulated chunk table looks like.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!(
+                "UPDATE \"{}\" SET file_path = 'gone.rs'",
+                quote_ident(&path_table_name(&table))
+            ))
+            .unwrap();
+
+        let db = Database::open_for_model_rebuild(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        assert_eq!(path_rows(&db, &table, "src/a.rs"), [2, 2, 2]);
+        assert_eq!(db.delete_chunks_for_file("src/a.rs").unwrap(), 2);
+        assert_eq!(path_rows(&db, &table, "src/b.rs"), [1, 1, 1]);
+        assert_sidecars_mirror_chunks(&db, &table);
     }
 
     #[test]
