@@ -1,11 +1,12 @@
 ## [Unreleased]
 
+## [0.38.0] - 2026-10-01
+
 ### Changed
 
-- `jinaai/jina-embeddings-v2-base-code` loads pinned derived ONNX graphs from `IA0x00/jina-embeddings-v2-base-code-codesage` that pool and normalize in-graph, plus a fused-attention fp16 graph for `device = "gpu"` that embeds about 4x faster on CUDA. The next `codesage index` re-embeds every Jina-indexed file.
-- `jinaai/jina-embeddings-v2-base-code` embeds up to 1024 tokens of each chunk instead of 512; other models keep 512.
+- `jinaai/jina-embeddings-v2-base-code` loads pinned graphs from `IA0x00/jina-embeddings-v2-base-code-codesage`, embeds about 4x faster with `device = "gpu"`, and embeds up to 1024 tokens of each chunk instead of 512 (other models keep 512); the next `codesage index` re-embeds every Jina-indexed file.
 - Chunks that are mostly digits and commas (lookup tables, timezone and Unicode data) are no longer embedded or returned by `search`; the next `codesage index` re-embeds every file for every model.
-- With `device = "gpu"`, the `cross-encoder/ms-marco-MiniLM-L6-v2` reranker loads a pinned fused fp16 graph from `IA0x00/ms-marco-MiniLM-L6-v2-codesage`, cutting reranking time about 5x per search; scores can move by up to about 0.02.
+- With `device = "gpu"`, the `cross-encoder/ms-marco-MiniLM-L6-v2` reranker loads a pinned fp16 graph from `IA0x00/ms-marco-MiniLM-L6-v2-codesage` and reranks about 5x faster; scores can move by up to about 0.02.
 
 ## [0.37.0] - 2026-09-27
 
@@ -1182,5 +1183,7 @@ Initial public release.
 
 [0.36.0]: https://github.com/iliaal/codesage/releases/tag/v0.36.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.37.0...HEAD
 [0.37.0]: https://github.com/iliaal/codesage/releases/tag/v0.37.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/iliaal/codesage/releases/tag/v0.38.0
