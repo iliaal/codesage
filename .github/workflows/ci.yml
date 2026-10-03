@@ -47,7 +47,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck shfmt
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep shellcheck shfmt
       - run: shellcheck scripts/*.sh
       - run: shfmt -d scripts/*.sh
       - run: bash scripts/regression-tests.sh
