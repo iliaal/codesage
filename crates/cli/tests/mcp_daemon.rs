@@ -2434,14 +2434,15 @@ fn onboard_rich_fixture(root: &std::path::Path) {
         "use fixture::helper::inner_step;\n\n\
          #[test]\nfn inner_step_returns_seven() {\n    assert_eq!(inner_step(), 7);\n}\n",
     );
+    write("py/__init__.py", "");
     write("py/util.py", "def shared_value():\n    return 7\n");
     write(
         "py/app.py",
-        "from util import shared_value\n\n\ndef use_shared():\n    return shared_value()\n",
+        "from .util import shared_value\n\n\ndef use_shared():\n    return shared_value()\n",
     );
     write(
         "py/main.py",
-        "from app import use_shared\n\n\ndef entry():\n    return use_shared()\n",
+        "from .app import use_shared\n\n\ndef entry():\n    return use_shared()\n",
     );
 
     let git = |args: &[&str]| {
