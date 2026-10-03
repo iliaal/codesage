@@ -30,6 +30,7 @@ def _load(filename: str, modname: str):
 
 def check(cond: bool, label: str) -> None:
     if not cond:
+        print(f"FAILED: {label}", file=sys.stderr)
         failures.append(f"  {label}")
 
 
@@ -550,6 +551,13 @@ proj.mkdir()
 (proj / ".codesage/config.toml").write_text('[embedding]\nmodel="test/model"\ndevice="cpu"\n')
 # These runner-format tests inject search responses; control integration has its
 # own real SQLite/ripgrep fixtures in test_retrieval_controls.py.
+fixture_bin = tmp / "codesage-fixture"
+fixture_bin.write_text(
+    '#!/bin/sh\n'
+    '[ "$#" -eq 1 ] && [ "$1" = "--version" ] || exit 64\n'
+    "printf 'codesage 0.0.0 (fixture)\\n  device configured: cpu\\n'\n"
+)
+fixture_bin.chmod(0o755)
 fixture_chunks = {"a.rs": ["fn a() {}"], "b.rs": [""]}
 fixture_chunks.update({f"noise{i}.rs": ["x" * 200] for i in range(20)})
 for path, content in fixture_chunks.items():
@@ -557,7 +565,7 @@ for path, content in fixture_chunks.items():
 fixture_context = {
     "head": "not-a-git-repo", "model": "test/model", "reranker": "none", "device": "cpu",
     **{k: "0" * 64 for k in cmp.CONTROL_DIGEST_KEYS},
-    "binary": {"path": "/fixture/codesage", "sha256": "0" * 64, "size": 1},
+    "binary": runner.file_pin(fixture_bin),
     "rg_binary": {"path": "/fixture/rg", "sha256": "0" * 64, "size": 1},
     "embedding_artifacts": [{"label": name, "path": "/fixture/" + name,
                               "sha256": "0" * 64, "size": 1} for name in ("tokenizer", "onnx", "ort_runtime")],
@@ -591,7 +599,7 @@ def canned_search(*_a, **_k):
 def run_runner(argv: list[str]) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
     old = sys.argv
-    sys.argv = ["codesage-bench-runner", *argv]
+    sys.argv = ["codesage-bench-runner", "--codesage-bin", str(fixture_bin), *argv]
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
@@ -619,6 +627,8 @@ check([r["id"] for r in env["records"]] == train_ids, "runner: results hold exac
 check(all(r["first_hit_rank"] == 1 and r["hits"] == ["a.rs", "b.rs"] and "error" not in r for r in env["records"]),
       "runner: canned hits scored at rank 1 with no error field")
 meta = env["meta"]
+check(meta.get("codesage") == "0.0.0 (fixture)", "runner: reads the disposable executable's fixture banner")
+check(meta["provenance"]["binary"] == runner.file_pin(fixture_bin), "runner: fixture provenance pins the disposable executable")
 check(meta.get("split") == "train" and meta.get("salt") == "s" and meta.get("corpus") == "run-corpus.yaml",
       f"runner: meta carries corpus/split/salt (got {meta})")
 check(meta.get("corpus_sha256") == _hashlib.sha256(run_corpus.read_bytes()).hexdigest(),

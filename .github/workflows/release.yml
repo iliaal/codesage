@@ -42,6 +42,8 @@ jobs:
         run: |
           python3 -m pip install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/onnxruntime" 'onnxruntime==1.24.4'
           echo "ORT_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/onnxruntime/capi/libonnxruntime.so.1.24.4" >> "$GITHUB_ENV"
+      - name: Expose the workspace CLI to script regressions
+        run: echo "$GITHUB_WORKSPACE/target/debug" >> "$GITHUB_PATH"
       - run: bash scripts/sanity-check.sh --cuda
 
   github-release:
