@@ -14,6 +14,22 @@ and `meta.head` are compared and a mismatch is refused unless
 `--allow-mismatch`. A file whose run did not finish (`complete: false`) is
 refused unless `--allow-partial`.
 
+Controlled input requires retrieval-controls-v2 evidence. Ranking/model
+environment, private-runtime policy, and exact runner/helper SHA-256 identity
+must agree; mixed instruments within an arm also require --allow-mismatch.
+Each paired case retains its originating file's provenance. Compatible
+multi-project inputs may use different file orders and partitions.
+Required evidence is shape-validated before scoring; null, empty, or malformed
+digests, fingerprints, manifests, and file pins cannot be overridden. No split
+uses null split/salt, no reranker uses an empty artifact list, and an empty
+environment records no overrides. Mixed-setting exceptions retain exact
+settings and every affected case/input origin on both arms.
+Semantic fingerprints require the supported v4 schema, consistent model/device
+identity, and valid pooling, pipeline, sequence, normalization, chunk, and ORT
+settings. Dynamic ORT requires a runtime byte pin; static ORT carries its build
+identity. Every controlled record must declare its text query.
+The comparator does not implicitly upgrade earlier control protocols.
+
 Search failures (records carrying `error`, or `meta.search_failures > 0`) are
 scored as misses by the runner, so a flaky arm manufactures lift for the other
 one. Failed ids are counted per arm and listed under the Arms table. The
@@ -96,8 +112,19 @@ import hashlib
 import json
 import math
 import random
+import re
 import sys
 from pathlib import Path
+from typing import NoReturn
+
+sys.path.append(str(Path(__file__).resolve().parent))
+from _retrieval_controls import (
+    CONTROL_PROTOCOL,
+    QUERY_RUNTIME,
+    InvalidRun,
+    digest_json,
+    validate_record,
+)
 
 RECALL_K = (5, 10)
 GATE_K = 10
@@ -108,7 +135,20 @@ MAX_MISS_DELTA = 0.005
 MIN_CLUSTER_R10_DELTA = -0.02
 MIN_CLUSTERS_FOR_INTERVAL = 5
 MIN_CLUSTER_SIZE_FOR_VETO = 5
-PROVENANCE_KEYS = ("corpus", "corpus_sha256", "split", "salt", "limit", "head")
+PROVENANCE_KEYS = ("corpus", "corpus_sha256", "split", "salt", "limit", "head",
+                   "model", "reranker", "device", "control_protocol", "control_seed",
+                   "runner_sha256", "controls_sha256")
+CONTROL_PROVENANCE_KEYS = (
+    "source_sha256", "eligible_files_sha256", "chunks_sha256", "semantic_files_sha256",
+    "semantic_fingerprint", "artifact_digest", "embedding_artifacts", "reranker_artifacts",
+    "config_sha256", "rg_binary", "environment", "query_runtime",
+)
+CONTROL_DIGEST_KEYS = (
+    "source_sha256", "eligible_files_sha256", "chunks_sha256", "semantic_files_sha256",
+    "artifact_digest", "config_sha256",
+)
+REQUIRED_CONTEXT_KEYS = (*CONTROL_PROVENANCE_KEYS, "binary", "source_manifest", "eligible_files",
+                         "head", "model", "reranker", "device")
 MIN_BOOTSTRAP = 200
 WARN_BOOTSTRAP = 1000
 DISPLAY_META_KEYS = (
@@ -184,42 +224,264 @@ def split_report(corpus_path: Path, salt: str) -> list[str]:
     return lines
 
 
+def valid_digest(value) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def valid_integer(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def valid_file_pin(value) -> bool:
+    return (isinstance(value, dict) and isinstance(value.get("path"), str)
+            and "\0" not in value["path"] and Path(value["path"]).is_absolute()
+            and bool(Path(value["path"]).name) and ".." not in Path(value["path"]).parts
+            and valid_digest(value.get("sha256")) and valid_integer(value.get("size"))
+            and value["size"] > 0)
+
+
+def valid_source_path(value) -> bool:
+    return (isinstance(value, str) and bool(value) and "\0" not in value
+            and not Path(value).is_absolute() and bool(Path(value).name)
+            and not ({"..", "."} & set(Path(value).parts)))
+
+
+def normalized_device(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    device = value.strip().lower()
+    return "cuda" if device in ("gpu", "cuda") else device if device in ("cpu", "coreml") else None
+
+
+def valid_unsigned_text(value: str, *, bits: int = 64, positive: bool = True) -> bool:
+    return (re.fullmatch(r"0|[1-9][0-9]{0,19}", value) is not None
+            and (0 if not positive else 1) <= int(value) < 2 ** bits)
+
+
+def validate_semantic_fingerprint(provenance: dict, model: str, device: str, where: str) -> dict:
+    def invalid(field) -> NoReturn:
+        raise Refused(f"{where}: invalid controlled-run provenance.semantic_fingerprint {field}")
+
+    fingerprint = provenance["semantic_fingerprint"]
+    if (not isinstance(fingerprint, str) or "\0" in fingerprint
+            or re.fullmatch(r"v4;[^\r\n]+", fingerprint) is None):
+        invalid("(unsupported or malformed version)")
+    parts = fingerprint.split(";")[1:]
+    if any("=" not in part or not all(part.split("=", 1)) for part in parts):
+        invalid("fields")
+    fields = dict(part.split("=", 1) for part in parts)
+    required = {"model", "artifacts", "dim", "pooling", "device", "ort", "pipeline",
+                "maxseq", "norm", "chunker", "chunk"}
+    if len(fields) != len(parts) or set(fields) != required:
+        invalid("fields (requires the complete v4 schema)")
+    if fields["model"] != model or fields["artifacts"] != provenance["artifact_digest"]:
+        invalid("model/artifacts (disagrees with metadata or pins)")
+    if fields["device"] != normalized_device(device):
+        invalid("device (disagrees with configured provider)")
+    if fields["pooling"] not in ("mean", "cls") or fields["norm"] not in ("l2", "none"):
+        invalid("pooling/norm")
+    for name in ("dim", "maxseq", "pipeline", "chunker"):
+        if not valid_unsigned_text(fields[name], bits=32 if name in ("pipeline", "chunker") else 64):
+            invalid(name)
+    chunk = fields["chunk"].split("/")
+    if len(chunk) != 3 or any(not valid_unsigned_text(value, positive=i == 0) for i, value in enumerate(chunk)):
+        invalid("chunk")
+    runtime = re.fullmatch(r"api1\.(0|[1-9][0-9]{0,9})/(dylib|static:[0-9a-f]{16})", fields["ort"])
+    if runtime is None or not valid_unsigned_text(runtime[1], bits=32, positive=False):
+        invalid("ort")
+    dynamic = runtime[2] == "dylib"
+    if dynamic and fields["device"] == "coreml":
+        invalid("ort/device (CoreML requires the statically linked Apple runtime)")
+    labels = [pin["label"] for pin in provenance["embedding_artifacts"]]
+    expected = ["tokenizer", "onnx"]
+    if "onnx_data" in labels:
+        expected.append("onnx_data")
+    if dynamic:
+        expected.append("ort_runtime")
+    if labels != expected:
+        invalid("ort/artifact labels (requires the producer's runtime mode and artifact order)")
+    return fields
+
+
+def validate_controlled_record(record: dict, fingerprint: dict | None = None) -> None:
+    if not isinstance(record.get("query"), str):
+        raise InvalidRun(f"case {record.get('id')!r}: missing or non-text controlled query")
+    validate_record(record)
+    if fingerprint is None:
+        return
+    stderr = record["arms"]["codesage"]["runtime"]["stderr"]
+    if "CODESAGE_ALLOW_CPU_FALLBACK" in stderr:
+        raise InvalidRun(f"case {record['id']!r}: degraded CPU fallback runtime")
+    for line in stderr.splitlines():
+        for marker, names in (("loading embedding model", ("model",)),
+                              ("embedding model loaded", ("dim", "pooling", "execution_provider"))):
+            if marker not in line:
+                continue
+            for name in names:
+                value = re.search(rf'\b{name}=(?:"([^"\n]*)"|([^\s]+))', line)
+                if value is None:
+                    continue
+                observed = value[1] if value[1] is not None else value[2]
+                field = "device" if name == "execution_provider" else name
+                observed = observed.lower() if name == "pooling" else observed
+                if observed != fingerprint[field]:
+                    raise InvalidRun(f"case {record['id']!r}: runtime {name}={observed!r} "
+                                     f"disagrees with semantic fingerprint {field}={fingerprint[field]!r}")
+
+
+def validate_controlled_metadata(meta: dict, where: str) -> dict:
+    def invalid(field):
+        raise Refused(f"{where}: invalid controlled-run {field}")
+
+    if meta.get("control_protocol") != CONTROL_PROTOCOL:
+        raise Refused(f"{where}: unknown control protocol")
+    missing = [key for key in PROVENANCE_KEYS if key not in meta]
+    if missing:
+        raise Refused(f"{where}: missing controlled-run metadata: {', '.join(missing)}")
+    for key in ("corpus_sha256", "runner_sha256", "controls_sha256"):
+        if not valid_digest(meta[key]):
+            invalid(key)
+    for key in ("corpus", "model", "reranker"):
+        if (not isinstance(meta[key], str) or not meta[key].strip()
+                or (key != "corpus" and meta[key].lower() in ("unknown", "null")) or "\0" in meta[key]):
+            invalid(key)
+    if meta["model"] == "none":
+        invalid("model")
+    if (not isinstance(meta["head"], str) or (meta["head"] != "not-a-git-repo"
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", meta["head"]) is None)):
+        invalid("head")
+    if normalized_device(meta["device"]) is None:
+        invalid("device")
+    if not valid_integer(meta["limit"]) or meta["limit"] < 1:
+        invalid("limit")
+    if not valid_integer(meta["control_seed"]):
+        invalid("control_seed")
+    if (meta["split"] not in (None, "train", "heldout")
+            or (meta["split"] is None and meta["salt"] is not None)
+            or (meta["split"] is not None and (not isinstance(meta["salt"], str)
+                or re.fullmatch(r"[A-Za-z0-9_.-]+", meta["salt"]) is None))):
+        invalid("split/salt")
+    provenance = meta.get("provenance")
+    if not isinstance(provenance, dict):
+        raise Refused(f"{where}: missing controlled-run provenance")
+    missing = [key for key in REQUIRED_CONTEXT_KEYS if key not in provenance]
+    if missing:
+        raise Refused(f"{where}: missing controlled-run provenance: {', '.join(missing)}")
+    for key in CONTROL_DIGEST_KEYS:
+        if not valid_digest(provenance[key]):
+            invalid(f"provenance.{key}")
+    for key in ("head", "model", "reranker"):
+        if provenance[key] != meta[key]:
+            invalid(f"provenance.{key} (disagrees with metadata)")
+    if normalized_device(provenance["device"]) != normalized_device(meta["device"]):
+        invalid("provenance.device (disagrees with metadata)")
+    for key in ("binary", "rg_binary"):
+        if not valid_file_pin(provenance[key]):
+            invalid(f"provenance.{key}")
+    embedding = provenance["embedding_artifacts"]
+    if (not isinstance(embedding, list) or not embedding
+            or any(not valid_file_pin(pin) or not isinstance(pin.get("label"), str)
+                   or re.fullmatch(r"[a-z][a-z0-9_]*", pin["label"]) is None for pin in embedding)):
+        invalid("provenance.embedding_artifacts")
+    labels = [pin["label"] for pin in embedding]
+    if len(labels) != len(set(labels)) or not {"tokenizer", "onnx"}.issubset(labels):
+        invalid("provenance.embedding_artifacts labels")
+    digest = hashlib.sha256("".join(f"{pin['label']}={pin['sha256']}\n" for pin in embedding).encode()).hexdigest()
+    if provenance["artifact_digest"] != digest:
+        invalid("provenance.artifact_digest (disagrees with artifact pins)")
+    reranker = provenance["reranker_artifacts"]
+    if (not isinstance(reranker, list) or any(not valid_file_pin(pin) for pin in reranker)
+            or (meta["reranker"] != "none" and len({pin["path"] for pin in reranker}) < 2)):
+        invalid("provenance.reranker_artifacts")
+    fingerprint = validate_semantic_fingerprint(provenance, meta["model"], meta["device"], where)
+    eligible = provenance["eligible_files"]
+    if (not isinstance(eligible, list) or not eligible or any(not valid_source_path(p) for p in eligible)
+            or len(eligible) != len(set(eligible))):
+        invalid("provenance.eligible_files")
+    manifest = provenance["source_manifest"]
+    if (not isinstance(manifest, list) or not manifest
+            or any(not isinstance(pin, dict) or not valid_source_path(pin.get("path"))
+                   or not valid_digest(pin.get("sha256")) for pin in manifest)
+            or len({pin["path"] for pin in manifest}) != len(manifest)
+            or {pin["path"] for pin in manifest} != set(eligible)):
+        invalid("provenance.source_manifest")
+    for key, value in (("source_sha256", manifest), ("eligible_files_sha256", eligible)):
+        if provenance[key] != digest_json(value):
+            invalid(f"provenance.{key} (disagrees with retained manifest)")
+    environment = provenance["environment"]
+    if (not isinstance(environment, dict) or any(
+            not isinstance(k, str) or not k or not isinstance(v, str) for k, v in environment.items())):
+        invalid("provenance.environment")
+    if provenance["query_runtime"] != QUERY_RUNTIME:
+        invalid("provenance.query_runtime")
+    return fingerprint
+
+
 def load_records(paths: list[Path], *, allow_partial: bool) -> tuple[dict, dict[str, dict]]:
     """Concatenate result files into (meta, id-keyed records).
 
     Accepts the `{"meta", "complete", "records"}` envelope or a bare list.
     Meta values from several files are merged; a key that differs across the
     files of one arm is recorded as a `MultiValue` (sorted by canonical JSON,
-    originals kept) so the cross-arm check reports it.
+    originals kept) for display. Controlled records retain the originating
+    metadata independently of the merged display metadata.
     """
     out: dict[str, dict] = {}
     meta: dict = {}
+    input_controlled: bool | None = None
     for path in paths:
         try:
             data = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as e:
             raise Refused(f"cannot read {path}: {e}")
         file_meta: dict = {}
+        completion = None
         if isinstance(data, dict):
             if "records" in data:
+                completion = data.get("complete")
                 if data.get("complete") is False and not allow_partial:
                     raise Refused(
                         f"{path}: run did not finish (complete: false); "
                         "pass --allow-partial to compare anyway"
                     )
                 file_meta = data.get("meta") or {}
+                if not isinstance(file_meta, dict):
+                    raise Refused(f"{path}: meta must be a mapping")
                 data = data["records"]
             else:
                 data = data.get("cases", data.get("results"))
         if not isinstance(data, list):
             raise Refused(f"{path}: expected a JSON list of case records or a results envelope")
+        controlled = (any(key in file_meta for key in ("control_protocol", "control_seed", "runner_sha256", "controls_sha256"))
+                      or any(isinstance(record, dict) and "arms" in record for record in data))
+        if input_controlled is not None and controlled != input_controlled:
+            raise Refused(f"{path}: cannot concatenate controlled and legacy inputs")
+        input_controlled = controlled
+        if controlled:
+            if not isinstance(completion, bool):
+                raise Refused(f"{path}: invalid controlled-run completion flag")
+            fingerprint = validate_controlled_metadata(file_meta, str(path))
         for i, rec in enumerate(data):
             if not isinstance(rec, dict) or rec.get("id") is None:
                 raise Refused(f"{path}: record #{i} has no `id`")
             cid = str(rec["id"])
             if cid in out:
                 raise Refused(f"{path}: duplicate case id {cid!r} within one arm")
-            out[cid] = rec
+            if file_meta.get("control_protocol"):
+                try:
+                    validate_controlled_record(rec, fingerprint)
+                    if rec["arms"]["codesage"]["runtime"]["reranker"] != file_meta["reranker"]:
+                        raise InvalidRun(f"case {cid!r}: runtime reranker disagrees with metadata")
+                    eligible = set(file_meta["provenance"]["eligible_files"])
+                    if (not set(rec["expected_files"]).issubset(eligible)
+                            or any(not set(arm["hits"]).issubset(eligible) for arm in rec["arms"].values())):
+                        raise InvalidRun(f"case {cid!r}: files outside pinned eligible universe")
+                except InvalidRun as exc:
+                    raise Refused(f"{path}: {exc}") from exc
+            out[cid] = {**rec, "_input_provenance": {
+                **{key: file_meta[key] for key in PROVENANCE_KEYS},
+                "provenance": dict(file_meta["provenance"]),
+            }, "_input_path": str(path)} if controlled else rec
         for k, v in file_meta.items():
             if k not in meta:
                 meta[k] = v
@@ -266,11 +528,86 @@ def exclude_failed(
 
 
 def provenance_mismatch(base_meta: dict, cand_meta: dict) -> list[str]:
-    diffs: list[str] = []
+    diffs = mixed_instrument_mismatch(base_meta, cand_meta)
     for key in PROVENANCE_KEYS:
         b, c = base_meta.get(key), cand_meta.get(key)
         if b != c:
             diffs.append(f"{key}: baseline {b!r} vs candidate {c!r}")
+    if base_meta.get("control_protocol") or cand_meta.get("control_protocol"):
+        for key in CONTROL_PROVENANCE_KEYS:
+            values = []
+            for meta in (base_meta, cand_meta):
+                provenance = meta.get("provenance") or {}
+                if isinstance(provenance, MultiValue):
+                    values.append(sorted((p.get(key) for p in provenance), key=lambda v: json.dumps(v, sort_keys=True)))
+                else:
+                    values.append(provenance.get(key))
+            b, c = values
+            if b != c:
+                diffs.append(f"provenance.{key}: baseline {b!r} vs candidate {c!r}")
+    return diffs
+
+
+def mixed_instrument_mismatch(base_meta: dict, cand_meta: dict) -> list[str]:
+    diffs = []
+    for label, meta in (("baseline", base_meta), ("candidate", cand_meta)):
+        for key in ("runner_sha256", "controls_sha256"):
+            value = meta.get(key)
+            if isinstance(value, MultiValue):
+                diffs.append(f"{key}: {label} mixes instrument identities {value!r}")
+        provenance = meta.get("provenance")
+        if isinstance(provenance, MultiValue):
+            for key in ("environment", "query_runtime"):
+                if len({json.dumps(p.get(key), sort_keys=True) for p in provenance}) > 1:
+                    diffs.append(f"provenance.{key}: {label} mixes instrument settings")
+    return diffs
+
+
+def mixed_origin_mismatch(records: dict[str, dict], label: str) -> list[str]:
+    origins = {}
+    for cid, record in records.items():
+        origin = record.get("_input_provenance")
+        if not isinstance(origin, dict):
+            raise Refused(f"{label} case {cid!r}: missing originating controlled-run provenance")
+        origins[cid] = origin
+    fields = {key: {cid: origin[key] for cid, origin in origins.items()}
+              for key in ("runner_sha256", "controls_sha256")}
+    for group in ("environment", "query_runtime"):
+        names = set().union(*(origin["provenance"][group] for origin in origins.values()))
+        for name in sorted(names):
+            fields[f"provenance.{group}.{name}"] = {
+                cid: {"present": name in origin["provenance"][group],
+                      "value": origin["provenance"][group].get(name)} for cid, origin in origins.items()}
+    differences = []
+    for field, values in fields.items():
+        if len({json.dumps(value, sort_keys=True) for value in values.values()}) < 2:
+            continue
+        kind = "identities" if field.endswith("sha256") else "settings"
+        for cid, value in sorted(values.items()):
+            if isinstance(value, dict):
+                rendered = repr(value["value"]) if value["present"] else "<unset>"
+            else:
+                rendered = repr(value)
+            differences.append(f"{label} mixes instrument {kind}: case {cid!r}, "
+                               f"input {records[cid]['_input_path']!r}, {field}={rendered}")
+    return differences
+
+
+def paired_provenance_mismatch(
+    base_meta: dict, cand_meta: dict, baseline: dict[str, dict], candidate: dict[str, dict],
+) -> list[str]:
+    if not (base_meta.get("control_protocol") and cand_meta.get("control_protocol")):
+        return provenance_mismatch(base_meta, cand_meta)
+    diffs = [*mixed_origin_mismatch(baseline, "baseline"), *mixed_origin_mismatch(candidate, "candidate")]
+    for cid in sorted(baseline.keys() & candidate.keys()):
+        base_origin = baseline[cid].get("_input_provenance")
+        cand_origin = candidate[cid].get("_input_provenance")
+        if not isinstance(base_origin, dict) or not isinstance(cand_origin, dict):
+            raise Refused(f"case {cid!r}: missing originating controlled-run provenance")
+        for difference in provenance_mismatch(base_origin, cand_origin):
+            diffs.append(f"case {cid!r}: {difference} "
+                         f"(baseline input {baseline[cid]['_input_path']!r}; "
+                         f"candidate input {candidate[cid]['_input_path']!r})")
     return diffs
 
 
@@ -451,13 +788,34 @@ def compare(
     base_meta: dict | None = None,
     cand_meta: dict | None = None,
     excluded: list[str] | None = None,
+    mismatch_overrides: list[str] | None = None,
 ) -> tuple[list[str], bool]:
     """Return (report lines, accept); raise Refused when no honest verdict exists."""
     ids = sorted(set(baseline) & set(candidate))
+    controlled = (base_meta or {}).get("control_protocol") or (cand_meta or {}).get("control_protocol")
+    if controlled:
+        if not all((meta or {}).get("control_protocol") for meta in (base_meta, cand_meta)):
+            raise Refused("controlled comparison requires controlled inputs for both arms")
+        if set(baseline) != set(candidate):
+            raise Refused("controlled arms must contain identical case ids")
+        for cid in ids:
+            try:
+                validate_controlled_record(baseline[cid])
+                validate_controlled_record(candidate[cid])
+            except InvalidRun as exc:
+                raise Refused(str(exc)) from exc
+            if any(baseline[cid].get(k) != candidate[cid].get(k) for k in ("query", "expected_files")):
+                raise Refused(f"case {cid!r}: query or gold differs between controlled arms")
     n = len(ids)
     lines: list[str] = ["# CodeSage paired comparison", ""]
     lines.append(f"- Baseline: {fmt_meta(base_meta or {})}")
     lines.append(f"- Candidate: {fmt_meta(cand_meta or {})}")
+    if mismatch_overrides:
+        lines.append("- Provenance gate overridden with `--allow-mismatch`; these inputs have differing settings or instrument identities.")
+        lines.extend(f"- Allowed mismatch: {difference}" for difference in mismatch_overrides)
+    if not controlled:
+        lines.append("- Legacy uncontrolled inputs: this verdict compares retained ranks; "
+                     "placebo advantage and source/index/model provenance are unverified.")
     base_failed = failed_ids(baseline)
     cand_failed = failed_ids(candidate)
     if excluded:
@@ -659,7 +1017,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         base_meta, baseline = load_records(args.baseline, allow_partial=args.allow_partial)
         cand_meta, candidate = load_records(args.candidate, allow_partial=args.allow_partial)
-        diffs = provenance_mismatch(base_meta, cand_meta)
+        diffs = paired_provenance_mismatch(base_meta, cand_meta, baseline, candidate)
         if diffs and not args.allow_mismatch:
             raise Refused(
                 "baseline and candidate provenance differ (" + "; ".join(diffs)
@@ -698,6 +1056,7 @@ def main(argv: list[str] | None = None) -> int:
             base_meta=base_meta,
             cand_meta=cand_meta,
             excluded=excluded,
+            mismatch_overrides=diffs if args.allow_mismatch else None,
         )
     except Refused as e:
         print(f"REFUSED: {e}", file=sys.stderr)

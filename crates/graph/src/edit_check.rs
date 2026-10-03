@@ -1,7 +1,6 @@
 #[cfg(unix)]
 use std::io::Read;
 use std::path::{Component, Path};
-use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
 use codesage_parser::{detect::detect_language, parse::parse_file};
@@ -100,8 +99,7 @@ pub struct EditCheckReport {
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .current_dir(root)
+    let output = crate::git_command(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .output()

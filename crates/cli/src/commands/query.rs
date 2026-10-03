@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use codesage_graph::{
-    FindSymbolOptions, TargetError, export_context, export_context_for_symbol, find_references,
+    FindSymbolOptions, TargetError, export_context, export_context_for_target, find_references,
     find_similar, find_symbol_with_options, impact_analysis_report, list_dependencies, search_page,
 };
 use codesage_protocol::{
@@ -566,12 +566,12 @@ pub(crate) fn cmd_export(
     // `export_format` folded `--json` into the format, so the bundle and any
     // target refusal are reported on the same channel.
     let json = format == "json";
-    // Branch on the resolved request, not the flag: a `sym:` handle is a
-    // symbol anchor whether or not `--symbol` was passed, and taking that
-    // path skips loading an embedder. Matches the MCP tool.
-    let bundle = if let Some(symbol) = req.symbol.clone() {
+    let structural = {
         let db = load_symbol_context_db(&root)?;
-        export_context_for_symbol(&db, &symbol, &req).map_err(|e| report_target_error(e, json))?
+        export_context_for_target(&db, &req).map_err(|e| report_target_error(e, json))?
+    };
+    let bundle = if let Some(bundle) = structural {
+        bundle
     } else {
         with_query_stack(&root, |db, embedder, reranker| {
             let query_embedding = embedder.embed_one(req.query.as_deref().unwrap_or_default())?;
@@ -585,18 +585,20 @@ pub(crate) fn cmd_export(
 
     match format {
         "json" => println!("{}", serde_json::to_string_pretty(&bundle)?),
-        "ingest" => print_bundle_ingest(&bundle, target, req.symbol.is_some()),
+        "ingest" => print_bundle_ingest(&bundle, target),
         _ => print_bundle_markdown(&bundle),
     }
     Ok(())
 }
 
 /// Portable context bundle; token counts are approximate.
-fn print_bundle_ingest(bundle: &ContextBundle, target: &str, is_symbol: bool) {
-    let target_label = if is_symbol {
+fn print_bundle_ingest(bundle: &ContextBundle, target: &str) {
+    let target_label = if bundle.target_description.starts_with("query: ") {
+        format!("query=\"{target}\"")
+    } else if bundle.target_description.starts_with("symbol: ") {
         format!("symbol={target}")
     } else {
-        format!("query=\"{target}\"")
+        format!("target={target}")
     };
 
     let mut all_results: Vec<&codesage_protocol::SearchResult> = bundle.primary.iter().collect();

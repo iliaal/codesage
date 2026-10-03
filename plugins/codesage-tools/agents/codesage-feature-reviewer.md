@@ -1,7 +1,7 @@
 ---
 name: codesage-feature-reviewer
 autoApprove: read
-tools: Read, Grep, mcp__codesage__feature_bundle, mcp__codesage__assess_risk_batch, mcp__codesage__list_dependencies, mcp__codesage__find_references, mcp__codesage__find_symbol
+tools: Read, Grep, mcp__codesage__describe, mcp__codesage__feature_bundle, mcp__codesage__assess_risk_batch, mcp__codesage__list_dependencies, mcp__codesage__find_references, mcp__codesage__find_symbol
 description: "Review one CodeSage feature slice and return strict JSON findings."
 ---
 

@@ -1,4 +1,4 @@
-//! Blank C++ export/visibility macros before tree-sitter sees them.
+//! Neutralize C and C++ export/visibility macros before tree-sitter sees them.
 //!
 //! `class MYLIB_API Widget {}` is valid C++ once the preprocessor has run, but
 //! tree-sitter parses the raw text: it takes `MYLIB_API` as the class name and
@@ -47,6 +47,26 @@ const MAX_MACRO_RUN: usize = 8;
 
 /// Declaration-head scan window, template arguments included.
 const MAX_HEAD_TOKENS: usize = 64;
+
+const C_MACROS: [&[u8]; 4] = [b"PHPAPI", b"ZEND_COLD", b"ZEND_FASTCALL", b"ZEND_NORETURN"];
+
+const C_QUALIFIERS: [&[u8]; 15] = [
+    b"const",
+    b"volatile",
+    b"restrict",
+    b"static",
+    b"inline",
+    b"extern",
+    b"register",
+    b"_Noreturn",
+    b"_Atomic",
+    b"_Thread_local",
+    b"thread_local",
+    b"constexpr",
+    b"struct",
+    b"union",
+    b"enum",
+];
 
 const QUALIFIER_KEYS: [&[u8]; 19] = [
     b"const",
@@ -114,7 +134,10 @@ enum Form {
     /// `edit_check`'s replaced byte range all still cover the macro, as
     /// they do for any other attribute. `[[ ]]` with no name does not parse.
     Attribute,
+    CSpecifier,
 }
+
+type MacroSpan = (usize, usize, Form);
 
 #[derive(Clone, Copy, Debug)]
 struct Token {
@@ -135,6 +158,104 @@ pub(crate) fn neutralize(source: &[u8]) -> Option<Vec<u8>> {
     }
     let tokens = tokenize(source);
     let spans = blank_spans(&tokens, source);
+    overwrite_spans(source, spans)
+}
+
+pub(crate) fn neutralize_c(source: &[u8]) -> Option<Vec<u8>> {
+    if !SUFFIXES
+        .iter()
+        .chain(C_MACROS.iter())
+        .any(|s| source.windows(s.len()).any(|w| w == *s))
+    {
+        return None;
+    }
+    let tokens = tokenize(source);
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let start = i;
+        let previous = i.checked_sub(1).and_then(|p| tokens.get(p));
+        let declaration_start = match previous.map(|t| t.kind) {
+            None | Some(Kind::Directive | Kind::Punct(b';' | b'{' | b'}')) => true,
+            Some(Kind::Ident) => ident_is(
+                previous,
+                source,
+                &[b"static", b"inline", b"extern", b"_Noreturn"],
+            ),
+            _ => false,
+        };
+        if declaration_start
+            && let Some((end, head_spans)) = c_function_head(&tokens, source, start)
+        {
+            spans.extend(head_spans);
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    overwrite_spans(source, spans)
+}
+
+fn c_function_head(
+    tokens: &[Token],
+    source: &[u8],
+    start: usize,
+) -> Option<(usize, Vec<MacroSpan>)> {
+    let mut spans = Vec::new();
+    let mut i = start;
+    for _ in 0..MAX_MACRO_RUN {
+        let t = tokens.get(i)?;
+        if t.kind != Kind::Ident
+            || !(is_candidate(text(t, source)) || C_MACROS.contains(&text(t, source)))
+        {
+            break;
+        }
+        let next = after_args(tokens, i)?;
+        let form = if spans.is_empty() {
+            Form::CSpecifier
+        } else {
+            Form::Spaces
+        };
+        spans.push((t.start, t.end, form));
+        if tokens[next - 1].end > t.end {
+            spans.push((t.end, tokens[next - 1].end, Form::Spaces));
+        }
+        i = next;
+    }
+    if spans.is_empty() {
+        return None;
+    }
+    let mut idents = 0;
+    let mut primitive = false;
+    while i < start + MAX_HEAD_TOKENS {
+        let t = tokens.get(i)?;
+        match t.kind {
+            Kind::Ident => {
+                let word = text(t, source);
+                if C_MACROS[1..].contains(&word)
+                    && tokens.get(i + 1).map(|t| t.kind) != Some(Kind::Punct(b'('))
+                {
+                    spans.push((t.start, t.end, Form::Spaces));
+                } else if PRIMITIVE_KEYS.contains(&word) || word == b"_Bool" {
+                    primitive = true;
+                } else if !C_QUALIFIERS.contains(&word) {
+                    idents += 1;
+                }
+            }
+            Kind::Punct(b'*') => {}
+            Kind::Punct(b'(') => {
+                // C has no constructor head: removing the sole type in
+                // `MY_TYPE_API const *f(void)` must never qualify.
+                return (idents + usize::from(primitive) == 2).then_some((i, spans));
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+    None
+}
+
+fn overwrite_spans(source: &[u8], spans: Vec<MacroSpan>) -> Option<Vec<u8>> {
     if spans.is_empty() {
         return None;
     }
@@ -158,6 +279,10 @@ pub(crate) fn neutralize(source: &[u8]) -> Option<Vec<u8>> {
             let n = span.len();
             span[..3].copy_from_slice(b"[[a");
             span[n - 2..].copy_from_slice(b"]]");
+        } else if form == Form::CSpecifier {
+            // C attributes can become a recovered statement's body after a
+            // malformed preprocessor tail; `extern` forces a declaration.
+            span[..6].copy_from_slice(b"extern");
         }
     }
     Some(out)

@@ -441,6 +441,41 @@ impl OverviewCache {
         self.slot(project)?.generation(project, db_path, control)
     }
 
+    pub(crate) fn ready_for_snapshot(
+        &self,
+        project: &Path,
+        db: &codesage_storage::Database,
+    ) -> Result<Option<(Generation, Arc<CompleteRiskRanking>)>> {
+        let ready = self
+            .state
+            .lock()
+            .projects
+            .get(project)
+            .and_then(|entry| entry.ready.as_ref())
+            .map(|ready| (ready.generation.clone(), ready.ranking.clone()));
+        match ready {
+            Some((generation, ranking)) if self.snapshot_matches(project, db, &generation)? => {
+                Ok(Some((generation, ranking)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn snapshot_matches(
+        &self,
+        project: &Path,
+        db: &codesage_storage::Database,
+        generation: &Generation,
+    ) -> Result<bool> {
+        let path = project.join(".codesage/index.db");
+        let control = codesage_protocol::work::current().unwrap_or_else(|| WorkControl::new(None));
+        match self.generation_in_execution(project, &path, &control) {
+            Ok(current) => Ok(current == *generation && db.path_still_matches_open_file(&path)?),
+            Err(error) if is_cache_unavailable(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) async fn get(
         &self,
         project: &Path,
@@ -1070,6 +1105,46 @@ mod tests {
         let warm = fixture.get(&cache, &WorkControl::new(None)).await.unwrap();
         assert_eq!(warm.disposition, CacheDisposition::Hit);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn describe_ready_lookup_reuses_only_the_open_snapshot_generation() {
+        let fixture = Fixture::new();
+        fixture.insert("src/a.rs");
+        let cache = OverviewCache::default();
+        let db = Database::open_read_only(&fixture.path).unwrap();
+        assert!(
+            cache
+                .ready_for_snapshot(fixture.root.path(), &db)
+                .unwrap()
+                .is_none()
+        );
+        let cached = fixture.get(&cache, &WorkControl::new(None)).await.unwrap();
+        let (generation, ranking) = cache
+            .ready_for_snapshot(fixture.root.path(), &db)
+            .unwrap()
+            .unwrap();
+        assert_eq!(generation, cached.generation);
+        assert!(Arc::ptr_eq(&ranking, &cached.ranking));
+        let snapshot = db.read_snapshot().unwrap();
+        assert!(
+            cache
+                .snapshot_matches(fixture.root.path(), &db, &generation)
+                .unwrap()
+        );
+        fixture.insert("src/b.rs");
+        assert!(
+            !cache
+                .snapshot_matches(fixture.root.path(), &db, &generation)
+                .unwrap()
+        );
+        assert!(
+            cache
+                .ready_for_snapshot(fixture.root.path(), &db)
+                .unwrap()
+                .is_none()
+        );
+        drop(snapshot);
     }
 
     #[tokio::test]

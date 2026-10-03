@@ -9,8 +9,8 @@ use std::path::Path;
 use anyhow::Result;
 use codesage_parser::discover::build_exclude_set;
 use codesage_protocol::{
-    FeatureFileRef, FeatureFileRole, FeatureMapStats, FeatureRecord, Reference, ReferenceKind,
-    TrustBoundary,
+    FeatureFileRef, FeatureFileRole, FeatureMapStats, FeatureRecord, Language, Reference,
+    ReferenceKind, TrustBoundary,
 };
 use codesage_storage::Database;
 
@@ -18,6 +18,7 @@ use crate::feature_id;
 use crate::mappers::{
     c::CCppMapper,
     go::GoMapper,
+    java::JavaMapper,
     js::JsMapper,
     php::{PhpMapper, laravel_route_handler_refs},
     python::PythonMapper,
@@ -69,9 +70,8 @@ pub fn map_features_detailed(
         excludes: excludes.as_ref(),
     };
     let collected = collect_seeds(&ctx)?;
-    let seeds = collected.seeds;
-    let mapper_errors = collected.errors;
-    let any_mapper_errored = !mapper_errors.is_empty();
+    let mut seeds = collected.seeds;
+    let mut mapper_errors = collected.errors;
     let mut keep_ids: Vec<String> = Vec::with_capacity(seeds.len());
     let mut created = 0usize;
     let mut updated = 0usize;
@@ -80,11 +80,45 @@ pub fn map_features_detailed(
     let all_files = walk_files(root, root, MAPPER_WALK_CAP, ctx.excludes);
     let walk_truncated = all_files.len() >= MAPPER_WALK_CAP;
     let test_index = TestFileIndex::build(&all_files);
+    let java_boundary_updates = if mapper_errors.iter().any(|error| error.starts_with("java:")) {
+        Vec::new()
+    } else {
+        let paths: BTreeSet<&str> = all_files.iter().map(String::as_str).collect();
+        let java_files: Vec<_> = db
+            .all_files_with_id_and_language()?
+            .into_iter()
+            .filter(|(_, path, language)| {
+                *language == Language::Java && ctx.allowed(path) && paths.contains(path.as_str())
+            })
+            .collect();
+        let context_paths: Vec<_> = all_files
+            .iter()
+            .filter(|path| path.ends_with(".java") && ctx.allowed(path))
+            .cloned()
+            .collect();
+        match crate::trust_boundary::boundary_updates_from_source_in_context(
+            root,
+            db,
+            &java_files,
+            &context_paths,
+        ) {
+            Ok(updates) => updates,
+            Err(error) => {
+                mapper_errors.push(format!("java: {error:#}"));
+                seeds.retain(|seed| seed.source != "java-maven-role");
+                Vec::new()
+            }
+        }
+    };
+    let any_mapper_errored = !mapper_errors.is_empty();
     // Framework route edges are derived from the filesystem before opening the
     // write transaction, then persisted atomically with feature rows below.
     let route_refs = laravel_route_handler_refs(root)?;
     let mut removed = 0usize;
     db.execute_batch(|db| {
+        for (id, boundaries) in &java_boundary_updates {
+            db.replace_file_trust_boundaries(*id, boundaries)?;
+        }
         for seed in &seeds {
             if !ctx.allowed(&seed.entry_path) {
                 continue;
@@ -153,6 +187,7 @@ fn default_mappers() -> Vec<Box<dyn FeatureMapper>> {
         Box::new(PythonMapper),
         Box::new(JsMapper),
         Box::new(GoMapper),
+        Box::new(JavaMapper),
     ]
 }
 

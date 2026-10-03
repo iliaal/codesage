@@ -49,19 +49,12 @@ enum GitRun {
 }
 
 fn git_command(cwd: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new("git");
+    let mut command = crate::git_command(cwd);
     command
         .args(args)
-        .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .stderr(Stdio::null());
     #[cfg(unix)]
     {

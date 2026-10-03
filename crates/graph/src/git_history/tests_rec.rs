@@ -543,6 +543,31 @@ pub fn recommend_tests(db: &Database, file_paths: &[String]) -> Result<TestRecom
     })
 }
 
+pub(crate) fn recommend_tests_with_commands(
+    root: &Path,
+    db: &Database,
+    file_paths: &[String],
+) -> Result<TestRecommendations> {
+    let mut recommendations = recommend_tests(db, file_paths)?;
+    let changed = file_paths
+        .iter()
+        .map(|p| (p.clone(), p.clone()))
+        .collect::<Vec<_>>();
+    let derived = super::test_commands::derive(
+        db,
+        &super::test_commands::CommandContext {
+            root: Some(root),
+            test_files: &recommendations.primary,
+            withheld_phpt: &[],
+            changed: &changed,
+        },
+    )?;
+    recommendations.commands = derived.commands;
+    recommendations.inline_test_modules = derived.modules;
+    recommendations.notes.extend(derived.notes);
+    Ok(recommendations)
+}
+
 /// Test file types with no tree-sitter grammar that are still runnable test
 /// entry points (php-src's `.phpt`). A test-shaped path outside this list and
 /// outside the parser's languages is data, not a test to run.

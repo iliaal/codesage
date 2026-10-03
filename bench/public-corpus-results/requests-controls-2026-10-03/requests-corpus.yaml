@@ -1,0 +1,106 @@
+project_root: /tmp/codesage-goal-20261003-retrieval-controls/requests/src/requests
+scoring:
+  k_values:
+  - 5
+  - 10
+cases:
+- id: requests-00
+  query: how HTTP sessions manage state and connections
+  expected_files:
+  - sessions.py
+  source: semble:architecture
+- id: requests-01
+  query: authentication mechanisms and credential handling
+  expected_files:
+  - auth.py
+  source: semble:semantic
+- id: requests-02
+  query: transport adapters and connection pooling
+  expected_files:
+  - adapters.py
+  source: semble:semantic
+- id: requests-03
+  query: cookie storage and persistence
+  expected_files:
+  - cookies.py
+  source: semble:semantic
+- id: requests-04
+  query: how redirects are followed
+  expected_files:
+  - sessions.py
+  source: semble:architecture
+- id: requests-05
+  query: error and exception types
+  expected_files:
+  - exceptions.py
+  source: semble:semantic
+- id: requests-06
+  query: request and response model internals
+  expected_files:
+  - models.py
+  source: semble:semantic
+- id: requests-07
+  query: SSL certificate verification
+  expected_files:
+  - adapters.py
+  source: semble:semantic
+- id: requests-08
+  query: event hooks system
+  expected_files:
+  - hooks.py
+  source: semble:semantic
+- id: requests-09
+  query: utility functions for encoding and headers
+  expected_files:
+  - utils.py
+  source: semble:semantic
+- id: requests-10
+  query: how a PreparedRequest is built from user-supplied arguments
+  expected_files:
+  - models.py
+  source: semble:architecture
+- id: requests-11
+  query: how digest authentication implements the challenge-response handshake
+  expected_files:
+  - auth.py
+  source: semble:architecture
+- id: requests-12
+  query: how response encoding is detected from headers and content
+  expected_files:
+  - utils.py
+  source: semble:architecture
+- id: requests-13
+  query: how proxy settings are read from environment variables
+  expected_files:
+  - utils.py
+  source: semble:architecture
+- id: requests-14
+  query: how connection keep-alive and pooling limits are configured
+  expected_files:
+  - adapters.py
+  source: semble:architecture
+- id: requests-15
+  query: Session
+  expected_files:
+  - sessions.py
+  source: semble:symbol
+- id: requests-16
+  query: HTTPDigestAuth
+  expected_files:
+  - auth.py
+  source: semble:symbol
+- id: requests-17
+  query: PreparedRequest
+  expected_files:
+  - models.py
+  source: semble:symbol
+- id: requests-18
+  query: HTTPAdapter
+  expected_files:
+  - adapters.py
+  source: semble:symbol
+- id: requests-19
+  query: Response
+  expected_files:
+  - models.py
+  source: semble:symbol

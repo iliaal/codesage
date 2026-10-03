@@ -245,7 +245,11 @@ fn attach_handles(
             .filter(|s| s.overloaded)
             .map(|s| s.line_start);
     }
-    if definitions.is_empty() {
+    if definitions.is_empty()
+        && !rows
+            .iter()
+            .any(|row| codesage_protocol::python::is_python_path(&row.from_file))
+    {
         return Ok(None);
     }
 
@@ -264,6 +268,24 @@ fn attach_handles(
         if Instant::now() >= deadline {
             capped = true;
             break;
+        }
+        if codesage_protocol::python::is_python_path(&row.from_file) {
+            if row.kind == ReferenceKind::Import {
+                continue;
+            }
+            let key = (row.from_file.clone(), row.to_name.clone());
+            if !resolved.contains_key(&key) && resolved.len() >= MAX_TO_RESOLUTION_PAIRS {
+                capped = true;
+                continue;
+            }
+            let candidates =
+                crate::python_bindings::resolve_reference(db, row)?.unwrap_or_default();
+            row.to = match candidates.as_slice() {
+                [only] => Some(only.handle().to_string()),
+                _ => None,
+            };
+            resolved.entry(key).or_insert(None);
+            continue;
         }
         if crate::bundle::is_package_import(row.kind, &row.from_file, &row.to_name) {
             continue;
@@ -571,6 +593,9 @@ fn resolve_path_imported_by(
     let mut known: HashSet<String> = entry.imported_by.iter().cloned().collect();
     known.insert(entry.file_path.clone());
     for (from_path, to_name) in all_refs {
+        if codesage_protocol::python::is_python_path(from_path) {
+            continue;
+        }
         if known.contains(from_path) {
             continue;
         }

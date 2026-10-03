@@ -2,11 +2,17 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub mod describe;
 pub mod handle;
+pub mod python;
 pub mod stat_cache;
 pub mod target;
 pub mod work;
 
+pub use describe::{
+    DescribeCard, DescribeCost, DescribeDetail, DescribeExpansion, DescribeIncomplete,
+    DescribeResult, DescribeSection,
+};
 pub use handle::Handle;
 pub use target::{CONFIDENT, ResolveVia, ResolvedTarget, TargetKind, TargetResolution};
 
@@ -2290,8 +2296,8 @@ pub struct SearchResults {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindSimilarResults {
     pub results: Vec<SimilarSymbol>,
-    /// The definitions the queried name reached. Rows are their union, so
-    /// `ambiguous` says whether a clone belongs to the definition you meant.
+    /// Input resolution. Clone seeds include every fingerprint sharing its
+    /// resolved bare names, so a unique input can still produce a name union.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<TargetResolution>,
 }

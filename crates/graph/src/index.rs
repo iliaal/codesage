@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use codesage_features::trust_boundary::derive_from_refs;
-use codesage_protocol::{FileInfo, IndexStats, Reference, Symbol};
+use anyhow::{Context, Result, ensure};
+use codesage_features::trust_boundary::{
+    JavaTypeContext, derive_for_files_with_source, derive_from_tree_with_context,
+};
+use codesage_protocol::python::PythonBindings;
+use codesage_protocol::{FileInfo, IndexStats, Language, Reference, Symbol, TrustBoundary};
 use codesage_storage::db::FingerprintInput;
 use codesage_storage::{Database, is_unique_violation};
 use rayon::prelude::*;
@@ -13,27 +16,37 @@ use codesage_parser::extract::{extract_symbols, file_is_test_by_syntax};
 use codesage_parser::fingerprint::{FunctionFingerprint, file_fingerprints};
 use codesage_parser::parse::{ParsedTree, parse_file_tolerant};
 use codesage_parser::references::extract_references;
+use codesage_parser::source::read_indexable_file;
 
 #[derive(Debug)]
 struct ParsedFile {
     info: FileInfo,
     symbols: Vec<Symbol>,
     refs: Vec<Reference>,
+    python_bindings: PythonBindings,
     fingerprints: Vec<FunctionFingerprint>,
+    boundaries: Vec<TrustBoundary>,
     /// The tree carried `ERROR` / `MISSING` nodes; everything outside them
     /// was still extracted.
     degraded: bool,
 }
 
-fn parse_one(root: &Path, file_info: &FileInfo) -> Result<ParsedFile> {
-    let abs_path = root.join(&file_info.path);
-    let source = std::fs::read(&abs_path).with_context(|| format!("reading {}", file_info.path))?;
+fn parse_one(
+    root: &Path,
+    file_info: &FileInfo,
+    java_context: &JavaTypeContext,
+) -> Result<ParsedFile> {
+    let snapshot = read_indexable_file(root, Path::new(&file_info.path))
+        .with_context(|| format!("reading {}", file_info.path))?
+        .with_context(|| format!("{} exceeds the indexable file size cap", file_info.path))?;
+    let source = snapshot.bytes;
     let ParsedTree { tree, degraded } = parse_file_tolerant(&source, file_info.language)
         .with_context(|| format!("parsing {}", file_info.path))?;
     // The discovery path heuristic and the parser's file-level verdict answer
     // the same question; either one makes the whole file test code, so the
     // stored `files.is_test` carries both rather than the path alone.
     let mut info = file_info.clone();
+    info.content_hash = snapshot.content_hash;
     info.is_test |= file_is_test_by_syntax(&tree, &source, info.language);
     let mut symbols = extract_symbols(&tree, &source, info.language, &info.path)
         .with_context(|| format!("extracting symbols from {}", info.path))?;
@@ -48,12 +61,27 @@ fn parse_one(root: &Path, file_info: &FileInfo) -> Result<ParsedFile> {
         .with_context(|| format!("extracting references from {}", info.path))?;
     dedupe_refs(&mut refs);
     populate_from_symbol(&symbols, &mut refs);
+    let python_bindings = if info.language == codesage_protocol::Language::Python {
+        codesage_parser::python_bindings::extract_python_bindings(&tree, &source, &refs, &symbols)
+    } else {
+        PythonBindings::default()
+    };
     let fingerprints = file_fingerprints(&tree, &source, info.language);
+    let boundaries = derive_from_tree_with_context(
+        &refs,
+        info.language,
+        &tree,
+        &source,
+        &info.path,
+        java_context,
+    );
     Ok(ParsedFile {
         info,
         symbols,
         refs,
+        python_bindings,
         fingerprints,
+        boundaries,
         degraded,
     })
 }
@@ -115,8 +143,7 @@ const STRUCTURAL_INDEX_BATCH_SIZE: usize = 50;
 
 /// Bump the relevant component whenever unchanged bytes can yield different
 /// symbols, references, fingerprints, or trust boundaries. Raw hashes stay separate.
-pub const STRUCTURAL_INTERPRETATION: &str =
-    "codesage/structural/v1;parser-queries=4;extraction=7;trust-boundaries=1";
+pub const STRUCTURAL_INTERPRETATION: &str = codesage_protocol::python::BINDING_INTERPRETATION;
 
 /// Whether an indexed file is test code. Rows written under the current
 /// interpretation carry a trustworthy `files.is_test`; a row indexed by an
@@ -129,9 +156,16 @@ pub(crate) fn file_is_test(path: &str, stored: bool, interpretation: Option<&str
 }
 
 /// Skip and record unreadable or unparseable files; retain degraded parses.
-fn parse_batch(root: &Path, batch: &[&FileInfo], stats: &mut IndexStats) -> Vec<ParsedFile> {
-    let results: Vec<(&FileInfo, Result<ParsedFile>)> =
-        batch.par_iter().map(|f| (*f, parse_one(root, f))).collect();
+fn parse_batch(
+    root: &Path,
+    batch: &[&FileInfo],
+    stats: &mut IndexStats,
+    java_context: &JavaTypeContext,
+) -> Vec<ParsedFile> {
+    let results: Vec<(&FileInfo, Result<ParsedFile>)> = batch
+        .par_iter()
+        .map(|f| (*f, parse_one(root, f, java_context)))
+        .collect();
     let mut parsed = Vec::with_capacity(results.len());
     for (file, result) in results {
         match result {
@@ -163,9 +197,9 @@ fn write_one(db: &Database, p: &ParsedFile) -> Result<()> {
     let file_id = db.upsert_file(&p.info)?;
     db.insert_symbols(file_id, &p.symbols)?;
     db.insert_references(file_id, &p.refs)?;
+    db.insert_python_bindings(file_id, &p.python_bindings)?;
     db.insert_fingerprints(file_id, &fingerprint_inputs(p))?;
-    let boundaries = derive_from_refs(&p.refs, p.info.language);
-    db.replace_file_trust_boundaries(file_id, &boundaries)?;
+    db.replace_file_trust_boundaries(file_id, &p.boundaries)?;
     db.record_file_interpretation(file_id, STRUCTURAL_INTERPRETATION)?;
     Ok(())
 }
@@ -294,6 +328,11 @@ fn index_discovery_report(
         .chain(discovery.failed_paths.iter().map(String::as_str))
         .collect();
     let existing_paths = db.all_file_paths()?;
+    let existing_languages: HashMap<_, _> = db
+        .all_files_with_id_and_language()?
+        .into_iter()
+        .map(|(_, path, language)| (path, language))
+        .collect();
     let orphans: Vec<&str> = existing_paths
         .iter()
         .filter(|p| !discovered_paths.contains(p.as_str()))
@@ -309,20 +348,30 @@ fn index_discovery_report(
         stats.files_removed = orphans.len();
     }
 
-    let to_parse: Vec<&FileInfo> = match strategy {
+    let unavailable_java_source = discovery.failed_paths.iter().any(|path| {
+        path.ends_with(".java") || existing_languages.get(path) == Some(&Language::Java)
+    });
+    let mut to_parse: Vec<&FileInfo> = match strategy {
         IndexStrategy::Full => files.iter().collect(),
         IndexStrategy::Incremental => {
             let existing_hashes = db.all_file_hashes()?;
             let interpretations = db.all_file_interpretations()?;
-            let existing_languages: HashMap<_, _> = db
-                .all_files_with_id_and_language()?
-                .into_iter()
-                .map(|(_, path, language)| (path, language))
-                .collect();
+            let java_changed = unavailable_java_source
+                || files.iter().any(|file| {
+                    file.language == Language::Java
+                        && (existing_hashes.get(&file.path) != Some(&file.content_hash)
+                            || existing_languages.get(&file.path) != Some(&file.language)
+                            || interpretations.get(&file.path).and_then(Option::as_deref)
+                                != Some(STRUCTURAL_INTERPRETATION))
+                })
+                || orphans
+                    .iter()
+                    .any(|path| existing_languages.get(*path) == Some(&Language::Java));
             files
                 .iter()
                 .filter(|f| {
                     existing_hashes.get(&f.path) != Some(&f.content_hash)
+                        || (f.language == Language::Java && java_changed)
                         || existing_languages.get(&f.path) != Some(&f.language)
                         || interpretations.get(&f.path).and_then(Option::as_deref)
                             != Some(STRUCTURAL_INTERPRETATION)
@@ -338,8 +387,44 @@ fn index_discovery_report(
         tracing::info!(files_to_parse = to_parse.len(), "parsing files");
     }
 
+    let java_paths: Vec<_> = files
+        .iter()
+        .filter(|file| file.language == Language::Java)
+        .map(|file| file.path.clone())
+        .collect();
+    let mut context_failed_paths = Vec::new();
+    let java_context = if to_parse.iter().any(|file| file.language == Language::Java)
+        || unavailable_java_source
+    {
+        let context = (|| {
+            ensure!(
+                !unavailable_java_source,
+                "Java source unavailable during discovery"
+            );
+            JavaTypeContext::from_files(root, &java_paths)
+        })();
+        match context {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "Java declaration context unavailable; retaining Java rows for retry");
+                mark_java_context_stale(db)?;
+                to_parse.retain(|file| {
+                    if file.language == Language::Java {
+                        context_failed_paths.push(file.path.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                JavaTypeContext::default()
+            }
+        }
+    } else {
+        JavaTypeContext::default()
+    };
+
     for batch in to_parse.chunks(STRUCTURAL_INDEX_BATCH_SIZE) {
-        let parsed = parse_batch(root, batch, &mut stats);
+        let parsed = parse_batch(root, batch, &mut stats, &java_context);
 
         if verbose {
             tracing::info!(
@@ -366,6 +451,8 @@ fn index_discovery_report(
     stats
         .failed_paths
         .extend(discovery.failed_paths.iter().cloned());
+    stats.files_failed += context_failed_paths.len();
+    stats.failed_paths.extend(context_failed_paths);
     Ok(stats)
 }
 
@@ -411,13 +498,86 @@ pub fn index_files(
         tracing::info!(count = files.len(), "indexing specific files");
     }
 
-    let file_refs: Vec<&FileInfo> = files.iter().collect();
+    let mut file_refs: Vec<&FileInfo> = files.iter().collect();
+    let java_changed = files.iter().any(|file| file.language == Language::Java);
+    let java_paths: Vec<_> = if java_changed {
+        db.all_files_with_id_and_language()?
+            .into_iter()
+            .filter(|(_, _, language)| *language == Language::Java)
+            .map(|(_, path, _)| path)
+            .chain(
+                files
+                    .iter()
+                    .filter(|file| file.language == Language::Java)
+                    .map(|file| file.path.clone()),
+            )
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut context_error = None;
+    let java_context = match JavaTypeContext::from_files(root, &java_paths) {
+        Ok(context) => context,
+        Err(error) => {
+            mark_java_context_stale(db)?;
+            file_refs.retain(|file| file.language != Language::Java);
+            context_error = Some(error);
+            JavaTypeContext::default()
+        }
+    };
     for batch in file_refs.chunks(STRUCTURAL_INDEX_BATCH_SIZE) {
-        let parsed = parse_batch(root, batch, &mut stats);
+        let parsed = parse_batch(root, batch, &mut stats, &java_context);
         write_parsed_batch(db, &parsed, &mut stats)?;
+    }
+    if let Some(error) = context_error {
+        return Err(error)
+            .context("Java declaration context unavailable; retaining Java rows for retry");
+    }
+    if java_changed {
+        refresh_java_boundaries(root, db)?;
     }
 
     Ok(stats)
+}
+
+fn refresh_java_boundaries(root: &Path, db: &Database) -> Result<()> {
+    let java_files: Vec<_> = db
+        .all_files_with_id_and_language()?
+        .into_iter()
+        .filter(|(_, _, language)| *language == Language::Java)
+        .collect();
+    if let Err(error) = derive_for_files_with_source(root, db, &java_files) {
+        mark_java_context_stale(db)?;
+        return Err(error).context("refreshing Java declaration dependent boundaries");
+    }
+    Ok(())
+}
+
+fn mark_java_context_stale(db: &Database) -> Result<()> {
+    let files = db.all_files_with_id_and_language()?;
+    db.execute_batch(|db| {
+        for (id, _, language) in &files {
+            if *language == Language::Java {
+                db.record_file_interpretation(*id, "codesage/structural/java-context-stale")?;
+            }
+        }
+        Ok(())
+    })
+}
+
+pub fn remove_files_with_source(root: &Path, db: &Database, paths: &[String]) -> Result<usize> {
+    let java_changed = paths.iter().any(|path| path.ends_with(".java"))
+        || db
+            .all_files_with_id_and_language()?
+            .iter()
+            .any(|(_, path, language)| *language == Language::Java && paths.contains(path));
+    let removed = remove_files(db, paths)?;
+    if java_changed {
+        refresh_java_boundaries(root, db)?;
+    }
+    Ok(removed)
 }
 
 pub fn remove_files(db: &Database, paths: &[String]) -> Result<usize> {
@@ -446,6 +606,42 @@ mod tests {
             content_hash: content_hash(source),
             is_test: false,
         }
+    }
+
+    #[test]
+    fn structural_reader_reparses_replacement_and_records_its_actual_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let info = file(root.path(), "a.rs", Language::Rust, b"fn before() {}\n");
+        let source = b"fn after() {}\n";
+        let replacement = root.path().join("replacement");
+        std::fs::write(&replacement, source).unwrap();
+        std::fs::rename(replacement, root.path().join("a.rs")).unwrap();
+
+        let parsed = parse_one(root.path(), &info, &JavaTypeContext::default()).unwrap();
+
+        assert_eq!(parsed.info.content_hash, content_hash(source));
+        assert_eq!(parsed.symbols.len(), 1);
+        assert_eq!(parsed.symbols[0].name, "after");
+    }
+
+    #[test]
+    fn structural_reader_rejects_growth_beyond_discovery_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let info = file(root.path(), "a.rs", Language::Rust, b"fn before() {}\n");
+        std::fs::File::options()
+            .write(true)
+            .open(root.path().join("a.rs"))
+            .unwrap()
+            .set_len(codesage_parser::discover::MAX_INDEXABLE_FILE_BYTES + 1)
+            .unwrap();
+
+        let error = parse_one(root.path(), &info, &JavaTypeContext::default()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the indexable file size cap")
+        );
     }
 
     #[test]
@@ -671,7 +867,7 @@ mod tests {
             is_test: false,
         };
 
-        let err = parse_one(root.path(), &file).unwrap_err();
+        let err = parse_one(root.path(), &file, &JavaTypeContext::default()).unwrap_err();
 
         assert!(
             err.to_string().contains("reading missing.rs"),
@@ -709,7 +905,12 @@ mod tests {
     }
 
     fn parsed(root: &Path, path: &str, language: Language, source: &[u8]) -> ParsedFile {
-        parse_one(root, &file(root, path, language, source)).unwrap()
+        parse_one(
+            root,
+            &file(root, path, language, source),
+            &JavaTypeContext::default(),
+        )
+        .unwrap()
     }
 
     #[test]

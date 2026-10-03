@@ -179,6 +179,12 @@ fn scan_object_at(map: &Map<String, Value>, depth: usize, out: &mut Signals) {
                 }
             }
             "unscored" if is_true(child) => out.mark(Kind::Unscored),
+            "completeness" if child.get("kind").and_then(Value::as_str) == Some("unscored") => {
+                out.mark(Kind::Unscored)
+            }
+            "completeness" if child.get("kind").and_then(Value::as_str) == Some("truncated") => {
+                out.mark(Kind::Truncated)
+            }
             "unscored_files" if non_empty_array(child).is_some() => {
                 out.mark(Kind::Unscored);
             }
@@ -242,6 +248,7 @@ fn coverage_gap(coverage: &Value) -> bool {
 /// stopped at an MCP bound. No argument is interpolated into the string.
 fn cli_command(tool: &str) -> Option<&'static str> {
     Some(match tool {
+        "describe" => "codesage describe",
         "project_overview" => "codesage overview",
         "search" => "codesage search",
         "find_symbol" => "codesage find-symbol",
@@ -381,7 +388,7 @@ pub(super) struct IndexFacts {
     /// `files_behind` is a lower bound: the comparison stopped at its
     /// candidate cap or time budget.
     files_behind_bounded: bool,
-    /// `Some("partial" | "none")`; `None` means every indexed file has chunks.
+    /// `None` means every indexed file has chunks; `unknown` is an unavailable measurement.
     semantic: Option<&'static str>,
     computed_at: Instant,
 }
@@ -471,7 +478,13 @@ fn coverage_of(semantic: usize, files: usize) -> Option<&'static str> {
 impl CodeSageServer {
     /// Measure drift and semantic coverage once per generation (or per TTL),
     /// so the per-call envelope costs a stat and a `PRAGMA data_version`.
-    fn index_facts(&self, root: &Path, db_path: &Path, generation: Option<u64>) -> IndexFacts {
+    fn index_facts(
+        &self,
+        root: &Path,
+        db_path: &Path,
+        generation: Option<u64>,
+        read_only: bool,
+    ) -> IndexFacts {
         if let Some(cached) = self.state.index_facts.get(root, generation) {
             return cached;
         }
@@ -486,20 +499,27 @@ impl CodeSageServer {
             semantic: None,
             computed_at: Instant::now(),
         };
-        match codesage_storage::Database::open_existing(db_path) {
+        let opened = if read_only {
+            codesage_storage::Database::open_read_only(db_path)
+        } else {
+            codesage_storage::Database::open_existing(db_path)
+        };
+        match opened {
             Ok(db) => {
                 let drift = codesage_graph::drift::check_drift(root, &db);
                 facts.head = drift.stored_sha.as_deref().map(short_sha);
                 facts.files_behind = drift.indexed_files_behind;
                 facts.files_behind_bounded = drift.indexed_files_behind_bounded;
                 facts.structural = structural_from_drift(&drift);
-                facts.semantic = self.semantic_state(root, db_path, &db);
+                facts.semantic = self.semantic_state(root, db_path, &db, read_only);
             }
             Err(error) => {
                 tracing::debug!(error = %error, "envelope index facts skipped");
             }
         }
-        self.state.index_facts.put(root, facts.clone());
+        if !read_only {
+            self.state.index_facts.put(root, facts.clone());
+        }
         facts
     }
 
@@ -512,23 +532,35 @@ impl CodeSageServer {
         root: &Path,
         db_path: &Path,
         db: &codesage_storage::Database,
+        read_only: bool,
     ) -> Option<&'static str> {
         let files = db.file_count().unwrap_or(0);
         if files == 0 {
             return None;
         }
-        let Some(model) = self.configured_model(root) else {
+        let Some(model) = self.configured_model(root, read_only) else {
             // Nothing to scope by: every chunk table is equally plausible.
-            return coverage_of(db.semantic_file_count().unwrap_or(0), files);
+            return match db.semantic_file_count() {
+                Ok(count) => coverage_of(count, files),
+                Err(_) if read_only => Some("unknown"),
+                Err(_) => Some("none"),
+            };
         };
-        match codesage_storage::Database::open_for_existing_model(db_path, &model)
-            .and_then(|scoped| scoped.semantic_freshness())
-        {
+        let scoped = if read_only {
+            codesage_storage::Database::open_read_only_for_existing_model(db_path, &model)
+        } else {
+            codesage_storage::Database::open_for_existing_model(db_path, &model)
+        };
+        match scoped.and_then(|scoped| scoped.semantic_freshness()) {
             Ok(None) => Some("none"),
             Ok(Some(freshness)) if freshness.indexed_files == 0 => Some("none"),
             Ok(Some(freshness)) if !freshness.is_fresh() => Some("partial"),
             Ok(Some(_)) => None,
             Err(error) => {
+                if read_only {
+                    tracing::debug!(error = %error, "read-only semantic freshness unavailable");
+                    return Some("unknown");
+                }
                 // Ambiguous or pre-registry chunk tables: the fallback count is
                 // coarser but stays scoped to the configured model.
                 tracing::debug!(error = %error, "envelope semantic freshness fell back to a count");
@@ -539,8 +571,13 @@ impl CodeSageServer {
 
     /// The project's configured embedding model, without the watcher side
     /// effect `resolve_project` carries: `edit_check` is enveloped too.
-    fn configured_model(&self, root: &Path) -> Option<String> {
-        self.resolve_project_inner(&root.to_string_lossy())
+    fn configured_model(&self, root: &Path, read_only: bool) -> Option<String> {
+        let state = if read_only {
+            self.resolve_project_read_only(&root.to_string_lossy())
+        } else {
+            self.resolve_project_inner(&root.to_string_lossy())
+        };
+        state
             .ok()
             .map(|state| state.embedding_config.model)
             .filter(|model| !model.is_empty())
@@ -559,14 +596,19 @@ impl CodeSageServer {
             .map(|generation| generation.id())
     }
 
-    fn index_block(&self, project: Option<&str>, stale: &[String]) -> Option<Value> {
+    fn index_block(
+        &self,
+        project: Option<&str>,
+        stale: &[String],
+        read_only: bool,
+    ) -> Option<Value> {
         let root = crate::evidence_root(Path::new(project?)).ok()?;
         let db_path = crate::db_path(&root);
         if !db_path.is_file() {
             return None;
         }
         let generation = self.index_generation(&root, &db_path);
-        let facts = self.index_facts(&root, &db_path, generation);
+        let facts = self.index_facts(&root, &db_path, generation, read_only);
         let mut out = Map::new();
         if let Some(generation) = generation {
             out.insert("generation".into(), json!(generation));
@@ -614,10 +656,16 @@ impl CodeSageServer {
         arguments: &Map<String, Value>,
         elapsed: Duration,
     ) -> CallToolResult {
-        if !self.state.envelope_enabled
-            || result.is_error == Some(true)
-            || UNENVELOPED_TOOLS.contains(&tool)
-        {
+        if result.is_error == Some(true) || UNENVELOPED_TOOLS.contains(&tool) {
+            return result;
+        }
+        if !self.state.envelope_enabled {
+            if tool == "describe"
+                && let Some(Value::Object(payload)) = result.structured_content.as_mut()
+            {
+                update_describe_cost(payload, elapsed);
+                super::render::rerender_json_text(&mut result);
+            }
             return result;
         }
         let Some(Value::Object(payload)) = result.structured_content.as_ref() else {
@@ -628,7 +676,7 @@ impl CodeSageServer {
         scan(payload, &mut signals);
 
         let project = arguments.get("project").and_then(Value::as_str);
-        let index = self.index_block(project, &signals.stale_paths);
+        let index = self.index_block(project, &signals.stale_paths, tool == "describe");
         let completeness = completeness(tool, arguments, &signals);
         let target = signals.ambiguous.then(|| {
             let mut out = Map::new();
@@ -657,8 +705,42 @@ impl CodeSageServer {
             "cost",
             json!({"ms": elapsed.as_millis() as u64, "bytes": bytes}),
         );
+        if tool == "describe" {
+            let recoveries = payload
+                .get("card")
+                .and_then(|card| card.get("sections"))
+                .and_then(Value::as_object)
+                .map(|sections| {
+                    sections
+                        .iter()
+                        .filter_map(|(name, section)| {
+                            section
+                                .pointer("/completeness/recover")
+                                .map(|recover| json!({"section": name, "recover": recover}))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !recoveries.is_empty()
+                && let Some(completeness) = payload.get_mut("completeness")
+            {
+                completeness["recover"] = json!({"sections": recoveries});
+            }
+            update_describe_cost(payload, elapsed);
+        }
         super::render::rerender_json_text(&mut result);
         result
+    }
+}
+
+fn update_describe_cost(payload: &mut Map<String, Value>, elapsed: Duration) {
+    payload["cost"]["ms"] = json!(elapsed.as_millis() as u64);
+    for _ in 0..4 {
+        let bytes = serde_json::to_vec(payload).map(|b| b.len()).unwrap_or(0);
+        if payload["cost"]["bytes"] == bytes {
+            break;
+        }
+        payload["cost"]["bytes"] = json!(bytes);
     }
 }
 
@@ -693,7 +775,7 @@ pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
                     "files_behind": {"type": "integer", "minimum": 1, "description": "Indexed files whose content at HEAD differs from the indexed content, plus supported source files committed since indexing. Absent when none do, including when HEAD has moved by commits that touched nothing indexed."},
                     "files_behind_bounded": {"const": true, "description": "`files_behind` (0 when absent) is a lower bound: the content comparison stopped at its 2,000-path cap or 500 ms budget before checking every candidate. Absent when the comparison completed."},
                     "structural": {"enum": ["behind", "dirty", "unknown"], "description": "`behind`: at least one indexed file's HEAD content differs from the index (`files_behind` counts them), or, when that comparison could not run or stopped before finding one (`files_behind_bounded`), the indexed SHA is not HEAD. `dirty`: a path in this response differs on disk from the index. `unknown`: drift could not be determined (git failed, the index carries no commit stamp, or it could not be opened). Absent when fresh."},
-                    "semantic": {"enum": ["partial", "none"], "description": "Semantic coverage of the indexed file set by the configured embedding model: none when that model has no chunks, partial when some indexed files lack chunks for it or their chunks predate the current content. Absent when the configured model covers every indexed file."},
+                    "semantic": {"enum": ["partial", "none", "unknown"], "description": "Semantic coverage of the indexed file set by the configured embedding model: none when that model has no chunks, partial when some indexed files lack chunks for it or their chunks predate the current content, unknown when a read-only describe could not measure coverage. Absent when the configured model covers every indexed file."},
                     "dirty_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths in this response that changed on disk since indexing."}
                 }
             }),

@@ -310,8 +310,7 @@ PHPAPI int php_request_startup(void) { return 0; }\n\
 MYLIB_API int c_free_fn(int a) { return a; }\n\
 ZEND_API zend_result zend_post_startup(int flags) { return 0; }\n";
     let syms = symbols(source, Language::C);
-    // Column 0 proves C sources are parsed as written: a blanked macro would
-    // move each definition's start to its return type.
+    // The declaration span must still cover its opening export macro.
     for name in [
         "zend_startup",
         "php_request_startup",

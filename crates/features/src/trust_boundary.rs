@@ -1,12 +1,17 @@
-//! Derive trust boundaries from parsed references without database access.
-//! Separate helpers persist results or re-derive them from indexed references.
+//! Derive trust boundaries from parsed references and Java framework roles.
+//! Persistence helpers support indexed references and current source.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use anyhow::Result;
+use codesage_parser::{parse::parse_file, references::extract_references};
 use codesage_protocol::{Language, Reference, ReferenceKind, TrustBoundary};
 use codesage_storage::Database;
+use tree_sitter::Tree;
 
+use crate::java_roles;
+pub use crate::java_roles::JavaTypeContext;
 use crate::trust_boundary_rules::{TrustBoundaryRule, rule_matches, rules_for};
 
 /// Derive the set of trust boundaries crossed by a file from its parsed
@@ -33,6 +38,109 @@ pub fn derive_from_refs(refs: &[Reference], language: Language) -> Vec<TrustBoun
         }
     }
     acc.into_iter().collect()
+}
+
+pub fn derive_from_tree(
+    refs: &[Reference],
+    language: Language,
+    tree: &Tree,
+    source: &[u8],
+) -> Vec<TrustBoundary> {
+    derive_from_tree_with_context(
+        refs,
+        language,
+        tree,
+        source,
+        "",
+        &JavaTypeContext::default(),
+    )
+}
+
+pub fn derive_from_tree_with_context(
+    refs: &[Reference],
+    language: Language,
+    tree: &Tree,
+    source: &[u8],
+    path: &str,
+    context: &JavaTypeContext,
+) -> Vec<TrustBoundary> {
+    let mut boundaries: BTreeSet<_> = derive_from_refs(refs, language).into_iter().collect();
+    if language == Language::Java {
+        for role in java_roles::roles_with_context(tree, source, path, context) {
+            boundaries.extend(role.boundaries());
+        }
+    }
+    boundaries.into_iter().collect()
+}
+
+pub(crate) fn boundary_updates_from_source(
+    root: &Path,
+    db: &Database,
+    files: &[(i64, String, Language)],
+) -> Result<Vec<(i64, Vec<TrustBoundary>)>> {
+    let paths = db
+        .all_files_with_id_and_language()?
+        .into_iter()
+        .filter(|(_, _, language)| *language == Language::Java)
+        .map(|(_, path, _)| path)
+        .collect::<Vec<_>>();
+    boundary_updates_from_source_in_context(root, db, files, &paths)
+}
+
+pub(crate) fn boundary_updates_from_source_in_context(
+    root: &Path,
+    db: &Database,
+    files: &[(i64, String, Language)],
+    paths: &[String],
+) -> Result<Vec<(i64, Vec<TrustBoundary>)>> {
+    let context = JavaTypeContext::from_files(root, paths)?;
+    let mut updates = Vec::with_capacity(files.len());
+    for (id, path, language) in files {
+        let boundaries = if *language == Language::Java {
+            let source = java_roles::read_source(root, path)?;
+            let tree = parse_file(&source, *language)?;
+            let refs = extract_references(&tree, &source, *language, path)?;
+            derive_from_tree_with_context(&refs, *language, &tree, &source, path, &context)
+        } else {
+            derive_from_refs(&indexed_references(db, *id)?, *language)
+        };
+        updates.push((*id, boundaries));
+    }
+    Ok(updates)
+}
+
+pub fn derive_for_files_with_source(
+    root: &Path,
+    db: &Database,
+    files: &[(i64, String, Language)],
+) -> Result<usize> {
+    let updates = boundary_updates_from_source(root, db, files)?;
+    db.execute_batch(|db| {
+        for (id, boundaries) in &updates {
+            db.replace_file_trust_boundaries(*id, boundaries)?;
+        }
+        Ok(())
+    })?;
+    Ok(updates.len())
+}
+
+fn indexed_references(db: &Database, id: i64) -> Result<Vec<Reference>> {
+    Ok(db
+        .refs_outgoing_for_file_id(id)?
+        .into_iter()
+        .map(|(to_name, kind)| Reference {
+            from_file: String::new(),
+            from_symbol: None,
+            to_name,
+            kind,
+            line: 0,
+            col: 0,
+            lazy: false,
+            to: None,
+            from_line: None,
+            is_test: false,
+        })
+        .collect())
 }
 
 /// C includes retain angle brackets or quotes; rules match the bare path.
@@ -69,9 +177,8 @@ fn apply_rules(table: &[TrustBoundaryRule], name: &str, acc: &mut BTreeSet<Trust
     }
 }
 
-/// Derive *and* persist boundaries for one file's parsed refs. Replaces
-/// whatever rows were stored previously for `file_id` (idempotent on
-/// re-index). Callers inside an `execute_batch` closure should use this.
+/// Replace a file's reference-derived boundaries. Java framework roles
+/// require `derive_from_tree` or `derive_for_files_with_source` instead.
 pub fn derive_for_file(
     db: &Database,
     file_id: i64,
@@ -83,19 +190,15 @@ pub fn derive_for_file(
     Ok(boundaries)
 }
 
-/// Walk every indexed file, re-derive boundaries from the `refs` rows the
-/// parser stored, and replace each file's boundary set. Use after a schema
-/// migration that introduces this table, or after rule-table changes that
-/// invalidate previously-computed boundaries. O(refs_total).
+/// Replace every file's reference-derived boundaries from indexed rows.
+/// Java framework roles require `derive_for_files_with_source` instead.
 pub fn derive_for_index(db: &Database) -> Result<usize> {
     let files = db.all_files_with_id_and_language()?;
     derive_for_files(db, &files)
 }
 
-/// Targeted version of `derive_for_index`: derive boundaries only for
-/// the given `(file_id, path, language)` tuples. Pair with
-/// `Database::files_pending_boundary_derivation` to backfill exactly
-/// the files that need work without reprocessing already-stamped ones.
+/// Targeted reference-only version of `derive_for_index`. Java framework
+/// roles require `derive_for_files_with_source` instead.
 pub fn derive_for_files(
     db: &Database,
     files: &[(i64, String, codesage_protocol::Language)],
@@ -106,22 +209,7 @@ pub fn derive_for_files(
     let mut updated = 0usize;
     db.execute_batch(|db| {
         for (file_id, _path, language) in files {
-            let refs = db.refs_outgoing_for_file_id(*file_id)?;
-            let in_memory: Vec<Reference> = refs
-                .into_iter()
-                .map(|(to_name, kind)| Reference {
-                    from_file: String::new(),
-                    from_symbol: None,
-                    to_name,
-                    kind,
-                    line: 0,
-                    col: 0,
-                    lazy: false,
-                    to: None,
-                    from_line: None,
-                    is_test: false,
-                })
-                .collect();
+            let in_memory = indexed_references(db, *file_id)?;
             let boundaries = derive_from_refs(&in_memory, *language);
             db.replace_file_trust_boundaries(*file_id, &boundaries)?;
             updated += 1;

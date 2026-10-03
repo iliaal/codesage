@@ -87,7 +87,7 @@ def extract_file_paths_from_value(value) -> set[str]:
 # Keep aligned with Commands in crates/cli/src/main.rs (clap kebab-case).
 CODESAGE_SUBCOMMANDS = frozenset(
     {
-        "init", "index", "overview", "search", "brief", "find-symbol",
+        "init", "index", "overview", "describe", "search", "brief", "find-symbol",
         "find-references", "dependencies", "impact", "trace", "from-trace", "export",
         "status", "mcp", "daemon", "watch", "install-hooks", "install",
         "uninstall", "cleanup", "coverage", "git-index", "coupling", "risk",

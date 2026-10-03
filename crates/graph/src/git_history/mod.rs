@@ -19,6 +19,7 @@ pub use risk::{
     assess_risk, assess_risk_batch, assess_risk_diff, find_coupling, find_coupling_ranked,
 };
 pub(crate) use tests_rec::reach_cap_clause;
+pub(crate) use tests_rec::recommend_tests_with_commands;
 pub(crate) use tests_rec::recommend_tests_with_walk_cache;
 pub use tests_rec::{
     ReachabilityOptions, abbreviate_paths, recommend_tests, recommend_tests_with_reachability,

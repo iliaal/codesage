@@ -154,6 +154,45 @@ fn cpp_overload_diff_keeps_unchanged_overloads_and_requires_selection() {
 }
 
 #[test]
+fn c_export_macro_typedef_return_is_checked_and_replaced_as_one_declaration() {
+    let source = "typedef int zend_result;\nPHPAPI\nzend_result f(void) { return 0; }\n";
+    let dir = project("api.c", source);
+    let report = edit_check(
+        dir.path(),
+        "api.c",
+        "sym:api.c#f@2",
+        None,
+        "zend_result f(int a) { return a; }",
+    )
+    .unwrap();
+    assert!(report.worktree_matches_head && report.arity_changed);
+    assert_eq!(report.symbol, "f");
+    assert_eq!(report.line, 2);
+    assert_eq!(report.before.declaration, "PHPAPI zend_result f(void)");
+    assert_eq!(report.after.declaration, "zend_result f(int a)");
+    assert_eq!(report.before.arity.unwrap().minimum, 0);
+    assert_eq!(report.after.arity.unwrap().minimum, 1);
+    assert_eq!(report.overloads_after.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("api.c")).unwrap(),
+        source
+    );
+}
+
+#[test]
+fn c_export_macro_edit_check_reads_original_static_linkage() {
+    for source in [
+        "typedef int zend_result;\nstatic CORE_API zend_result f(void) { return 0; }\n",
+        "typedef int zend_result;\nCORE_API static zend_result f(void) { return 0; }\n",
+    ] {
+        let report = check("api.c", source, "zend_result f(void) { return 0; }");
+        assert_eq!(report.before.visibility.as_deref(), Some("internal"));
+        assert_eq!(report.after.visibility.as_deref(), Some("external"));
+        assert!(report.visibility_changed);
+    }
+}
+
+#[test]
 fn parses_each_unambiguous_supported_language() {
     for (file, source, replacement, before, after) in [
         ("a.rs", "fn f(a: i32) {}", "fn f() {}", Some(1), Some(0)),

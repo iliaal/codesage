@@ -2,8 +2,10 @@ pub mod branch_overlap;
 mod brief;
 mod bundle;
 mod call_path;
+mod describe;
 pub mod drift;
 pub mod edit_check;
+mod git;
 mod git_history;
 pub mod hook_health;
 mod impact;
@@ -11,6 +13,7 @@ mod import_graph;
 mod index;
 mod lookups;
 mod overview;
+mod python_bindings;
 mod rehearsal;
 pub mod resolver;
 mod rust_modules;
@@ -24,8 +27,12 @@ pub mod state_file;
 mod trace_locate;
 
 pub use brief::build_edit_brief;
-pub use bundle::{export_context, export_context_for_symbol, feature_bundle};
+pub use bundle::{
+    export_context, export_context_for_symbol, export_context_for_target, feature_bundle,
+};
 pub use call_path::trace_call_path;
+pub use describe::{DescribeOptions, DescribeParameterError, describe, describe_with_ranking};
+pub use git::git_command;
 pub use git_history::{
     IndexMode, ReachabilityOptions, abbreviate_paths, assess_risk, assess_risk_batch,
     assess_risk_diff, changed_files_since, feature_touched_since, find_coupling,
@@ -36,6 +43,7 @@ pub use impact::{impact_analysis, impact_analysis_report};
 pub use import_graph::file_import_pairs;
 pub use index::{
     STRUCTURAL_INTERPRETATION, full_index, incremental_index, index_files, remove_files,
+    remove_files_with_source,
 };
 pub use lookups::{
     FindSymbolOptions, find_references, find_references_with_budget, find_symbol,

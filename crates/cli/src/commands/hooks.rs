@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 
 use crate::find_project_root;
-use crate::util::{self, git_common_dir};
+use crate::util::git_common_dir;
+
+mod fs;
+use fs::HookDirectory;
 
 /// Outcome of one `install-hooks` run. `skipped` names every hook the command
 /// was asked to wire but left untouched, with the printed reason.
@@ -58,7 +61,7 @@ pub(crate) fn install_hooks_at(
     with_leak_check: bool,
 ) -> Result<InstallOutcome> {
     let (hooks_dir, is_husky) = resolve_hooks_dir(root)?;
-    std::fs::create_dir_all(&hooks_dir)?;
+    let directory = HookDirectory::create(&hooks_dir)?;
 
     let hook_body = generate_post_commit_hook_body(codesage_path);
 
@@ -67,31 +70,25 @@ pub(crate) fn install_hooks_at(
     let mut outcome = InstallOutcome::default();
     for name in &hook_names {
         let path = hooks_dir.join(name);
-        if path.exists() {
-            let existing = std::fs::read_to_string(&path).unwrap_or_default();
-            if !existing.contains("codesage install-hooks") {
-                println!(
-                    "skip: {} already exists and is not a codesage hook — \
+        let existing = directory.read(name)?;
+        if let Some(existing) = &existing
+            && !existing.content().contains("codesage install-hooks")
+        {
+            println!(
+                "skip: {} already exists and is not a codesage hook — \
                      codesage will NOT auto-reindex on {name}",
-                    path.display()
-                );
-                println!(
-                    "      to wire it up, chain `codesage index --lock-wait 60` and \
+                path.display()
+            );
+            println!(
+                "      to wire it up, chain `codesage index --lock-wait 60` and \
                      `codesage git-index --incremental --lock-wait 60` into your existing \
                      hook (backgrounded), or move it aside and re-run `codesage install-hooks`"
-                );
-                outcome.skipped.push(format!("{name} (foreign hook)"));
-                continue;
-            }
+            );
+            outcome.skipped.push(format!("{name} (foreign hook)"));
+            continue;
         }
 
-        std::fs::write(&path, &hook_body)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-        }
+        directory.write(name, hook_body.as_bytes(), 0o755, existing.as_ref())?;
 
         println!("installed: {}", path.display());
         outcome.installed.push(path);
@@ -357,22 +354,23 @@ fn install_leak_check_hook(
     }
 
     let path = hooks_dir.join("pre-commit");
-    if path.exists() {
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        if !existing.contains("codesage install-hooks") {
-            println!(
-                "skip: {} already exists and is not a codesage hook — \
+    let directory = HookDirectory::create(hooks_dir)?;
+    let existing = directory.read("pre-commit")?;
+    if let Some(existing) = &existing
+        && !existing.content().contains("codesage install-hooks")
+    {
+        println!(
+            "skip: {} already exists and is not a codesage hook — \
                  the leak-check will NOT run on commit",
-                path.display()
-            );
-            println!(
-                "      to wire it up, exec scripts/leak-check.sh from your existing \
+            path.display()
+        );
+        println!(
+            "      to wire it up, exec scripts/leak-check.sh from your existing \
                  pre-commit hook, or move it aside and re-run \
                  `codesage install-hooks --with-leak-check`"
-            );
-            outcome.skipped.push("pre-commit (foreign hook)".to_owned());
-            return Ok(());
-        }
+        );
+        outcome.skipped.push("pre-commit (foreign hook)".to_owned());
+        return Ok(());
     }
 
     let body = "#!/bin/sh\n\
@@ -381,13 +379,7 @@ fn install_leak_check_hook(
                 script=\"$root/scripts/leak-check.sh\"\n\
                 [ -x \"$script\" ] || exit 0\n\
                 exec \"$script\"\n";
-    std::fs::write(&path, body)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-    }
+    directory.write("pre-commit", body.as_bytes(), 0o755, existing.as_ref())?;
     println!("installed: {} (leak-check)", path.display());
     outcome.installed.push(path.clone());
 
@@ -413,12 +405,11 @@ pub(crate) enum HooksLayout {
 
 pub(crate) fn read_hooks_path(root: &std::path::Path) -> Option<String> {
     // Match Git's tilde expansion instead of resolving a literal ~/ below root.
-    std::process::Command::new("git")
+    codesage_graph::git_command(root)
         .arg("config")
         .arg("--type=path")
         .arg("--get")
         .arg("core.hooksPath")
-        .current_dir(root)
         .output()
         .ok()
         .and_then(|out| {
@@ -438,7 +429,9 @@ pub(crate) fn classify_hooks_path(
     let Some(raw) = configured else {
         let common = git_common_dir(root)
             .ok_or_else(|| anyhow::anyhow!("unable to resolve git common dir"))?;
-        return Ok(HooksLayout::Git(common.join("hooks")));
+        let hooks = common.join("hooks");
+        HookDirectory::open(&hooks, false)?;
+        return Ok(HooksLayout::Git(hooks));
     };
     let path = std::path::Path::new(raw);
     let resolved = if path.is_absolute() {
@@ -446,17 +439,32 @@ pub(crate) fn classify_hooks_path(
     } else {
         root.join(path)
     };
+    let configured_dir = HookDirectory::open(&resolved, false)?;
     // Explicit configuration of the default directory needs no special treatment.
     if let Some(common) = git_common_dir(root) {
         let default_hooks = common.join("hooks");
-        if util::paths_resolve_same(&resolved, &default_hooks) {
+        // An unused default directory must not block a configured Husky directory.
+        let default_dir = HookDirectory::open(&default_hooks, false).ok().flatten();
+        let same = match (&configured_dir, &default_dir) {
+            (Some(a), Some(b)) => a.same_directory(b)?,
+            _ => resolved == default_hooks,
+        };
+        if same {
             return Ok(HooksLayout::Git(default_hooks));
         }
     }
-    let runtime_present = resolved.join("h").is_file() || resolved.join("husky.sh").is_file();
+    let runtime_present = match &configured_dir {
+        Some(directory) => {
+            directory.has_regular_file("h")? || directory.has_regular_file("husky.sh")?
+        }
+        None => false,
+    };
     // Fresh Husky clones may lack the generated runtime; recognize its directory layout.
     let looks_like_husky_runtime = resolved.file_name().is_some_and(|n| n == "_")
-        && resolved.parent().is_some_and(|p| p.is_dir());
+        && match resolved.parent() {
+            Some(parent) => HookDirectory::open(parent, false)?.is_some(),
+            None => false,
+        };
     if runtime_present || looks_like_husky_runtime {
         let user_dir = resolved
             .parent()
@@ -500,32 +508,37 @@ fn exclude_husky_hook_paths(root: &std::path::Path, hooks: &[PathBuf]) -> Result
     let Some(exclude) = git_local_exclude_path(root) else {
         return Ok(());
     };
-    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    let parent = exclude.parent().context("git exclude path has no parent")?;
+    let directory = HookDirectory::create(parent)?;
+    let existing = directory.read("exclude")?;
+    let text = existing
+        .as_ref()
+        .map(|file| file.content())
+        .unwrap_or_default();
     let mut to_add: Vec<String> = Vec::new();
     for hook in hooks {
         let Ok(rel) = hook.strip_prefix(root) else {
             continue;
         };
         let line = format!("/{}", rel.display());
-        if !existing.lines().any(|l| l.trim() == line.trim()) {
+        if !text.lines().any(|l| l.trim() == line.trim()) {
             to_add.push(line);
         }
     }
     if to_add.is_empty() {
         return Ok(());
     }
-    if let Some(parent) = exclude.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&exclude)?;
+    let mut body = existing
+        .as_ref()
+        .map(|file| file.bytes().to_vec())
+        .unwrap_or_default();
     use std::io::Write;
-    writeln!(f, "\n# codesage husky hooks")?;
+    writeln!(body, "\n# codesage husky hooks")?;
     for line in &to_add {
-        writeln!(f, "{line}")?;
+        writeln!(body, "{line}")?;
     }
+    let mode = existing.as_ref().map(|file| file.mode()).unwrap_or(0o600);
+    directory.write("exclude", &body, mode, existing.as_ref())?;
     println!(
         "    added {} husky hook path(s) to .git/info/exclude",
         to_add.len()
@@ -540,6 +553,10 @@ fn git_local_exclude_path(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
 
     // A concurrent test's fork can hold a just-written script's fd until its
     // exec, so the first spawn may hit ETXTBSY; retry briefly.
@@ -561,7 +578,7 @@ mod tests {
 
     #[test]
     fn husky9_runtime_dir_is_recognized_even_before_it_is_generated() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         std::fs::create_dir(root.path().join(".husky")).unwrap();
         let configured = root.path().join(".husky/_");
         match classify_hooks_path(root.path(), Some(configured.to_str().unwrap())).unwrap() {
@@ -580,7 +597,7 @@ mod tests {
 
     #[test]
     fn husky_runtime_dir_with_the_h_shim_is_recognized_as_present() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         std::fs::create_dir_all(root.path().join(".husky/_")).unwrap();
         std::fs::write(root.path().join(".husky/_/h"), "#!/bin/sh\n").unwrap();
         let configured = root.path().join(".husky/_");
@@ -599,7 +616,7 @@ mod tests {
 
     #[test]
     fn an_unrelated_hooks_path_is_still_refused() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempdir();
         std::fs::create_dir(root.path().join("custom-hooks")).unwrap();
         let configured = root.path().join("custom-hooks");
         let err = classify_hooks_path(root.path(), Some(configured.to_str().unwrap()))
@@ -1872,7 +1889,7 @@ mod tests {
     }
 
     fn leak_check_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join("scripts")).unwrap();
         std::fs::write(root.join("scripts/leak-check.sh"), "#!/bin/sh\nexit 0\n").unwrap();
@@ -1943,7 +1960,7 @@ mod tests {
 
     #[test]
     fn leak_check_hook_noop_without_script() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let root = dir.path().to_path_buf();
         let hooks_dir = root.join(".git/hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
@@ -1961,7 +1978,7 @@ mod tests {
 
     #[test]
     fn install_hooks_at_reports_foreign_hook_as_skipped() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let root = dir.path();
         init_git_repo(root);
         let hooks_dir = root.join(".git/hooks");
@@ -1987,7 +2004,7 @@ mod tests {
 
     #[test]
     fn install_hooks_at_is_idempotent_on_own_hooks() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let root = dir.path();
         init_git_repo(root);
 

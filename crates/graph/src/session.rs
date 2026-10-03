@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use codesage_protocol::work::checkpoint;
-use codesage_protocol::{SessionDiff, SessionRiskEntry, SessionRiskRegression, SessionSnapshot};
+use codesage_protocol::{
+    RiskAssessment, SessionDiff, SessionRiskEntry, SessionRiskRegression, SessionSnapshot,
+};
 use codesage_storage::Database;
 
 use crate::git_history::{RiskRequestScope, assess_risk_batch, assess_risk_with_scope};
@@ -19,6 +21,26 @@ const TOP_RISK_BASELINE: usize = 50;
 #[derive(Clone, Debug)]
 pub struct CompleteRiskRanking {
     rows: Vec<SessionRiskEntry>,
+    assessments: Vec<CachedRiskAssessment>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CachedRiskAssessment {
+    pub file: String,
+    pub score: f64,
+    pub unscored: bool,
+    pub notes: Vec<String>,
+}
+
+impl From<RiskAssessment> for CachedRiskAssessment {
+    fn from(assessment: RiskAssessment) -> Self {
+        Self {
+            file: assessment.file,
+            score: assessment.score,
+            unscored: assessment.unscored,
+            notes: assessment.notes,
+        }
+    }
 }
 
 impl CompleteRiskRanking {
@@ -35,6 +57,34 @@ impl CompleteRiskRanking {
                     .map(|row| row.file.capacity())
                     .fold(0usize, usize::saturating_add),
             )
+            .saturating_add(
+                self.assessments
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CachedRiskAssessment>()),
+            )
+            .saturating_add(
+                self.assessments
+                    .iter()
+                    .map(|assessment| {
+                        assessment
+                            .file
+                            .capacity()
+                            .saturating_add(
+                                assessment
+                                    .notes
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<String>()),
+                            )
+                            .saturating_add(
+                                assessment
+                                    .notes
+                                    .iter()
+                                    .map(String::capacity)
+                                    .fold(0usize, usize::saturating_add),
+                            )
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
     }
 
     pub fn rows(&self) -> &[SessionRiskEntry] {
@@ -43,6 +93,10 @@ impl CompleteRiskRanking {
 
     pub fn into_rows(self) -> Vec<SessionRiskEntry> {
         self.rows
+    }
+
+    pub(crate) fn assessments(&self) -> &[CachedRiskAssessment] {
+        &self.assessments
     }
 }
 
@@ -91,8 +145,16 @@ pub fn top_risk_ranking_with_options(
     include_tests: bool,
 ) -> Result<CompleteRiskRanking> {
     let _policy = crate::git_history::CompletePolicy::enter(recurrence);
+    let assessments = top_risk_assessments(db, TOP_RISK_BASELINE, include_tests)?;
     Ok(CompleteRiskRanking {
-        rows: top_risk_files_with_options(db, TOP_RISK_BASELINE, include_tests)?,
+        rows: assessments
+            .iter()
+            .map(|assessment| SessionRiskEntry {
+                file: assessment.file.clone(),
+                score: assessment.score,
+            })
+            .collect(),
+        assessments,
     })
 }
 
@@ -208,8 +270,10 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
         .collect();
     let (after_scores, risk_failure) = risk_scores(db, &baseline_files)?;
     let mut risk_assessment_failed = risk_failure.is_some();
-    let after_by_file: HashMap<&str, f64> =
-        after_scores.iter().map(|(f, s)| (f.as_str(), *s)).collect();
+    let after_by_file: HashMap<&str, f64> = after_scores
+        .iter()
+        .map(|assessment| (assessment.file.as_str(), assessment.score))
+        .collect();
 
     let mut risk_regressions: Vec<SessionRiskRegression> = Vec::new();
     let mut max_risk_regression = 0.0_f64;
@@ -336,8 +400,8 @@ fn compute_cycles(db: &Database) -> Result<(Vec<Vec<String>>, u32)> {
 }
 
 /// The top-`limit` highest-risk files across the whole indexed project.
-/// Backs `project_overview`. Returns empty when no files are indexed or git
-/// history hasn't been indexed (every file scores ~0 without it).
+/// Backs `project_overview`. Missing history leaves only structural scores;
+/// the complete ranking retains that measurement state for later reuse.
 pub fn top_risk_files(db: &Database, limit: usize) -> Result<Vec<SessionRiskEntry>> {
     top_risk_files_with_options(db, limit, false)
 }
@@ -349,6 +413,20 @@ pub fn top_risk_files_with_options(
     limit: usize,
     include_tests: bool,
 ) -> Result<Vec<SessionRiskEntry>> {
+    Ok(top_risk_assessments(db, limit, include_tests)?
+        .into_iter()
+        .map(|assessment| SessionRiskEntry {
+            file: assessment.file,
+            score: assessment.score,
+        })
+        .collect())
+}
+
+fn top_risk_assessments(
+    db: &Database,
+    limit: usize,
+    include_tests: bool,
+) -> Result<Vec<CachedRiskAssessment>> {
     checkpoint()?;
     let _policy = crate::git_history::CompletePolicy::enter_current();
     let files: Vec<String> = db
@@ -368,7 +446,7 @@ fn compute_top_risk(
     db: &Database,
     files: &[String],
     limit: usize,
-) -> Result<Vec<SessionRiskEntry>> {
+) -> Result<Vec<CachedRiskAssessment>> {
     // Bound per-file dependency walks by selecting high-churn candidates.
     const CANDIDATE_BUDGET: usize = 400;
     let candidates: Vec<String> = if files.len() > CANDIDATE_BUDGET {
@@ -385,14 +463,10 @@ fn compute_top_risk(
         files.to_vec()
     };
     checkpoint()?;
-    let (pairs, failure) = risk_scores(db, &candidates)?;
+    let (mut scored, failure) = risk_scores(db, &candidates)?;
     if let Some(cause) = failure {
         return Err(IncompleteRiskRanking::new(cause).into());
     }
-    let mut scored: Vec<SessionRiskEntry> = pairs
-        .into_iter()
-        .map(|(file, score)| SessionRiskEntry { file, score })
-        .collect();
     scored.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -404,7 +478,7 @@ fn compute_top_risk(
 
 /// Batch shared graph work; fall back to per-file scoring on batch failure.
 /// Retain the first unrecovered error alongside any completed scores.
-type RiskScores = (Vec<(String, f64)>, Option<anyhow::Error>);
+type RiskScores = (Vec<CachedRiskAssessment>, Option<anyhow::Error>);
 
 fn risk_scores(db: &Database, files: &[String]) -> Result<RiskScores> {
     checkpoint()?;
@@ -412,10 +486,21 @@ fn risk_scores(db: &Database, files: &[String]) -> Result<RiskScores> {
         return Ok((Vec::new(), None));
     }
     match assess_risk_batch(db, files) {
-        Ok(batch) => Ok((
-            batch.files.into_iter().map(|r| (r.file, r.score)).collect(),
-            None,
-        )),
+        Ok(batch) => {
+            let assessments = batch
+                .files
+                .into_iter()
+                .map(|mut assessment| {
+                    for note in &mut assessment.notes {
+                        if let Some(full) = batch.legend.get(note) {
+                            *note = full.clone();
+                        }
+                    }
+                    CachedRiskAssessment::from(assessment)
+                })
+                .collect();
+            Ok((assessments, None))
+        }
         batch => {
             checkpoint()?;
             if let Err(e) = batch {
@@ -428,14 +513,13 @@ fn risk_scores(db: &Database, files: &[String]) -> Result<RiskScores> {
             }
             let mut out = Vec::with_capacity(files.len());
             let mut failure = None;
-            // Only `score` is kept, so skip the per-file symbol resolution
-            // pass and share one walk cache across the fallback.
+            // Ranking and card facts do not need the symbol breakdown.
             let mut cache = WalkCache::default();
             let mut scope = RiskRequestScope::score_only(&mut cache);
             for f in files {
                 checkpoint()?;
                 match assess_risk_with_scope(db, f, &mut scope) {
-                    Ok(r) => out.push((r.file, r.score)),
+                    Ok(r) => out.push(CachedRiskAssessment::from(r)),
                     Err(e) => {
                         checkpoint()?;
                         if e.downcast_ref::<codesage_protocol::work::WorkStopped>()
@@ -458,10 +542,9 @@ fn risk_scores(db: &Database, files: &[String]) -> Result<RiskScores> {
 /// Best-effort `git rev-parse HEAD`. Returns None when not a git repo or
 /// git isn't available; sessions still work without it.
 fn read_git_head(project_root: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = crate::git_command(project_root)
         .arg("rev-parse")
         .arg("HEAD")
-        .current_dir(project_root)
         .output()
         .ok()?;
     if !out.status.success() {
@@ -612,10 +695,25 @@ mod tests {
         let mut file = String::with_capacity(1024);
         file.push_str("src/a.rs");
         rows.push(SessionRiskEntry { file, score: 0.5 });
+        let mut assessments = Vec::with_capacity(300);
+        let mut notes = Vec::with_capacity(20);
+        let mut note = String::with_capacity(4096);
+        note.push_str("unscored history");
+        notes.push(note);
+        assessments.push(CachedRiskAssessment {
+            file: "src/a.rs".into(),
+            score: 0.5,
+            unscored: true,
+            notes,
+        });
         let expected = std::mem::size_of::<CompleteRiskRanking>()
             + rows.capacity() * std::mem::size_of::<SessionRiskEntry>()
-            + rows[0].file.capacity();
-        let ranking = CompleteRiskRanking { rows };
+            + rows[0].file.capacity()
+            + assessments.capacity() * std::mem::size_of::<CachedRiskAssessment>()
+            + assessments[0].file.capacity()
+            + assessments[0].notes.capacity() * std::mem::size_of::<String>()
+            + assessments[0].notes[0].capacity();
+        let ranking = CompleteRiskRanking { rows, assessments };
         assert_eq!(ranking.allocated_bytes(), expected);
         assert!(ranking.allocated_bytes() >= 400 * std::mem::size_of::<SessionRiskEntry>() + 1024);
     }

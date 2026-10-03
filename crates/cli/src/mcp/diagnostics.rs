@@ -13,6 +13,7 @@ const HISTOGRAM_MS: [u64; 10] = [1, 5, 10, 50, 100, 500, 1_000, 5_000, 25_000, u
 
 fn tool_name(value: &str) -> &'static str {
     match value {
+        "describe" => "describe",
         "project_overview" => "project_overview",
         "search" => "search",
         "find_symbol" => "find_symbol",

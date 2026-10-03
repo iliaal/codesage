@@ -14,6 +14,85 @@ use codesage_storage::Database;
 use serde_json::Value;
 
 #[test]
+fn daemon_git_reads_follow_each_project_despite_startup_selectors() {
+    let projects = tempfile::tempdir().unwrap();
+    let target = projects.path().join("target");
+    let decoy = projects.path().join("decoy");
+    for (root, source) in [
+        (&target, "pub fn selected(x: i32) -> i32 { x }\n"),
+        (&decoy, "pub fn selected() -> i32 { 1 }\n"),
+    ] {
+        std::fs::create_dir(root).unwrap();
+        let git = |args: &[&str], input: Option<String>| {
+            let mut child = Command::new("git")
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .current_dir(root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            if let Some(input) = input {
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(input.as_bytes())
+                    .unwrap();
+            } else {
+                drop(child.stdin.take());
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        };
+        git(&["init", "-q", "-b", "main"], None);
+        git(
+            &["fast-import", "--quiet"],
+            Some(format!(
+                "commit refs/heads/main\ncommitter Fixture <fixture@example.invalid> 1700000000 +0000\ndata 4\nfix\nM 100644 inline src/lib.rs\ndata {}\n{source}\n",
+                source.len()
+            )),
+        );
+        git(&["reset", "--hard", "-q", "HEAD"], None);
+    }
+    let git_dir = decoy.join(".git");
+    let index = git_dir.join("index");
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start_with_env(
+        runtime.path(),
+        &[
+            ("GIT_DIR", git_dir.to_str().unwrap()),
+            ("GIT_WORK_TREE", decoy.to_str().unwrap()),
+            ("GIT_INDEX_FILE", index.to_str().unwrap()),
+            ("GIT_COMMON_DIR", git_dir.to_str().unwrap()),
+        ],
+    );
+    session.initialize();
+    for (id, root, arity) in [(2, &target, 1), (3, &decoy, 0), (4, &target, 1)] {
+        let report = call_mcp_tool(
+            &mut session,
+            id,
+            "edit_check",
+            serde_json::json!({
+                "project": root,
+                "file_path": "src/lib.rs",
+                "target": "selected",
+                "replacement": "pub fn selected() -> i32 { 0 }"
+            }),
+        );
+        assert_eq!(report["before"]["arity"]["minimum"], arity, "{report}");
+        assert_eq!(report["worktree_matches_head"], true, "{report}");
+    }
+}
+
+#[test]
 fn mcp_shim_starts_daemon_and_lists_tools() {
     let runtime = tempfile::tempdir().unwrap();
     let _daemon_cleanup = DaemonCleanup {
@@ -1136,6 +1215,11 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
 
     // Preserve order: session_end requires the preceding session_start.
     let calls: Vec<(&str, Value, &[&str])> = vec![
+        (
+            "describe",
+            serde_json::json!({"target": "file:src/lib.rs"}),
+            &["card", "cost"],
+        ),
         (
             "edit_check",
             serde_json::json!({"file_path":"src/util.rs", "symbol_name":"shared_value", "replacement":"pub fn shared_value() -> u32 { 8 }"}),

@@ -51,6 +51,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Describe an indexed file, symbol, feature, or directory
+    Describe {
+        target: String,
+        #[arg(long, default_value = "compact", value_parser = ["compact", "standard", "full"])]
+        detail: String,
+        #[arg(long, value_delimiter = ',')]
+        sections: Option<Vec<String>>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Initialize CodeSage for the current project
     Init {
         /// Initialize even in a directory codesage would refuse (filesystem
@@ -219,11 +229,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Export a context bundle for a query or symbol
+    /// Export a context bundle for an entity target or semantic query
     Export {
-        /// Query string or symbol name
+        /// Shared target grammar (handle, indexed path, path:line, name, route, command), or free text
         target: String,
-        /// Treat target as a symbol name instead of a query
+        /// Deprecated: force symbol lookup for unresolved text
         #[arg(long)]
         symbol: bool,
         /// Max primary results
@@ -1105,6 +1115,12 @@ fn run(cli: Cli) -> Result<()> {
             json,
         ),
         Commands::Overview { json } => session::cmd_overview(json),
+        Commands::Describe {
+            target,
+            detail,
+            sections,
+            json,
+        } => commands::describe::run(&target, &detail, sections, json),
         Commands::Export {
             target,
             symbol,

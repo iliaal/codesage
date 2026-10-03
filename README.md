@@ -9,7 +9,7 @@
 
 ![CodeSage: structural and semantic code intelligence for AI agents](images/codesage-hero.jpg)
 
-CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP. Nine languages today (PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go). On the [semble](https://github.com/MinishLab/semble) retrieval corpus, codesage `search` scores **per-language NDCG@10 of 0.7455–0.9434 across 663 queries** (see [External-corpus benchmark](#external-corpus-benchmark-semble) below).
+CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP. Nine languages today (PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go). A [controlled run on 20 public Requests queries](bench/public-corpus-results/requests-controls-2026-10-03/README.md) measured recall@10 of 1.00 versus 0.45 for a random-file placebo at the same byte budget. This bounded result does not establish quality across languages.
 
 ## 🔍 What you can do with it
 
@@ -34,6 +34,7 @@ The rows follow the capabilities that GitNexus, SocratiCode, code-review-graph, 
 | Natural-language semantic search | ✓ Jina code embeddings + optional cross-encoder reranker |
 | Symbol-level lookup (definitions, references, callers/callees, inheritance) | ✓ tree-sitter, 9 languages, exact line/column ranges |
 | File-level dependency mapping (imports / imported-by) | ✓ via `list_dependencies` |
+| One entity card (file, symbol, feature, or directory) | ✓ via `describe` and `codesage describe`, with section expansion calls |
 | Change impact / blast-radius analysis | ✓ via `impact_analysis`, configurable depth, symbol or file target |
 | Call-flow / "who-touches-X" tracing | ✓ via `find_references` + `impact_analysis` composition |
 | Per-file risk score (churn, fix ratio, blast radius, coupling, test gap, cycles, trust boundaries) | ✓ via `assess_risk`, seven-signal blend |
@@ -47,7 +48,7 @@ The rows follow the capabilities that GitNexus, SocratiCode, code-review-graph, 
 | Cycle / SCC detection in the import graph | ✓ folded into `assess_risk` and `assess_risk_diff.cycles_touching_patch` |
 | Feature-slice mapping (behavior-keyed bundles) | ✓ via `codesage map` / `features-list` / `feature-show` / `feature-for`, MCP `list_features` / `find_feature` |
 | Curated feature bundle (entry + owned + tests + context for one slice) | ✓ via `codesage feature-bundle <id>` and MCP `feature_bundle` |
-| Trust-boundary derivation (network / fs / secrets / process-exec / db / etc.) | ✓ per-file table from imports/includes/calls, aggregated per feature, feeds `assess_risk` |
+| Trust-boundary derivation (network / fs / secrets / process-exec / db / etc.) | ✓ per-file table from imports/includes/calls and Java framework roles, aggregated per feature, feeds `assess_risk` |
 | Local deployment (no Docker, no managed services) | ✓ one application binary + one SQLite file per project; Linux inference needs ONNX Runtime |
 | Auto-refresh on commit/merge/checkout/rebase | ✓ git hooks installed by `codesage install-hooks` |
 | Symbol-level edits (rename, move, replace_symbol_body) | Not supported: read-only by design; pair with Serena or your editor |
@@ -78,7 +79,7 @@ For Linux CPU inference, install the runtime described in [CPU setup](#cpu-setup
 
 ## 📊 Benchmarks
 
-Retrieval quality is measured against semble's published corpus. See [External-corpus benchmark](#external-corpus-benchmark-semble) below for the current per-language table and its artifact.
+Retrieval quality is measured against semble's published corpus. The current controlled measurement covers its 20 Requests queries; the broader per-language table below is historical and has no measured placebo delta.
 
 The git-mined ripgrep and nest figures were removed on 2026-08-04. They were measured at codesage 0.4.5, 16 tagged releases earlier (`git tag --sort=v:refname`), and describe a ranker that has since been largely rewritten. Neither corpus is present in `CODESAGE_BENCH_CORPUS_DIR`, so they cannot be re-measured at all. The same applies to the code-review-graph head-to-head that shared those corpora.
 
@@ -86,21 +87,34 @@ CodeSage embeds chunks (~50-line regions) rather than individual function bodies
 
 ### External-corpus benchmark (semble)
 
+On 2026-10-03, installed CodeSage 0.38.0 ran all 20 corrected Requests queries against a freshly built CUDA index at the pinned repository revision. Each query used private inference in a fresh runtime directory, with no daemon reuse. The measured ranking override was `CODESAGE_QUALIFIED_NAME_BOOST=1`. The runner executed a seeded random-file placebo, a real `rg --sort path` floor, and rg cut at the CodeSage byte budget over the same 18 eligible files.
+
+| Arm | Recall@10 | NDCG@10 | Mean path/content bytes |
+|---|--:|--:|--:|
+| CodeSage | 1.0000 | 0.9262 | 15,414.75 |
+| Matched-byte placebo | 0.4500 | 0.2246 | 15,414.75 |
+| rg floor | 0.6500 | 0.3313 | 34,207.40 |
+| rg at matched budget | 0.6500 | 0.3313 | 11,466.95 |
+
+CodeSage minus placebo recall@10 was **+0.5500**, with 11/20 strict case wins. The [scorecard and provenance](bench/public-corpus-results/requests-controls-2026-10-03/README.md) define the byte unit, random sampling, literal-token rg query policy, and limits of this single-repository, single-seed measurement. All 20 placebo pages consumed exactly the CodeSage budget; rg can exhaust its matches before that budget. This measures current-state file retrieval, not agent completion, indexing speed, or prospective change prediction.
+
+The following 2026-09-08 figures are retained as historical observations from a modified 0.27.0 binary. Their placebo deltas are **unknown**: the original runs did not execute controls. They are withdrawn as current-release quality or ranking-advantage claims. A controlled rerun across all 663 queries is still needed for those claims.
+
 [semble](https://github.com/MinishLab/semble) publishes 1,251 queries over 63 repositories and 19 languages. This 2026-09-08 run uses its corrected annotations at [a772a37](https://github.com/MinishLab/semble/commit/a772a37d558c11bffbd99b18141705df3f2982be) and each repository's pinned revision and `benchmark_root`.
 
 CodeSage uses Jina v2 base-code embeddings and the MiniLM cross-encoder reranker on CUDA. Results are deduplicated by file; each language's NDCG@10 is the mean over its queries.
 
-| Language | CodeSage NDCG@10 | Repositories | Queries |
-|---|--:|--:|--:|
-| JavaScript | 0.9434 | 3 | 60 |
-| C++ | 0.9007 | 3 | 60 |
-| Go | 0.8805 | 3 | 58 |
-| Python | 0.8686 | 9 | 184 |
-| PHP | 0.8539 | 3 | 60 |
-| Java | 0.8441 | 3 | 61 |
-| Rust | 0.7653 | 3 | 60 |
-| TypeScript | 0.7493 | 3 | 60 |
-| C | 0.7455 | 3 | 60 |
+| Language | Historical CodeSage NDCG@10 | Placebo delta | Repositories | Queries |
+|---|--:|--:|--:|--:|
+| JavaScript | 0.9434 | unknown | 3 | 60 |
+| C++ | 0.9007 | unknown | 3 | 60 |
+| Go | 0.8805 | unknown | 3 | 58 |
+| Python | 0.8686 | unknown | 9 | 184 |
+| PHP | 0.8539 | unknown | 3 | 60 |
+| Java | 0.8441 | unknown | 3 | 61 |
+| Rust | 0.7653 | unknown | 3 | 60 |
+| TypeScript | 0.7493 | unknown | 3 | 60 |
+| C | 0.7455 | unknown | 3 | 60 |
 
 [Run artifact](bench/public-corpus-results/semble-per-language-2026-09-08-corrected.json): 33 repositories, 663 queries, nine languages, zero skipped repositories, and zero degraded queries. It records per-query stderr and fallback classification, annotation and source hashes, the CUDA binary hash, and fresh fingerprint attestations for all indexes. The binary reports 0.27.0 and includes the recorded uncommitted changes; it is not the stock 0.27.0 release. Parser syntax-error diagnostics remain in the artifact, separately from read failures and query degradation.
 
@@ -119,7 +133,7 @@ The harness retains usable results from nonzero exits and reports degradation pe
 
 The table measures codesage against semble's published ground truth. It does not compare codesage with semble: a head-to-head would require running semble end-to-end on the same 63 repos under matched conditions, which is out of scope here.
 
-Use the annotation and repository revisions and embedding configurations recorded in the artifact. Clear experimental `CODESAGE_*` overrides and fully rebuild the indexes with the matching CUDA binary before scoring:
+To reproduce the historical instrument, use the annotation and repository revisions and embedding configurations recorded in its artifact. This command does not execute placebo or rg controls; use `bench/codesage-bench-runner` for controlled ranking claims. Clear experimental `CODESAGE_*` overrides and fully rebuild the indexes with the matching CUDA binary before scoring:
 
 ```sh
 python3 bench/semble-ndcg-runner \
@@ -132,7 +146,7 @@ python3 bench/semble-ndcg-runner \
 
 Index each repo inside its `benchmark_root`, not at the repo root, and pass `--codesage-bin` as an absolute path: each search runs with its cwd set to the corpus repo.
 
-For your own codebase, `bench/codesage-bench-runner <corpus.yaml>` takes a `project_root` plus a `cases` list of `{id, query, expected_files}`. Corpora are not bundled, so private repo names don't leak by accident.
+For your own codebase, `bench/codesage-bench-runner <corpus.yaml>` takes a `project_root` plus a `cases` list of `{id, query, expected_files}`. It always executes placebo and rg controls, ignores ambient rg configuration with `--no-config`, refuses stale semantic indexes, and pins source, chunk, config, binary, ranking settings, and model artifact provenance. Executable paths resolve once from your caller directory and `PATH`; every child uses that absolute identity. Each query runs private inference in a fresh runtime directory; initialization logs and directory checks enforce no daemon reuse. If you configure a reranker, repeat `--reranker-artifact` for its tokenizer and selected ONNX graph. When you compare several input files, each paired case must agree on its originating provenance; compatible projects may use different file orders and partitions. Private corpora are not bundled.
 
 ## 🚀 Getting started
 
@@ -161,7 +175,8 @@ codesage impact src/auth/session.ts --json
 
 # Context bundle for LLM consumption
 codesage export "authentication flow" --limit 5 --callers
-codesage export MyClass --symbol --format md
+codesage export MyClass --format md
+codesage export src/auth/session.ts --format json
 codesage export "auth flow" --format ingest    # gitingest-style flat-text bundle
 
 # Git history: churn, fix ratio, co-change, risk score
@@ -285,7 +300,15 @@ After upgrading, run `codesage map` in an existing project to refresh its route 
 codesage trust-boundaries crates/cli/src/main.rs --json
 ```
 
-Per-file capability tags (network, filesystem, process-exec, secrets, database, user-input, external-api, serialization, auth, concurrency) derived from imports / includes / calls. The same signal contributes to `assess_risk` and surfaces a "crosses N trust boundaries, security review recommended" note when a file touches three or more. These tags prioritize inspection; they do not trace untrusted values from sources to sinks or establish exploitability.
+Per-file capability tags (network, filesystem, process-exec, secrets, database, user-input, external-api, serialization, auth, concurrency) derived from imports / includes / calls and source-evidenced Java framework roles. The same signal contributes to `assess_risk` and surfaces a "crosses N trust boundaries, security review recommended" note when a file touches three or more. These tags prioritize inspection; they do not trace untrusted values from sources to sinks or establish exploitability.
+
+For Maven projects, `codesage map` groups conventional `src/main/java/` sources per module into web-entrypoint, application-service, persistence-boundary, external-client, configuration, and framework-component slices. Qualified or imported Spring, JAX-RS, servlet, and persistence annotations, repository inheritance, and HTTP client fields supply role evidence; file names and directory names alone do not. Imported types respect lexical shadowing, type parameters, and same-package declarations within the source root; supported client builders also accept static type imports. Source-declared single static member types take precedence over wildcard imports; same-named methods and fields do not shadow types. Web entrypoints add network, user-input, and serialization; persistence boundaries add database and serialization; external clients add network, external-api, and serialization. Role and import tags merge without duplicates. Custom Maven source roots and custom meta-annotations remain unclassified. Sources over 1 MB skip role inference while retaining current import tags within the structural reader's 10 MiB limit. An unavailable source or a 50,000-file discovery cap reports partial mapping and retains existing slices. If Java declaration context is unavailable, indexing preserves prior Java facts, reports incomplete work, and marks interpretation stale for retry. Run `codesage index --no-semantic` after upgrading to populate existing Java files and their slices; adding, changing, or removing Java source also refreshes unchanged Java dependents on the next index.
+
+If a conflicting single static import's member kind is unavailable, wildcard role inference for that name remains unclassified. Java declaration context requires UTF-8 source; failed reads retain prior facts until a successful retry.
+
+Qualified framework spellings also respect lexical, imported, and same-package types at the start of the name. Conventional Maven test sources can see declarations from the same module's main source root; main sources do not see test-only declarations, and modules remain isolated. Comments and type-use annotations inside qualified names preserve their type identity. HTTP client array fields supply the same role evidence as scalar fields, including multidimensional arrays and dimensions written after the variable name. Generic containers of clients supply no direct client role.
+
+Accessible source-declared member types imported with ordinary or static wildcards participate in type precedence; static wildcards include only static member types, and imported methods and values do not shadow types. Import lookup respects public, package, and private declaration access. Interface and annotation-type client fields supply the same role evidence as class fields.
 
 ## 🔌 Agent plugins
 
@@ -581,7 +604,7 @@ Storage is a single SQLite database per project at `.codesage/index.db`: structu
 
 `bench/` holds the harness:
 
-- `codesage-bench-runner` runs a YAML corpus of ground-truth cases through `codesage search` and reports miss rate, median first-hit, recall@5, and recall@10.
+- `codesage-bench-runner` reports CodeSage, matched-byte placebo, and executed rg scores and byte costs for a pinned YAML corpus with private inference per query. `compare-runs.py` requires recorded text queries, complete supported semantic fingerprints and runtime artifact evidence, consistent file metrics, and compatible source/index/model/device/artifact/settings/instrument provenance in controlled results.
 - `extract-eval-cases.py` mines eval cases from Claude Code session transcripts and git commit history.
 
 Corpora aren't bundled. Bring your own, or point the plugin at `$CODESAGE_BENCH_CORPUS_DIR`.

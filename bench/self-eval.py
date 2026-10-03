@@ -118,6 +118,9 @@ try:
 except ImportError:
     sys.exit("pyyaml required: pip install pyyaml")
 
+sys.path.append(str(Path(__file__).resolve().parent))
+from _retrieval_controls import git_environment  # noqa: E402
+
 MIN_COMMENT_WORDS = 6
 MIN_DOC_QUERY_TOKENS = 4
 MAX_DOC_QUERY_WORDS = 12
@@ -915,6 +918,7 @@ def _git(project: Path, args: list[str], *, binary: bool = False) -> subprocess.
             ["git", *args], cwd=project, capture_output=True, text=not binary,
             encoding=None if binary else "utf-8", errors=None if binary else "replace",
             timeout=GIT_TIMEOUT_SECS,
+            env=git_environment(),
         )
     except subprocess.TimeoutExpired:
         print(f"[self-eval] warn: git timed out after {GIT_TIMEOUT_SECS}s in {project}", file=sys.stderr)
@@ -925,7 +929,7 @@ def _git(project: Path, args: list[str], *, binary: bool = False) -> subprocess.
 
 
 def git_log_commits(
-    project: Path, commits: int,
+    project: Path, commits: int, pinned_head: str | None = None,
 ) -> tuple[list[tuple[str, str, list[str]]], int] | None:
     """Return ([(sha, subject, changed_paths)], window_size) or None when git fails.
 
@@ -934,7 +938,12 @@ def git_log_commits(
     project directory are returned, with `--relative` paths that match the
     index when the project root is a git subdirectory.
     """
-    rev = _git(project, ["rev-list", "--no-merges", f"-n{commits}", "HEAD"])
+    if pinned_head is None:
+        head = _git(project, ["rev-parse", "--verify", "HEAD^{commit}"])
+        if head is None or head.returncode != 0:
+            return None
+        pinned_head = head.stdout.strip()
+    rev = _git(project, ["rev-list", "--no-merges", f"-n{commits}", pinned_head])
     if rev is None or rev.returncode != 0:
         detail = rev.stderr.strip() if rev is not None else "timeout"
         print(f"[cochange] warn: git rev-list failed in {project}: {detail}", file=sys.stderr)
@@ -942,7 +951,7 @@ def git_log_commits(
     window = set(rev.stdout.split())
     log = _git(project, [
         "log", "-z", "--name-only", "--no-merges", "--relative", f"-n{commits}",
-        "--format=%x00%H%x00%s", "--", ".",
+        "--format=%x00%H%x00%s", pinned_head, "--", ".",
     ], binary=True)
     if log is None or log.returncode != 0:
         detail = log.stderr.decode("utf-8", errors="replace").strip() if log is not None else "timeout"
@@ -1454,6 +1463,18 @@ def index_digest(conn: sqlite3.Connection) -> str:
     return f"{h.hexdigest()[:16]} (files={counts[0]}, symbols={counts[1]}, refs={counts[2]})"
 
 
+def source_snapshot_digest(project: Path, conn: sqlite3.Connection) -> str:
+    digest = hashlib.sha256()
+    for row in conn.execute("SELECT path FROM files ORDER BY path"):
+        path = row["path"]
+        try:
+            source = hashlib.sha256((project / path).read_bytes()).hexdigest()
+        except OSError:
+            source = "unavailable"
+        digest.update(f"{path}\0{source}\n".encode("utf-8", errors="surrogateescape"))
+    return digest.hexdigest()
+
+
 def script_revision(script: Path) -> str:
     """HEAD of the script's repo; `-dirty+sha256:<8>` appended when the script has local edits."""
     script = script.resolve()
@@ -1466,9 +1487,10 @@ def script_revision(script: Path) -> str:
     return rev.stdout.strip() + (f"-dirty+sha256:{digest[:8]}" if dirty else "")
 
 
-def provenance_lines(project: Path, conn: sqlite3.Connection) -> list[str]:
-    head = _git(project, ["rev-parse", "HEAD"])
-    project_head = head.stdout.strip() if head is not None and head.returncode == 0 else "not-a-git-repo"
+def provenance_lines(project: Path, conn: sqlite3.Connection, project_head: str | None = None) -> list[str]:
+    if project_head is None:
+        head = _git(project, ["rev-parse", "HEAD"])
+        project_head = head.stdout.strip() if head is not None and head.returncode == 0 else "not-a-git-repo"
     script_rev = script_revision(Path(__file__))
     try:
         ver = subprocess.run(["codesage", "--version"], capture_output=True, text=True, timeout=15)
@@ -1481,6 +1503,7 @@ def provenance_lines(project: Path, conn: sqlite3.Connection) -> list[str]:
         f"codesage: {codesage_version}",
         f"script_revision: {script_rev}",
         f"index_digest: {index_digest(conn)}",
+        "instrument: current-state retrieval; cochange history is retrospective, not prospective prediction",
     ]
 
 
@@ -1588,9 +1611,11 @@ def write_corpus(out_dir: Path, filename: str, text: str) -> Path:
     return path
 
 
-def run_cochange(project: Path, args: argparse.Namespace, conn: sqlite3.Connection) -> Path | None:
+def run_cochange(project: Path, args: argparse.Namespace, conn: sqlite3.Connection,
+                 provenance: list[str] | None = None, pinned_head: str | None = None,
+                 source_digest: str | None = None) -> Path | None:
     stats = CochangeStats()
-    walked = git_log_commits(project, args.commits)
+    walked = git_log_commits(project, args.commits, pinned_head)
     if walked is None:
         print("[cochange] warn: skipping cochange (project is not a usable git checkout)", file=sys.stderr)
         return None
@@ -1612,10 +1637,13 @@ def run_cochange(project: Path, args: argparse.Namespace, conn: sqlite3.Connecti
         f"seed by subject: {stats.seed_by_subject}, seed by symbol count: {stats.seed_by_symbols}",
         f"cases written: {len(cases)}",
     ]
+    if source_digest is not None and source_snapshot_digest(project, conn) != source_digest:
+        raise RuntimeError("source changed during corpus generation; no cochange corpus written")
     path = write_corpus(
         args.out,
         f"{project_name(project)}-cochange.yaml",
-        render_corpus(project, "cochange", cases, summary, provenance=provenance_lines(project, conn)),
+        render_corpus(project, "cochange", cases, summary,
+                      provenance=provenance if provenance is not None else provenance_lines(project, conn, pinned_head)),
     )
     for line in summary[:-1]:
         print(f"[cochange] {line}")
@@ -1623,7 +1651,8 @@ def run_cochange(project: Path, args: argparse.Namespace, conn: sqlite3.Connecti
     return path
 
 
-def run_known_item(project: Path, args: argparse.Namespace, conn: sqlite3.Connection) -> Path:
+def run_known_item(project: Path, args: argparse.Namespace, conn: sqlite3.Connection,
+                   provenance: list[str] | None = None, source_digest: str | None = None) -> Path:
     stats = KnownItemStats()
     symbols = eligible_symbols(
         conn,
@@ -1650,12 +1679,14 @@ def run_known_item(project: Path, args: argparse.Namespace, conn: sqlite3.Connec
     first += f", sampled: {stats.sampled} (seed {args.seed})"
     summary = [first, f"cases written: {len(cases)}, doc-leaky: {stats.leaky}"]
     suffix = "known-item" if args.gold == "defining" else "known-item-refs"
+    if source_digest is not None and source_snapshot_digest(project, conn) != source_digest:
+        raise RuntimeError("source changed during corpus generation; no known-item corpus written")
     path = write_corpus(
         args.out,
         f"{project_name(project)}-{suffix}.yaml",
         render_corpus(
             project, "known-item", cases, summary, gold=args.gold,
-            provenance=provenance_lines(project, conn),
+            provenance=provenance if provenance is not None else provenance_lines(project, conn),
             gate_lines=stats.gate.lines() if args.gold == "references" else None,
         ),
     )
@@ -1715,13 +1746,22 @@ def main(argv: list[str] | None = None) -> int:
 
     conn = open_index(project)
     try:
+        conn.execute("BEGIN")
+        head = _git(project, ["rev-parse", "--verify", "HEAD^{commit}"])
+        pinned_head = head.stdout.strip() if head is not None and head.returncode == 0 else "not-a-git-repo"
+        provenance = provenance_lines(project, conn, pinned_head)
+        source_digest = source_snapshot_digest(project, conn)
+        provenance.append(f"source_snapshot_sha256: {source_digest}")
         cochange_path: Path | None = None
         if args.mode in ("cochange", "both"):
-            cochange_path = run_cochange(project, args, conn)
+            cochange_path = run_cochange(project, args, conn, provenance, pinned_head, source_digest)
             if cochange_path is None and args.mode == "cochange":
                 return 1
         if args.mode in ("known-item", "both"):
-            run_known_item(project, args, conn)
+            run_known_item(project, args, conn, provenance, source_digest)
+    except RuntimeError as exc:
+        print(f"[self-eval] error: {exc}", file=sys.stderr)
+        return 1
     finally:
         conn.close()
     return 0

@@ -32,6 +32,7 @@ Every tool that names an entity takes `target`, or `targets` on the tools that t
 ## Route MCP calls
 
 - Start unfamiliar-project orientation with `mcp__codesage__project_overview` when its combined language, freshness, feature, risk, and convention summary replaces several narrower calls.
+- Use `mcp__codesage__describe` for one file, symbol, feature, or directory card. Follow a section's `expand` call for more detail; inspect `completeness` and `recover` when a section is unscored. An ambiguous target returns candidates without combining their facts.
 - Use `mcp__codesage__find_symbol` for exact definitions and `mcp__codesage__find_references` for callers, imports, inheritance, and type uses.
 - Use `mcp__codesage__search` for intent, behavior, or symptoms when the symbol name is unknown.
 - Use `mcp__codesage__list_features` to discover mapped behavior slices and `mcp__codesage__find_feature` to identify the slice owning a file.

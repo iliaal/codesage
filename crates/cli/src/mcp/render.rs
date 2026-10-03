@@ -25,6 +25,19 @@ impl CodeSageServer {
         self.render_coverage_gated(project, r, kind, true)
     }
 
+    pub(super) fn render_read_only<T: serde::Serialize>(
+        &self,
+        project: &str,
+        r: Result<T>,
+        kind: &str,
+    ) -> CallToolResult {
+        super::next::annotate(
+            project,
+            kind,
+            self.annotate_staleness_mode(project, render_with_kind(r, kind), true),
+        )
+    }
+
     /// Suppress coverage notes for intentionally empty pages (zero limit or exhausted offset).
     pub(super) fn render_coverage_gated<T: serde::Serialize>(
         &self,
@@ -155,7 +168,16 @@ impl CodeSageServer {
     pub(super) fn annotate_staleness(
         &self,
         project: &str,
+        result: CallToolResult,
+    ) -> CallToolResult {
+        self.annotate_staleness_mode(project, result, false)
+    }
+
+    fn annotate_staleness_mode(
+        &self,
+        project: &str,
         mut result: CallToolResult,
+        read_only: bool,
     ) -> CallToolResult {
         if result.is_error == Some(true) || !staleness_enabled() {
             return result;
@@ -172,7 +194,7 @@ impl CodeSageServer {
         }
         paths.truncate(STALENESS_MAX_FILES);
 
-        let stale = match self.compute_stale_files(project, &paths) {
+        let stale = match self.compute_stale_files(project, &paths, read_only) {
             Ok(stale) if !stale.is_empty() => stale,
             Ok(_) => return result,
             Err(e) => {
@@ -200,17 +222,30 @@ impl CodeSageServer {
     }
 
     /// Changed, missing, or unreadable indexed paths are stale; unindexed references are skipped.
-    fn compute_stale_files(&self, project: &str, rel_paths: &[String]) -> Result<Vec<String>> {
+    fn compute_stale_files(
+        &self,
+        project: &str,
+        rel_paths: &[String],
+        read_only: bool,
+    ) -> Result<Vec<String>> {
         // `resolve_project_inner` keeps the check free of watcher side effects,
         // so `edit_check` can be annotated without starting one.
-        let state = self.resolve_project_inner(project)?;
+        let state = if read_only {
+            self.resolve_project_read_only(project)?
+        } else {
+            self.resolve_project_inner(project)?
+        };
         let root = state
             .db_path
             .parent()
             .and_then(|p| p.parent())
             .ok_or_else(|| anyhow::anyhow!("could not derive project root from db path"))?
             .to_path_buf();
-        let db = self.open_structural_db_for(&state)?;
+        let db = if read_only {
+            codesage_storage::Database::open_read_only(&state.db_path)?
+        } else {
+            self.open_structural_db_for(&state)?
+        };
         let mut stale = Vec::new();
         for rel in rel_paths {
             let Some(expected) = db.get_file_hash(rel)? else {
@@ -294,7 +329,12 @@ fn render_with_budget<T: serde::Serialize>(
                 serde_json::Value::Array(items) => serde_json::json!({ "results": items }),
                 other => other,
             };
-            let text = serde_json::to_string_pretty(&structured).unwrap_or_default();
+            let text = if kind == "describe" {
+                serde_json::to_string(&structured)
+            } else {
+                serde_json::to_string_pretty(&structured)
+            }
+            .unwrap_or_default();
             let mut result = CallToolResult::structured(structured);
             // Override rmcp's compact JSON with readable transcript output.
             result.content = vec![ContentBlock::text(text)];
@@ -410,8 +450,17 @@ pub(super) fn rerender_json_text(result: &mut CallToolResult) {
         if let Some(text) = content.as_text()
             && serde_json::from_str::<serde_json::Value>(&text.text).is_ok()
         {
-            *content =
-                ContentBlock::text(serde_json::to_string_pretty(payload).unwrap_or_default());
+            let compact = payload.get("tool").and_then(serde_json::Value::as_str)
+                == Some("describe")
+                || payload.get("card").is_some();
+            *content = ContentBlock::text(
+                if compact {
+                    serde_json::to_string(payload)
+                } else {
+                    serde_json::to_string_pretty(payload)
+                }
+                .unwrap_or_default(),
+            );
         }
     }
 }
@@ -584,6 +633,9 @@ fn cap_to_budget_with(
     kind: &str,
     budget_chars: usize,
 ) -> serde_json::Value {
+    if kind == "describe" {
+        return cap_describe(value, budget_chars.saturating_sub(2000));
+    }
     let approx_tokens_budget = budget_chars / MCP_CHARS_PER_TOKEN;
     let hint = budget_hint(kind);
     let initial_len = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
@@ -701,6 +753,75 @@ fn cap_to_budget_with(
             serde_json::Value::Object(map)
         }
         other => other,
+    }
+}
+
+fn cap_describe(mut value: serde_json::Value, budget: usize) -> serde_json::Value {
+    loop {
+        if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= budget) {
+            break;
+        }
+        let Some(sections) = value
+            .pointer_mut("/card/sections")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            break;
+        };
+        let candidate = sections
+            .iter()
+            .filter_map(|(name, section)| {
+                largest_describe_data(section.get("data")?, String::new())
+                    .map(|(pointer, bytes)| (name.clone(), pointer, bytes))
+            })
+            .max_by_key(|(_, _, bytes)| *bytes);
+        let Some((name, pointer, _)) = candidate else {
+            break;
+        };
+        let section = sections.get_mut(&name).expect("selected section");
+        let Some(data) = section
+            .get_mut("data")
+            .and_then(|data| data.pointer_mut(&pointer))
+        else {
+            break;
+        };
+        match data {
+            serde_json::Value::Array(items) => items.truncate(items.len() / 2),
+            serde_json::Value::String(text) => {
+                let mut end = text.len() / 2;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                text.push('…');
+            }
+            _ => break,
+        }
+        section["completeness"] = serde_json::json!({"kind": "truncated", "reason": "response_budget", "recover": section["expand"]});
+    }
+    value
+}
+
+fn largest_describe_data(value: &serde_json::Value, pointer: String) -> Option<(String, usize)> {
+    match value {
+        serde_json::Value::Array(items) if !items.is_empty() && !pointer.ends_with("/lines") => {
+            Some((pointer, serde_json::to_vec(value).ok()?.len()))
+        }
+        serde_json::Value::Object(map) => map
+            .iter()
+            .filter_map(|(key, value)| {
+                let key = key.replace('~', "~0").replace('/', "~1");
+                largest_describe_data(value, format!("{pointer}/{key}"))
+            })
+            .max_by_key(|(_, bytes)| *bytes),
+        serde_json::Value::String(text)
+            if text.len() > 128
+                && ["/text", "/description", "/summary", "/label"]
+                    .iter()
+                    .any(|key| pointer.ends_with(key)) =>
+        {
+            Some((pointer, text.len()))
+        }
+        _ => None,
     }
 }
 
@@ -981,6 +1102,29 @@ fn shrink_content_field(item: &mut serde_json::Value, budget_chars: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn describe_budget_preserves_sections_expansions_and_reports_nested_cuts() {
+        let expand = serde_json::json!({"tool": "describe", "arguments": {"project": "/tmp/project", "target": "file:src/lib.rs", "detail": "full", "sections": ["symbols"]}});
+        let input = serde_json::json!({"card": {"handle": "file:src/lib.rs", "kind": "file", "sections": {
+            "identity": {"data": {"language": "rust", "lines": 9}, "expand": expand},
+            "symbols": {"data": {"total": 100, "top": (0..100).map(|n| serde_json::json!({"handle": format!("sym:src/lib.rs#function_{n}"), "description": "large symbol ".repeat(100)})).collect::<Vec<_>>()}, "expand": expand}
+        }}});
+        let result = super::render_with_budget(Ok(input), "describe", 4000);
+        let output = result.structured_content.as_ref().unwrap();
+        assert!(serde_json::to_vec(output).unwrap().len() <= 4000);
+        assert_eq!(output["card"]["sections"].as_object().unwrap().len(), 2);
+        assert_eq!(output["card"]["sections"]["identity"]["data"]["lines"], 9);
+        assert_eq!(output["card"]["sections"]["symbols"]["data"]["total"], 100);
+        let section = &output["card"]["sections"]["symbols"];
+        assert_eq!(section["expand"], expand);
+        assert_eq!(section["completeness"]["recover"], expand);
+        assert_eq!(section["completeness"]["kind"], "truncated");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.content[0].as_text().unwrap().text)
+                .unwrap(),
+            *output
+        );
+    }
     use std::sync::Arc;
 
     use codesage_protocol::Language;
@@ -1853,6 +1997,7 @@ mod tests {
                     "src/gone.rs".to_string(),
                     "src/never_indexed.rs".to_string(),
                 ],
+                false,
             )
             .unwrap();
 
@@ -2099,7 +2244,11 @@ mod tests {
 
         let server = CodeSageServer::with_state(Arc::new(CodeSageServerState::new()));
         let stale = server
-            .compute_stale_files(root.to_str().unwrap(), std::slice::from_ref(&outside_path))
+            .compute_stale_files(
+                root.to_str().unwrap(),
+                std::slice::from_ref(&outside_path),
+                false,
+            )
             .unwrap();
 
         assert_eq!(stale, vec![outside_path]);

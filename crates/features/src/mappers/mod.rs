@@ -2,6 +2,7 @@
 
 pub mod c;
 pub mod go;
+pub mod java;
 pub mod js;
 pub mod php;
 pub mod python;

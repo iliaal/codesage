@@ -230,18 +230,11 @@ fn noise_path(path: &str) -> bool {
 }
 
 fn git(root: &Path, args: &[&str], deadline: Instant) -> Result<Vec<u8>> {
-    let mut command = Command::new("git");
+    let mut command = crate::git_command(root);
     command
-        .current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .args(["--no-pager", "--literal-pathspecs"])
         .args(args);
     run_git(command, args[0], deadline)

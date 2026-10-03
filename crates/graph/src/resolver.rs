@@ -518,8 +518,11 @@ fn resolve_handle(
             Vec::new(),
         )),
         Handle::Dir { path } => {
-            let prefix = format!("{path}/");
-            let holds_files = !db.indexed_files_with_prefix(&prefix)?.is_empty();
+            let prefix = format!("{}/", path.trim_end_matches('/'));
+            let holds_files = db
+                .indexed_files_with_prefix(&prefix)?
+                .iter()
+                .any(|file| file.starts_with(&prefix));
             let resolution = if holds_files {
                 one(
                     input,
@@ -1067,6 +1070,41 @@ mod tests {
         assert_eq!(moved.resolved[0].via, ResolveVia::Suffix);
         assert!(resolve(&db, "file:src/gone.rs").resolved.is_empty());
         assert!(resolve(&db, "dir:src/empty").resolved.is_empty());
+    }
+
+    #[test]
+    fn directory_handles_require_literal_indexed_ancestry() {
+        let db = project();
+        db.execute_raw_for_tests(
+            "INSERT INTO files (path, language, content_hash) VALUES
+                ('src-other/outside.rs', 'rust', 'outside'),
+                ('literal_/only.rs', 'rust', 'underscore'),
+                ('literalX/outside.rs', 'rust', 'wildcard'),
+                ('literal%/only.rs', 'rust', 'percent'),
+                ('literalXYZ/outside.rs', 'rust', 'wildcard');",
+        )
+        .unwrap();
+        for path in ["src", "src/", "src/index", "literal_", "literal%"] {
+            let handle = Handle::dir(path).unwrap().to_string();
+            let resolution = resolve(&db, &handle);
+            assert_eq!(resolution.kind, TargetKind::Dir);
+            assert_eq!(
+                resolution.sole().unwrap().handle,
+                Handle::dir(path.trim_end_matches('/')).unwrap().to_string()
+            );
+        }
+        for path in ["SRC", "LITERAL_", "literal", "src/empty", "absent"] {
+            let handle = Handle::dir(path).unwrap().to_string();
+            let resolution = resolve(&db, &handle);
+            assert_eq!(resolution.kind, TargetKind::Dir);
+            assert!(resolution.resolved.is_empty(), "{resolution:?}");
+            assert_eq!(resolution.candidates_total, 0);
+            let error = require_one(&resolution).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<TargetError>(),
+                Some(TargetError::NotFound { .. })
+            ));
+        }
     }
 
     #[test]

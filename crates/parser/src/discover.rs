@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +11,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 
 use crate::detect::{detect_language_with_dialect, is_unambiguous_cpp_extension};
+use crate::source::IndexableFile;
 
 /// Bound per-file allocation even when generated files evade exclusion patterns.
 pub const MAX_INDEXABLE_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -145,7 +145,7 @@ pub fn discover_files_report_with_cache(
                 return WalkState::Continue;
             }
             let (hash, observation, reused, bytes_hashed) =
-                match hash_indexable_file(path, cache.get(&rel_path)) {
+                match hash_indexable_file(&root, Path::new(&rel_path), cache.get(&rel_path)) {
                     Ok(Some(c)) => c,
                     Ok(None) => {
                         tracing::warn!(
@@ -253,19 +253,19 @@ fn file_stat(_: &std::fs::Metadata) -> Option<FileStat> {
 type HashObservation = (String, Option<CachedFileHash>, bool, u64);
 
 fn hash_indexable_file(
-    path: &Path,
+    root: &Path,
+    relative: &Path,
     cached: Option<&CachedFileHash>,
 ) -> Result<Option<HashObservation>> {
-    let file = std::fs::File::open(path)?;
-    let before = file.metadata()?;
-    if before.len() > MAX_INDEXABLE_FILE_BYTES {
+    let Some(file) = IndexableFile::open(root, relative)? else {
         return Ok(None);
-    }
+    };
     let started = now_ns();
-    let stat = file_stat(&before);
+    let stat = file_stat(file.metadata());
     if let (Some(cached), Some(stat), Some(now)) = (cached, stat.as_ref(), started)
         && cached.reusable(stat, now)
     {
+        file.verify()?;
         return Ok(Some((
             cached.content_hash.clone(),
             Some(cached.clone()),
@@ -273,24 +273,19 @@ fn hash_indexable_file(
             0,
         )));
     }
-    let mut content = Vec::new();
-    (&file)
-        .take(MAX_INDEXABLE_FILE_BYTES + 1)
-        .read_to_end(&mut content)?;
-    if content.len() as u64 > MAX_INDEXABLE_FILE_BYTES {
+    let Some(source) = file.read()? else {
         return Ok(None);
-    }
-    let hash = content_hash(&content);
-    let after = file_stat(&file.metadata()?);
-    let observation = match (stat, after, started) {
-        (Some(stat), Some(after), Some(hashed_at_ns)) if stat == after => Some(CachedFileHash {
+    };
+    let hash = source.content_hash;
+    let observation = match (stat, started) {
+        (Some(stat), Some(hashed_at_ns)) => Some(CachedFileHash {
             stat,
             content_hash: hash.clone(),
             hashed_at_ns,
         }),
         _ => None,
     };
-    Ok(Some((hash, observation, false, content.len() as u64)))
+    Ok(Some((hash, observation, false, source.bytes.len() as u64)))
 }
 
 fn project_relative_path(root: &Path, path: &Path) -> Option<String> {

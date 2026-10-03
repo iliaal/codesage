@@ -132,6 +132,7 @@ use rayon::prelude::*;
 #[cfg(test)]
 use codesage_parser::discover::discover_files_with_excludes;
 use codesage_parser::discover::{DiscoveryReport, discover_files_report_with_cache};
+use codesage_parser::source::read_indexable_file;
 
 #[derive(Debug)]
 struct ChunkedFile {
@@ -140,19 +141,25 @@ struct ChunkedFile {
     chunks: Vec<(String, u32, u32)>,
 }
 
-fn chunk_one(root: &Path, f: &FileInfo, config: &ChunkConfig) -> Result<Option<ChunkedFile>> {
-    let abs = root.join(&f.path);
-    let bytes =
-        std::fs::read(&abs).with_context(|| format!("reading {} for semantic chunks", f.path))?;
+fn chunk_one(
+    root: &Path,
+    f: &FileInfo,
+    config: &ChunkConfig,
+) -> Result<(FileInfo, Option<ChunkedFile>)> {
+    let snapshot = read_indexable_file(root, Path::new(&f.path))
+        .with_context(|| format!("reading {} for semantic chunks", f.path))?
+        .with_context(|| format!("{} exceeds the indexable file size cap", f.path))?;
+    let mut info = f.clone();
+    info.content_hash = snapshot.content_hash;
     // Match structural parsing: invalid UTF-8 replaces characters rather than dropping files.
-    let content = String::from_utf8_lossy(&bytes);
+    let content = String::from_utf8_lossy(&snapshot.bytes);
     if content.is_empty() {
-        return Ok(None);
+        return Ok((info, None));
     }
 
     let chunks = chunk_text(&content, config);
     if chunks.is_empty() {
-        return Ok(None);
+        return Ok((info, None));
     }
 
     let tuples: Vec<(String, u32, u32)> = chunks
@@ -160,11 +167,14 @@ fn chunk_one(root: &Path, f: &FileInfo, config: &ChunkConfig) -> Result<Option<C
         .map(|c| (c.text, c.start_line, c.end_line))
         .collect();
 
-    Ok(Some(ChunkedFile {
-        path: f.path.clone(),
-        language: f.language.as_str().to_string(),
-        chunks: tuples,
-    }))
+    Ok((
+        info,
+        Some(ChunkedFile {
+            path: f.path.clone(),
+            language: f.language.as_str().to_string(),
+            chunks: tuples,
+        }),
+    ))
 }
 
 fn augment_chunks(cf: &mut ChunkedFile, symbols: &[Symbol]) {
@@ -327,7 +337,7 @@ fn process_semantic_batch(
         reuse_stored,
         purge_failed,
     } = policy;
-    let chunk_results: Vec<(&FileInfo, Result<Option<ChunkedFile>>)> = batch
+    let chunk_results: Vec<_> = batch
         .par_iter()
         .map(|f| (*f, chunk_one(root, f, config)))
         .collect();
@@ -336,11 +346,12 @@ fn process_semantic_batch(
     let mut failed = Vec::new();
     for (file, result) in chunk_results {
         match result {
-            Ok(Some(cf)) => {
-                selected.push(file);
-                chunked.push(cf);
+            Ok((info, chunks)) => {
+                selected.push(info);
+                if let Some(cf) = chunks {
+                    chunked.push(cf);
+                }
             }
-            Ok(None) => selected.push(file),
             Err(e) => {
                 stats.files_failed += 1;
                 stats.failed_paths.push(file.path.clone());
@@ -370,11 +381,14 @@ fn process_semantic_batch(
         return Ok(());
     }
 
-    let augment_paths: Vec<String> = chunked
-        .iter()
-        .filter(|cf| should_augment(&cf.language))
-        .map(|cf| cf.path.clone())
-        .collect();
+    let mut augment_paths = Vec::new();
+    for file in &selected {
+        if should_augment(file.language.as_str())
+            && db.get_file_hash(&file.path)?.as_deref() == Some(file.content_hash.as_str())
+        {
+            augment_paths.push(file.path.clone());
+        }
+    }
     if !augment_paths.is_empty() {
         let by_file = db.symbols_for_files(&augment_paths)?;
         for cf in &mut chunked {
@@ -429,6 +443,7 @@ fn process_semantic_batch(
         .into_iter()
         .map(|v| v.expect("every slot filled by reuse or embedding"))
         .collect();
+    let selected: Vec<&FileInfo> = selected.iter().collect();
     write_semantic_updates(db, &selected, &chunked, &all_embeddings, stats)?;
     Ok(())
 }
@@ -1662,7 +1677,8 @@ mod tests {
             prepared_with: Vec::new(),
             batches: 0,
         };
-        let files = vec![file("a.rs", "h"), unreadable("b.rs")];
+        let mut files = discover_files_with_excludes(root.path(), &[]).unwrap();
+        files.push(unreadable("b.rs"));
         let full = |db: &Database, fake: &mut FakeEmbedder| {
             semantic_index_discovered(
                 root.path(),
@@ -2031,6 +2047,244 @@ mod tests {
         let count = count_removed_paths(&["gone.rs", "both.rs"], &["stale.rs", "both.rs"]);
 
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn semantic_reader_rejects_growth_beyond_discovery_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.rs");
+        std::fs::write(&path, "fn before() {}\n").unwrap();
+        let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(codesage_parser::discover::MAX_INDEXABLE_FILE_BYTES + 1)
+            .unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+
+        let stats =
+            semantic_index_files(root.path(), &db, &mut fake, &files, &test_fp(), false).unwrap();
+
+        assert_eq!(stats.failed_paths, vec!["a.rs"]);
+        assert_eq!(stats.files_processed, 0);
+        assert!(db.chunks_for_file("a.rs").unwrap().is_empty());
+        assert!(!db.all_semantic_file_hashes().unwrap().contains_key("a.rs"));
+        assert_eq!(fake.batches, 0);
+    }
+
+    #[test]
+    fn semantic_reader_rediscovers_replacement_and_records_its_actual_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.rs");
+        std::fs::write(&path, "fn before() {}\n").unwrap();
+        let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+        let replacement = root.path().join("replacement");
+        let source = b"fn after() {}\n";
+        std::fs::write(&replacement, source).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+
+        let stats =
+            semantic_index_files(root.path(), &db, &mut fake, &files, &test_fp(), false).unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.files_failed, 0);
+        assert_eq!(
+            db.all_semantic_file_hashes().unwrap()["a.rs"],
+            codesage_parser::discover::content_hash(source)
+        );
+        assert_eq!(
+            db.chunks_for_file("a.rs").unwrap()[0].content,
+            "fn after() {}\n"
+        );
+        assert_eq!(fake.batches, 1);
+    }
+
+    #[test]
+    fn semantic_reader_records_the_actual_hash_when_replacement_is_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.rs");
+        std::fs::write(&path, "fn before() {}\n").unwrap();
+        let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+
+        let stats =
+            semantic_index_files(root.path(), &db, &mut fake, &files, &test_fp(), false).unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.files_failed, 0);
+        assert_eq!(
+            db.all_semantic_file_hashes().unwrap()["a.rs"],
+            codesage_parser::discover::content_hash(b"")
+        );
+        assert!(db.chunks_for_file("a.rs").unwrap().is_empty());
+        assert_eq!(fake.batches, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_reader_refuses_symlink_fifo_and_directory_replacements() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["symlink", "fifo", "directory", "ancestor_symlink"] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("nested")).unwrap();
+            let path = root.path().join("nested/a.rs");
+            std::fs::write(&path, "fn before() {}\n").unwrap();
+            let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            match kind {
+                "symlink" => {
+                    let target = outside.path().join("target.rs");
+                    std::fs::write(&target, "fn forbidden() {}\n").unwrap();
+                    symlink(target, &path).unwrap();
+                }
+                "fifo" => {
+                    assert!(
+                        std::process::Command::new("mkfifo")
+                            .arg(&path)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+                "directory" => std::fs::create_dir(&path).unwrap(),
+                "ancestor_symlink" => {
+                    std::fs::remove_dir(root.path().join("nested")).unwrap();
+                    std::fs::write(outside.path().join("a.rs"), "fn forbidden() {}\n").unwrap();
+                    symlink(outside.path(), root.path().join("nested")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let db = Database::open_in_memory().unwrap();
+            let mut fake = FakeEmbedder {
+                prepared_with: Vec::new(),
+                batches: 0,
+            };
+
+            let stats =
+                semantic_index_files(root.path(), &db, &mut fake, &files, &test_fp(), false)
+                    .unwrap();
+
+            assert_eq!(stats.failed_paths, vec!["nested/a.rs"], "{kind}");
+            assert_eq!(stats.files_processed, 0, "{kind}");
+            assert!(
+                db.chunks_for_file("nested/a.rs").unwrap().is_empty(),
+                "{kind}"
+            );
+            assert!(
+                !db.all_semantic_file_hashes()
+                    .unwrap()
+                    .contains_key("nested/a.rs"),
+                "{kind}"
+            );
+            assert_eq!(fake.batches, 0, "{kind}");
+        }
+    }
+
+    #[test]
+    fn semantic_reader_drops_headers_from_an_older_structural_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.py");
+        let marker = root
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .replace('.', "_");
+        let obsolete = format!("before_{marker}");
+        let old_source = format!("def {obsolete}(): pass\n");
+        std::fs::write(&path, old_source).unwrap();
+        let db = Database::open_in_memory().unwrap();
+        crate::index::full_index(root.path(), &db, &[], false).unwrap();
+        let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+        let replacement = root.path().join("replacement");
+        let source = b"def current(): pass\n";
+        std::fs::write(&replacement, source).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+
+        semantic_index_files(root.path(), &db, &mut fake, &files, &test_fp(), false).unwrap();
+
+        let chunk = &db.chunks_for_file("a.py").unwrap()[0].content;
+        assert!(chunk.contains("def current(): pass"));
+        assert!(
+            !chunk.contains(&obsolete),
+            "stale structural header: {chunk}"
+        );
+        assert_eq!(
+            db.get_file_hash("a.py").unwrap(),
+            Some(files[0].content_hash.clone())
+        );
+        assert_eq!(
+            db.all_semantic_file_hashes().unwrap()["a.py"],
+            codesage_parser::discover::content_hash(source)
+        );
+
+        crate::index::incremental_index(root.path(), &db, &[], false).unwrap();
+        semantic_incremental_index(root.path(), &db, &mut fake, &[], &test_fp(), false).unwrap();
+        let chunk = &db.chunks_for_file("a.py").unwrap()[0].content;
+        assert!(chunk.contains("# current (function)"));
+        assert!(!chunk.contains(&obsolete));
+        assert_eq!(
+            db.get_file_hash("a.py").unwrap().unwrap(),
+            db.all_semantic_file_hashes().unwrap()["a.py"]
+        );
+    }
+
+    #[test]
+    fn semantic_reader_normal_indexing_smoke_preserves_symbols_chunks_and_incremental_skip() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn live() {}\n").unwrap();
+        std::fs::write(root.path().join("a.py"), "def current(): pass\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+
+        let structural = crate::index::full_index(root.path(), &db, &[], false).unwrap();
+        let semantic =
+            semantic_full_index(root.path(), &db, &mut fake, &[], &test_fp(), false).unwrap();
+
+        assert_eq!(structural.files_indexed, 2);
+        assert_eq!(semantic.files_processed, 2);
+        assert_eq!(semantic.files_failed, 0);
+        assert_eq!(db.symbols_for_file("a.rs").unwrap()[0].name, "live");
+        assert!(
+            db.chunks_for_file("a.py").unwrap()[0]
+                .content
+                .contains("# current (function)")
+        );
+        assert_eq!(
+            db.all_file_hashes().unwrap(),
+            db.all_semantic_file_hashes().unwrap()
+        );
+        require_current_semantic_table(&db, &test_fp()).unwrap();
+        let unchanged =
+            semantic_incremental_index(root.path(), &db, &mut fake, &[], &test_fp(), false)
+                .unwrap();
+        assert_eq!(unchanged.files_skipped, 2);
+        assert_eq!(unchanged.files_processed, 0);
+        assert_eq!(fake.batches, 1);
     }
 
     #[test]

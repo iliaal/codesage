@@ -161,6 +161,7 @@ fn validate_arguments(request: &CallToolRequestParams) -> Result<(), serde_json:
         };
     }
     match request.name.as_ref() {
+        "describe" => validate!(DescribeParams),
         "project_overview" => validate!(ProjectOverviewParams),
         "review_rehearsal" => validate!(ReviewRehearsalParams),
         "edit_check" => validate!(super::edit_check::EditCheckParams),
@@ -864,6 +865,7 @@ impl CodeSageServer {
                 });
                 let server = self.clone();
                 let evidence_only = matches!(tool.as_str(), "edit_check" | "review_rehearsal");
+                let read_only = tool == "describe";
                 let project = self
                     .run_controlled(
                         preflight,
@@ -871,7 +873,11 @@ impl CodeSageServer {
                             if evidence_only {
                                 crate::evidence_root(Path::new(&raw_project))
                             } else {
-                                let state = server.resolve_project_inner(&raw_project)?;
+                                let state = if read_only {
+                                    server.resolve_project_read_only(&raw_project)?
+                                } else {
+                                    server.resolve_project_inner(&raw_project)?
+                                };
                                 state
                                     .db_path
                                     .parent()

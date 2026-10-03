@@ -141,6 +141,22 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Option<Value> {
     // Each edge moves toward a bundle, which is terminal, so following next
     // cannot cycle even when the underlying dependency graph does.
     match kind {
+        "describe" => {
+            let card = payload.get("card")?;
+            match card.get("kind")?.as_str()? {
+                "file" => Some(call("find_feature", handle(card.get("handle")?, FILE)?)),
+                "symbol" => Some(call(
+                    "find_references",
+                    handle(card.get("handle")?, SYMBOL)?,
+                )),
+                "feature" => Some(call("feature_bundle", text(card.get("handle")?)?)),
+                "dir" => Some(call(
+                    "list_dependencies",
+                    handle(card.pointer("/sections/fan_in/data/top/0/handle")?, FILE)?,
+                )),
+                _ => None,
+            }
+        }
         "find_symbol" => {
             let target = first_handle(payload, "results", SYMBOL)
                 .or_else(|| first_field(payload, "results", "qualified_name").and_then(text))

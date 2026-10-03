@@ -2,6 +2,21 @@
 """
 Benchmark CodeSage semantic search against ground-truth YAML corpora.
 
+Every run executes a uniform-file seeded placebo at the exact CodeSage
+path/content byte budget, a real path-sorted literal-token rg floor, and
+that rg page cut at the CodeSage budget. JSON records carry all four arms,
+scores, byte costs, and evidence. Missing/failed arms invalidate the run.
+The runner pins actual source bytes, eligible semantic files/chunks, the
+persisted semantic fingerprint, model/runtime artifact bytes, config, and
+binary bytes before and after retrieval. A stale semantic index is refused.
+Executable arguments resolve once against the caller's cwd/PATH; every
+version, status, search, and rg child uses the resulting absolute identity.
+For a configured reranker, repeat --reranker-artifact with the tokenizer
+and the selected ONNX graph; verify selection against the binary's loader
+pins. Each query uses a fresh private runtime directory, observes private
+model initialization, and rejects daemon reuse. This instrument does not
+measure indexing pass mode, prospective prediction, or agent completion.
+
 Emits a scorecard in the "named repo + named model + named baseline + named
 quantities" shape adopted from the external landscape sweep (see
 notes/20260424-reference-tool-recommendations.md, item 1.6). Every public
@@ -49,15 +64,22 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent))
 from _codesage_version import codesage_version_info  # noqa: E402
+from _retrieval_controls import (  # noqa: E402
+    CONTROL_PROTOCOL, QUERY_LOG_FILTER, QUERY_NO_COLOR, QUERY_RUNTIME, InvalidRun,
+    absolute_executable, capture_context, distinct, file_pin, git_environment,
+    page, placebo_rows, resolve_executable, run_rg, search_rows, validate_record, validate_runtime,
+)
 
 try:
     import yaml
@@ -69,7 +91,8 @@ try:
     import tiktoken
     _ENCODING = tiktoken.get_encoding("cl100k_base")
     def _count_tokens(text: str) -> int:
-        return len(_ENCODING.encode(text or ""))
+        encoding = _ENCODING
+        return len(encoding.encode(text or "")) if encoding is not None else 0
 except ImportError:
     _ENCODING = None
     def _count_tokens(_text: str) -> int:
@@ -83,7 +106,8 @@ _MISS_TOKEN_PENALTY = 32_000
 
 def _run(cmd: list[str], cwd: Path | None = None) -> str:
     try:
-        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=30,
+                           env=git_environment() if cmd[0] == "git" else None)
         if r.returncode == 0:
             return r.stdout.strip()
     except (subprocess.SubprocessError, FileNotFoundError):
@@ -131,24 +155,10 @@ def codesage_config(project_root: Path) -> dict:
     cfg = project_root / ".codesage" / "config.toml"
     if not cfg.is_file():
         return {}
-    # Only simple section/key values are supported, avoiding another dependency.
-    out: dict[str, dict[str, str]] = {}
-    section = ""
     try:
-        for raw in cfg.read_text().splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("[") and line.endswith("]"):
-                section = line[1:-1].strip()
-                out.setdefault(section, {})
-                continue
-            if "=" in line and section:
-                k, v = line.split("=", 1)
-                out[section][k.strip()] = v.strip().strip('"').strip("'")
-    except OSError:
+        return tomllib.loads(cfg.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
         return {}
-    return out
 
 
 def now_iso_utc() -> str:
@@ -157,30 +167,54 @@ def now_iso_utc() -> str:
 
 def run_codesage_search(
     codesage_bin: str, project_root: Path, query: str, limit: int
-) -> tuple[str, str | None]:
-    """Return (stdout, error). `error` is None on a clean run, else
+) -> tuple[str, str | None, dict]:
+    """Return (stdout, error, runtime). `error` is None on a clean run, else
     `"timeout"`, `"rc=N"`, or `"error"`; the case is still scored (as a miss
     when stdout is empty) so one bad search does not discard the run, but the
     failure is recorded so compare-runs can refuse to read lift into it."""
+    codesage_bin = absolute_executable(codesage_bin)
     cmd = [codesage_bin, "search", "--json", "--limit", str(limit), query]
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"[warn] codesage search timed out after 120s: {query!r}", file=sys.stderr)
-        return "", "timeout"
-    except subprocess.SubprocessError as e:
-        print(f"[warn] codesage search errored: {e}", file=sys.stderr)
-        return "", "error"
-    if result.returncode != 0:
-        print(f"[warn] codesage search failed rc={result.returncode}: {result.stderr}", file=sys.stderr)
-        return result.stdout, f"rc={result.returncode}"
-    return result.stdout, None
+    runtime = {**QUERY_RUNTIME, "command": cmd}
+    with tempfile.TemporaryDirectory(prefix="codesage-bench-query-") as directory:
+        runtime_path = Path(directory)
+        runtime.update(runtime_dir=directory, directory_mode=runtime_path.stat().st_mode & 0o777,
+                       entries_before=sorted(p.name for p in runtime_path.iterdir()),
+                       reranker=codesage_config(project_root).get("embedding", {}).get("reranker", "none"))
+        try:
+            child = subprocess.Popen(
+                cmd, cwd=project_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env={**os.environ, "RUST_LOG": QUERY_LOG_FILTER, "NO_COLOR": QUERY_NO_COLOR,
+                     "CODESAGE_DAEMON_RUNTIME_DIR": directory},
+            )
+            runtime["pid"] = child.pid
+            try:
+                stdout, stderr = child.communicate(timeout=120)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                stdout, stderr = child.communicate()
+                runtime.update(stderr=stderr, stderr_sha256=hashlib.sha256(stderr.encode()).hexdigest())
+                print(f"[warn] codesage search timed out after 120s: {query!r}", file=sys.stderr)
+                return stdout, "timeout", runtime
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"[warn] codesage search errored: {exc}", file=sys.stderr)
+            return "", "error", runtime
+        runtime.update(entries_after=sorted(p.name for p in runtime_path.iterdir()),
+                       stderr=stderr, stderr_sha256=hashlib.sha256(stderr.encode()).hexdigest(),
+                       returncode=child.returncode)
+        if child.returncode != 0:
+            print(f"[warn] codesage search failed rc={child.returncode}: {stderr}", file=sys.stderr)
+            return stdout, f"rc={child.returncode}", runtime
+        try:
+            validate_runtime(runtime)
+        except InvalidRun as exc:
+            print(f"[warn] query runtime: {exc}", file=sys.stderr)
+            return stdout, "invalid-runtime", runtime
+    if any(message in stderr for message in (
+        "cross-encoder rerank failed", "daemon reranking failed", "CODESAGE_ALLOW_CPU_FALLBACK",
+    )):
+        print(f"[warn] degraded search: {stderr}", file=sys.stderr)
+        return stdout, "degraded", runtime
+    return stdout, None, runtime
 
 
 def parse_results(output: str) -> list[tuple[str, str]]:
@@ -253,6 +287,8 @@ def write_results_json(path: Path, meta: dict, results: list[dict], project_root
         }
         if r.get("error"):
             rec["error"] = r["error"]
+        if "arms" in r:
+            rec["arms"] = r["arms"]
         records.append(rec)
     meta = {**meta, "search_failures": sum(1 for r in results if r.get("error"))}
     envelope = {"meta": meta, "complete": complete, "records": records}
@@ -317,6 +353,11 @@ def score_case(
         "tokens_to_first_hit": tokens_to_first_hit,
         **{f"recall@{k}": recalls[k] for k in k_values},
         "returned_count": len(returned),
+        "mrr": 1.0 / first_rank if first_rank else 0.0,
+        "ndcg@10": sum(1 / math.log2(i + 2) for i, p in enumerate(paths_only[:10])
+                       if p in expected_set) / sum(
+                           1 / math.log2(i + 2) for i in range(min(10, len(expected_set)))
+                       ) if expected_set else 0.0,
     }
 
 
@@ -395,14 +436,17 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=10)
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("--codesage-bin", default="codesage")
+    ap.add_argument("--project-root", type=Path,
+                    help="Use another checkout of the same corpus; source/index pins still apply.")
     ap.add_argument(
         "--baseline",
-        default=os.environ.get("CODESAGE_BENCH_BASELINE", "not configured"),
-        help="Named baseline for comparison (informational header field). "
-             "E.g. 'ripgrep 14.1.0 (grep -rn)'. Does not run the baseline; "
-             "fill in what the numbers are being compared against when "
-             "quoting the scorecard externally.",
+        default=os.environ.get("CODESAGE_BENCH_BASELINE", "placebo+rg"),
+        help="Optional historical comparison label. Placebo and rg controls always execute.",
     )
+    ap.add_argument("--control-seed", type=int, default=0)
+    ap.add_argument("--rg-bin", default="rg")
+    ap.add_argument("--reranker-artifact", type=Path, action="append", default=[],
+                    help="Pin actual reranker tokenizer and selected ONNX graph bytes (repeat).")
     ap.add_argument(
         "--results-json",
         type=Path,
@@ -422,6 +466,8 @@ def main() -> int:
         help="Exit 0 even when some `codesage search` calls failed (they still score as misses).",
     )
     args = ap.parse_args()
+    if args.limit < 1:
+        ap.error("--limit must be >= 1")
 
     if (args.split is None) != (args.salt is None):
         ap.error("--split and --salt must be given together")
@@ -458,7 +504,7 @@ def main() -> int:
         if problem:
             print(f"corpus {args.corpus}: case #{i} {problem}", file=sys.stderr)
             return 2
-    project_root = Path(corpus["project_root"]).expanduser()
+    project_root = (args.project_root or Path(corpus["project_root"])).expanduser().resolve()
     k_values = corpus.get("scoring", {}).get("k_values", [5, 10])
     cases = corpus["cases"]
     if args.split is not None:
@@ -473,6 +519,8 @@ def main() -> int:
 
     if not project_root.exists():
         sys.exit(f"project_root does not exist: {project_root}")
+    if len({c["id"] for c in cases}) != len(cases):
+        ap.error("case ids must be unique")
 
     if args.results_json is not None:
         # Probe before expensive searches without clobbering an existing result.
@@ -485,16 +533,31 @@ def main() -> int:
         except OSError as e:
             sys.exit(f"--results-json {args.results_json} is not writable: {e}")
 
+    try:
+        args.codesage_bin = resolve_executable(args.codesage_bin)
+        args.rg_bin = resolve_executable(args.rg_bin)
+    except (InvalidRun, OSError) as exc:
+        print(f"[error] invalid executable identity: {exc}", file=sys.stderr)
+        return 3
     cs_info = codesage_version_info(args.codesage_bin, cwd=project_root)
     cs_version = cs_info["version"]
-    head_sha = project_head_sha(project_root)
+    try:
+        context, chunks = capture_context(project_root, args.codesage_bin, args.rg_bin,
+                                          args.reranker_artifact)
+        missing_gold = {p for c in cases for p in c["expected_files"] if p not in chunks}
+        if missing_gold:
+            raise InvalidRun(f"gold files outside eligible semantic universe: {sorted(missing_gold)}")
+    except (InvalidRun, OSError, ValueError) as e:
+        print(f"[error] invalid control provenance: {e}", file=sys.stderr)
+        return 3
+    head_sha = context["head"]
     file_count, line_count = project_size(project_root)
     size_str = format_size(file_count, line_count)
     cfg = codesage_config(project_root)
     emb_section = cfg.get("embedding", {})
-    embedding_model = emb_section.get("model", "unknown")
-    embedding_device = emb_section.get("device", "")
-    reranker = emb_section.get("reranker", "none")
+    embedding_model = context.get("model", emb_section.get("model", "unknown"))
+    embedding_device = context.get("device", emb_section.get("device", ""))
+    reranker = context.get("reranker", emb_section.get("reranker", "none"))
     embedding_dim = emb_section.get("dimensions", "")
     run_ts = now_iso_utc()
     results_meta = {
@@ -512,6 +575,11 @@ def main() -> int:
         "run_at": run_ts,
         "project_root": str(project_root),
         "limit": args.limit,
+        "control_protocol": CONTROL_PROTOCOL,
+        "control_seed": args.control_seed,
+        "provenance": context,
+        "runner_sha256": file_pin(Path(__file__))["sha256"],
+        "controls_sha256": file_pin(Path(__file__).with_name("_retrieval_controls.py"))["sha256"],
     }
     if args.results_json is not None:
         write_results_json(args.results_json, results_meta, [], project_root, complete=False)
@@ -521,8 +589,36 @@ def main() -> int:
         cid = case["id"]
         query = case["query"]
         expected = case["expected_files"]
-        raw, error = run_codesage_search(args.codesage_bin, project_root, query, args.limit)
-        returned = returned_for_case(parse_results(raw), case)
+        raw, error, runtime = run_codesage_search(args.codesage_bin, project_root, query, args.limit)
+        arms = {}
+        try:
+            rows = search_rows(raw) if error is None else []
+            if any(p not in chunks for p, _ in rows):
+                raise InvalidRun("CodeSage returned files outside pinned eligible universe")
+            emitted, real_budget = page(rows)
+            arm_rows = {"codesage": (emitted, real_budget)}
+            arm_rows["placebo"] = page(placebo_rows(chunks, cid, args.control_seed, real_budget["bytes"]), real_budget["bytes"])
+            rg_rows, rg_evidence = run_rg(project_root, sorted(chunks), query, args.rg_bin)
+            arm_rows["rg"] = page(rg_rows)
+            arm_rows["rg_matched"] = page(rg_rows, real_budget["bytes"])
+            for name, (emitted_rows, budget) in arm_rows.items():
+                ranked = distinct(emitted_rows, case.get("defining_file"))
+                arms[name] = {**score_case(expected, ranked, k_values), **budget,
+                              "hits": [p for p, _ in ranked]}
+            arms["rg"]["evidence"] = rg_evidence
+            arms["codesage"]["raw_stdout_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
+            arms["codesage"]["raw_stdout_bytes"] = len(raw.encode())
+            arms["codesage"]["runtime"] = runtime
+            if error:
+                arms["codesage"]["error"] = error
+            validate_record({"id": cid, "expected_files": expected,
+                             "hits": arms["codesage"]["hits"],
+                             "first_hit_rank": arms["codesage"]["first_hit_rank"], "arms": arms})
+            returned = distinct(emitted, case.get("defining_file"))
+        except InvalidRun as exc:
+            error = error or f"invalid-control: {exc}"
+            returned = []
+            print(f"[warn] {cid}: {exc}", file=sys.stderr)
         scored = score_case(expected, returned, k_values)
         scored["id"] = cid
         scored["query"] = query
@@ -530,6 +626,7 @@ def main() -> int:
         scored["source"] = case.get("source", "?")
         scored["returned"] = [p for p, _ in returned]
         scored["expected"] = expected
+        scored["arms"] = arms
         results.append(scored)
         if args.results_json is not None:
             # Full rewrite per case is O(n^2) in bytes by design: crash safety
@@ -543,6 +640,15 @@ def main() -> int:
                   file=sys.stderr)
             print(f"  expected: {expected}", file=sys.stderr)
             print(f"  returned[:5]: {returned[:5]}", file=sys.stderr)
+
+    try:
+        after, _ = capture_context(project_root, args.codesage_bin, args.rg_bin,
+                                    args.reranker_artifact)
+        if after != context:
+            raise InvalidRun("source/index/config/binary/artifact provenance changed during run")
+    except (InvalidRun, OSError, ValueError) as exc:
+        print(f"[error] {exc}; saved run remains incomplete", file=sys.stderr)
+        return 3
 
     split_str = f" (split {args.split}, salt {args.salt})" if args.split is not None else ""
     header = format_header(
@@ -565,6 +671,16 @@ def main() -> int:
     )
     for line in header:
         print(line)
+    print(f"- **Executed controls**: seeded uniform-file placebo (seed {args.control_seed}), "
+          "`rg --sort path` literal query-token OR, and rg at the CodeSage byte budget.")
+    print("- **Byte unit**: UTF-8 path + LF + content + LF, all emitted chunks charged; "
+          "duplicate files and refs-mode exclusions consume bytes. Final control row may be cut; "
+          "a file counts only after its full path header fits.")
+    print(f"- **Actual semantic fingerprint**: `{context['semantic_fingerprint']}`")
+    print(f"- **Eligible files**: {len(chunks)}, SHA-256 `{context['eligible_files_sha256']}`")
+    print("- **Instrument**: current-state retrieval; fresh private inference per query, "
+          "with initialization logs and no daemon reuse. Indexing pass mode and "
+          "prospective change prediction are not measured.")
 
     print()
     print("## Per-case results")
@@ -586,6 +702,38 @@ def main() -> int:
             ttf_str = f"{ttf:,}" if r["first_hit_rank"] else f"MISS ({_MISS_TOKEN_PENALTY:,})"
             line += f"| {ttf_str} "
         print(line + f"| {r['returned_count']} |")
+
+    print("\n## Paired controls\n")
+    print("| id | real r@10 | placebo r@10 | rg r@10 | rg matched r@10 | real B | placebo B | rg B | rg matched B |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for r in results:
+        if r.get("error"):
+            print(f"| {r['id']} | INVALID | | | | | | | |")
+            continue
+        arms = r["arms"]
+        values = [f"{arms[a]['recall@10']:.3f}" for a in ("codesage", "placebo", "rg", "rg_matched")]
+        values += [str(arms[a]["bytes"]) for a in ("codesage", "placebo", "rg", "rg_matched")]
+        print("| " + r["id"] + " | " + " | ".join(values) + " |")
+
+    placebo_r10 = rg_r10 = rg_matched_r10 = delta = None
+    wins = 0
+    if not any(r.get("error") for r in results):
+        print("\n| arm | miss rate | median first hit | recall@5 | recall@10 | NDCG@10 | mean B |\n"
+              "|---|---:|---:|---:|---:|---:|---:|")
+        for name in ("codesage", "placebo", "rg", "rg_matched"):
+            arm = [r["arms"][name] for r in results]
+            ranks = sorted(r["first_hit_rank"] for r in arm if r["first_hit_rank"])
+            print(f"| {name} | {sum(r['first_hit_rank'] is None for r in arm)/len(arm):.3f} "
+                  f"| {ranks[len(ranks)//2] if ranks else 'MISS'} "
+                  + "".join(f"| {sum(r[k] for r in arm)/len(arm):.4f} " for k in ("recall@5", "recall@10", "ndcg@10", "bytes")) + "|")
+        delta = sum(r["arms"]["codesage"]["recall@10"] - r["arms"]["placebo"]["recall@10"] for r in results)/len(results)
+        placebo_r10 = sum(r["arms"]["placebo"]["recall@10"] for r in results)/len(results)
+        rg_r10 = sum(r["arms"]["rg"]["recall@10"] for r in results)/len(results)
+        rg_matched_r10 = sum(r["arms"]["rg_matched"]["recall@10"] for r in results)/len(results)
+        wins = sum(r["arms"]["codesage"]["recall@10"] > r["arms"]["placebo"]["recall@10"] for r in results)
+        print(f"\nReal minus placebo recall@10: {delta:+.4f}; wins {wins}/{len(results)}. "
+              + ("Clears the predeclared majority-of-cases ranking check." if wins > len(results)/2
+                 else "Does not clear the majority-of-cases ranking check; no ranking advantage claim."))
 
     search_failures = sum(1 for r in results if r.get("error"))
     hits = [r for r in results if r["first_hit_rank"] is not None]
@@ -626,7 +774,13 @@ def main() -> int:
           f"{embedding_model}"
           + (f" + {reranker}" if reranker and reranker != "none" else "")
           + f", {median_str}, mean recall@10 {avg_r10:.2f}. "
-          f"Baseline for comparison: {args.baseline}. Run {run_ts}.")
+          f"Baseline for comparison: {args.baseline}. "
+          + (f"Matched-byte placebo recall@10 {placebo_r10:.2f}, delta {delta:+.2f}, "
+             f"wins {wins}/{len(results)}; rg recall@10 {rg_r10:.2f} "
+             f"(matched-budget {rg_matched_r10:.2f}). "
+             + ("No majority-of-cases ranking advantage. " if wins <= len(results)/2 else "")
+             if delta is not None else "Control comparison invalid. ")
+          + f"Run {run_ts}.")
 
     print()
     metrics = (
@@ -644,6 +798,10 @@ def main() -> int:
     if args.split is not None:
         metrics += f" split={args.split} salt={args.salt}"
     metrics += f" search_failures={search_failures}"
+    if delta is not None:
+        metrics += (f" placebo_r10={placebo_r10:.4f} rg_r10={rg_r10:.4f} "
+                    f"rg_matched_r10={rg_matched_r10:.4f} placebo_delta={delta:.4f} "
+                    f"placebo_wins={wins} control_seed={args.control_seed}")
     print(f"<!-- METRICS: {metrics} -->")
 
     if args.results_json is not None:

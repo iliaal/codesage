@@ -113,6 +113,14 @@ fn merge_meta_property(schema: &mut serde_json::Map<String, serde_json::Value>) 
             props.entry(name.to_string()).or_insert(fragment);
         }
     }
+    if let Some(serde_json::Value::Array(required)) = schema.get_mut("required") {
+        required.retain(|field| {
+            !matches!(
+                field.as_str(),
+                Some("tool" | "index" | "target" | "completeness" | "cost")
+            )
+        });
+    }
 }
 
 /// Normalize schemas and advertise query tools as read-only for gated clients.

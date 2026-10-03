@@ -1,5 +1,28 @@
 ## [Unreleased]
 
+### Added
+
+- `describe` and `codesage describe` return compact file, symbol, feature, and directory cards with executable section expansions and bounded risk disclosure.
+- `codesage map` groups Maven Java sources by framework role; Java role and import boundaries feed `trust-boundaries`, feature slices, and `assess_risk` after the next `codesage index`.
+
+### Changed
+
+- The first `codesage git-index` after upgrading rescans history in full, including `--incremental` runs.
+
+### Fixed
+
+- Python imports and calls no longer resolve to unrelated project definitions that share their name; the next `codesage index` refreshes Python binding evidence.
+- C functions with export macros and typedef return types are indexed under their declared names, including `PHPAPI`, `ZEND_API`, and Zend calling-convention modifiers; the next `codesage index` reparses unchanged files.
+- Git history indexing and project Git queries use the selected project's repository despite inherited Git repository variables.
+- `codesage rehearse` discovers project-relative tracked and nonignored untracked changes, including sources before the first commit.
+- `codesage export` and `export_context` resolve entity targets before semantic search and report ambiguous targets with candidate handles.
+- Directory handles and exports use indexed directories with matching letter case and path components.
+
+### Security
+
+- `codesage index` and watcher indexing bound source reads to 10 MiB, refuse symlinks and nonregular files, and record structural and semantic hashes from the source bytes each pass reads.
+- `codesage install-hooks` refuses symlinked directories and nonregular hook files and verifies each staged hook before reporting installation.
+
 ## [0.38.0] - 2026-10-01
 
 ### Changed

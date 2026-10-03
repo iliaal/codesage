@@ -812,6 +812,14 @@ impl CodeSageServer {
     }
 
     pub(super) fn resolve_project_inner(&self, project: &str) -> Result<ProjectState> {
+        self.resolve_project_inner_mode(project, false)
+    }
+
+    pub(super) fn resolve_project_read_only(&self, project: &str) -> Result<ProjectState> {
+        self.resolve_project_inner_mode(project, true)
+    }
+
+    fn resolve_project_inner_mode(&self, project: &str, read_only: bool) -> Result<ProjectState> {
         // Cached roots still need config-mtime and index-existence checks after edits or resets.
         if let Some(state) = self.state.project_cache.lock().raw(project) {
             return Ok(state);
@@ -878,7 +886,7 @@ impl CodeSageServer {
             config_mtime,
         };
         // Keep structural calls available, but never cache errors that a config repair can fix.
-        if state.embedding_config_error.is_some() {
+        if read_only || state.embedding_config_error.is_some() {
             return Ok(state);
         }
         // Reloads replace stale state; admission after an eviction registers it again.
@@ -1445,6 +1453,36 @@ fn write_drift_log_for_project(project_root: &Path, db_path: &Path) -> Result<()
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn describe_does_not_start_an_explicitly_enabled_watcher() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".codesage")).unwrap();
+        std::fs::write(
+            root.path().join(".codesage/config.toml"),
+            "[project]\nname='describe_fixture'\n[index]\nwatch=true\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("source.rs"), "pub fn subject() {}\n").unwrap();
+        let db = Database::open(&root.path().join(".codesage/index.db")).unwrap();
+        codesage_graph::full_index(root.path(), &db, &[], false).unwrap();
+        drop(db);
+        let server = CodeSageServer::new();
+        let result = server
+            .describe_tool(super::super::Parameters(super::super::DescribeParams {
+                project: root.path().to_string_lossy().into_owned(),
+                target: "file:source.rs".into(),
+                detail: Default::default(),
+                sections: Some(vec!["identity".into()]),
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(
+            result.structured_content.unwrap()["card"]["sections"]["identity"]["data"]["language"],
+            "rust"
+        );
+        assert!(server.state.watchers.lock().is_empty());
+    }
+
     use super::*;
 
     #[test]

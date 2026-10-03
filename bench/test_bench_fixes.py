@@ -316,7 +316,7 @@ with tempfile.TemporaryDirectory() as td:
     sessions = Path(td) / "sessions"
     root.mkdir()
     sessions.mkdir()
-    for name in ("a", "b", "c", "d", "e"):
+    for name in ("a", "b", "c", "d", "e", "f"):
         (root / f"{name}.rs").write_text(f"fn {name}() {{}}\n")
 
     def _turn(query: str, tool_name: str, tool_input: dict, path: Path) -> list[str]:
@@ -342,6 +342,8 @@ with tempfile.TemporaryDirectory() as td:
                 {"command": f"cd {root}\ncargo build"}, root / "d.rs")
         + _turn("where is the e handler wired up in this crate", "Bash",
                 {"command": f"git -C {root} log --oneline"}, root / "e.rs")
+        + _turn("where is the f handler wired up in this crate", "Bash",
+                {"command": "codesage describe file:f.rs"}, root / "f.rs")
     )
     (sessions / "mixed.jsonl").write_text("\n".join(lines) + "\n")
 
@@ -353,7 +355,7 @@ with tempfile.TemporaryDirectory() as td:
         f"extract: codesage-used windows are excluded by default (got {cases!r})",
     )
     check(
-        stats.get("excluded_cases") == 2 and stats.get("codesage_sessions") == 1,
+        stats.get("excluded_cases") == 3 and stats.get("codesage_sessions") == 1,
         f"extract: contamination stats count excluded windows and sessions (got {stats!r})",
     )
     kept = extract.extract_cases(
@@ -361,7 +363,7 @@ with tempfile.TemporaryDirectory() as td:
     )
     tagged = sorted((c["files"][0], bool(c.get("codesage_used"))) for c in kept)
     check(
-        tagged == [("a.rs", True), ("b.rs", True), ("c.rs", False), ("d.rs", False), ("e.rs", False)],
+        tagged == [("a.rs", True), ("b.rs", True), ("c.rs", False), ("d.rs", False), ("e.rs", False), ("f.rs", True)],
         f"extract: --include-codesage-sessions keeps and tags contaminated cases (got {tagged!r})",
     )
 
@@ -409,6 +411,9 @@ for cmd in (
     "./target/debug/codesage search auth",
     "cargo run -p codesage -- search auth",
     "git diff --name-only | codesage risk-diff",
+    "codesage describe file:src/handler.rs",
+    "./target/debug/codesage describe dir:src",
+    "cargo run -p codesage -- describe Handler",
 ):
     check(extract.CODESAGE_BASH_RE.search(cmd), f"extract: bash regex matches {cmd!r}")
 for cmd in (

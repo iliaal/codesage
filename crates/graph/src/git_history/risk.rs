@@ -2684,81 +2684,19 @@ mod tests {
 
     #[test]
     fn lazy_pair_inside_an_eager_ring_is_not_a_suppressed_edge() {
-        use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
-
-        let db = Database::open_in_memory().unwrap();
-        for path in ["a.py", "b.py", "c.py", "d.py", "x.py", "y.py"] {
-            db.upsert_file(&FileInfo {
-                path: path.to_string(),
-                language: Language::Python,
-                content_hash: "hash".to_string(),
-                is_test: false,
-            })
-            .unwrap();
-        }
-        let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
-        for (path, name) in [
-            ("a.py", "fa"),
-            ("b.py", "fb"),
-            ("c.py", "fc"),
-            ("d.py", "fd"),
-            ("x.py", "fx"),
-            ("y.py", "fy"),
+        let root = tempfile::tempdir().unwrap();
+        for (path, source) in [
+            ("a.py", "import c\ndef fa():\n    import b\n    import d\n"),
+            ("b.py", "import a\ndef fb():\n    pass\n"),
+            ("c.py", "import b\ndef fc():\n    pass\n"),
+            ("d.py", "import b\ndef fd():\n    pass\n"),
+            ("x.py", "def fx():\n    import y\n"),
+            ("y.py", "import x\ndef fy():\n    pass\n"),
         ] {
-            db.insert_symbols(
-                ids(path),
-                &[Symbol {
-                    is_test: false,
-                    overloaded: false,
-                    name: name.to_string(),
-                    qualified_name: name.to_string(),
-                    kind: SymbolKind::Function,
-                    file_path: path.to_string(),
-                    line_start: 1,
-                    line_end: 2,
-                    col_start: 0,
-                    col_end: 0,
-                    rationale: Vec::new(),
-                    visibility: None,
-                }],
-            )
-            .unwrap();
+            std::fs::write(root.path().join(path), source).unwrap();
         }
-        let imp = |from: &str, to: &str, line: u32, lazy: bool| Reference {
-            from_line: None,
-            is_test: false,
-            to: None,
-            from_file: from.to_string(),
-            from_symbol: None,
-            to_name: to.to_string(),
-            kind: ReferenceKind::Import,
-            line,
-            col: 0,
-            lazy,
-        };
-        // Eager ring a -> c -> b -> a, plus a lazy a -> b shortcut inside it
-        // (redundant) and a lazy a -> d that would pull the eager d -> b
-        // spoke into the ring (enlargement).
-        db.insert_references(
-            ids("a.py"),
-            &[
-                imp("a.py", "fc", 1, false),
-                imp("a.py", "fb", 2, true),
-                imp("a.py", "fd", 3, true),
-            ],
-        )
-        .unwrap();
-        db.insert_references(ids("d.py"), &[imp("d.py", "fb", 1, false)])
-            .unwrap();
-        db.insert_references(ids("c.py"), &[imp("c.py", "fb", 1, false)])
-            .unwrap();
-        db.insert_references(ids("b.py"), &[imp("b.py", "fa", 1, false)])
-            .unwrap();
-        // Lazy x -> y that would close a cycle with the eager y -> x.
-        db.insert_references(ids("x.py"), &[imp("x.py", "fy", 1, true)])
-            .unwrap();
-        db.insert_references(ids("y.py"), &[imp("y.py", "fx", 1, false)])
-            .unwrap();
+        let db = Database::open_in_memory().unwrap();
+        crate::full_index(root.path(), &db, &[], false).unwrap();
 
         let cycles = ImportCycles::load(&db).unwrap();
         let mut suppressed = cycles.suppressed_pairs.clone();

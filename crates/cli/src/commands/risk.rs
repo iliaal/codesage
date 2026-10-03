@@ -364,7 +364,7 @@ pub(crate) fn cmd_tests_for(files: Vec<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Prefer explicit paths, then piped stdin, then tracked changes against HEAD.
+/// Prefer explicit paths, then piped stdin, then working-tree changes.
 fn resolve_patch_files(root: &Path, files: Vec<String>) -> Result<Vec<String>> {
     if !files.is_empty() {
         return Ok(files);
@@ -376,23 +376,76 @@ fn resolve_patch_files(root: &Path, files: Vec<String>) -> Result<Vec<String>> {
     working_tree_changes(root)
 }
 
-/// Tracked changes against HEAD, both endpoints of a rename included;
+fn has_unborn_head(root: &Path) -> Result<bool> {
+    let head = codesage_graph::git_command(root)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output()?;
+    if head.status.code() != Some(1) {
+        return Ok(false);
+    }
+    let branch = codesage_graph::git_command(root)
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .output()?;
+    Ok(branch.status.success() && branch.stdout.starts_with(b"refs/heads/"))
+}
+
+/// Tracked changes against HEAD or an empty unborn baseline, plus nonignored
+/// untracked files, project-relative,
+/// with both endpoints of a rename included and new `.codesage` state excluded;
 /// NUL-delimited so quoted, whitespace-bearing, and non-ASCII paths
 /// survive (a non-UTF-8 byte sequence is replaced, not rejected).
 /// Empty when git exits unsuccessfully.
 fn working_tree_changes(root: &Path) -> Result<Vec<String>> {
-    let out = std::process::Command::new("git")
-        .args(["diff", "--no-renames", "--name-only", "-z", "HEAD", "--"])
-        .current_dir(root)
+    let mut out = codesage_graph::git_command(root)
+        .args([
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "--relative",
+            "HEAD",
+            "--",
+        ])
         .output()?;
     if !out.status.success() {
-        return Ok(Vec::new());
+        if !has_unborn_head(root)? {
+            return Ok(Vec::new());
+        }
+        out = codesage_graph::git_command(root)
+            .args([
+                "diff",
+                "--cached",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                "--relative",
+                "--",
+            ])
+            .output()?;
+        if !out.status.success() {
+            return Ok(Vec::new());
+        }
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .split('\0')
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .collect())
+        .collect();
+    let untracked = codesage_graph::git_command(root)
+        .args(["ls-files", "-z", "-o", "--exclude-standard", "--", "."])
+        .output()?;
+    if !untracked.status.success() {
+        return Ok(Vec::new());
+    }
+    files.extend(
+        String::from_utf8_lossy(&untracked.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty() && !Path::new(s).starts_with(".codesage"))
+            .map(String::from),
+    );
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 
 pub(crate) fn cmd_rehearse(files: Vec<String>, json: bool) -> Result<()> {
@@ -481,6 +534,157 @@ mod tests {
             files,
             [" lead space é.rs", "new.rs", "old.rs"],
             "R100 rename must list both paths; -z keeps the padded non-ASCII name verbatim"
+        );
+    }
+
+    #[test]
+    fn working_tree_changes_includes_tracked_and_nonignored_untracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+        std::fs::create_dir(root.join(".codesage")).unwrap();
+        std::fs::write(root.join(".codesage/tracked-config"), "base\n").unwrap();
+        for path in ["staged.rs", "unstaged.rs", "deleted.rs"] {
+            std::fs::write(root.join(path), "fn base() {}\n").unwrap();
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "base"]);
+        std::fs::write(root.join("staged.rs"), "fn staged() {}\n").unwrap();
+        git(root, &["add", "staged.rs"]);
+        std::fs::write(root.join("unstaged.rs"), "fn unstaged() {}\n").unwrap();
+        std::fs::remove_file(root.join("deleted.rs")).unwrap();
+        for path in ["fresh.rs", " odd \"é\"\nfile.rs", "ignored.rs"] {
+            std::fs::write(root.join(path), "fn fresh() {}\n").unwrap();
+        }
+        std::fs::write(root.join(".codesage/tracked-config"), "changed\n").unwrap();
+        std::fs::write(root.join(".codesage/local-state"), "state\n").unwrap();
+
+        let mut files = working_tree_changes(root).unwrap();
+        files.sort();
+        assert_eq!(
+            files,
+            [
+                " odd \"é\"\nfile.rs",
+                ".codesage/tracked-config",
+                "deleted.rs",
+                "fresh.rs",
+                "staged.rs",
+                "unstaged.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn working_tree_changes_uses_nested_project_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let project = root.join("module");
+        std::fs::create_dir(&project).unwrap();
+        git(root, &["init", "-q"]);
+        for path in ["module/changed.rs", "module/old.rs", "outside.rs"] {
+            std::fs::write(root.join(path), "fn base() {}\n").unwrap();
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "base"]);
+        std::fs::write(project.join("changed.rs"), "fn changed() {}\n").unwrap();
+        git(root, &["mv", "module/old.rs", "module/new.rs"]);
+        std::fs::write(root.join("outside.rs"), "fn outside() {}\n").unwrap();
+        std::fs::write(root.join("outside-new.rs"), "fn outside() {}\n").unwrap();
+        std::fs::write(project.join("fresh.rs"), "fn fresh() {}\n").unwrap();
+
+        let mut files = working_tree_changes(&project).unwrap();
+        assert!(!files.iter().any(|file| file.starts_with("outside")));
+        files.sort();
+        assert_eq!(files, ["changed.rs", "fresh.rs", "new.rs", "old.rs"]);
+    }
+
+    #[test]
+    fn working_tree_changes_lists_a_recreated_staged_deletion_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("recreated.rs"), "fn base() {}\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "base"]);
+        git(root, &["rm", "recreated.rs"]);
+        std::fs::write(root.join("recreated.rs"), "fn new() {}\n").unwrap();
+
+        assert_eq!(working_tree_changes(root).unwrap(), ["recreated.rs"]);
+    }
+
+    #[test]
+    fn working_tree_changes_includes_untracked_files_when_tracked_files_are_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        git(root, &["commit", "--allow-empty", "-qm", "base"]);
+        std::fs::write(root.join("fresh.rs"), "fn fresh() {}\n").unwrap();
+
+        assert_eq!(working_tree_changes(root).unwrap(), ["fresh.rs"]);
+    }
+
+    fn unborn_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let project = root.join("module");
+        git(root, &["init", "-q", "-b", "base"]);
+        std::fs::create_dir_all(project.join(".codesage")).unwrap();
+        std::fs::write(project.join(".codesage/local-state"), "state\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+        std::fs::write(root.join("outside.rs"), "fn outside() {}\n").unwrap();
+        for path in ["fresh.rs", " odd \"é\"\nfile.rs", "ignored.rs"] {
+            std::fs::write(project.join(path), "fn fresh() {}\n").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn working_tree_changes_includes_untracked_files_before_first_commit() {
+        let dir = unborn_fixture();
+        assert_eq!(
+            working_tree_changes(&dir.path().join("module")).unwrap(),
+            [" odd \"é\"\nfile.rs", "fresh.rs"]
+        );
+    }
+
+    #[test]
+    fn working_tree_changes_includes_staged_files_before_first_commit() {
+        let dir = unborn_fixture();
+        git(dir.path(), &["add", "--", "module/fresh.rs"]);
+        assert_eq!(
+            working_tree_changes(&dir.path().join("module")).unwrap(),
+            [" odd \"é\"\nfile.rs", "fresh.rs"]
+        );
+    }
+
+    #[test]
+    fn working_tree_changes_does_not_treat_a_nonrepository_as_unborn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fresh.rs"), "fn fresh() {}\n").unwrap();
+        assert!(working_tree_changes(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn working_tree_changes_does_not_treat_a_corrupt_head_as_unborn() {
+        let dir = unborn_fixture();
+        std::fs::write(dir.path().join(".git/refs/heads/base"), "not-a-hash\n").unwrap();
+        let untracked = Command::new("git")
+            .args(["ls-files", "-z", "-o", "--exclude-standard", "--", "."])
+            .current_dir(dir.path().join("module"))
+            .output()
+            .unwrap();
+        assert!(untracked.status.success());
+        assert!(
+            untracked
+                .stdout
+                .windows(9)
+                .any(|path| path == b"fresh.rs\0")
+        );
+        assert!(
+            working_tree_changes(&dir.path().join("module"))
+                .unwrap()
+                .is_empty()
         );
     }
 }

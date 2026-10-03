@@ -177,8 +177,9 @@ fn python_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         1 => Some(ReferenceKind::Import),        // from X import (module)
         2 => Some(ReferenceKind::ImportBinding), // from X import Y (specific name)
         3 => Some(ReferenceKind::ImportBinding), // from X import Y as Z (aliased)
-        4 | 5 => Some(ReferenceKind::Call),      // call expression
-        6 => Some(ReferenceKind::Import),        // relative import module (from . import x)
+        12 => Some(ReferenceKind::Import),
+        4 | 5 => Some(ReferenceKind::Call), // call expression
+        6 => Some(ReferenceKind::Import),   // relative import module (from . import x)
         // Preserve Call for decorators and Java annotations so existing kind filters keep working.
         7..=10 => Some(ReferenceKind::Call),
         11 => Some(ReferenceKind::Inheritance),

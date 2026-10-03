@@ -53,7 +53,19 @@ def patched(attr: str, fn):
 
 
 def patched_search(fn):
-    return patched("run_codesage_search", fn)
+    def invoke(*args, **kwargs):
+        stdout, error = fn(*args, **kwargs)
+        return stdout, error, fixture_runtime()
+    return patched("run_codesage_search", invoke)
+
+
+def fixture_runtime():
+    stderr = "embedding model loaded\n"
+    return {**runner.QUERY_RUNTIME, "pid": 1, "directory_mode": 0o700,
+            "returncode": 0,
+            "runtime_dir": "/fixture/query", "entries_before": [], "entries_after": [],
+            "reranker": "none", "stderr": stderr,
+            "stderr_sha256": _hashlib.sha256(stderr.encode()).hexdigest()}
 
 
 
@@ -534,6 +546,34 @@ check(rc == 0 and "\nACCEPT\n" in out, f"bad rank: integral 1.0 and '1' are acce
 
 proj = tmp / "proj"
 proj.mkdir()
+(proj / ".codesage").mkdir()
+(proj / ".codesage/config.toml").write_text('[embedding]\nmodel="test/model"\ndevice="cpu"\n')
+# These runner-format tests inject search responses; control integration has its
+# own real SQLite/ripgrep fixtures in test_retrieval_controls.py.
+fixture_chunks = {"a.rs": ["fn a() {}"], "b.rs": [""]}
+fixture_chunks.update({f"noise{i}.rs": ["x" * 200] for i in range(20)})
+for path, content in fixture_chunks.items():
+    (proj / path).write_text(content[0])
+fixture_context = {
+    "head": "not-a-git-repo", "model": "test/model", "reranker": "none", "device": "cpu",
+    **{k: "0" * 64 for k in cmp.CONTROL_DIGEST_KEYS},
+    "binary": {"path": "/fixture/codesage", "sha256": "0" * 64, "size": 1},
+    "rg_binary": {"path": "/fixture/rg", "sha256": "0" * 64, "size": 1},
+    "embedding_artifacts": [{"label": name, "path": "/fixture/" + name,
+                              "sha256": "0" * 64, "size": 1} for name in ("tokenizer", "onnx", "ort_runtime")],
+    "reranker_artifacts": [], "eligible_files": sorted(fixture_chunks),
+    "source_manifest": [{"path": name, "sha256": _hashlib.sha256((proj / name).read_bytes()).hexdigest()}
+                        for name in sorted(fixture_chunks)],
+    "environment": {}, "query_runtime": runner.QUERY_RUNTIME.copy(),
+}
+fixture_context["artifact_digest"] = _hashlib.sha256("".join(
+    f"{pin['label']}={pin['sha256']}\n" for pin in fixture_context["embedding_artifacts"]).encode()).hexdigest()
+fixture_context["semantic_fingerprint"] = (
+    f"v4;model=test/model;artifacts={fixture_context['artifact_digest']};dim=768;pooling=mean;device=cpu;"
+    "ort=api1.24/dylib;pipeline=1;maxseq=512;norm=l2;chunker=3;chunk=1500/350/200")
+fixture_context["source_sha256"] = cmp.digest_json(fixture_context["source_manifest"])
+fixture_context["eligible_files_sha256"] = cmp.digest_json(fixture_context["eligible_files"])
+runner.capture_context = lambda *_a, **_k: (fixture_context, fixture_chunks)
 run_corpus = tmp / "run-corpus.yaml"
 run_ids = [f"r{i}" for i in range(20)]
 run_corpus.write_text(
@@ -619,8 +659,8 @@ check(errs == {"r3": "timeout", "r7": "rc=1"}, f"runner: per-record error tags (
 check(all(r["first_hit_rank"] is None for r in env["records"] if "error" in r), "runner: failed searches scored as misses")
 rc, out, err = run(["--baseline", str(tmp / "full.json"), "--candidate", str(tmp / "flaky.json"), "--min-n", "20",
                     "--bootstrap", "200"])
-check(rc == 2 and "search failures recorded (baseline 0, candidate 2)" in err,
-      f"runner->compare: flaky arm is refused end to end (rc={rc})")
+check(rc == 2 and "failed codesage arm: timeout" in err,
+      f"runner->compare: flaky arm is refused end to end (rc={rc}, err={err.strip()})")
 
 BANNER = (
     "codesage 0.26.1 (release)\n"
@@ -690,7 +730,7 @@ with patched_search(lambda *_a, **_k: ("", "rc=65")):
 check(rc == 0 and "[INVALID: 5 search failures]" in out, f"failures: --allow-search-failures exits 0, still flagged (rc={rc})")
 with patched_search(canned_search):
     rc, out, _ = run_runner([str(five_corpus)])
-check(rc == 0 and " search_failures=0 -->" in out and "INVALID" not in out and "Search failures" not in out,
+check(rc == 0 and " search_failures=0 placebo_r10=" in out and "INVALID" not in out and "Search failures" not in out,
       "failures: clean run reports search_failures=0 and no flags")
 
 bad_corpus = tmp / "bad-corpus.yaml"

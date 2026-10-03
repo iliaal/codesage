@@ -29,9 +29,9 @@ fn as_sig(fp: &[u64]) -> Option<&Fingerprint> {
 /// Fingerprints are stored by bare name, so the rows are keyed on the bare
 /// name of whatever the input resolved to: a `sym:` handle or `Foo::run`
 /// finds the same clones as `run`. Rows are the union across every
-/// definition sharing that name, which is the answer a clone search wants;
-/// `target` discloses when there was more than one, with a handle per
-/// definition. An input that resolves to nothing falls back to the raw
+/// definition sharing that name. `target` describes the input resolution,
+/// which can be unique even when fingerprints share the resolved bare name.
+/// An input that resolves to nothing falls back to the raw
 /// spelling, so a fingerprint with no indexed symbol row is still reachable.
 pub fn find_similar(
     db: &Database,
@@ -39,6 +39,15 @@ pub fn find_similar(
     min_jaccard: f32,
     limit: usize,
 ) -> Result<FindSimilarResults> {
+    find_similar_with_seeds(db, symbol_name, min_jaccard, limit).map(|(results, _)| results)
+}
+
+pub(crate) fn find_similar_with_seeds(
+    db: &Database,
+    symbol_name: &str,
+    min_jaccard: f32,
+    limit: usize,
+) -> Result<(FindSimilarResults, Vec<StoredFingerprint>)> {
     let (target, symbols) = resolve_symbols(db, symbol_name, ResolveOptions::symbol())?;
     // NaN would bypass the score threshold comparison.
     let min_jaccard = if min_jaccard.is_finite() {
@@ -58,11 +67,21 @@ pub fn find_similar(
     for name in names {
         targets.extend(db.fingerprints_named(name)?);
     }
+    targets.retain(|seed| as_sig(&seed.fp).is_some());
+    targets.sort_by(|a, b| {
+        (&a.file_path, a.line_start, &a.name).cmp(&(&b.file_path, b.line_start, &b.name))
+    });
+    targets.dedup_by(|a, b| {
+        a.file_path == b.file_path && a.line_start == b.line_start && a.name == b.name
+    });
     if targets.is_empty() {
-        return Ok(FindSimilarResults {
-            results: Vec::new(),
-            target: Some(target),
-        });
+        return Ok((
+            FindSimilarResults {
+                results: Vec::new(),
+                target: Some(target),
+            },
+            targets,
+        ));
     }
 
     // Tree-sitter kind IDs are grammar-local; compare only within one language.
@@ -70,6 +89,7 @@ pub fn find_similar(
 
     let mut best: HashMap<(String, u32), SimilarSymbol> = HashMap::new();
     for seed in &targets {
+        codesage_protocol::work::checkpoint()?;
         let Some(tsig) = as_sig(&seed.fp) else {
             continue;
         };
@@ -87,6 +107,7 @@ pub fn find_similar(
             }
         }
         for ci in candidates {
+            codesage_protocol::work::checkpoint()?;
             let c = &index.rows[ci];
             if c.file_path == seed.file_path && c.line_start == seed.line_start {
                 continue;
@@ -124,10 +145,13 @@ pub fn find_similar(
             .then_with(|| a.line_start.cmp(&b.line_start))
     });
     out.truncate(limit);
-    Ok(FindSimilarResults {
-        results: out,
-        target: Some(target),
-    })
+    Ok((
+        FindSimilarResults {
+            results: out,
+            target: Some(target),
+        },
+        targets,
+    ))
 }
 
 struct LanguageFingerprintIndex {

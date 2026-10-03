@@ -9,7 +9,7 @@ use codesage_protocol::{
 use codesage_storage::Database;
 
 use crate::impact::{WalkCache, is_qualified_symbol_name};
-use crate::resolver::{ResolveOptions, TargetError, matched_symbols, resolve_symbols};
+use crate::resolver::{ResolveOptions, TargetError, matched_symbols, require_one, resolve_symbols};
 use crate::search::{RerankFn, annotate_with_symbols, env_default_on, parse_db_language, search};
 
 /// Default-on; opt-out via `CODESAGE_BUNDLE_LINE_NUMBERS=0` (or "false").
@@ -99,8 +99,8 @@ pub fn export_context(
     rerank: Option<RerankFn<'_>>,
     req: &ExportRequest,
 ) -> Result<ContextBundle> {
-    if let Some(sym_name) = &req.symbol {
-        return export_context_for_symbol(db, sym_name, req);
+    if let Some(bundle) = export_context_for_target(db, req)? {
+        return Ok(bundle);
     }
 
     let query = req.query.as_deref().unwrap_or_default();
@@ -160,6 +160,126 @@ pub fn export_context(
         related,
         symbol_definitions: symbol_defs,
     }))
+}
+
+/// Resolve an entity bundle without inference; only unresolved text returns `None`.
+pub fn export_context_for_target(
+    db: &Database,
+    req: &ExportRequest,
+) -> Result<Option<ContextBundle>> {
+    let input = req
+        .symbol
+        .as_deref()
+        .or(req.query.as_deref())
+        .unwrap_or_default();
+    if input.trim().is_empty() {
+        anyhow::bail!("export_context requires either `query` or `symbol`");
+    }
+    let (resolution, symbols) = resolve_symbols(db, input, ResolveOptions::default())?;
+    if resolution.kind == TargetKind::Text {
+        return req
+            .symbol
+            .as_deref()
+            .map(|symbol| export_context_for_symbol(db, symbol, req))
+            .transpose();
+    }
+    let target = require_one(&resolution)?;
+    let bundle = match resolution.kind {
+        TargetKind::Symbol => symbol_bundle(db, input, symbols, req)?,
+        TargetKind::Feature | TargetKind::Route | TargetKind::Command => build_feature_bundle(
+            db,
+            &target.handle,
+            req.include_callers,
+            req.include_callees,
+            req.limit,
+            true,
+        )?,
+        TargetKind::File | TargetKind::Dir | TargetKind::Chunk => {
+            let path = target.path.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("resolved context target carries no indexed path")
+            })?;
+            let mut paths = if resolution.kind == TargetKind::Dir {
+                let prefix = format!("{path}/");
+                db.indexed_files_with_prefix(&prefix)?
+                    .into_iter()
+                    .filter(|file| file.starts_with(&prefix))
+                    .collect()
+            } else {
+                vec![path.to_string()]
+            };
+            paths.sort();
+            let limit = if req.limit == 0 { 5 } else { req.limit };
+            let overlaps = |start: u32, end: u32| {
+                target.line_start.is_none_or(|line| end >= line)
+                    && target.line_end.is_none_or(|line| start <= line)
+            };
+            let mut primary = Vec::new();
+            let mut definitions = Vec::new();
+            for path in paths {
+                codesage_protocol::work::checkpoint()?;
+                if primary.len() < limit {
+                    let mut chunks = db.chunks_for_file(&path)?;
+                    chunks.sort_by_key(|chunk| chunk.start_line);
+                    for chunk in chunks
+                        .into_iter()
+                        .filter(|chunk| overlaps(chunk.start_line, chunk.end_line))
+                        .take(limit - primary.len())
+                    {
+                        primary.push(SearchResult {
+                            file_path: chunk.file_path,
+                            language: parse_db_language(&chunk.language),
+                            content: chunk.content,
+                            start_line: chunk.start_line,
+                            end_line: chunk.end_line,
+                            score: 0.0,
+                            symbols: Vec::new(),
+                            trace: None,
+                        });
+                    }
+                }
+                if definitions.len() < limit {
+                    definitions.extend(
+                        db.symbols_for_file(&path)?
+                            .into_iter()
+                            .filter(|symbol| overlaps(symbol.line_start, symbol.line_end))
+                            .take(limit - definitions.len()),
+                    );
+                }
+                if primary.len() >= limit && definitions.len() >= limit {
+                    break;
+                }
+            }
+            annotate_with_symbols(db, &mut primary)?;
+            let mut related = Vec::new();
+            let mut keys = primary
+                .iter()
+                .map(|chunk| (chunk.file_path.clone(), chunk.start_line))
+                .collect();
+            let bounded = if req.include_callers || req.include_callees {
+                add_related_for_symbols(
+                    db,
+                    &definitions,
+                    req.include_callers,
+                    req.include_callees,
+                    limit,
+                    &mut related,
+                    &mut keys,
+                )?
+            } else {
+                false
+            };
+            finalize_bundle(ContextBundle {
+                bounded,
+                found: true,
+                target_description: format!("{}: {input}", target.kind),
+                primary,
+                related,
+                symbol_definitions: definitions,
+            })
+        }
+        TargetKind::Text => unreachable!("text returned before requiring an entity"),
+    };
+    Ok(Some(bundle))
 }
 
 /// `"<what>: <input> (not found)"`, naming the resolver's nearest candidates
@@ -223,6 +343,15 @@ pub fn export_context_for_symbol(
         });
     }
 
+    symbol_bundle(db, sym_name, defs, req)
+}
+
+fn symbol_bundle(
+    db: &Database,
+    sym_name: &str,
+    defs: Vec<Symbol>,
+    req: &ExportRequest,
+) -> Result<ContextBundle> {
     // Match feature_bundle's zero-limit default instead of returning an empty hit.
     let limit = if req.limit == 0 { 5 } else { req.limit };
     let defs: Vec<Symbol> = defs.into_iter().take(limit).collect();
@@ -284,6 +413,24 @@ pub fn feature_bundle(
     include_callers: bool,
     include_callees: bool,
     limit: usize,
+) -> Result<ContextBundle> {
+    build_feature_bundle(
+        db,
+        feature_id,
+        include_callers,
+        include_callees,
+        limit,
+        false,
+    )
+}
+
+fn build_feature_bundle(
+    db: &Database,
+    feature_id: &str,
+    include_callers: bool,
+    include_callees: bool,
+    limit: usize,
+    structural_definitions: bool,
 ) -> Result<ContextBundle> {
     use codesage_protocol::FeatureFileRole;
     let limit = if limit == 0 { 5 } else { limit };
@@ -377,6 +524,32 @@ pub fn feature_bundle(
             }
             if let Some(d) = find_definition_for_summary(db, sum, &r.file_path)? {
                 symbol_definitions.push(d);
+            }
+        }
+    }
+
+    if structural_definitions && symbol_definitions.is_empty() {
+        let mut seen = HashSet::new();
+        for role in [FeatureFileRole::Entry, FeatureFileRole::Owned] {
+            for file in feature.files.iter().filter(|file| file.role == role) {
+                if symbol_definitions.len() >= limit {
+                    break;
+                }
+                codesage_protocol::work::checkpoint()?;
+                let mut definitions = db.symbols_for_file(&file.path)?;
+                crate::resolver::retain_definitions(&mut definitions, false);
+                for definition in definitions {
+                    if seen.insert((
+                        definition.file_path.clone(),
+                        definition.qualified_name.clone(),
+                        definition.line_start,
+                    )) {
+                        symbol_definitions.push(definition);
+                        if symbol_definitions.len() >= limit {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -562,7 +735,7 @@ fn add_callees_for_symbol(
         if !is_callee_reference(r.kind) {
             continue;
         }
-        for def in cache.resolve_symbols(db, &sym.file_path, &r.to_name)? {
+        for def in cache.resolve_reference(db, &r)? {
             let key = (
                 def.file_path.clone(),
                 def.qualified_name.clone(),
@@ -619,6 +792,25 @@ pub(crate) fn resolve_callee_definitions_with_modules(
     load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
     modules: &crate::rust_modules::RustModules,
 ) -> Result<Vec<Symbol>> {
+    if codesage_protocol::python::is_python_path(caller_file) {
+        let mut resolved = Vec::new();
+        let mut seen = HashSet::new();
+        for row in db.references_in_file_range(caller_file, 1, u32::MAX)? {
+            if row.to_name != to_name {
+                continue;
+            }
+            for symbol in crate::python_bindings::resolve_reference(db, &row)?.unwrap_or_default() {
+                if seen.insert((
+                    symbol.file_path.clone(),
+                    symbol.qualified_name.clone(),
+                    symbol.line_start,
+                )) {
+                    resolved.push(symbol);
+                }
+            }
+        }
+        return Ok(resolved);
+    }
     // Gate before any strategy runs: a candidate the caller cannot name must
     // not resurface through a looser tier (lone-candidate return, case fold,
     // import evidence). The lone-candidate shortcut keys on the pre-gate
@@ -793,7 +985,7 @@ pub(crate) fn is_package_import(kind: ReferenceKind, from_file: &str, to_name: &
     if kind != ReferenceKind::Import {
         return false;
     }
-    if from_file.ends_with(".go") {
+    if from_file.ends_with(".go") || codesage_protocol::python::is_python_path(from_file) {
         return true;
     }
     matches!(
@@ -835,7 +1027,9 @@ pub(crate) fn import_ref_targets_symbol(
     callee_name: &str,
     sym: &Symbol,
 ) -> bool {
-    if import_ref.ends_with("::*") || (caller_file.ends_with(".py") && import_ref.ends_with(".*")) {
+    if import_ref.ends_with("::*")
+        || (codesage_protocol::python::is_python_path(caller_file) && import_ref.ends_with(".*"))
+    {
         return import_ref_targets_file(import_ref, caller_file, &sym.file_path);
     }
     if import_ref == sym.qualified_name || import_ref == sym.name {
@@ -960,33 +1154,12 @@ pub(crate) fn import_ref_targets_file(
     importer_file: &str,
     target_file: &str,
 ) -> bool {
-    if importer_file.ends_with(".py") && target_file.ends_with(".py") {
-        let import_ref = import_ref.strip_suffix('*').map_or(import_ref, |module| {
-            if module.chars().all(|c| c == '.') {
-                module
-            } else {
-                module.strip_suffix('.').unwrap_or(import_ref)
-            }
-        });
-        let dots = import_ref.bytes().take_while(|b| *b == b'.').count();
-        let module = &import_ref[dots..];
-        if !module
-            .split('.')
-            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_'))
-            && !module.is_empty()
-        {
-            return false;
-        }
-        let path = module.replace('.', "/");
-        let resolved = if dots == 0 {
-            Some(path)
-        } else {
-            let base = importer_file.rsplit_once('/').map_or("", |(dir, _)| dir);
-            lexical_join(base, &format!("{}{}", "../".repeat(dots - 1), path))
-        };
-        return resolved.is_some_and(|path| {
-            target_file == format!("{path}.py") || target_file == format!("{path}/__init__.py")
-        });
+    if codesage_protocol::python::is_python_path(importer_file)
+        && codesage_protocol::python::is_python_path(target_file)
+    {
+        return crate::python_bindings::module_candidates(import_ref, importer_file)
+            .iter()
+            .any(|candidate| candidate == target_file);
     }
     if import_ref.starts_with("./") || import_ref.starts_with("../") {
         return import_path_targets_file(import_ref, importer_file, target_file);
@@ -1063,8 +1236,7 @@ fn quoted_include_candidates<'a>(
 /// `import_ref_targets_file(spec, importer, t)` holds exactly when `t` is in
 /// this list, so `list_dependencies` keeps every candidate while a consumer
 /// that needs the one file actually loaded takes the first indexed entry.
-/// Every other importer (Rust, Python, Go, ...) yields nothing. May repeat a
-/// path.
+/// Every other importer (Rust, Go, Python, ...) yields nothing. May repeat a path.
 pub(crate) fn path_import_candidates(import_ref: &str, importer_file: &str) -> Vec<String> {
     let dialect = importer_dialect(importer_file);
     let relative = import_ref.starts_with("./") || import_ref.starts_with("../");

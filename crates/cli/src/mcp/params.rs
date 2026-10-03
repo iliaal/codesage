@@ -6,6 +6,23 @@ use super::error::{ErrorCode, McpError};
 
 const PROJECT_ARG_DESC: &str = "Absolute path to the project root. Must be an onboarded CodeSage project (contains .codesage/index.db).";
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DescribeParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(
+        description = "File, symbol, feature, or directory handle; indexed path; path:line; qualified or bare name; route:METHOD path; cmd:name. Ambiguity returns candidates without a card."
+    )]
+    pub target: String,
+    #[serde(default)]
+    pub detail: codesage_protocol::DescribeDetail,
+    #[schemars(
+        description = "Optional section selection. File: identity,symbols,dependencies,features,risk,coupling,tests,boundaries,findings. Symbol: identity,references,callees,clones,features,hotness,cycles. Feature: identity,risk,tests,boundaries,findings. Directory: module_map,fan_in,features,risk. Unknown or inapplicable sections are E_PARAM."
+    )]
+    pub sections: Option<Vec<String>>,
+}
+
 /// Entity-naming argument on the tools whose answer is about a symbol, a
 /// feature, or free text.
 const SYMBOL_TARGET_DESC: &str = "Preferred spelling of what to look up: a `sym:`/`file:` handle, an indexed path, `path:line`, a qualified or bare name, a `feat_` id, `route:METHOD path`, or `cmd:name`. Alias of `name` — pass one, or the same value in both.";
@@ -533,11 +550,11 @@ pub struct ExportContextParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Natural language query, or an entity in the shared target grammar: a `sym:` handle, an indexed path, `path:line`, or a qualified or bare name. Anything the index does not name is taken as a semantic query."
+        description = "Natural language query, or an entity in the shared target grammar: a `sym:`, `file:`, `dir:`, `chunk:`, or feature handle, an indexed path, `path:line`, a qualified or bare name, `route:METHOD path`, or `cmd:name`. Entity ambiguity and misses return resolver errors; only a Text resolution uses semantic search."
     )]
     pub target: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: the grammar disambiguates. Treat target as a symbol name instead of a semantic query. Ignored when `target` is a `sym:` handle, which names its own kind."
+        description = "DEPRECATED, removed in the next minor: the grammar disambiguates. For unresolved text, force symbol lookup instead of semantic search; a missing forced symbol returns found:false. Resolved entities always name their own kind."
     )]
     pub is_symbol: Option<bool>,
     #[schemars(

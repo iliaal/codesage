@@ -18,18 +18,18 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use codesage_graph::{
-    assess_risk, assess_risk_batch, assess_risk_diff, export_context, export_context_for_symbol,
+    assess_risk, assess_risk_batch, assess_risk_diff, export_context, export_context_for_target,
     feature_bundle, find_coupling, find_references, find_similar, find_symbol, from_trace,
     impact_analysis_report, list_dependencies, recommend_tests_with_reachability, search_page,
     session_end, session_start, trace_call_path,
 };
 use codesage_protocol::{
-    CallPathReport, CallPathRequest, ContextBundle, CouplingReport, DependencyEntry, ExportRequest,
-    FeatureListResults, FindReferencesRequest, FindReferencesResults, FindSimilarResults,
-    FindSymbolRequest, FindSymbolResults, FromTraceReport, FromTraceRequest, ImpactOptions,
-    ImpactReport, ImpactRequest, ImpactTarget, ProjectOverview, ReviewRehearsal, RiskAssessment,
-    RiskBatchAssessment, RiskDiffAssessment, SearchRequest, SearchResults, SessionDiff,
-    SessionStartReport, TestRecommendations,
+    CallPathReport, CallPathRequest, ContextBundle, CouplingReport, DependencyEntry,
+    DescribeResult, ExportRequest, FeatureListResults, FindReferencesRequest,
+    FindReferencesResults, FindSimilarResults, FindSymbolRequest, FindSymbolResults,
+    FromTraceReport, FromTraceRequest, ImpactOptions, ImpactReport, ImpactRequest, ImpactTarget,
+    ProjectOverview, ReviewRehearsal, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment,
+    SearchRequest, SearchResults, SessionDiff, SessionStartReport, TestRecommendations,
 };
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -333,6 +333,60 @@ impl CodeSageServer {
 #[tool_router]
 impl CodeSageServer {
     #[tool(
+        name = "describe",
+        description = "Compact indexed card for one file, symbol, feature, or directory. Includes test-aware facts, freshness, dependencies, features, bounded risk, and executable expand calls. Symbol cards include rationale, callers/callees, clones, hotness, and file import cycles; directory cards summarize a subtree. Ambiguous targets return candidates only. detail expands samples; sections selects facts. Deadline-cut sections are unscored with recover; no inference or writes.",
+        output_schema = schema_for_type::<DescribeResult>()
+    )]
+    async fn describe_tool(
+        &self,
+        Parameters(params): Parameters<DescribeParams>,
+    ) -> CallToolResult {
+        self.blocking(move |server| {
+            let result = (|| {
+                let state = server.resolve_project_read_only(&params.project)?;
+                let db = codesage_storage::Database::open_read_only(&state.db_path)?;
+                let root = state
+                    .db_path
+                    .parent()
+                    .and_then(|path| path.parent())
+                    .ok_or_else(|| anyhow::anyhow!("could not derive project root from db path"))?;
+                let db = &db;
+                let ranking = if server.state.overview_cache_enabled {
+                    server.state.overview_cache.ready_for_snapshot(root, db)?
+                } else {
+                    None
+                };
+                let _snapshot = db.read_snapshot()?;
+                let ranking = match ranking {
+                    Some((generation, ranking))
+                        if server.state.overview_cache.snapshot_matches(
+                            root,
+                            db,
+                            &generation,
+                        )? =>
+                    {
+                        Some(ranking)
+                    }
+                    _ => None,
+                };
+                codesage_graph::describe_with_ranking(
+                    root,
+                    db,
+                    &params.target,
+                    &codesage_graph::DescribeOptions {
+                        detail: params.detail,
+                        sections: params.sections.clone(),
+                        ..Default::default()
+                    },
+                    ranking.as_deref(),
+                )
+            })();
+            server.render_read_only(&params.project, result, "describe")
+        })
+        .await
+    }
+
+    #[tool(
         name = "project_overview",
         description = "First-call orientation for a project: one bounded response with languages and file/symbol counts, index freshness (structural drift vs git HEAD + semantic coverage), mapped feature summary by kind, a sample of entrypoints (routes/CLI/services/libraries), the top-risk files, trust-boundary clusters, the test-file naming conventions per language, and suggested next CodeSage calls for common intents. Aggregates indexed facts and computes risk analysis, reusing a shared ranking when the index is unchanged; no semantic search or model inference. Call this once at the start of a session to orient before reaching for `search`/`find_symbol`/`assess_risk`. `top_risk_files` is empty until git history is indexed; `freshness.structural_kind` of `behind_head`/`unrelated_ancestor` means structural results may be stale (re-run `codesage index`).",
         output_schema = schema_for_type::<ProjectOverview>()
@@ -476,7 +530,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_similar",
-        description = "Find functions/methods structurally similar to a named one (near-clone detection via MinHash over AST shape; identifiers and literals are ignored). Use before editing a function to find its copies so a fix lands everywhere, to spot divergent forks of a helper, or to locate copy-paste during review. Returns {name, file_path, line_start, line_end, kind, jaccard} ranked by similarity (1.0 = structurally identical body). Test files are excluded. Tune `min_jaccard` up for exact clones, down for looser matches. `min_jaccard` outside [0, 1] is clamped and `limit` over 100 is capped; either adjustment is reported under `_meta.clamps` as requested-vs-applied.",
+        description = "Find functions/methods structurally similar to a named one (near-clone detection via MinHash over AST shape; identifiers and literals are ignored). Even an exact symbol handle seeds all fingerprints sharing its bare name; target describes input resolution, not seed uniqueness. Use before editing a function to find its copies so a fix lands everywhere, to spot divergent forks of a helper, or to locate copy-paste during review. Returns {name, file_path, line_start, line_end, kind, jaccard} ranked by similarity (1.0 = structurally identical body). Test files are excluded. Tune `min_jaccard` up for exact clones, down for looser matches. `min_jaccard` outside [0, 1] is clamped and `limit` over 100 is capped; either adjustment is reported under `_meta.clamps` as requested-vs-applied.",
         output_schema = schema_for_type::<FindSimilarResults>()
     )]
     async fn find_similar_tool(
@@ -734,7 +788,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "export_context",
-        description = "Build a curated context bundle for a free-form **query** or a single **symbol**: semantic search results, overlapping symbol definitions, and optionally caller/callee code, all wrapped as a structured bundle ready for LLM consumption. Use when the anchor is a phrase ('error handling in the parser') or one named symbol. For an already-mapped feature slice (entrypoint + owned files + tests + context already resolved), use `feature_bundle` instead — that anchors on `feature_id` and avoids re-running semantic search. Symbol entries inside the bundle carry `rationale[]` when the author left `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments — preserve these in any synthesis the agent performs from the bundle. Currently extracted for Rust and Python. A missing symbol target sets top-level `found: false` (with an empty bundle) — check that flag, not the `target_description` text.",
+        description = "Build a curated context bundle from the shared target grammar or free-form text, with symbol definitions and optional caller/callee code. Exact entities resolve before inference; ambiguous entities return E_AMBIGUOUS with candidate handles, and entity misses return E_NOT_FOUND. File and directory targets read stored chunks in path/line order; chunk targets read stored chunks overlapping their line range. Feature, route, and command targets use mapped feature files; if entry-symbol and stored-chunk lookup yield no definitions, exports collect available Entry/Owned definitions up to limit. Only a Text resolution uses semantic search. An entity without stored chunks still returns found:true and available structural definitions. A missing symbol forced through deprecated is_symbol returns found:false. Symbol entries carry rationale[] extracted from Rust and Python author comments; preserve these in synthesis.",
         output_schema = schema_for_type::<ContextBundle>()
     )]
     async fn export_context_tool(
@@ -753,27 +807,22 @@ impl CodeSageServer {
                 params.include_callees.unwrap_or(false),
             );
             let budget = s.bundle_budget_chars(&params.project);
-            if let Some(sym_name) = req.symbol.clone() {
-                let result = s.render_budget(
-                    &params.project,
-                    s.with_project_context_db(&params.project, |db| {
-                        export_context_for_symbol(db, &sym_name, &req)
-                    }),
-                    "export_context",
-                    budget,
-                );
-                return render::annotate_clamps(result, clamps);
-            }
-            let query_for_embed = req.query.clone().unwrap_or_default();
-            let result = s.render_budget(
-                &params.project,
-                s.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
-                    export_context(db, emb, rr, &req)
-                }),
-                "export_context",
-                budget,
-            );
-            let result = render::annotate_test_override(result, Self::test_override_active());
+            let mut semantic = false;
+            let bundle = s
+                .with_project_context_db(&params.project, |db| export_context_for_target(db, &req))
+                .and_then(|bundle| match bundle {
+                    Some(bundle) => Ok(bundle),
+                    None => {
+                        semantic = true;
+                        let query = req.query.as_deref().unwrap_or_default();
+                        s.with_project_query(&params.project, query, |db, emb, rr| {
+                            export_context(db, emb, rr, &req)
+                        })
+                    }
+                });
+            let result = s.render_budget(&params.project, bundle, "export_context", budget);
+            let result =
+                render::annotate_test_override(result, semantic && Self::test_override_active());
             render::annotate_clamps(result, clamps)
         })
         .await

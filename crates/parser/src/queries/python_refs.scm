@@ -37,3 +37,6 @@
 ; Pattern 11: class bases; references.rs unwraps generic/parenthesized bases
 ; and rejects keyword arguments and dynamic factory expressions.
 (class_definition superclasses: (argument_list (_) @ref))
+
+; Pattern 12: plain aliased import (import unittest.mock as mock)
+(import_statement name: (aliased_import name: (dotted_name) @ref))

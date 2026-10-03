@@ -60,6 +60,7 @@ const MAPPER_MANIFEST_BASENAMES: &[&str] = &[
     "configure.ac",
     "go.mod",
     "package.json",
+    "pom.xml",
     "pyproject.toml",
     "setup.py",
 ];
@@ -453,7 +454,9 @@ fn run_index_passes(
             if verbose {
                 tracing::info!(pending = n_pending, "backfilling trust boundaries");
             }
-            match codesage_features::derive_for_files(&db, &pending) {
+            match codesage_features::trust_boundary::derive_for_files_with_source(
+                &root, &db, &pending,
+            ) {
                 Ok(n) => {
                     boundaries_backfilled = n;
                     if verbose {

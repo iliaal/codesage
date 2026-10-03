@@ -1,5 +1,6 @@
 //! Subcommand handlers; clap definitions and dispatch live in main.rs.
 
+pub(crate) mod describe;
 pub(crate) mod features;
 pub(crate) mod hooks;
 pub(crate) mod index;

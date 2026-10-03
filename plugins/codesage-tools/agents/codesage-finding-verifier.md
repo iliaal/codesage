@@ -1,7 +1,7 @@
 ---
 name: codesage-finding-verifier
 autoApprove: read
-tools: Read, Grep, mcp__codesage__find_symbol, mcp__codesage__find_references, mcp__codesage__list_dependencies
+tools: Read, Grep, mcp__codesage__describe, mcp__codesage__find_symbol, mcp__codesage__find_references, mcp__codesage__list_dependencies
 description: "Adversarially verify a bounded array of new findings from one feature."
 ---
 

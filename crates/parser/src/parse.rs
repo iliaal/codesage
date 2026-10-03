@@ -34,8 +34,8 @@ pub struct ParsedTree {
 
 /// Parse one source file and report whether the parse was degraded. Only a
 /// parser that returns no tree at all (cancelled, or the language failed to
-/// load) is an error. C++ export macros (`class MYLIB_API Widget`) are blanked
-/// first (`export_macro.rs`).
+/// load) is an error. C and C++ export macros are neutralized first
+/// (`export_macro.rs`).
 pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTree> {
     let mut parser = Parser::new();
     parser.set_language(&ts_language(language))?;
@@ -43,6 +43,7 @@ pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTr
     // neutralized copy is byte-for-byte the same length with the same
     // newlines, so the tree's offsets apply to both.
     let neutralized = match language {
+        Language::C => crate::export_macro::neutralize_c(source),
         Language::Cpp => crate::export_macro::neutralize(source),
         _ => None,
     };

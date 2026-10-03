@@ -111,6 +111,8 @@ pub(crate) struct WalkCache {
     caller_imports: HashMap<String, Arc<Vec<String>>>,
     reference_bytes: usize,
     file_imports: Option<Arc<Vec<Reference>>>,
+    python_indexed: Option<Arc<HashSet<String>>>,
+    python_imports: HashMap<codesage_protocol::python::PythonImportSite, Arc<Vec<String>>>,
     import_matches: HashMap<String, Arc<Vec<usize>>>,
     rust_modules: Option<Arc<crate::rust_modules::RustModules>>,
     #[cfg(test)]
@@ -183,6 +185,63 @@ impl WalkCache {
             + self.import_matches.len()
             + self.resolutions.len()
             + self.caller_imports.len()
+            + self.python_imports.len()
+    }
+
+    fn python_import_targets(
+        &mut self,
+        db: &Database,
+        row: &Reference,
+    ) -> Result<Arc<Vec<String>>> {
+        use codesage_protocol::python::PythonImportSite;
+
+        codesage_protocol::work::checkpoint()?;
+        if row.kind != ReferenceKind::Import {
+            return Ok(Arc::new(Vec::new()));
+        }
+        let key = PythonImportSite {
+            file: row.from_file.clone(),
+            to_name: row.to_name.clone(),
+            line: row.line,
+            col: row.col,
+        };
+        if let Some(targets) = self.python_imports.get(&key) {
+            return Ok(Arc::clone(targets));
+        }
+        let indexed = match &self.python_indexed {
+            Some(indexed) => Arc::clone(indexed),
+            None => {
+                let indexed = Arc::new(db.all_file_paths()?.into_iter().collect::<HashSet<_>>());
+                let bytes = indexed.iter().fold(
+                    indexed
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                    |bytes, path| bytes.saturating_add(path.capacity()),
+                );
+                if bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes) {
+                    self.reference_bytes += bytes;
+                    self.python_indexed = Some(Arc::clone(&indexed));
+                }
+                indexed
+            }
+        };
+        let targets = Arc::new(db.python_import_targets_indexed(row, &indexed)?);
+        let bytes = targets.iter().fold(
+            targets
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>())
+                .saturating_add(std::mem::size_of::<PythonImportSite>())
+                .saturating_add(key.file.capacity())
+                .saturating_add(key.to_name.capacity()),
+            |bytes, path| bytes.saturating_add(path.capacity()),
+        );
+        if self.entry_count() < Self::MAX_SYMBOLS
+            && bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes)
+        {
+            self.reference_bytes += bytes;
+            self.python_imports.insert(key, Arc::clone(&targets));
+        }
+        Ok(targets)
     }
 
     pub(crate) fn context_capped(&self) -> bool {
@@ -209,6 +268,17 @@ impl WalkCache {
             &mut || self.caller_imports(db, caller_file),
             &modules,
         )
+    }
+
+    pub(crate) fn resolve_reference(
+        &mut self,
+        db: &Database,
+        row: &Reference,
+    ) -> Result<Vec<Symbol>> {
+        if let Some(resolved) = crate::python_bindings::resolve_reference(db, row)? {
+            return Ok(resolved);
+        }
+        self.resolve_symbols(db, &row.from_file, &row.to_name)
     }
 
     fn resolve(
@@ -605,6 +675,18 @@ pub(crate) fn impact_analysis_walk_shared(
                 let reference_index = cached_matches.as_ref().map_or(index, |rows| rows[index]);
                 let r = &file_imports[reference_index];
                 if cached_matches.is_none()
+                    && codesage_protocol::python::is_python_path(&r.from_file)
+                    && !cache
+                        .as_deref_mut()
+                        .expect("walk cache initialized")
+                        .python_import_targets(db, r)?
+                        .iter()
+                        .any(|target| target == file)
+                {
+                    continue;
+                }
+                if cached_matches.is_none()
+                    && !codesage_protocol::python::is_python_path(&r.from_file)
                     && !import_ref_targets_file_with_modules(
                         &r.to_name,
                         &r.from_file,
@@ -952,6 +1034,12 @@ fn resolve_references_to_symbol(
     let identity = symbol_identity_key(sym);
     for r in raw {
         codesage_protocol::work::checkpoint()?;
+        if let Some(resolved) = crate::python_bindings::resolve_reference(db, &r)? {
+            if resolved.iter().any(|s| symbol_identity_key(s) == identity) {
+                out.push(r);
+            }
+            continue;
+        }
         if crate::bundle::is_package_import(r.kind, &r.from_file, &r.to_name) {
             continue;
         }

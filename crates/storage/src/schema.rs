@@ -734,7 +734,22 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         "0025_git_exclusion_fingerprint",
         migrate_0025_git_exclusion_fingerprint,
     ),
+    ("0026_python_bindings", migrate_0026_python_bindings),
 ];
+
+fn migrate_0026_python_bindings(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS python_bindings (
+             file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+             kind TEXT NOT NULL,
+             to_name TEXT NOT NULL,
+             line INTEGER NOT NULL,
+             col INTEGER NOT NULL,
+             target TEXT NOT NULL,
+             PRIMARY KEY (file_id, kind, to_name, line, col)
+         );",
+    )
+}
 
 /// Stores the canonical effective git-history exclusion set. A NULL value is
 /// treated as stale by the indexer and forces one safe full rebuild.
@@ -1894,6 +1909,28 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(again, count, "second init_db must be a registry no-op");
+    }
+    #[test]
+    fn python_binding_migration_is_additive_and_preserves_legacy_references() {
+        let conn = open_initialized();
+        conn.execute_batch("DROP TABLE python_bindings;
+            DELETE FROM schema_migrations WHERE name = '0026_python_bindings';
+            INSERT INTO files(id,path,language,content_hash) VALUES(101,'legacy.py','python','legacy');
+            INSERT INTO refs(from_file_id,to_name,to_name_tail,kind,line,col)
+            VALUES(101,'patch','patch','call',1,0);").unwrap();
+        init_db(&conn).unwrap();
+        let refs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refs WHERE from_file_id=101",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let evidence: i64 = conn
+            .query_row("SELECT COUNT(*) FROM python_bindings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refs, 1);
+        assert_eq!(evidence, 0);
     }
     #[test]
     fn legacy_git_state_update_invalidates_exclusion_fingerprint() {

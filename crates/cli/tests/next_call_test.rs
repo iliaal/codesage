@@ -407,6 +407,7 @@ fn every_advertised_tool_emits_executable_evidence_derived_terminating_next() {
     assert!(feature_id.is_string());
     let calls = [
         ("project_overview", json!({}), true),
+        ("describe", json!({"target":"file:src/helper.rs"}), true),
         ("find_symbol", json!({"name":"inner"}), true),
         ("find_references", json!({"name":"inner"}), true),
         ("find_similar", json!({"name":"twin_a"}), true),

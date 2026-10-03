@@ -1,9 +1,10 @@
 //! Files / symbols / refs / dependencies.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
 use codesage_protocol::handle::mark_overloads;
+use codesage_protocol::python::{PythonBindingTarget, PythonBindings};
 use codesage_protocol::{
     DependencyEntry, FileInfo, Handle, Language, RationaleEntry, Reference, ReferenceKind, Symbol,
     SymbolKind, TrustBoundary, Visibility,
@@ -251,6 +252,9 @@ impl Database {
             .prepare_cached("DELETE FROM refs WHERE from_file_id = ?1")?
             .execute(params![file_id])?;
         self.conn
+            .prepare_cached("DELETE FROM python_bindings WHERE file_id = ?1")?
+            .execute(params![file_id])?;
+        self.conn
             .prepare_cached("DELETE FROM symbol_fingerprints WHERE file_id = ?1")?
             .execute(params![file_id])?;
         self.conn
@@ -312,6 +316,109 @@ impl Database {
             ])?;
         }
         Ok(())
+    }
+
+    pub fn insert_python_bindings(&self, file_id: i64, bindings: &PythonBindings) -> Result<()> {
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO python_bindings (file_id, kind, to_name, line, col, target)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for binding in &bindings.references {
+            stmt.execute(params![
+                file_id,
+                binding.kind.as_str(),
+                binding.to_name,
+                binding.line,
+                binding.col,
+                serde_json::to_string(&binding.target)?
+            ])?;
+        }
+        for (name, target) in &bindings.exports {
+            stmt.execute(params![
+                file_id,
+                "export",
+                name,
+                0,
+                0,
+                serde_json::to_string(target)?
+            ])?;
+        }
+        for binding in &bindings.classes {
+            stmt.execute(params![
+                file_id,
+                "class_member",
+                format!("{}.{}", binding.qualified_class, binding.name),
+                binding.definition_line,
+                0,
+                serde_json::to_string(&binding.target)?
+            ])?;
+        }
+        Ok(())
+    }
+
+    pub fn python_reference_binding(
+        &self,
+        reference: &Reference,
+    ) -> Result<Option<PythonBindingTarget>> {
+        self.python_binding(
+            &reference.from_file,
+            reference.kind.as_str(),
+            &reference.to_name,
+            reference.line,
+            reference.col,
+        )
+    }
+
+    pub fn python_export_binding(
+        &self,
+        file: &str,
+        name: &str,
+    ) -> Result<Option<PythonBindingTarget>> {
+        self.python_binding(file, "export", name, 0, 0)
+    }
+
+    pub fn python_class_binding(
+        &self,
+        file: &str,
+        qualified_class: &str,
+        definition_line: u32,
+        name: &str,
+    ) -> Result<Option<PythonBindingTarget>> {
+        self.python_binding(
+            file,
+            "class_member",
+            &format!("{qualified_class}.{name}"),
+            definition_line,
+            0,
+        )
+    }
+
+    fn python_binding(
+        &self,
+        file: &str,
+        kind: &str,
+        name: &str,
+        line: u32,
+        col: u32,
+    ) -> Result<Option<PythonBindingTarget>> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'python_bindings' AND type = 'table')", [], |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let target: Option<String> = self
+            .conn
+            .prepare_cached(
+                "SELECT p.target FROM python_bindings p
+             JOIN files f ON f.id = p.file_id
+             WHERE f.path = ?1 AND p.kind = ?2 AND p.to_name = ?3 AND p.line = ?4 AND p.col = ?5",
+            )?
+            .query_row(params![file, kind, name, line, col], |row| row.get(0))
+            .optional()?;
+        target
+            .map(|target| serde_json::from_str(&target).map_err(Into::into))
+            .transpose()
     }
 
     /// Persist MinHash fingerprints for one file's functions/methods. Caller
@@ -572,8 +679,8 @@ impl Database {
     }
 
     /// Distinct cross-file load-time import/include/inheritance/trait-use
-    /// edges, plus Python import bindings. Match qualified names or short
-    /// names unique to one file. A pair whose directives are all lazy
+    /// edges, plus Python module paths. Match qualified names or short
+    /// names unique to one file in other languages. A pair whose directives are all lazy
     /// (function-body or TypeScript type-only imports) is excluded; see
     /// [`Self::lazy_import_pairs`].
     pub fn enumerate_file_import_edges(&self) -> Result<Vec<(String, String)>> {
@@ -589,7 +696,7 @@ impl Database {
     /// Both partitions of the cross-file import graph from one pass over the
     /// refs x symbols join. `MIN(lazy) = 0` means at least one load-time
     /// directive joins the pair. Only directives that name a symbol form an
-    /// edge here: path specifiers (`./b.js`, `"y.h"`) come from
+    /// edge in the join: Python imports resolve by module path, while path specifiers (`./b.js`, `"y.h"`) come from
     /// [`Self::path_import_refs`], and a Go import names a package, never a
     /// symbol, so it joins nothing.
     pub fn enumerate_file_import_pairs(&self) -> Result<ImportPairs> {
@@ -613,6 +720,7 @@ impl Database {
             WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
               AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
+              AND f_from.language <> 'python'
               AND f_from.path <> f_to.path
             GROUP BY f_from.path, f_to.path
         "#;
@@ -632,7 +740,414 @@ impl Database {
                 pairs.lazy_only.push((from, to));
             }
         }
+        let mut merged = self.python_file_import_pairs()?;
+        for pair in pairs.eager {
+            merged.insert(pair, false);
+        }
+        for pair in pairs.lazy_only {
+            merged.entry(pair).or_insert(true);
+        }
+        let mut pairs = ImportPairs::default();
+        for (pair, lazy) in merged {
+            if lazy {
+                pairs.lazy_only.push(pair);
+            } else {
+                pairs.eager.push(pair);
+            }
+        }
         Ok(pairs)
+    }
+
+    fn python_file_import_pairs(&self) -> Result<BTreeMap<(String, String), bool>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, r.to_name, r.line, r.col, r.lazy FROM refs r JOIN files f ON f.id = r.from_file_id
+             WHERE f.language = 'python' AND r.kind = 'import'",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let indexed = self.all_file_paths()?.into_iter().collect();
+        let mut pairs = BTreeMap::new();
+        for (from, module, line, col, lazy) in rows {
+            let row = Reference {
+                from_file: from.clone(),
+                from_symbol: None,
+                to_name: module,
+                kind: codesage_protocol::ReferenceKind::Import,
+                line,
+                col,
+                lazy,
+                is_test: false,
+                to: None,
+                from_line: None,
+            };
+            for to in self.python_import_targets_indexed(&row, &indexed)? {
+                if from == to {
+                    continue;
+                }
+                pairs
+                    .entry((from.clone(), to))
+                    .and_modify(|existing| *existing &= lazy)
+                    .or_insert(lazy);
+            }
+        }
+        Ok(pairs)
+    }
+
+    pub fn python_loaded_module(
+        &self,
+        from: &str,
+        module: &str,
+    ) -> Result<Option<codesage_protocol::python::PythonModule>> {
+        let files = self.all_file_paths()?.into_iter().collect();
+        Ok(codesage_protocol::python::load_module(module, from, &files))
+    }
+
+    pub fn python_import_targets(&self, row: &Reference) -> Result<Vec<String>> {
+        let indexed = self.all_file_paths()?.into_iter().collect();
+        self.python_import_targets_indexed(row, &indexed)
+    }
+
+    pub fn python_import_sites_load_module(
+        &self,
+        sites: &[codesage_protocol::python::PythonImportSite],
+        module: &str,
+    ) -> Result<Option<bool>> {
+        use codesage_protocol::python::BINDING_INTERPRETATION;
+        let indexed = self.all_file_paths()?.into_iter().collect();
+        let mut pending: Vec<_> = sites
+            .iter()
+            .map(|site| Reference {
+                from_file: site.file.clone(),
+                from_symbol: None,
+                to_name: site.to_name.clone(),
+                kind: ReferenceKind::Import,
+                line: site.line,
+                col: site.col,
+                lazy: false,
+                is_test: false,
+                to: None,
+                from_line: None,
+            })
+            .collect();
+        let mut visited: HashSet<_> = sites.iter().map(|site| site.file.clone()).collect();
+        let mut examined = 0;
+        while let Some(row) = pending.pop() {
+            codesage_protocol::work::checkpoint()?;
+            examined += 1;
+            if examined > 32
+                || !self.file_interpretation_matches(&row.from_file, BINDING_INTERPRETATION)?
+                || self.python_reference_binding(&row)?.is_none()
+            {
+                return Ok(None);
+            }
+            let Some(loaded) = self.python_import_load_indexed(&row, &indexed)? else {
+                continue;
+            };
+            if loaded.module_keys.iter().any(|key| key == module) {
+                return Ok(Some(true));
+            }
+            for file in loaded.loaded {
+                if !visited.insert(file.clone()) {
+                    continue;
+                }
+                if visited.len() > 32
+                    || !self.file_interpretation_matches(&file, BINDING_INTERPRETATION)?
+                {
+                    return Ok(None);
+                }
+                pending.extend(
+                    self.references_in_file_range(&file, 0, u32::MAX)?
+                        .into_iter()
+                        .filter(|row| row.kind == ReferenceKind::Import && !row.lazy),
+                );
+            }
+        }
+        Ok(Some(false))
+    }
+
+    pub fn python_first_module_load(
+        &self,
+        initializer: &str,
+        child: &str,
+    ) -> Result<codesage_protocol::python::PythonModuleLoad> {
+        use codesage_protocol::python::{BINDING_INTERPRETATION, PythonModuleLoad};
+        let indexed = self.all_file_paths()?.into_iter().collect();
+        let mut statements = Vec::new();
+        for row in self.references_in_file_range(initializer, 0, u32::MAX)? {
+            if row.kind == ReferenceKind::Import && !row.lazy {
+                let Some(target) = self.python_reference_binding(&row)? else {
+                    return Ok(PythonModuleLoad::Unknown);
+                };
+                if target.event_order == 0 {
+                    return Ok(PythonModuleLoad::Unknown);
+                }
+                statements.push((target.event_order, row));
+            }
+        }
+        statements.sort_by_key(|(order, _)| *order);
+        let mut visited = HashSet::from([initializer.to_string()]);
+        if !self.file_interpretation_matches(initializer, BINDING_INTERPRETATION)? {
+            return Ok(PythonModuleLoad::Unknown);
+        }
+        for (order, row) in statements {
+            let mut pending = vec![row];
+            while let Some(row) = pending.pop() {
+                codesage_protocol::work::checkpoint()?;
+                let Some(loaded) = self.python_import_load_indexed(&row, &indexed)? else {
+                    continue;
+                };
+                if loaded.module_keys.iter().any(|key| key == child) {
+                    return Ok(PythonModuleLoad::Loaded(order));
+                }
+                for file in loaded.loaded {
+                    if !visited.insert(file.clone()) {
+                        continue;
+                    }
+                    if visited.len() > 32
+                        || !self.file_interpretation_matches(&file, BINDING_INTERPRETATION)?
+                    {
+                        return Ok(PythonModuleLoad::Unknown);
+                    }
+                    pending.extend(
+                        self.references_in_file_range(&file, 0, u32::MAX)?
+                            .into_iter()
+                            .filter(|row| row.kind == ReferenceKind::Import && !row.lazy),
+                    );
+                }
+            }
+        }
+        Ok(PythonModuleLoad::Unloaded)
+    }
+
+    pub fn python_import_targets_indexed(
+        &self,
+        row: &Reference,
+        indexed: &HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let mut files = self
+            .python_import_load_indexed(row, indexed)?
+            .map_or_else(Vec::new, |loaded| loaded.loaded);
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
+    fn python_import_load_indexed(
+        &self,
+        row: &Reference,
+        indexed: &HashSet<String>,
+    ) -> Result<Option<codesage_protocol::python::PythonModule>> {
+        codesage_protocol::work::checkpoint()?;
+        if !self.file_interpretation_matches(
+            &row.from_file,
+            codesage_protocol::python::BINDING_INTERPRETATION,
+        )? {
+            return Ok(None);
+        }
+        let Some(target) = self.python_reference_binding(row)? else {
+            return Ok(None);
+        };
+        let Some(module) = &target.module else {
+            return Ok(None);
+        };
+        let Some(mut loaded) =
+            codesage_protocol::python::load_module(module, &row.from_file, indexed)
+        else {
+            return Ok(None);
+        };
+        if loaded.package {
+            let names = if target.wildcard {
+                if loaded.file.as_deref() == Some(row.from_file.as_str()) {
+                    target
+                        .namespace
+                        .as_ref()
+                        .and_then(|namespace| namespace.iter().find(|(name, _)| name == "__all__"))
+                        .filter(|(_, all)| all.bound && !all.deleted)
+                        .and_then(|(_, all)| all.export_names.clone())
+                        .unwrap_or_default()
+                } else {
+                    match &loaded.file {
+                        Some(file) => self
+                            .python_export_binding(file, "__all__")?
+                            .filter(|all| all.bound && !all.deleted)
+                            .and_then(|all| all.export_names)
+                            .unwrap_or_default(),
+                        None => Vec::new(),
+                    }
+                }
+            } else if target.name.is_empty() {
+                Vec::new()
+            } else {
+                vec![target.name.clone()]
+            };
+            for name in names {
+                let presence = match &loaded.file {
+                    Some(file) if file == &row.from_file => {
+                        let Some(namespace) = &target.namespace else {
+                            return Ok(None);
+                        };
+                        self.python_namespace_presence(file, namespace, &name)?
+                    }
+                    Some(file) => self.python_export_presence(file, &name)?,
+                    None => Some(false),
+                };
+                if presence == Some(false) {
+                    let separator = if module.ends_with('.') { "" } else { "." };
+                    if let Some(child) = codesage_protocol::python::load_module(
+                        &format!("{module}{separator}{name}"),
+                        &row.from_file,
+                        indexed,
+                    ) {
+                        loaded.loaded.extend(child.loaded);
+                        loaded.module_keys.extend(child.module_keys);
+                    }
+                }
+            }
+        }
+        Ok(Some(loaded))
+    }
+
+    fn python_namespace_presence(
+        &self,
+        file: &str,
+        namespace: &[(String, PythonBindingTarget)],
+        name: &str,
+    ) -> Result<Option<bool>> {
+        let presence = if let Some((_, target)) = namespace.iter().find(|(key, _)| key == name) {
+            self.python_target_presence(file, name, target, 0)?
+        } else if let Some((_, target)) = namespace.iter().find(|(key, _)| key == "*") {
+            self.python_target_presence(file, name, target, 0)?
+        } else {
+            Some(false)
+        };
+        if presence != Some(false) {
+            return Ok(presence);
+        }
+        let getter = match namespace.iter().find(|(key, _)| key == "__getattr__") {
+            Some((_, target)) => self.python_target_presence(file, "__getattr__", target, 0)?,
+            None => Some(false),
+        };
+        Ok(Self::python_presence_with_getter(presence, getter))
+    }
+
+    fn python_presence_with_getter(presence: Option<bool>, getter: Option<bool>) -> Option<bool> {
+        if presence == Some(false) && getter != Some(false) {
+            None
+        } else {
+            presence
+        }
+    }
+
+    pub fn python_export_presence(&self, file: &str, name: &str) -> Result<Option<bool>> {
+        self.python_presence(file, name, false, 0)
+    }
+
+    pub fn python_wildcard_exports_name(&self, file: &str, name: &str) -> Result<Option<bool>> {
+        self.python_presence(file, name, true, 0)
+    }
+
+    fn python_presence(
+        &self,
+        file: &str,
+        name: &str,
+        wildcard: bool,
+        depth: usize,
+    ) -> Result<Option<bool>> {
+        codesage_protocol::work::checkpoint()?;
+        if depth >= 32
+            || !self.file_interpretation_matches(
+                file,
+                codesage_protocol::python::BINDING_INTERPRETATION,
+            )?
+        {
+            return Ok(None);
+        }
+        if wildcard {
+            if let Some(all) = self.python_export_binding(file, "__all__")?
+                && all.bound
+                && !all.deleted
+            {
+                return Ok(all
+                    .export_names
+                    .map(|names| names.iter().any(|n| n == name)));
+            }
+            if self.python_binding_presence(file, "__getattr__", depth + 1)? != Some(false) {
+                return Ok(None);
+            }
+            if name.starts_with('_') {
+                return Ok(Some(false));
+            }
+        }
+        let presence = self.python_binding_presence(file, name, depth + 1)?;
+        if presence != Some(false) {
+            return Ok(presence);
+        }
+        let getter = self.python_binding_presence(file, "__getattr__", depth + 1)?;
+        Ok(Self::python_presence_with_getter(presence, getter))
+    }
+
+    fn python_binding_presence(
+        &self,
+        file: &str,
+        name: &str,
+        depth: usize,
+    ) -> Result<Option<bool>> {
+        if let Some(target) = self.python_export_binding(file, name)? {
+            self.python_target_presence(file, name, &target, depth)
+        } else if let Some(target) = self.python_export_binding(file, "*")? {
+            self.python_target_presence(file, name, &target, depth)
+        } else {
+            Ok(Some(false))
+        }
+    }
+
+    fn python_target_presence(
+        &self,
+        file: &str,
+        name: &str,
+        target: &PythonBindingTarget,
+        depth: usize,
+    ) -> Result<Option<bool>> {
+        if depth >= 32 {
+            return Ok(None);
+        }
+        if target.deleted || !target.bound {
+            return Ok(Some(false));
+        }
+        if !target.wildcard {
+            return Ok(Some(true));
+        }
+        let Some(module) = &target.module else {
+            return Ok(None);
+        };
+        let Some(loaded) = self.python_loaded_module(file, module)? else {
+            return Ok(None);
+        };
+        let Some(origin) = loaded.file else {
+            return Ok(Some(false));
+        };
+        let presence = self.python_presence(&origin, name, true, depth + 1)?;
+        if presence != Some(false) {
+            return Ok(presence);
+        }
+        match &target.fallback {
+            Some(fallback) if fallback.bound => {
+                self.python_target_presence(file, name, fallback, depth + 1)
+            }
+            _ => Ok(Some(false)),
+        }
     }
 
     pub fn import_targets_for_file(&self, file_path: &str) -> Result<Vec<String>> {
@@ -656,13 +1171,22 @@ impl Database {
             WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
               AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
+              AND f_from.language <> 'python'
               AND f_from.path = ?1
               AND f_from.path <> f_to.path
         "#;
         let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map(params![file_path], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.extend(
+            self.python_file_import_pairs()?
+                .into_keys()
+                .filter(|(from, _)| from == file_path)
+                .map(|(_, to)| to),
+        );
+        rows.sort();
+        rows.dedup();
         Ok(rows)
     }
 
@@ -687,13 +1211,22 @@ impl Database {
             WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
               AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
+              AND f_from.language <> 'python'
               AND f_to.path = ?1
               AND f_from.path <> f_to.path
         "#;
         let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map(params![file_path], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.extend(
+            self.python_file_import_pairs()?
+                .into_keys()
+                .filter(|(_, to)| to == file_path)
+                .map(|(from, _)| from),
+        );
+        rows.sort();
+        rows.dedup();
         Ok(rows)
     }
 
@@ -829,7 +1362,7 @@ impl Database {
              FROM refs r JOIN files f ON r.from_file_id = f.id
              WHERE r.to_name = ?1
                AND r.kind IN ('import', 'include')
-               AND f.language NOT IN ('javascript', 'typescript')
+               AND f.language NOT IN ('javascript', 'typescript', 'python')
                AND f.path <> ?1
              UNION
              SELECT DISTINCT f_from.path
@@ -852,12 +1385,21 @@ impl Database {
                AND (r.kind IN ('import', 'include')
                     OR (r.kind = 'import_binding' AND f_from.language = 'python'))
                AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
+               AND f_from.language <> 'python'
                AND f_from.path <> f_to.path
              ORDER BY 1",
         )?;
-        let imported_by: Vec<String> = imported_by_stmt
+        let mut imported_by: Vec<String> = imported_by_stmt
             .query_map(params![file_path], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        imported_by.extend(
+            self.python_file_import_pairs()?
+                .into_keys()
+                .filter(|(_, to)| to == file_path)
+                .map(|(from, _)| from),
+        );
+        imported_by.sort();
+        imported_by.dedup();
 
         Ok(DependencyEntry {
             handle: Handle::file(file_path)
@@ -1351,6 +1893,98 @@ mod tests {
     };
 
     use super::Database;
+
+    #[test]
+    fn python_binding_evidence_round_trips_and_is_cleared_on_reindex() {
+        use codesage_protocol::python::{
+            PythonBindingTarget, PythonBindings, PythonClassBinding, PythonReferenceBinding,
+        };
+        use codesage_protocol::{FileInfo, Reference, ReferenceKind};
+        let db = Database::open_in_memory().unwrap();
+        let file = FileInfo {
+            path: "caller.py".into(),
+            language: Language::Python,
+            content_hash: "hash".into(),
+            is_test: false,
+        };
+        let id = db.upsert_file(&file).unwrap();
+        let row = Reference {
+            from_file: file.path.clone(),
+            from_symbol: Some("run".into()),
+            to_name: "patch".into(),
+            kind: ReferenceKind::Call,
+            line: 4,
+            col: 2,
+            lazy: false,
+            is_test: false,
+            to: None,
+            from_line: None,
+        };
+        assert!(db.python_reference_binding(&row).unwrap().is_none());
+        let target = PythonBindingTarget {
+            module: Some("unittest.mock".into()),
+            name: "patch".into(),
+            definition_line: None,
+            ..Default::default()
+        };
+        db.insert_python_bindings(
+            id,
+            &PythonBindings {
+                references: vec![PythonReferenceBinding {
+                    to_name: row.to_name.clone(),
+                    kind: row.kind,
+                    line: row.line,
+                    col: row.col,
+                    target: target.clone(),
+                }],
+                exports: vec![("patch".into(), target.clone())],
+                classes: [2, 6]
+                    .into_iter()
+                    .map(|definition_line| PythonClassBinding {
+                        qualified_class: "View".into(),
+                        definition_line,
+                        name: "patch".into(),
+                        target: target.clone(),
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.python_reference_binding(&row).unwrap(),
+            Some(target.clone())
+        );
+        assert_eq!(
+            db.python_export_binding("caller.py", "patch").unwrap(),
+            Some(target.clone())
+        );
+        for line in [2, 6] {
+            assert_eq!(
+                db.python_class_binding("caller.py", "View", line, "patch")
+                    .unwrap(),
+                Some(target.clone())
+            );
+        }
+        assert!(
+            db.python_export_binding("caller.py", "View.patch")
+                .unwrap()
+                .is_none()
+        );
+        db.upsert_file(&file).unwrap();
+        assert!(db.python_reference_binding(&row).unwrap().is_none());
+        assert!(
+            db.python_export_binding("caller.py", "patch")
+                .unwrap()
+                .is_none()
+        );
+        for line in [2, 6] {
+            assert!(
+                db.python_class_binding("caller.py", "View", line, "patch")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
 
     fn feature(id: &str, entry: &str, owned: &str) -> FeatureRecord {
         FeatureRecord {

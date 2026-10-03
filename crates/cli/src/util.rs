@@ -1,5 +1,6 @@
 //! Shared helpers for CLI + doctor.
 
+#[cfg(test)]
 use std::path::Path;
 
 use tracing_subscriber::EnvFilter;
@@ -17,6 +18,7 @@ pub(crate) fn init_tracing() {
 pub(crate) use codesage_graph::drift::git_common_dir;
 
 /// Compare canonical paths, falling back to lexical equality if either cannot resolve.
+#[cfg(test)]
 pub(crate) fn paths_resolve_same(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(x), Ok(y)) => x == y,

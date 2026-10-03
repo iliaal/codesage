@@ -734,6 +734,28 @@ const JS_RULES: &[TrustBoundaryRule] = &[
     rule("fast-xml-parser", MatchMode::PrefixSlash, SERIALIZATION),
 ];
 
+const JAVA_RULES: &[TrustBoundaryRule] = &[
+    rule("java.net", MatchMode::PrefixDot, NETWORK),
+    rule("java.net.http", MatchMode::PrefixDot, NETWORK_API),
+    rule("java.nio.file", MatchMode::PrefixDot, FS),
+    rule("java.sql", MatchMode::PrefixDot, DB),
+    rule("javax.sql", MatchMode::PrefixDot, DB),
+    rule("org.springframework.jdbc", MatchMode::PrefixDot, DB),
+    rule(
+        "org.springframework.web.client",
+        MatchMode::PrefixDot,
+        NETWORK_API,
+    ),
+    rule(
+        "org.springframework.web.reactive.function.client",
+        MatchMode::PrefixDot,
+        NETWORK_API,
+    ),
+    rule("okhttp3", MatchMode::PrefixDot, NETWORK_API),
+    rule("com.fasterxml.jackson", MatchMode::PrefixDot, SERIALIZATION),
+    rule("com.google.gson", MatchMode::PrefixDot, SERIALIZATION),
+];
+
 /// Returns the language-specific rule table; for C++ also returns the C
 /// rules so they apply. Empty slice when the language has no rules yet.
 pub fn rules_for(language: Language) -> &'static [&'static [TrustBoundaryRule]] {
@@ -742,7 +764,7 @@ pub fn rules_for(language: Language) -> &'static [&'static [TrustBoundaryRule]] 
         Language::Php => &[PHP_RULES],
         Language::C => &[C_RULES],
         Language::Cpp => &[C_RULES, CPP_EXTRA_RULES],
-        Language::Java => &[],
+        Language::Java => &[JAVA_RULES],
         Language::Python => &[PYTHON_RULES],
         Language::Go => &[GO_RULES],
         Language::JavaScript | Language::TypeScript => &[JS_RULES],

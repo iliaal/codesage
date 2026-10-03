@@ -300,6 +300,12 @@ pub(crate) fn classify(error: &anyhow::Error) -> Classified {
                 remedy: Some(Remedy::command(REINDEX_FULL_COMMAND)),
             };
         }
+        if cause.is::<codesage_graph::DescribeParameterError>() {
+            return Classified {
+                code: ErrorCode::Param,
+                remedy: None,
+            };
+        }
         if let Some(refusal) = cause.downcast_ref::<EditCheckRefusal>() {
             return match refusal {
                 EditCheckRefusal::ProjectPath(_) => Classified {

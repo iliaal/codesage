@@ -7,11 +7,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use codesage_embed::config::EmbeddingConfig;
 use codesage_embed::model::Embedder;
-use codesage_graph::{index_files, remove_files, semantic_index_files, semantic_remove_files};
+use codesage_graph::{
+    index_files, remove_files_with_source, semantic_index_files, semantic_remove_files,
+};
 use codesage_parser::detect::{
     detect_language, detect_language_with_dialect, is_unambiguous_cpp_extension,
 };
-use codesage_parser::discover::{WatchFilter, content_hash, is_test_like_path};
+use codesage_parser::discover::{WatchFilter, is_test_like_path};
+use codesage_parser::source::read_indexable_file;
 use codesage_protocol::FileInfo;
 use codesage_storage::Database;
 use notify::event::ModifyKind;
@@ -757,8 +760,6 @@ fn process_ready(
     for path in ready {
         pending.remove(&path);
 
-        let rel_str = path.to_string_lossy().to_string();
-
         if filter.is_ignored(&config.project_root.join(&path), false) {
             work_retries.remove(&path);
             parked.remove(&path);
@@ -813,23 +814,8 @@ fn process_ready(
             rederive_header = true;
         }
 
-        if recheck_queue.remove(&path) {
-            let abs_path = config.project_root.join(&path);
-            if abs_path.exists()
-                && let Ok(bytes) = std::fs::read(&abs_path)
-            {
-                let new_hash = content_hash(&bytes);
-                let needs_reindex = match Database::open(&config.db_path) {
-                    Ok(db) => match db.get_file_hash(&rel_str) {
-                        Ok(Some(stored_hash)) => new_hash != stored_hash,
-                        _ => true,
-                    },
-                    Err(_) => true,
-                };
-                if needs_reindex {
-                    pending.insert(path, Instant::now());
-                }
-            }
+        if recheck_queue.remove(&path) && recheck_needs_reindex(config, &path) {
+            pending.insert(path, Instant::now());
         }
     }
 
@@ -846,6 +832,19 @@ fn process_ready(
         );
     }
     rederive_header
+}
+
+fn recheck_needs_reindex(config: &StateWatcherConfig, rel: &Path) -> bool {
+    let Ok(Some(source)) = read_indexable_file(&config.project_root, rel) else {
+        return true;
+    };
+    let Ok(db) = Database::open(&config.db_path) else {
+        return true;
+    };
+    !matches!(
+        db.get_file_hash(&rel.to_string_lossy()),
+        Ok(Some(stored)) if stored == source.content_hash
+    )
 }
 
 /// A successful batch carries only the paths whose semantic rows remain stale.
@@ -1056,13 +1055,38 @@ fn reindex_one(
     header_is_cpp: bool,
     stale_semantic: &mut Option<FileInfo>,
 ) -> WorkOutcome {
-    let abs = config.project_root.join(rel);
+    reindex_one_with(
+        config,
+        rel,
+        semantic_enabled,
+        header_is_cpp,
+        stale_semantic,
+        || {},
+    )
+}
+
+fn reindex_one_with(
+    config: &StateWatcherConfig,
+    rel: &Path,
+    semantic_enabled: bool,
+    header_is_cpp: bool,
+    stale_semantic: &mut Option<FileInfo>,
+    before_parse: impl FnOnce(),
+) -> WorkOutcome {
+    *stale_semantic = None;
     let rel_str = rel.to_string_lossy().to_string();
 
-    let bytes = match std::fs::read(&abs) {
-        Ok(b) => b,
+    let source = match read_indexable_file(&config.project_root, rel) {
+        Ok(Some(source)) => source,
+        Ok(None) => {
+            tracing::warn!(path = %rel_str, "file exceeds indexing size limit");
+            return WorkOutcome::Failed;
+        }
         // Rename-old paths arrive as Modify, and editor swaps can disappear before this read.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
             return purge_one_locked(config, &rel_str);
         }
         Err(e) => {
@@ -1070,16 +1094,16 @@ fn reindex_one(
             return WorkOutcome::Failed;
         }
     };
-    if bytes.is_empty() {
+    if source.bytes.is_empty() {
         return purge_one_locked(config, &rel_str);
     }
 
-    let hash = content_hash(&bytes);
+    let hash = source.content_hash;
     let Some(lang) = detect_language_with_dialect(rel, header_is_cpp) else {
         return WorkOutcome::Done;
     };
 
-    let file_info = FileInfo {
+    let mut file_info = FileInfo {
         path: rel_str.clone(),
         language: lang,
         content_hash: hash.clone(),
@@ -1113,6 +1137,7 @@ fn reindex_one(
 
     match Database::open(&config.db_path) {
         Ok(db) => {
+            before_parse();
             match index_files(
                 &config.project_root,
                 &db,
@@ -1120,8 +1145,29 @@ fn reindex_one(
                 false,
             ) {
                 Ok(stats) => {
+                    if stats.files_failed > 0 {
+                        tracing::warn!(path = %rel_str, "structural reindex rejected source");
+                        *stale_semantic = None;
+                        return WorkOutcome::Failed;
+                    }
                     if stats.files_indexed > 0 {
                         if semantic_enabled {
+                            file_info.content_hash = match db.get_file_hash(&rel_str) {
+                                Ok(Some(hash)) => hash,
+                                Ok(None) => {
+                                    *stale_semantic = None;
+                                    return WorkOutcome::Failed;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(path = %rel_str, error = %e, "reading indexed source hash");
+                                    *stale_semantic = None;
+                                    return if is_retryable_db_error(&e) {
+                                        WorkOutcome::Skipped
+                                    } else {
+                                        WorkOutcome::Failed
+                                    };
+                                }
+                            };
                             *stale_semantic = Some(file_info.clone());
                         }
                         tracing::info!(
@@ -1247,7 +1293,7 @@ fn purge_index_rows(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcom
         }
     };
 
-    match remove_files(&db, paths) {
+    match remove_files_with_source(&config.project_root, &db, paths) {
         Ok(n) => {
             if n > 0 {
                 tracing::info!(removed = n, paths = ?paths, "files removed from index");
@@ -2131,6 +2177,7 @@ pub fn register_shutdown_flag() -> Arc<AtomicBool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codesage_parser::discover::content_hash;
 
     #[cfg(unix)]
     #[test]
@@ -3490,6 +3537,397 @@ mod tests {
             reindex_one(&config, Path::new("foo.rs"), false, false, &mut None),
             WorkOutcome::Skipped
         );
+    }
+
+    #[test]
+    fn java_removal_refreshes_unchanged_watcher_dependents_and_retries_missing_rows() {
+        use codesage_protocol::TrustBoundary;
+
+        for fail_first_refresh in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            std::fs::create_dir_all(root.join(".codesage")).unwrap();
+            std::fs::create_dir_all(root.join("src/main/java/example")).unwrap();
+            let user_path = "src/main/java/example/Consumer.java";
+            let shadow_path = "src/main/java/example/java.java";
+            let user_source =
+                "package example; class Consumer { java.net.http.HttpClient client; }\n";
+            let shadow_source = "package example; class java {}\n";
+            std::fs::write(root.join(user_path), user_source).unwrap();
+            std::fs::write(root.join(shadow_path), shadow_source).unwrap();
+            let config = test_config(root);
+            let db = Database::open_for_model(
+                &config.db_path,
+                &config.embed_config.model,
+                codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+            )
+            .unwrap();
+            codesage_graph::full_index(root, &db, &[], false).unwrap();
+            let before_hash = db.get_file_hash(user_path).unwrap();
+            assert!(
+                db.trust_boundaries_for_file_path(user_path)
+                    .unwrap()
+                    .is_empty()
+            );
+            std::fs::remove_file(root.join(shadow_path)).unwrap();
+            if fail_first_refresh {
+                std::fs::write(root.join(user_path), [0xff]).unwrap();
+                assert_eq!(
+                    purge_index_rows(&config, &[shadow_path.into()]),
+                    WorkOutcome::Failed
+                );
+                assert!(db.file_id_for_path(shadow_path).unwrap().is_none());
+                assert!(
+                    db.trust_boundaries_for_file_path(user_path)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    !db.file_interpretation_matches(
+                        user_path,
+                        codesage_graph::STRUCTURAL_INTERPRETATION
+                    )
+                    .unwrap()
+                );
+                std::fs::write(root.join(user_path), user_source).unwrap();
+            }
+            assert_eq!(
+                purge_index_rows(&config, &[shadow_path.into()]),
+                WorkOutcome::Done
+            );
+            assert_eq!(
+                db.trust_boundaries_for_file_path(user_path).unwrap(),
+                [
+                    TrustBoundary::Network,
+                    TrustBoundary::ExternalApi,
+                    TrustBoundary::Serialization
+                ]
+            );
+            assert_eq!(db.get_file_hash(user_path).unwrap(), before_hash);
+            std::fs::write(root.join(shadow_path), shadow_source).unwrap();
+            let mut stale = None;
+            assert_eq!(
+                reindex_one(&config, Path::new(shadow_path), true, false, &mut stale),
+                WorkOutcome::Done
+            );
+            assert!(
+                db.trust_boundaries_for_file_path(user_path)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(db.get_file_hash(user_path).unwrap(), before_hash);
+        }
+    }
+
+    fn watcher_reader_fixture(root: &Path) -> (StateWatcherConfig, FileInfo) {
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        let source = "fn watch_before() {}\n";
+        std::fs::write(root.join("src/watch.rs"), source).unwrap();
+        let config = test_config(root);
+        let info = FileInfo {
+            path: "src/watch.rs".into(),
+            language: codesage_protocol::Language::Rust,
+            content_hash: content_hash(source.as_bytes()),
+            is_test: false,
+        };
+        let db = Database::open_for_model(
+            &config.db_path,
+            &config.embed_config.model,
+            codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+        )
+        .unwrap();
+        let stats = index_files(root, &db, std::slice::from_ref(&info), false).unwrap();
+        assert_eq!(stats.files_indexed, 1);
+        assert_eq!(stats.files_failed, 0);
+        let embedding = vec![0.0; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        db.insert_chunks(&info.path, "rust", &[(source, 1, 1, &embedding)])
+            .unwrap();
+        db.upsert_semantic_file_hash(&info.path, &info.content_hash)
+            .unwrap();
+        (config, info)
+    }
+
+    fn assert_watcher_reader_fixture_retained(config: &StateWatcherConfig, info: &FileInfo) {
+        let db =
+            Database::open_for_existing_model(&config.db_path, &config.embed_config.model).unwrap();
+        assert_eq!(
+            db.get_file_hash(&info.path).unwrap().as_deref(),
+            Some(info.content_hash.as_str())
+        );
+        let symbols = db.symbols_for_file(&info.path).unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "watch_before");
+        assert_eq!(
+            db.get_semantic_file_hash(&info.path).unwrap().as_deref(),
+            Some(info.content_hash.as_str())
+        );
+        let chunks = db.chunks_for_file(&info.path).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].content, "fn watch_before() {}\n");
+    }
+
+    #[cfg(unix)]
+    fn watcher_reader_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: CString supplies a NUL-terminated pathname and keeps its pointer
+        // valid throughout the call; 0o600 contains only valid permission bits.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    #[test]
+    fn watcher_reader_indexes_a_normal_saved_file_and_reports_current_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, before) = watcher_reader_fixture(tmp.path());
+        let source = "fn watch_after() { let saved = 1; }\n";
+        std::fs::write(tmp.path().join(&before.path), source).unwrap();
+        let hash = content_hash(source.as_bytes());
+        let mut stale = None;
+        assert_eq!(
+            reindex_one(&config, Path::new(&before.path), true, false, &mut stale),
+            WorkOutcome::Done
+        );
+        assert_eq!(stale.unwrap().content_hash, hash);
+        let db = Database::open(&config.db_path).unwrap();
+        assert_eq!(db.get_file_hash(&before.path).unwrap(), Some(hash));
+        let symbols = db.symbols_for_file(&before.path).unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "watch_after");
+        assert!(
+            db.file_interpretation_matches(&before.path, codesage_graph::STRUCTURAL_INTERPRETATION)
+                .unwrap()
+        );
+        let semantic_db =
+            Database::open_for_existing_model(&config.db_path, &config.embed_config.model).unwrap();
+        assert!(
+            semantic_db
+                .get_semantic_file_hash(&before.path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn watcher_reader_rejects_oversized_saved_files_without_scheduling_or_persistence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, before) = watcher_reader_fixture(tmp.path());
+        std::fs::File::options()
+            .write(true)
+            .truncate(true)
+            .open(tmp.path().join(&before.path))
+            .unwrap()
+            .set_len(codesage_parser::discover::MAX_INDEXABLE_FILE_BYTES + 1)
+            .unwrap();
+        let mut stale = Some(before.clone());
+        assert_eq!(
+            reindex_one(&config, Path::new(&before.path), true, false, &mut stale),
+            WorkOutcome::Failed
+        );
+        assert!(stale.is_none());
+        assert_watcher_reader_fixture_retained(&config, &before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_reader_rejects_leaf_and_ancestor_symlinks_without_scheduling_or_persistence() {
+        for ancestor in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let (config, before) = watcher_reader_fixture(tmp.path());
+            std::fs::write(outside.path().join("watch.rs"), "fn outside_source() {}\n").unwrap();
+            if ancestor {
+                std::fs::rename(tmp.path().join("src"), tmp.path().join("original-src")).unwrap();
+                std::os::unix::fs::symlink(outside.path(), tmp.path().join("src")).unwrap();
+            } else {
+                std::fs::remove_file(tmp.path().join(&before.path)).unwrap();
+                std::os::unix::fs::symlink(
+                    outside.path().join("watch.rs"),
+                    tmp.path().join(&before.path),
+                )
+                .unwrap();
+            }
+            let mut stale = Some(before.clone());
+            assert_eq!(
+                reindex_one(&config, Path::new(&before.path), true, false, &mut stale),
+                WorkOutcome::Failed,
+                "ancestor={ancestor}"
+            );
+            assert!(stale.is_none());
+            assert_watcher_reader_fixture_retained(&config, &before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_reader_rejects_a_fifo_without_waiting_for_a_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, before) = watcher_reader_fixture(tmp.path());
+        std::fs::remove_file(tmp.path().join(&before.path)).unwrap();
+        watcher_reader_fifo(&tmp.path().join(&before.path));
+        let rel = before.path.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut stale = None;
+            let outcome = reindex_one(&config, Path::new(&rel), true, false, &mut stale);
+            tx.send((config, outcome, stale)).unwrap();
+        });
+        let (config, outcome, stale) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("watcher FIFO read must return without a writer");
+        worker.join().unwrap();
+        assert_eq!(outcome, WorkOutcome::Failed);
+        assert!(stale.is_none());
+        assert_watcher_reader_fixture_retained(&config, &before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_reader_withdraws_scheduling_when_source_changes_before_structural_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, before) = watcher_reader_fixture(tmp.path());
+        let path = tmp.path().join(&before.path);
+        std::fs::write(&path, "fn saved_before_replacement() {}\n").unwrap();
+        let mut stale = None;
+        assert_eq!(
+            reindex_one_with(
+                &config,
+                Path::new(&before.path),
+                true,
+                false,
+                &mut stale,
+                || {
+                    std::fs::remove_file(&path).unwrap();
+                    watcher_reader_fifo(&path);
+                },
+            ),
+            WorkOutcome::Failed
+        );
+        assert!(stale.is_none());
+        assert_watcher_reader_fixture_retained(&config, &before);
+    }
+
+    #[test]
+    fn watcher_reader_reports_the_hash_structural_parsing_actually_indexed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, before) = watcher_reader_fixture(tmp.path());
+        let path = tmp.path().join(&before.path);
+        std::fs::write(&path, "fn watched_snapshot() {}\n").unwrap();
+        let replacement = "fn parsed_replacement() {}\n";
+        let mut stale = None;
+        assert_eq!(
+            reindex_one_with(
+                &config,
+                Path::new(&before.path),
+                true,
+                false,
+                &mut stale,
+                || {
+                    let saved = tmp.path().join("saved.rs");
+                    std::fs::write(&saved, replacement).unwrap();
+                    std::fs::rename(saved, &path).unwrap();
+                },
+            ),
+            WorkOutcome::Done
+        );
+        let hash = content_hash(replacement.as_bytes());
+        assert_eq!(stale.unwrap().content_hash, hash);
+        let db = Database::open(&config.db_path).unwrap();
+        assert_eq!(db.get_file_hash(&before.path).unwrap(), Some(hash));
+        let symbols = db.symbols_for_file(&before.path).unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "parsed_replacement");
+    }
+
+    #[test]
+    fn watcher_reader_purges_missing_and_empty_files_without_scheduling() {
+        for missing in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (config, before) = watcher_reader_fixture(tmp.path());
+            if missing {
+                std::fs::remove_file(tmp.path().join(&before.path)).unwrap();
+            } else {
+                std::fs::write(tmp.path().join(&before.path), "").unwrap();
+            }
+            let mut stale = Some(before.clone());
+            assert_eq!(
+                reindex_one(&config, Path::new(&before.path), true, false, &mut stale),
+                WorkOutcome::Done,
+                "missing={missing}"
+            );
+            assert!(stale.is_none());
+            let db = Database::open_for_existing_model(&config.db_path, &config.embed_config.model)
+                .unwrap();
+            assert!(db.get_file_hash(&before.path).unwrap().is_none());
+            assert!(db.symbols_for_file(&before.path).unwrap().is_empty());
+            assert!(db.chunks_for_file(&before.path).unwrap().is_empty());
+            assert!(db.get_semantic_file_hash(&before.path).unwrap().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_reader_does_not_purge_a_dangling_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, before) = watcher_reader_fixture(tmp.path());
+        std::fs::remove_file(tmp.path().join(&before.path)).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("missing.rs"), tmp.path().join(&before.path))
+            .unwrap();
+        let mut stale = Some(before.clone());
+        assert_eq!(
+            reindex_one(&config, Path::new(&before.path), true, false, &mut stale),
+            WorkOutcome::Failed
+        );
+        assert!(stale.is_none());
+        assert_watcher_reader_fixture_retained(&config, &before);
+    }
+
+    #[test]
+    fn watcher_reader_recheck_distinguishes_current_changed_missing_and_oversized_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, before) = watcher_reader_fixture(tmp.path());
+        let rel = Path::new(&before.path);
+        assert!(!recheck_needs_reindex(&config, rel));
+        std::fs::write(tmp.path().join(rel), "fn changed_again() {}\n").unwrap();
+        assert!(recheck_needs_reindex(&config, rel));
+        std::fs::File::options()
+            .write(true)
+            .truncate(true)
+            .open(tmp.path().join(rel))
+            .unwrap()
+            .set_len(codesage_parser::discover::MAX_INDEXABLE_FILE_BYTES + 1)
+            .unwrap();
+        assert!(recheck_needs_reindex(&config, rel));
+        std::fs::remove_file(tmp.path().join(rel)).unwrap();
+        assert!(recheck_needs_reindex(&config, rel));
+        assert_watcher_reader_fixture_retained(&config, &before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watcher_reader_recheck_rejects_symlinks_and_fifo_without_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, before) = watcher_reader_fixture(tmp.path());
+        let path = tmp.path().join(&before.path);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(tmp.path().join("target.rs"), "fn target() {}\n").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("target.rs"), &path).unwrap();
+        assert!(recheck_needs_reindex(&config, Path::new(&before.path)));
+        std::fs::remove_file(&path).unwrap();
+        watcher_reader_fifo(&path);
+        let rel = before.path.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let needs_reindex = recheck_needs_reindex(&config, Path::new(&rel));
+            tx.send((config, needs_reindex)).unwrap();
+        });
+        let (config, needs_reindex) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("watcher FIFO recheck must return without a writer");
+        worker.join().unwrap();
+        assert!(needs_reindex);
+        assert_watcher_reader_fixture_retained(&config, &before);
     }
 
     #[test]

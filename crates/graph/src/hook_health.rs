@@ -42,9 +42,8 @@ pub(crate) const LOCK_HELD_NO_PID: &str = "held_no_pid";
 /// writes.
 pub(crate) fn hooks_dir(root: &Path) -> Option<PathBuf> {
     let common = git_common_dir(root)?;
-    let configured = Command::new("git")
+    let configured = crate::git_command(root)
         .args(["config", "--type=path", "--get", "core.hooksPath"])
-        .current_dir(root)
         .output()
         .ok()
         .filter(|out| out.status.success())

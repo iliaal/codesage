@@ -164,20 +164,29 @@ pub fn connection_path_still_matches_open_file(
 }
 
 fn install_work_control(conn: &Connection) -> Result<()> {
-    let Some(control) = codesage_protocol::work::current() else {
-        return Ok(());
-    };
-    control.check()?;
-    let interrupt = conn.get_interrupt_handle();
-    let registration = control.on_cancel(std::sync::Arc::new(move || interrupt.interrupt()));
+    let control = codesage_protocol::work::current();
+    let controlled = control.is_some();
+    let registration = control.as_ref().map(|control| {
+        let interrupt = conn.get_interrupt_handle();
+        control.on_cancel(std::sync::Arc::new(move || interrupt.interrupt()))
+    });
+    if let Some(control) = &control {
+        control.check()?;
+    }
     conn.progress_handler(
         256,
         Some(move || {
             let _registration = &registration;
-            control.reason().is_some()
+            control
+                .as_ref()
+                .is_some_and(|outer| outer.reason().is_some())
+                || codesage_protocol::work::current()
+                    .is_some_and(|nested| nested.reason().is_some())
         }),
     )?;
-    conn.busy_timeout(std::time::Duration::from_millis(100))?;
+    if controlled {
+        conn.busy_timeout(std::time::Duration::from_millis(100))?;
+    }
     Ok(())
 }
 
@@ -966,7 +975,24 @@ impl Database {
     /// degrades to the legacy-candidate path instead of `no such table`.
     pub fn open_for_existing_model(path: &Path, model: &str) -> Result<Self> {
         let conn = open_connection_no_migrations(path)?;
-        let matches = if semantic_models_table_exists(&conn)? {
+        let chunk_table = Self::existing_model_chunk_table(&conn, model)?;
+        harden_db_path_permissions(path)?;
+        Ok(Database {
+            conn,
+            chunk_table,
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            verified_sidecars: Default::default(),
+        })
+    }
+
+    pub fn open_read_only_for_existing_model(path: &Path, model: &str) -> Result<Self> {
+        let mut db = Self::open_read_only(path)?;
+        db.chunk_table = Self::existing_model_chunk_table(&db.conn, model)?;
+        Ok(db)
+    }
+
+    fn existing_model_chunk_table(conn: &Connection, model: &str) -> Result<String> {
+        let matches = if semantic_models_table_exists(conn)? {
             let mut stmt = conn.prepare(
                 "SELECT sm.chunk_table FROM semantic_models sm
                  JOIN sqlite_master m
@@ -986,7 +1012,7 @@ impl Database {
         };
         let chunk_table = match matches.as_slice() {
             [] => {
-                let legacy = legacy_chunk_table_candidates(&conn, model)?;
+                let legacy = legacy_chunk_table_candidates(conn, model)?;
                 if !legacy.is_empty() {
                     anyhow::bail!(
                         "chunk table(s) match model {model:?} but lack exact semantic model metadata: {}; run `codesage index --full` with this CodeSage version to rebuild them",
@@ -1003,13 +1029,7 @@ impl Database {
                 );
             }
         };
-        harden_db_path_permissions(path)?;
-        Ok(Database {
-            conn,
-            chunk_table,
-            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
-            verified_sidecars: Default::default(),
-        })
+        Ok(chunk_table)
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -1245,6 +1265,47 @@ mod tests {
         FeatureConfidence, FeatureKind, FeatureRecord, FileInfo, Language, Reference, Symbol,
         TrustBoundary,
     };
+
+    #[test]
+    fn nested_work_deadline_interrupts_sql_without_poisoning_parent_connection() {
+        use codesage_protocol::work::{StopReason, WorkControl};
+        for open_under_parent in [false, true] {
+            let parent = WorkControl::new(None);
+            let captured_scope = open_under_parent.then(|| parent.enter());
+            let db = Database::open_in_memory().unwrap();
+            let _parent_scope = (!open_under_parent).then(|| parent.enter());
+            let nested = WorkControl::new(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(5),
+            ));
+            {
+                let _nested_scope = nested.enter();
+                let result = db.conn.query_row(
+                "WITH RECURSIVE many(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM many WHERE n<100000000) SELECT SUM(n) FROM many",
+                [], |row| row.get::<_, i64>(0),
+            );
+                assert_eq!(
+                    result.unwrap_err().sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::OperationInterrupted)
+                );
+                assert_eq!(nested.reason(), Some(StopReason::DeadlineExceeded));
+            }
+            assert_eq!(parent.reason(), None);
+            assert_eq!(
+                db.conn
+                    .query_row("SELECT 7", [], |row| row.get::<_, i32>(0))
+                    .unwrap(),
+                7
+            );
+            parent.cancel(StopReason::ClientCancelled);
+            assert!(parent.check().is_err());
+            let interrupted = db.conn.query_row("WITH RECURSIVE many(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM many WHERE n<100000000) SELECT SUM(n) FROM many", [], |row| row.get::<_, i64>(0));
+            assert_eq!(
+                interrupted.unwrap_err().sqlite_error_code(),
+                Some(rusqlite::ErrorCode::OperationInterrupted)
+            );
+            drop(captured_scope);
+        }
+    }
 
     #[test]
     fn is_unique_violation_matches_only_unique_failures_through_the_chain() {

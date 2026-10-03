@@ -44,6 +44,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -274,7 +275,7 @@ fn commit_epoch(root: &Path, sha: &str) -> Result<Option<i64>> {
 
 fn read_commit_epoch(root: &Path, sha: &str) -> Result<Option<i64>> {
     // `log.showSignature` would print verification text ahead of the date.
-    let Ok(out) = Command::new("git")
+    let Ok(out) = crate::git_command(root)
         .args([
             "log",
             "--no-show-signature",
@@ -283,7 +284,6 @@ fn read_commit_epoch(root: &Path, sha: &str) -> Result<Option<i64>> {
             sha,
             "--",
         ])
-        .current_dir(root)
         .output()
     else {
         return Ok(None);
@@ -347,7 +347,7 @@ pub fn git_history_index_with_options(
     let effective_mode = match mode {
         IndexMode::Full => IndexMode::Full,
         IndexMode::Incremental | IndexMode::Auto => match db.get_git_index_state()? {
-            // Rows built under another exclusion policy cannot be composed.
+            // Rows built under another history policy cannot be composed.
             Some(_) if policy_changed => IndexMode::Full,
             Some((last_sha, last_indexed_at)) if last_sha == head_sha => {
                 // HEAD is unchanged, so the anchor is too: the decay below is a
@@ -472,15 +472,15 @@ fn compile_excludes(extra: &[String]) -> Result<(GlobSet, GlobSet)> {
     Ok((hard_set, test_set))
 }
 
-/// Bump when code-level rules that decide stored history rows change (commit
-/// soft-skips, fix-commit detection, pair accounting), so the next pass
+/// Bump when repository selection or rules that decide stored history rows
+/// change (commit soft-skips, fix-commit detection, pair accounting), so the next pass
 /// rebuilds instead of composing rows written under two rule sets.
-const HISTORY_POLICY_VERSION: u32 = 1;
+const HISTORY_POLICY_VERSION: u32 = 2;
 
-/// Canonical, order-independent identity for the effective exclusion policy:
-/// the hard exclusions plus the test-like set and per-commit file cap that
-/// decide which co-change pairs are stored. An empty user list is still a valid fingerprint so
-/// legacy NULL state cannot silently reuse rows built under another policy.
+/// Canonical, order-independent identity for the history and exclusion policy:
+/// repository selection, hard exclusions, the test-like set, and per-commit
+/// file cap decide which rows are stored. An empty user list is still a valid
+/// fingerprint so legacy NULL state cannot silently reuse another policy's rows.
 fn effective_exclusion_fingerprint(extra_excludes: &[String]) -> String {
     let mut encoded =
         format!("policy:{HISTORY_POLICY_VERSION}\0cap:{MAX_FILES_PER_COMMIT_FOR_COCHANGE}\0");
@@ -819,9 +819,8 @@ fn remap_dead_paths(
 
 /// Every path in `sha`'s tree, repository-relative like `git log` paths.
 fn head_paths(root: &Path, sha: &str) -> Result<std::collections::HashSet<String>> {
-    let out = Command::new("git")
+    let out = crate::git_command(root)
         .args(["ls-tree", "-r", "-z", "--name-only", "--full-tree", sha])
-        .current_dir(root)
         .output()
         .with_context(|| format!("git ls-tree {sha} in {}", root.display()))?;
     if !out.status.success() {
@@ -924,9 +923,8 @@ fn accumulate(
 }
 
 fn resolve_head_sha(root: &Path) -> Result<String> {
-    let out = Command::new("git")
+    let out = crate::git_command(root)
         .args(["rev-parse", "HEAD"])
-        .current_dir(root)
         .output()
         .with_context(|| format!("git rev-parse HEAD in {}", root.display()))?;
     if !out.status.success() {
@@ -954,7 +952,7 @@ pub fn changed_files_since(
         ));
     }
     let range = format!("{git_ref}...HEAD");
-    let out = Command::new("git")
+    let out = crate::git_command(root)
         // `--` terminates option parsing so `range` is always read as a
         // revision range, never as flags. A rename touches both paths, so
         // rename detection must not collapse the pair to its destination.
@@ -967,7 +965,6 @@ pub fn changed_files_since(
             &range,
             "--",
         ])
-        .current_dir(root)
         .output()
         .with_context(|| format!("git diff --name-only {range} in {}", root.display()))?;
     if !out.status.success() {
@@ -1001,9 +998,8 @@ pub fn feature_touched_since(
 
 fn is_ancestor(root: &Path, old: &str, new: &str) -> Result<bool> {
     // Missing ancestry or an unavailable SHA requires a full scan; spawn errors propagate.
-    let status = Command::new("git")
+    let status = crate::git_command(root)
         .args(["merge-base", "--is-ancestor", old, new])
-        .current_dir(root)
         .status()
         .with_context(|| {
             format!(
@@ -1063,9 +1059,8 @@ fn run_git_log(root: &Path, range: Option<&str>, since_epoch: i64) -> Result<Str
     if let Some(r) = range {
         args.push(r);
     }
-    let output = Command::new("git")
+    let output = crate::git_command(root)
         .args(&args)
-        .current_dir(root)
         .output()
         .with_context(|| format!("running git log in {}", root.display()))?;
 

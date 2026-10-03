@@ -196,6 +196,15 @@ fn callees_of(
             );
             break;
         }
+        if codesage_protocol::python::is_python_path(&r.from_file) {
+            for def in resolver.resolve_reference(db, &r)? {
+                let k = key_of(&def);
+                if seen.insert(k) {
+                    out.push((def, r.line));
+                }
+            }
+            continue;
+        }
         let cache_key = (sym.file_path.clone(), r.to_name.clone());
         if !cache.contains_key(&cache_key) {
             let resolved = resolver.resolve_symbols(db, &sym.file_path, &r.to_name)?;
