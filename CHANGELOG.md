@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.40.0] - 2026-10-03
+
 ### Added
 
 - `help` explains MCP tools, fields, recovery, investigation recipes, and measured daemon latency.
@@ -1228,5 +1230,7 @@ Initial public release.
 
 [0.38.0]: https://github.com/iliaal/codesage/releases/tag/v0.38.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.39.0...HEAD
 [0.39.0]: https://github.com/iliaal/codesage/releases/tag/v0.39.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.40.0...HEAD
+[0.40.0]: https://github.com/iliaal/codesage/releases/tag/v0.40.0
