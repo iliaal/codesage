@@ -2267,13 +2267,16 @@ fn default_true() -> bool {
 
 /// `{"results": [...]}` envelope around `Vec<SearchResult>`. See [`FindSymbolResults`].
 ///
-/// The three optional fields disclose the relevance cliff of the returned
-/// page. They describe ranking flatness only, not whether the answer exists
-/// (see [`SearchConfidence`]). All default to absent so pre-cliff JSON still
-/// deserializes.
+/// The relevance-cliff fields describe ranking flatness only, not whether
+/// the answer exists (see [`SearchConfidence`]). Optional fields default to
+/// absent so older search responses still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchResults {
     pub results: Vec<SearchResult>,
+    /// BM25 lookup failed and the page retained dense candidates. Present
+    /// even when the page is empty; absent for a successful lookup with no hits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_fallback_reason: Option<String>,
     /// `high` when the page has a relative score drop that rounds to 20% or
     /// more between adjacent rows, `low` when the ranking is flat. A flatness
     /// signal, not evidence the answer exists.

@@ -999,6 +999,157 @@ fn tools_call_search_returns_seeded_hits_without_model_download() {
 }
 
 #[test]
+fn tools_call_search_discloses_lexical_failure_with_and_without_dense_rows() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_fixture_project(project.path());
+    seed_search_chunks(project.path());
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start_with_env(
+        runtime.path(),
+        &[("CODESAGE_MCP_TEST_QUERY_EMBEDDING", "0.1,0.2,0.3,0.4")],
+    );
+    session.initialize();
+    let mut arguments = serde_json::json!({
+        "project": project.path(), "query": "use `AbsentNeedle` here", "limit": 3
+    });
+    let baseline = call_mcp_tool(&mut session, 2, "search", arguments.clone());
+    assert_eq!(baseline["results"].as_array().unwrap().len(), 1);
+    assert!(baseline.get("lexical_fallback_reason").is_none());
+    let db = Database::open_for_existing_model(
+        &project.path().join(".codesage/index.db"),
+        "jinaai/jina-embeddings-v2-base-code",
+    )
+    .unwrap();
+    let fts = codesage_storage::schema::fts_table_name(db.chunk_table_name());
+    db.execute_raw_for_tests(&format!("DROP TABLE \"{fts}\""))
+        .unwrap();
+    drop(db);
+
+    for (id, empty, explain) in [
+        (3, false, false),
+        (4, false, true),
+        (5, true, false),
+        (6, true, true),
+    ] {
+        arguments["offset"] = serde_json::json!(if empty { 10 } else { 0 });
+        arguments["explain"] = serde_json::json!(explain);
+        let page = call_mcp_tool(&mut session, id, "search", arguments.clone());
+        assert_eq!(
+            page["results"].as_array().unwrap().is_empty(),
+            empty,
+            "{page}"
+        );
+        assert!(
+            page["lexical_fallback_reason"]
+                .as_str()
+                .unwrap()
+                .contains("no such table")
+        );
+        assert_eq!(page["completeness"]["kind"], "partial", "{page}");
+        assert_eq!(
+            page["completeness"]["recover"]["reason"],
+            "lexical_lookup_failed"
+        );
+        assert_eq!(
+            page["completeness"]["recover"]["command"],
+            "codesage index --full"
+        );
+        if !empty {
+            assert_eq!(page["results"][0]["score"], baseline["results"][0]["score"]);
+            assert_eq!(
+                page["results"][0]["file_path"],
+                baseline["results"][0]["file_path"]
+            );
+        }
+    }
+
+    let repaired = Database::open_for_model(
+        &project.path().join(".codesage/index.db"),
+        "jinaai/jina-embeddings-v2-base-code",
+        4,
+    )
+    .unwrap();
+    assert_eq!(
+        repaired
+            .search_bm25("\"hello_symbol\"", 3, None, None)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(repaired);
+    arguments["offset"] = serde_json::json!(0);
+    arguments["explain"] = serde_json::json!(false);
+    let recovered = call_mcp_tool(&mut session, 7, "search", arguments);
+    assert!(recovered.get("lexical_fallback_reason").is_none());
+    assert!(recovered.get("completeness").is_none(), "{recovered}");
+    assert_eq!(recovered["results"], baseline["results"]);
+}
+
+#[test]
+fn tools_call_search_keeps_lexical_repair_when_initial_render_truncates_rows() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_fixture_project(project.path());
+    let db_path = project.path().join(".codesage/index.db");
+    let db = Database::open_for_model(&db_path, "jinaai/jina-embeddings-v2-base-code", 4).unwrap();
+    let embedding = [0.1_f32, 0.2, 0.3, 0.4];
+    let source = "pub fn hello_symbol() {}\n".repeat(100);
+    let chunks: Vec<_> = (1..=50)
+        .map(|line| (source.as_str(), line, line, embedding.as_slice()))
+        .collect();
+    db.insert_chunks("src/lib.rs", "rust", &chunks).unwrap();
+    drop(db);
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start_with_env(
+        runtime.path(),
+        &[("CODESAGE_MCP_TEST_QUERY_EMBEDDING", "0.1,0.2,0.3,0.4")],
+    );
+    session.initialize();
+    let mut arguments = serde_json::json!({"project": project.path(), "query": "use `AbsentNeedle` here", "limit": 50, "detail": "compact", "budget_tokens": 8000});
+    let baseline = call_mcp_tool(&mut session, 2, "search", arguments.clone());
+    assert_eq!(baseline["results"].as_array().unwrap().len(), 50);
+    let db =
+        Database::open_for_existing_model(&db_path, "jinaai/jina-embeddings-v2-base-code").unwrap();
+    let fts = codesage_storage::schema::fts_table_name(db.chunk_table_name());
+    db.execute_raw_for_tests(&format!("DROP TABLE \"{fts}\""))
+        .unwrap();
+    drop(db);
+    arguments["detail"] = serde_json::json!("standard");
+    let page = call_mcp_tool(&mut session, 3, "search", arguments);
+    let retained = page["results"].as_array().unwrap().len();
+    assert!(retained > 0 && retained < 50, "{page}");
+    assert_eq!(
+        page["_meta"]["truncated"], true,
+        "initial rendering must exercise its row cap"
+    );
+    assert_eq!(
+        page["completeness"]["kinds"],
+        serde_json::json!(["truncated", "partial"])
+    );
+    assert!(
+        page["lexical_fallback_reason"]
+            .as_str()
+            .unwrap()
+            .contains("no such table")
+    );
+    let mut completeness = &page["completeness"];
+    while let Some(prior) = completeness.get("prior") {
+        completeness = prior;
+    }
+    let recover = &completeness["recover"];
+    assert_eq!(recover["command"], "codesage index --full");
+    assert_eq!(recover["reason"], "lexical_lookup_failed");
+    assert_eq!(recover["arguments"]["offset"], retained);
+    assert_eq!(recover["returned"], retained);
+    assert_eq!(recover["total"], 50);
+}
+
+#[test]
 fn tools_call_search_round_trips_tool_error_without_protocol_failure() {
     let project = tempfile::tempdir().unwrap();
     onboard_fixture_project(project.path());
@@ -1215,6 +1366,11 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
 
     // Preserve order: session_end requires the preceding session_start.
     let calls: Vec<(&str, Value, &[&str])> = vec![
+        (
+            "help",
+            serde_json::json!({"tool": "find_symbol"}),
+            &["subject", "price_list"],
+        ),
         (
             "describe",
             serde_json::json!({"target": "file:src/lib.rs"}),
@@ -1772,7 +1928,8 @@ fn hidden_daemon_stats_and_cli_report_the_same_shared_state() {
     );
     let cli_stats: Value = serde_json::from_slice(&cli.stdout).expect("daemon stats JSON");
     assert_eq!(
-        cli_stats, direct,
+        stable(&cli_stats),
+        stable(&direct),
         "the CLI must query the existing daemon rather than a fresh diagnostics state"
     );
 }
@@ -2355,13 +2512,14 @@ fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
     assert_eq!(ckeys, mkeys, "top-level field sets diverge");
     assert_eq!(
         mcp_report["next"],
-        serde_json::json!({
-            "tool": "list_dependencies",
+        serde_json::json!([{
+            "tool": "export_context",
             "arguments": {
                 "project": project.path(),
-                "target": mcp_steps[0]["file_path"]
-            }
-        })
+                "target": mcp_steps[0]["handle"]
+            },
+            "why": "Read the implementation behind this call path"
+        }])
     );
 }
 
@@ -2537,12 +2695,18 @@ const MCP_ONLY_FIELDS: &[&str] = &[
     "cost",
 ];
 
-/// Blank the one envelope field that is wall time, so two responses that
-/// describe the same index state compare equal. `cost.bytes` stays compared.
+/// Exact bytes include the timing's digit width; verify them before comparing stable facts.
 fn stable(value: &Value) -> Value {
+    assert_eq!(
+        value["cost"]["bytes"].as_u64(),
+        Some(serde_json::to_vec(value).unwrap().len() as u64)
+    );
     let mut value = value.clone();
     if let Some(ms) = value.pointer_mut("/cost/ms") {
         *ms = Value::Null;
+    }
+    if let Some(bytes) = value.pointer_mut("/cost/bytes") {
+        *bytes = Value::Null;
     }
     value
 }

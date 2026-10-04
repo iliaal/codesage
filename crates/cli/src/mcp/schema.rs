@@ -63,7 +63,7 @@ fn strip_nonstandard_schema_formats(value: &mut serde_json::Value) {
 const NON_READONLY_TOOLS: &[&str] = &["session_start", "session_end"];
 
 /// Optional render-layer annotations shared by all output schemas.
-fn meta_property_schema() -> serde_json::Value {
+pub(super) fn meta_property_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "description": "DEPRECATED, removed in the next minor: read the top-level \
@@ -94,6 +94,12 @@ fn meta_property_schema() -> serde_json::Value {
             "stale_files": { "type": "array", "items": { "type": "string" }, "description": "referenced files that changed on disk since indexing" },
             "stale_warning": { "type": "string", "description": "human-readable staleness notice" },
             "ranking_recomputed": { "type": "boolean", "description": "cached overview or session ranking could not be reused and was recomputed for this request's read snapshot; does not imply analysis failed or that the index changed during computation" },
+            "recover": {"type": "object", "description": super::help::field_description("_meta.recover"), "properties": {
+                "tool": {"type": "string", "description": super::help::field_description("_meta.recover.tool")},
+                "arguments": {"type": "object", "description": super::help::field_description("_meta.recover.arguments")}
+            }},
+            "trimmed": super::envelope::trimmed_schema("_meta.trimmed"),
+            "shortened": super::envelope::shortened_schema("_meta.shortened"),
             "test_override": { "type": "boolean", "description": "response was served through the debug-only test query-embedding override (debug builds only); production responses never carry it" }
         }
     })
@@ -128,12 +134,14 @@ fn merge_meta_property(schema: &mut serde_json::Map<String, serde_json::Value>) 
 pub(super) fn finalize_tools_for_listing(tools: &mut [rmcp::model::Tool]) {
     for tool in tools.iter_mut() {
         let mut input = serde_json::Value::Object((*tool.input_schema).clone());
+        super::detail::advertise(&tool.name, &mut input);
         strip_nonstandard_schema_formats(&mut input);
         if let serde_json::Value::Object(map) = input {
             tool.input_schema = Arc::new(map);
         }
         if let Some(output) = tool.output_schema.take() {
             let mut out = serde_json::Value::Object((*output).clone());
+            super::detail::adapt_output_schema(&mut out);
             strip_nonstandard_schema_formats(&mut out);
             if let serde_json::Value::Object(mut map) = out {
                 merge_meta_property(&mut map);

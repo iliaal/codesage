@@ -792,6 +792,11 @@ pub(crate) fn resolve_callee_definitions_with_modules(
     load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
     modules: &crate::rust_modules::RustModules,
 ) -> Result<Vec<Symbol>> {
+    if caller_file.ends_with(".rs")
+        && let Some(resolved) = modules.external_definitions(db, caller_file, to_name)?
+    {
+        return Ok(resolved);
+    }
     if codesage_protocol::python::is_python_path(caller_file) {
         let mut resolved = Vec::new();
         let mut seen = HashSet::new();

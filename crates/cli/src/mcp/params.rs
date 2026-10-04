@@ -8,6 +8,21 @@ const PROJECT_ARG_DESC: &str = "Absolute path to the project root. Must be an on
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct HelpParams {
+    /// Absolute existing project directory. An index and model are not required.
+    pub project: String,
+    /// Advertised tool name, hidden tool name, or daemon for operator tools.
+    pub tool: Option<String>,
+    /// Envelope field, or a tool field such as input.query or output.results[].score.
+    pub field: Option<String>,
+    /// Error code such as E_NOT_FOUND. Cannot combine with other selectors.
+    pub code: Option<String>,
+    /// Ordered investigation plan. Cannot combine with other selectors.
+    pub intent: Option<super::help::Intent>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DescribeParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,

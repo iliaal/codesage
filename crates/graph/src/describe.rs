@@ -21,6 +21,7 @@ use crate::resolver::{ResolveOptions, TargetError, require_one, resolve_target};
 const MAX_READ: u64 = 10 * 1024 * 1024;
 const SECTION_BUDGET: Duration = Duration::from_millis(500);
 const RISK_BUDGET: Duration = Duration::from_millis(250);
+const MAX_FINDINGS: usize = 4_096;
 
 #[derive(Debug, Clone)]
 pub struct DescribeOptions {
@@ -271,11 +272,21 @@ impl Builder<'_> {
         codesage_protocol::work::checkpoint()?;
         let section = match attempt {
             Ok(data) if control.reason().is_none() => {
-                let completeness = data.get("unavailable").map(|_| DescribeIncomplete {
+                if name == "findings" && data.is_null() {
+                    return Ok(());
+                }
+                let mut completeness = data.get("unavailable").map(|_| DescribeIncomplete {
                     kind: "unscored".into(),
                     reason: "optional_schema_unavailable".into(),
                     recover: expand.clone(),
                 });
+                if name == "findings" && data.get("truncated") == Some(&Value::Bool(true)) {
+                    completeness = Some(DescribeIncomplete {
+                        kind: "truncated".into(),
+                        reason: "findings_row_limit".into(),
+                        recover: expand.clone(),
+                    });
+                }
                 DescribeSection {
                     data,
                     expand,
@@ -818,16 +829,10 @@ impl Builder<'_> {
 
     fn findings(&self, path: Option<&str>, features: &[FeatureRecord]) -> Result<Value> {
         let directory = self.root.join(".codesage/findings");
-        if !directory.try_exists()? {
-            return Ok(json!({"open": 0}));
+        if !findings_path_exists(self.root, ".codesage/findings", true)? {
+            return Ok(Value::Null);
         }
-        ensure!(
-            directory
-                .canonicalize()?
-                .starts_with(self.root.canonicalize()?),
-            "findings store escapes project root"
-        );
-        let mut ids = HashSet::new();
+        let mut by_id = BTreeMap::new();
         let mut stores = if path.is_some() {
             let mut stores = Vec::new();
             for (index, entry) in std::fs::read_dir(&directory)?.enumerate() {
@@ -852,46 +857,155 @@ impl Builder<'_> {
             stores.len() <= 512,
             "findings store exceeds describe scan limit"
         );
+        let mut bytes_read = 0;
+        let mut records_read = 0;
+        let mut stores_read = 0;
         for relative in stores {
             codesage_protocol::work::checkpoint()?;
-            let bytes = match read_regular(self.root, &relative, 1024 * 1024) {
-                Ok(bytes) => bytes,
-                Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            if !findings_path_exists(self.root, &relative, false)? {
+                continue;
+            }
+            let bytes = read_regular(self.root, &relative, 1024 * 1024)?;
+            bytes_read += bytes.len() as u64;
+            ensure!(
+                bytes_read <= MAX_READ,
+                "findings store exceeds describe read limit"
+            );
+            stores_read += 1;
             let document: Value = serde_json::from_slice(&bytes)?;
             let findings = document
                 .get("findings")
                 .and_then(Value::as_array)
                 .context("findings store has no findings array")?;
             for finding in findings {
-                if finding.get("status").and_then(Value::as_str) != Some("open") {
+                codesage_protocol::work::checkpoint()?;
+                records_read += 1;
+                ensure!(
+                    records_read <= MAX_FINDINGS,
+                    "findings store exceeds describe record limit"
+                );
+                let status = finding.get("status").and_then(Value::as_str);
+                ensure!(
+                    matches!(
+                        status,
+                        Some("open" | "fixed" | "false-positive" | "wont-fix")
+                    ),
+                    "finding has invalid status"
+                );
+                if status != Some("open") {
+                    continue;
+                }
+                if let Some(transfer) = finding.get("ack_transferred_to").filter(|v| !v.is_null()) {
+                    let destinations = transfer
+                        .as_array()
+                        .context("open finding has invalid transfer metadata")?;
+                    ensure!(
+                        !destinations.is_empty()
+                            && destinations.iter().all(|destination| {
+                                [("feature_id", "feat_", 16), ("finding_id", "fnd_", 8)]
+                                    .into_iter()
+                                    .all(|(field, prefix, length)| {
+                                        destination
+                                            .get(field)
+                                            .and_then(Value::as_str)
+                                            .and_then(|id| id.strip_prefix(prefix))
+                                            .is_some_and(|suffix| {
+                                                suffix.len() == length
+                                                    && suffix.bytes().all(|byte| {
+                                                        byte.is_ascii_digit()
+                                                            || (b'a'..=b'f').contains(&byte)
+                                                    })
+                                            })
+                                    })
+                            }),
+                        "open finding has invalid transfer metadata"
+                    );
                     continue;
                 }
                 let file = finding
                     .get("file")
                     .or_else(|| finding.pointer("/location/file"))
                     .or_else(|| finding.pointer("/location/file_path"))
-                    .and_then(Value::as_str);
-                if path.is_some_and(|p| file != Some(p)) {
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .context("open finding has no file")?;
+                if path.is_some_and(|p| file != p) {
                     continue;
                 }
                 let id = finding
                     .get("finding_id")
                     .or_else(|| finding.get("id"))
                     .and_then(Value::as_str)
+                    .filter(|s| s.starts_with("fnd_") && s.len() > 4 && s.len() <= 128)
                     .context("open finding has no stable id")?;
-                ids.insert(id.to_string());
+                let severity = finding
+                    .get("severity")
+                    .and_then(Value::as_str)
+                    .context("open finding has no severity")?;
+                let rank = match severity {
+                    "high" => 0,
+                    "medium" => 1,
+                    "low" => 2,
+                    _ => anyhow::bail!("open finding has invalid severity"),
+                };
+                let title = finding
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .context("open finding has no title")?;
+                let line = finding
+                    .get("line")
+                    .or_else(|| finding.pointer("/location/line"))
+                    .and_then(Value::as_u64)
+                    .filter(|line| *line > 0)
+                    .context("open finding has no positive line")?;
+                let summary = (rank, file.to_string(), line, title.to_string());
+                if let Some(previous) = by_id.insert(id.to_string(), summary.clone()) {
+                    ensure!(previous == summary, "conflicting records for finding {id}");
+                }
             }
         }
-        Ok(json!({"open": ids.len()}))
+        if stores_read == 0 {
+            return Ok(Value::Null);
+        }
+        let mut findings: Vec<_> = by_id.into_iter().collect();
+        findings.sort_by(|(left_id, left), (right_id, right)| {
+            (&left.0, &left.1, &left.2, left_id).cmp(&(&right.0, &right.1, &right.2, right_id))
+        });
+        let limit = row_limit(self.options.detail);
+        let ids: Vec<_> = findings.iter().take(limit).map(|(id, _)| id).collect();
+        let top: Vec<_> = findings.iter().take(limit).map(|(id, (rank, _, line, title))| {
+            let severity = ["high", "medium", "low"][*rank];
+            json!({"id": id, "severity": severity, "title": brief(title, self.options.detail), "line": line})
+        }).collect();
+        let mut result = json!({"open": findings.len(), "ids": ids, "top": top});
+        if findings.len() > limit {
+            result["truncated"] = json!(true);
+        }
+        Ok(result)
     }
+}
+
+fn findings_path_exists(root: &Path, relative: &str, directory: bool) -> Result<bool> {
+    let components: Vec<_> = Path::new(relative).components().collect();
+    ensure!(
+        components.iter().all(|c| matches!(c, Component::Normal(_))),
+        "invalid findings path"
+    );
+    let mut path = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        path.push(component.as_os_str());
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(!metadata.is_symlink(), "findings path contains a symlink");
+        if directory || index + 1 < components.len() {
+            ensure!(metadata.is_dir(), "findings path is not a directory");
+        }
+    }
+    Ok(true)
 }
 
 #[derive(Default)]
@@ -1054,7 +1168,8 @@ mod tests {
     fn describe_file_and_symbol_expose_test_split_relationships_and_commands() {
         let (root, db, _) = fixture();
         let file = card(root.path(), &db, "file:src/helper.rs");
-        assert_eq!(file.sections.len(), 9);
+        assert_eq!(file.sections.len(), 8);
+        assert!(!file.sections.contains_key("findings"));
         let symbols = &file.sections["symbols"].data;
         assert!(symbols["test"].as_u64().unwrap() >= 2);
         assert_eq!(
@@ -1561,7 +1676,7 @@ mod tests {
     }
 
     #[test]
-    fn describe_findings_counts_existing_open_records_and_discloses_bad_store() {
+    fn describe_findings_lists_existing_open_records_and_discloses_bad_store() {
         let (root, db, feature) = fixture();
         let directory = root.path().join(".codesage/findings");
         std::fs::create_dir_all(&directory).unwrap();
@@ -1569,24 +1684,317 @@ mod tests {
         std::fs::write(
             &path,
             serde_json::to_vec(&json!({"findings": [
-                {"finding_id": "fnd_a", "file": "src/helper.rs", "status": "open"},
-                {"finding_id": "fnd_b", "file": "src/lib.rs", "status": "open"},
+                {"finding_id": "fnd_a", "file": "src/helper.rs", "status": "open", "severity": "medium", "title": "Helper defect", "line": 2},
+                {"finding_id": "fnd_b", "file": "src/lib.rs", "status": "open", "severity": "high", "title": "Library defect", "line": 1},
                 {"finding_id": "fnd_c", "file": "src/helper.rs", "status": "fixed"}
             ]}))
             .unwrap(),
         )
         .unwrap();
+        let file = card(root.path(), &db, "src/helper.rs");
         assert_eq!(
-            card(root.path(), &db, "src/helper.rs").sections["findings"].data["open"],
-            1
+            file.sections["findings"].data,
+            json!({"open": 1, "ids": ["fnd_a"], "top": [{"id": "fnd_a", "severity": "medium", "title": "Helper defect", "line": 2}]})
+        );
+        let feature_card = card(root.path(), &db, &feature.feature_id);
+        assert_eq!(feature_card.sections["findings"].data["open"], 2);
+        assert_eq!(
+            feature_card.sections["findings"].data["ids"],
+            json!(["fnd_b"])
         );
         assert_eq!(
-            card(root.path(), &db, &feature.feature_id).sections["findings"].data["open"],
-            2
+            feature_card.sections["findings"]
+                .completeness
+                .as_ref()
+                .unwrap()
+                .kind,
+            "truncated"
         );
         std::fs::write(path, "malformed").unwrap();
         let result = card(root.path(), &db, "src/helper.rs");
         assert_eq!(result.sections["findings"].data["unscored"], true);
         assert!(result.sections["findings"].completeness.is_some());
+    }
+
+    #[test]
+    fn describe_findings_missing_and_empty_stores_are_distinct() {
+        let (root, db, feature) = fixture();
+        let directory = root.path().join(".codesage/findings");
+        for target in ["src/helper.rs", feature.feature_id.as_str()] {
+            assert!(
+                !card(root.path(), &db, target)
+                    .sections
+                    .contains_key("findings")
+            );
+        }
+        std::fs::create_dir_all(&directory).unwrap();
+        for target in ["src/helper.rs", feature.feature_id.as_str()] {
+            assert!(
+                !card(root.path(), &db, target)
+                    .sections
+                    .contains_key("findings")
+            );
+        }
+        std::fs::write(
+            directory.join(format!("{}.json", feature.feature_id)),
+            r#"{"findings":[]}"#,
+        )
+        .unwrap();
+        for target in ["src/helper.rs", feature.feature_id.as_str()] {
+            assert_eq!(
+                card(root.path(), &db, target).sections["findings"].data,
+                json!({"open": 0, "ids": [], "top": []})
+            );
+        }
+    }
+
+    #[test]
+    fn describe_findings_deduplicates_and_orders_severity_location_then_id() {
+        let (root, db, feature) = fixture();
+        let directory = root.path().join(".codesage/findings");
+        std::fs::create_dir_all(&directory).unwrap();
+        let records = json!([
+            {"finding_id":"fnd_low", "file":"src/helper.rs", "line":1, "severity":"low", "title":"Low", "status":"open"},
+            {"finding_id":"fnd_b", "file":"src/helper.rs", "line":2, "severity":"high", "title":"High B", "status":"open"},
+            {"finding_id":"fnd_a", "file":"src/helper.rs", "line":2, "severity":"high", "title":"High A", "status":"open"},
+            {"finding_id":"fnd_first", "file":"src/helper.rs", "line":1, "severity":"high", "title":"High first", "status":"open"},
+            {"finding_id":"fnd_other", "file":"src/lib.rs", "line":1, "severity":"high", "title":"Other file", "status":"open"},
+            {"finding_id":"fnd_fixed", "file":"src/helper.rs", "status":"fixed"},
+            {"finding_id":"fnd_false", "file":"src/helper.rs", "status":"false-positive"},
+            {"finding_id":"fnd_wont", "file":"src/helper.rs", "status":"wont-fix"},
+            {"finding_id":"fnd_transferred", "file":"src/helper.rs", "status":"open", "ack_transferred_to": [{"feature_id":"feat_1111111111111111", "finding_id":"fnd_11111111"}]}
+        ]);
+        let document = serde_json::to_vec(&json!({"findings": records})).unwrap();
+        std::fs::write(
+            directory.join(format!("{}.json", feature.feature_id)),
+            &document,
+        )
+        .unwrap();
+        std::fs::write(directory.join("duplicate.json"), &document).unwrap();
+        let options = DescribeOptions {
+            detail: DescribeDetail::Full,
+            sections: Some(vec!["findings".into()]),
+            ..Default::default()
+        };
+        let file = describe(root.path(), &db, "src/helper.rs", &options)
+            .unwrap()
+            .card
+            .unwrap();
+        assert_eq!(file.sections["findings"].data["open"], 4);
+        assert_eq!(
+            file.sections["findings"].data["ids"],
+            json!(["fnd_first", "fnd_a", "fnd_b", "fnd_low"])
+        );
+        assert!(file.sections["findings"].completeness.is_none());
+        let feature_card = describe(root.path(), &db, &feature.feature_id, &options)
+            .unwrap()
+            .card
+            .unwrap();
+        assert_eq!(feature_card.sections["findings"].data["open"], 5);
+        assert_eq!(
+            feature_card.sections["findings"].data["ids"],
+            json!(["fnd_first", "fnd_a", "fnd_b", "fnd_other", "fnd_low"])
+        );
+    }
+
+    #[test]
+    fn describe_findings_bounds_rows_and_refuses_malformed_records() {
+        let (root, db, feature) = fixture();
+        let directory = root.path().join(".codesage/findings");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{}.json", feature.feature_id));
+        let record = json!({"finding_id":"fnd_a", "file":"src/helper.rs", "line":1, "severity":"high", "title":"A defect", "status":"open"});
+        let records: Vec<_> = (0..101)
+            .map(|i| {
+                let mut r = record.clone();
+                r["finding_id"] = json!(format!("fnd_{i:03}"));
+                r
+            })
+            .collect();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"findings": records})).unwrap(),
+        )
+        .unwrap();
+        for (detail, limit) in [
+            (DescribeDetail::Compact, 1),
+            (DescribeDetail::Standard, 5),
+            (DescribeDetail::Full, 100),
+        ] {
+            let options = DescribeOptions {
+                detail,
+                sections: Some(vec!["findings".into()]),
+                ..Default::default()
+            };
+            let card = describe(root.path(), &db, "src/helper.rs", &options)
+                .unwrap()
+                .card
+                .unwrap();
+            let section = &card.sections["findings"];
+            assert_eq!(section.data["open"], 101);
+            assert_eq!(section.data["ids"].as_array().unwrap().len(), limit);
+            assert_eq!(section.data["top"].as_array().unwrap().len(), limit);
+            assert_eq!(section.completeness.as_ref().unwrap().kind, "truncated");
+        }
+        for (field, value) in [
+            ("finding_id", json!("")),
+            ("severity", json!("critical")),
+            ("title", json!(null)),
+            ("line", json!(true)),
+            ("line", json!(0)),
+            ("status", json!("unknown")),
+        ] {
+            let mut invalid = record.clone();
+            invalid[field] = value;
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&json!({"findings": [invalid]})).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                card(root.path(), &db, "src/helper.rs").sections["findings"].data,
+                json!({"unscored":true}),
+                "{field}"
+            );
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"findings": vec![record.clone(); MAX_FINDINGS + 1]}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            card(root.path(), &db, "src/helper.rs").sections["findings"]
+                .completeness
+                .as_ref()
+                .unwrap()
+                .reason
+                .contains("record limit")
+        );
+        std::fs::write(&path, " ".repeat(1024 * 1024 + 1)).unwrap();
+        assert!(
+            card(root.path(), &db, "src/helper.rs").sections["findings"]
+                .completeness
+                .as_ref()
+                .unwrap()
+                .reason
+                .contains("read limit")
+        );
+        let mut conflict = record.clone();
+        conflict["title"] = json!("Different defect");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"findings": [record, conflict]})).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            card(root.path(), &db, "src/helper.rs").sections["findings"]
+                .completeness
+                .as_ref()
+                .unwrap()
+                .reason
+                .contains("conflicting records")
+        );
+    }
+
+    #[test]
+    fn describe_findings_refuses_malformed_transfer_metadata() {
+        let (root, db, feature) = fixture();
+        let directory = root.path().join(".codesage/findings");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{}.json", feature.feature_id));
+        let mut record = json!({"finding_id":"fnd_11111111", "file":"src/helper.rs", "line":1, "severity":"high", "title":"A defect", "status":"open"});
+        for transfer in [
+            json!(false),
+            json!(0),
+            json!(""),
+            json!({}),
+            json!([]),
+            json!([{}]),
+            json!([{"feature_id":"feat_1111111111111111"}]),
+            json!([{"feature_id":"", "finding_id":"fnd_22222222"}]),
+            json!([{"feature_id":"feat_1111111111111111", "finding_id":false}]),
+            json!([{"feature_id":"feat_1111111111111111", "finding_id":"fnd_abcdefgh"}]),
+        ] {
+            record["ack_transferred_to"] = transfer.clone();
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&json!({"findings":[record]})).unwrap(),
+            )
+            .unwrap();
+            for target in ["src/helper.rs", feature.feature_id.as_str()] {
+                let card = card(root.path(), &db, target);
+                let section = &card.sections["findings"];
+                assert_eq!(section.data, json!({"unscored":true}), "{transfer}");
+                assert!(
+                    section
+                        .completeness
+                        .as_ref()
+                        .unwrap()
+                        .reason
+                        .contains("transfer metadata")
+                );
+            }
+        }
+        record["ack_transferred_to"] = Value::Null;
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"findings":[record]})).unwrap(),
+        )
+        .unwrap();
+        for target in ["src/helper.rs", feature.feature_id.as_str()] {
+            let card = card(root.path(), &db, target);
+            assert_eq!(card.sections["findings"].data["open"], 1);
+            assert_eq!(
+                card.sections["findings"].data["ids"],
+                json!(["fnd_11111111"])
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn describe_findings_refuses_symlinked_components_and_nonregular_stores() {
+        use std::os::unix::fs::symlink;
+        for component in [
+            ".codesage",
+            ".codesage/findings",
+            ".codesage/findings/feat_1111111111111111.json",
+        ] {
+            for dangling in [false, true] {
+                let (root, db, feature) = fixture();
+                let destination = root.path().join("inside");
+                if !dangling {
+                    std::fs::create_dir_all(&destination).unwrap();
+                }
+                let link = root.path().join(component);
+                std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+                symlink(&destination, &link).unwrap();
+                for target in ["src/helper.rs", feature.feature_id.as_str()] {
+                    let result = card(root.path(), &db, target);
+                    let section = &result.sections["findings"];
+                    assert_eq!(section.data, json!({"unscored":true}));
+                    assert!(
+                        section
+                            .completeness
+                            .as_ref()
+                            .unwrap()
+                            .reason
+                            .contains("symlink"),
+                        "{component}"
+                    );
+                }
+            }
+        }
+        let (root, db, _) = fixture();
+        std::fs::create_dir_all(root.path().join(".codesage/findings/directory.json")).unwrap();
+        assert!(
+            card(root.path(), &db, "src/helper.rs").sections["findings"]
+                .completeness
+                .as_ref()
+                .unwrap()
+                .reason
+                .contains("not a regular file")
+        );
     }
 }

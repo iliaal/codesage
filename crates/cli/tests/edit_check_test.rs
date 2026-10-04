@@ -151,7 +151,7 @@ fn mcp_reports_break_before_writing_without_touching_index_or_starting_watcher()
         assert_eq!(report["arity_changed"], true);
         assert_eq!(report["visibility_changed"], true);
         assert_eq!(report["worktree_matches_head"], !indexed);
-        assert_eq!(report["next"], Value::Null);
+        assert_eq!(report["next"], json!([]));
         std::thread::sleep(Duration::from_millis(250));
         assert_eq!(std::fs::read(root.join("lib.rs")).unwrap(), before_source);
         assert_eq!(
@@ -254,6 +254,21 @@ fn mcp_reports_break_before_writing_without_touching_index_or_starting_watcher()
         json!({"tool": "edit_check", "arguments": {"project": root, "file_path": "dup.rs", "symbol_name": "f", "replacement": "fn f() {}", "line": 1}}),
         "{ambiguous}"
     );
+    assert_eq!(ambiguous["next"].as_array().unwrap().len(), 2);
+    for next in ambiguous["next"].as_array().unwrap() {
+        assert_eq!(next["tool"], "edit_check");
+        assert_eq!(next["arguments"]["replacement"], "fn f() {}");
+        assert!(next["arguments"].get("symbol_name").is_none());
+        let selected = session.request(
+            "tools/call",
+            json!({"name":"edit_check", "arguments":next["arguments"]}),
+        );
+        assert_ne!(selected["isError"], true, "{selected}");
+        assert_eq!(
+            selected["structuredContent"]["line"],
+            next["arguments"]["line"]
+        );
+    }
     let disambiguated = session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"dup.rs", "symbol_name":"f", "replacement":"fn f() {}", "line": 2}}));
     assert_ne!(disambiguated["isError"], true, "{disambiguated}");
 }
@@ -275,7 +290,11 @@ fn failure(result: &Value) -> Value {
     let block = blocks.into_iter().next().unwrap();
     assert_eq!(block["tool"], "edit_check", "{block}");
     assert_eq!(block["complete"], false, "{block}");
-    assert_eq!(block["next"], Value::Null, "{block}");
+    if block["error"]["code"] == "E_AMBIGUOUS" {
+        assert!(!block["next"].as_array().unwrap().is_empty(), "{block}");
+    } else {
+        assert_eq!(block["next"], json!([]), "{block}");
+    }
     assert_eq!(block["error"]["message"], text, "{block}");
     block
 }

@@ -123,7 +123,11 @@ fn failure(result: &Value, tool: &str) -> Failure {
     let block = blocks.into_iter().next().unwrap();
     assert_eq!(block["tool"], tool, "{block}");
     assert_eq!(block["complete"], false, "{block}");
-    assert_eq!(block["next"], Value::Null, "{block}");
+    if block["error"]["code"] == "E_AMBIGUOUS" {
+        assert!(!block["next"].as_array().unwrap().is_empty(), "{block}");
+    } else {
+        assert_eq!(block["next"], json!([]), "{block}");
+    }
     for key in [
         "status",
         "phase",

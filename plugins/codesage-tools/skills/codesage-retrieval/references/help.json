@@ -1,0 +1,211 @@
+{
+  "recovery": {
+    "empty": {"meaning": "No matching evidence was found in the indexed scope; this does not prove absence.", "steps": ["Inspect index freshness and completeness first.", "Check the target spelling and scope with find_symbol or describe; use returned candidate handles.", "For literal occurrences or unsupported syntax, search the working tree with rg.", "Stop when the evidence answers the question; otherwise report the unmeasured scope."]},
+    "floor": {"meaning": "Counts are lower bounds from modelled or name-based edges. Zero means none found, not none exist.", "steps": ["Inspect completeness.recover.reason and ambiguous definitions.", "Split references by from_file or resolved to handle; inspect source for dynamic or indirect calls.", "Stop when the requested claim is supported, or retain the lower-bound qualification."]},
+    "bounded": {"meaning": "An analysis or walk stopped at a time, depth, or work cap.", "steps": ["Follow completeness.recover when it gives a call or CLI command, supplying required target arguments for a command synopsis.", "Narrow the target or split the file set before retrying.", "Stop if the same bound recurs; inspect source and disclose the remaining scope."]},
+    "truncated": {"meaning": "Existing rows or payload content were omitted from the delivered response.", "steps": ["Inspect total and returned in completeness.recover.", "Use the supplied recovery arguments only with the same tool; page only when that tool accepts offset.", "Narrow the target or request a larger supported budget. A walk cap cannot be fixed by a larger response budget.", "Stop after the required evidence has been retained; do not interpret a shortened page as exhaustive."]},
+    "partial": {"meaning": "Some inputs, index coverage, or retrieval stages were unavailable.", "steps": ["Inspect completeness.recover and per-input reason lists.", "Reindex when missing or stale index coverage is the cause; investigate lexical_lookup_failed before relying on identifier search ranking.", "Retry only the affected inputs and retain the missing-scope qualification until measured."]},
+    "clamped": {"meaning": "At least one requested parameter was adjusted to an allowed value.", "steps": ["Compare requested and applied values in completeness.recover.", "Split the input or use the documented broader CLI surface if the applied cap cannot answer the question.", "Stop when the applied bounds are sufficient for the intended claim."]},
+    "unscored": {"meaning": "Evidence needed to compute a score or section was unavailable; absence of a score is not low risk.", "steps": ["Inspect the section's recover and the top-level completeness.recover.", "Run codesage git-index when history is missing, or follow the specific section recovery when a deadline stopped it.", "Stop when measured, or label that section unscored."]},
+    "stale": {"meaning": "The response's index or referenced files may differ from the current working tree or HEAD.", "steps": ["Inspect index.structural, files_behind, files_behind_bounded, semantic, and dirty_paths.", "Read changed source before acting. Run codesage index from the project when current indexed facts are needed.", "Repeat the focused query and verify freshness. A bounded zero or unknown freshness is not proof of freshness."]}
+  },
+  "fields": {
+    "target.ambiguous": "True when the input resolved to several definitions. Union tools disclose all candidates; single-entity tools may refuse with E_AMBIGUOUS.",
+    "target.candidates_total": "Total candidate definitions before response presentation limits.",
+    "completeness.kind": "Most severe applicable limitation: truncated > bounded > partial > clamped > unscored > floor. Inspect every entry of kinds and the recovery ladder.",
+    "completeness.kinds": "All applicable limitation classes in severity order. The leading class alone does not replace the others.",
+    "completeness.prior": "Completeness evidence captured before the final response-budget pass. Inspect its kinds and recover as well as the outer budget recovery; paging and lexical index repair can remain here.",
+    "completeness.recover.tool": "MCP tool name for a recovery call. Invoke with the accompanying arguments after checking task authority.",
+    "completeness.recover.arguments": "Arguments for the recovery tool, or for the original tool when tool is omitted. Preserve explicit project and target values.",
+    "completeness.recover.command": "Operator CLI remedy. Run from the project; a command synopsis without required target arguments must be completed before execution.",
+    "completeness.recover.cwd": "Working directory for a command remedy, passed separately from shell text.",
+    "completeness.recover.reason": "Machine-readable cause of a limitation, including name_based_edges, unmodelled_test_edges, or lexical_lookup_failed.",
+    "completeness.recover.total": "Count before response truncation; not a global graph cardinality.",
+    "completeness.recover.returned": "Rows retained after response truncation.",
+    "completeness.recover.requested": "Parameter values requested before clamping.",
+    "completeness.recover.applied": "Parameter values actually used after clamping.",
+    "completeness.recover.detail": "Suggested presentation level for expanding budget-trimmed evidence. Use the accompanying tool and arguments for a complete retry.",
+    "completeness.recover.trimmed": "Arrays shortened by response budgeting, with their delivered row counts and omitted row counts.",
+    "completeness.recover.trimmed.field": "JSON pointer to the array from which response budgeting omitted rows, such as /results or /files.",
+    "completeness.recover.trimmed.returned": "Number of rows delivered at this array path after response budgeting.",
+    "completeness.recover.trimmed.omitted": "Number of rows omitted from this array across applicable rendering passes; this is not a global graph count.",
+    "completeness.recover.trimmed.omitted_handles": "Identifiers retained for omitted protected rows, such as files or clustered directories. Values may be handles or fallback paths/names; the list does not cover every omitted row when identifiers were unavailable.",
+    "completeness.recover.shortened": "JSON-pointer strings naming source-text values shortened by response budgeting. Entries are strings, not row-omission records.",
+    "completeness.recover.sections": "Per-section recovery evidence; each entry identifies the section and its own recover object.",
+    "completeness.recover.sections.section": "Name of the describe section whose evidence needs recovery.",
+    "completeness.recover.sections.recover": "Recovery for the named describe section; use its tool arguments or operator command according to the stated limitation.",
+    "completeness.recover.unwalked_files": "Inputs whose graph walk was skipped or stopped.",
+    "completeness.recover.partial_files": "Inputs with incomplete evidence.",
+    "completeness.recover.unindexed_files": "Inputs absent from the structural index.",
+    "completeness.recover.no_symbol_files": "Inputs without indexed symbols for the requested analysis.",
+    "cost.ms": "Wall-clock milliseconds from request receipt through work and admission wait; not CPU time or a future-call estimate.",
+    "cost.bytes": "Exact byte length of the final JSON result object, including envelope metadata: structuredContent on success, the JSON metadata text block on error. Excludes duplicated MCP transport content.",
+    "cost.detail": "Applied presentation level: compact, standard, or full, after resolving deprecated verbosity aliases.",
+    "cost.budget_tokens": "Applied response budget in approximate tokens, at four serialized UTF-8 bytes per token, capped by the server's tool budget.",
+    "index.recover.command": "Operator CLI command to refresh a stale index. Run it in the accompanying cwd when indexing is authorized.",
+    "index.recover.why": "Reason to refresh indexed evidence before relying on this response.",
+    "next.tool": "Name of an evidence-derived MCP follow-up tool. Pass the accompanying arguments without substituting a different target.",
+    "next.arguments": "Arguments for the suggested MCP call; inspect why before deciding whether the call helps the current task.",
+    "next.arguments.project": "Absolute project path for the suggested MCP call.",
+    "next.arguments.target": "Retained evidence handle or target for the suggested MCP call.",
+    "next.why": "Rationale for the suggested call, derived from retained evidence. A suggestion does not grant authority to mutate.",
+    "_meta.clamps.param": "Name of the numeric argument that was clamped.",
+    "_meta.clamps.requested": "Original numeric argument value before clamping.",
+    "_meta.clamps.applied": "Numeric argument value actually used after clamping.",
+    "_meta.recover": "Executable retry retained by the legacy response envelope when budgeting omits or shortens evidence. It does not grant execution authority.",
+    "_meta.recover.tool": "MCP tool name for the legacy envelope's budget-recovery retry.",
+    "_meta.recover.arguments": "Complete arguments for the legacy envelope's budget-recovery retry.",
+    "_meta.trimmed": "Legacy response-budget row omissions, with the same array paths and counts as completeness.recover.trimmed.",
+    "_meta.trimmed.field": "JSON pointer to the array from which response budgeting omitted rows.",
+    "_meta.trimmed.returned": "Number of rows delivered at this array path after response budgeting.",
+    "_meta.trimmed.omitted": "Number of rows omitted from this array across applicable rendering passes.",
+    "_meta.trimmed.omitted_handles": "Identifiers retained for omitted protected rows; values can be handles or fallback paths/names and need not cover every omitted row.",
+    "_meta.shortened": "JSON-pointer strings naming source-text values shortened by response budgeting. Entries are strings, not row-omission records.",
+    "error": "Failure contract containing code, message, and a concrete remedy or null. Failed tools return isError=true and a JSON text block, not successful structured content.",
+    "error.code": "Stable E_* classification. Use help with code for semantics and recovery.",
+    "error.message": "Human-readable cause chain, matching the readable error text.",
+    "error.remedy": "A tool/arguments call, command with optional cwd, or null when the server has no concrete remedy. It does not authorize writes.",
+    "error.remedy.tool": "MCP tool name for the recovery call.",
+    "error.remedy.arguments": "Complete arguments for the recovery call, including original arguments preserved by retry remedies.",
+    "error.remedy.command": "Operator command to address the failure; execute only within existing task authority.",
+    "error.remedy.cwd": "Working directory for an operator remedy, separate from its shell command.",
+    "status": "Legacy failure class; error.code is the stable detailed classification.",
+    "phase": "Execution phase when the failure was reported.",
+    "work_continuing": "Whether physical work may still be running after the logical request stopped.",
+    "request_id": "Daemon-local request identifier, or null when no request ticket exists.",
+    "persistence_committed": "Whether this request already persisted a session snapshot before stopping. Check before retrying a writer.",
+    "complete": "False on failed or interrupted requests; do not consume their evidence as a completed result."
+  },
+  "tool_fields": {
+    "search": {
+      "output.results.score": "Final ranking score after retrieval, boosts, and any reranking or query-mention anchoring. Higher ranks first within this response; it is not a probability or a calibrated score across queries.",
+      "output.results.file_path": "Repository-relative path of the indexed source chunk.",
+      "output.results.language": "Detected source language for the chunk.",
+      "output.results.content": "Indexed source text for the chunk. Response budgeting may shorten it; inspect completeness before treating it as the full source.",
+      "output.results.start_line": "One-based inclusive first source line of the indexed chunk.",
+      "output.results.end_line": "One-based inclusive last source line of the indexed chunk.",
+      "output.results.trace.stage": "Name of the search-pipeline stage that produced this score transition.",
+      "output.results.trace.before": "Score entering this stage; null when the stage introduces the candidate.",
+      "output.results.trace.after": "Score after this stage; the final retained trace transition ends at the result's ranking score.",
+      "output.results.trace.reason": "Explanation of the stage's score transition or skipped operation."
+    }
+  },
+  "errors": {
+    "E_PARAM": {"meaning": "Arguments failed validation or contradict one another.", "recovery": "Inspect input fields with help; correct the named argument. Do not repeat an unchanged invalid call."},
+    "E_PROJECT_PATH": {"meaning": "The project path is invalid, relative, or unavailable.", "recovery": "Pass an absolute existing project directory; verify access and repository boundary."},
+    "E_NOT_ONBOARDED": {"meaning": "The requested tool requires an index that the project does not have.", "recovery": "Run codesage init and codesage index from that project when onboarding is authorized. Help and edit_check remain available without an index."},
+    "E_SCHEMA_TOO_NEW": {"meaning": "The index was migrated by a newer CodeSage binary.", "recovery": "Use a compatible newer binary; do not delete or downgrade the database to suppress the error."},
+    "E_NOT_FOUND": {"meaning": "No indexed entity matched the requested target.", "recovery": "Inspect returned candidates, verify spelling and scope, and use a candidate handle. Reindex when source has changed."},
+    "E_AMBIGUOUS": {"meaning": "Several entities matched a question that requires one.", "recovery": "Choose a candidate handle, or a declaration line for edit_check; do not combine the candidates into one answer."},
+    "E_EMPTY_INPUT": {"meaning": "A required file set or input sequence was empty.", "recovery": "Provide the intended explicit inputs. MCP does not infer changed files from stdin or the working tree."},
+    "E_OVER_CAP": {"meaning": "An input exceeds a fixed count or byte cap.", "recovery": "Split the input according to the stated cap or use the concrete retry remedy. Preserve all relevant inputs across calls."},
+    "E_MODEL": {"meaning": "Model configuration, loading, or inference failed.", "recovery": "Run codesage doctor and inspect the cause chain. Structural tools can still answer without inference."},
+    "E_DB_BUSY": {"meaning": "The database is locked or busy.", "recovery": "Wait for the active writer, then retry the focused query. Inspect daemon_stats for concurrent work; do not remove live locks."},
+    "E_SATURATED": {"meaning": "The daemon cannot admit more work within its bounded capacity.", "recovery": "Inspect daemon_stats, reduce concurrent calls, and retry after admitted work completes."},
+    "E_TIMEOUT": {"meaning": "The request exceeded its deadline.", "recovery": "Inspect work_continuing and persistence_committed. Narrow the target or file set before retrying."},
+    "E_CANCELLED": {"meaning": "The request lost its consumer or was cancelled.", "recovery": "Check persistence_committed and work_continuing before repeating a writer. Retry only if the result is still needed."},
+    "E_SHUTDOWN": {"meaning": "The daemon is stopping.", "recovery": "Reconnect after shutdown completes; check whether the interrupted request persisted before retrying."},
+    "E_INCOMPLETE": {"meaning": "The operation could not complete the evidence required for a valid result.", "recovery": "Inspect the cause and remedy; reduce scope or repair missing evidence. Do not treat the failure as an empty successful result."},
+    "E_INTERNAL": {"meaning": "The failure has no more specific public classification.", "recovery": "Inspect the cause chain and run codesage doctor. Preserve reproduction details; avoid unchanged retry loops."}
+  },
+  "recipe_execution": {
+    "mode": "plan_only",
+    "binding_rule": "The server replaces $project. Other $name strings are argument templates, never literal executable values. Bind them from the named sources, preserve their stated types, then call the tool. Skip a conditional step when its condition is false. These plans do not grant write or shell authority.",
+    "common_stop": "Stop expanding when the requested claim is supported by current source and measured checks. If recovery repeats the same limitation, disclose the remaining unknown instead of claiming completeness."
+  },
+  "intents": {
+    "review": {
+      "bindings": {"changed_files": "Non-empty array of repository-relative files in the intended patch: inspect staged, unstaged, and relevant untracked changes, deleted paths, both sides of renames, and merge-base diff for branch reviews.", "target": "Returned symbol or file handle implicated by the patch."},
+      "steps": [
+        {"tool": "project_overview", "arguments": {"project": "$project"}, "why": "Establish index freshness and project conventions.", "stop_when": "Orientation is understood; recover stale facts before relying on them."},
+        {"tool": "assess_risk_diff", "arguments": {"project": "$project", "targets": "$changed_files"}, "why": "Prioritize changed files and cycles that merit inspection.", "stop_when": "Each high-risk or unscored changed file has an explicit disposition."},
+        {"tool": "describe", "arguments": {"project": "$project", "target": "$target"}, "when": "A changed entity needs structural context.", "why": "Inspect its dependencies, callers, and evidence.", "stop_when": "The changed contract and relevant callers are understood."},
+        {"tool": "review_rehearsal", "arguments": {"project": "$project", "targets": "$changed_files"}, "why": "Check predicted objections against the actual diff and tests.", "stop_when": "Every supported objection is resolved or reported; run applicable checks before concluding."}
+      ]
+    },
+    "fix_bug": {
+      "bindings": {"query": "Concrete observed failure or symptom from the user's report and reproduction.", "target": "Handle returned by search or find_symbol for the implicated definition.", "changed_files": "Non-empty array of files actually changed by the fix.", "session_id": "Caller-chosen valid unique snapshot name, reused for session_end."},
+      "steps": [
+        {"tool": "project_overview", "arguments": {"project": "$project"}, "why": "Check evidence freshness before diagnosis.", "stop_when": "Freshness limitations are understood or repaired."},
+        {"tool": "search", "arguments": {"project": "$project", "query": "$query"}, "why": "Locate behavior when the failing symbol is unknown.", "stop_when": "A source-backed failing path is identified; an empty page alone does not establish absence."},
+        {"tool": "describe", "arguments": {"project": "$project", "target": "$target"}, "why": "Inspect the implicated contract and caller context before forming a fix.", "stop_when": "A reproduction demonstrates the root cause."},
+        {"tool": "session_start", "arguments": {"project": "$project", "session_id": "$session_id"}, "when": "Edits are authorized and a structural baseline is useful.", "why": "Persist the pre-edit graph baseline.", "stop_when": "The snapshot is confirmed before edits."},
+        {"tool": "recommend_tests", "arguments": {"project": "$project", "targets": "$changed_files"}, "when": "The fix has been applied.", "why": "Choose regression checks for the actual changed paths.", "stop_when": "The original reproduction and relevant tests pass; recommendations alone are not verification."},
+        {"tool": "session_end", "arguments": {"project": "$project", "session_id": "$session_id"}, "when": "session_start succeeded and the changed source has been reindexed.", "why": "Compare the current structural graph with the pre-edit baseline.", "stop_when": "New cycles and risk changes are inspected, then report checks and remaining limitations."}
+      ]
+    },
+    "rename": {
+      "bindings": {"target": "Exact definition handle selected with find_symbol, including disambiguation when needed.", "changed_files": "Non-empty array of changed files, including old and new paths for file renames."},
+      "steps": [
+        {"tool": "project_overview", "arguments": {"project": "$project"}, "why": "Confirm indexed coverage before tracing a rename.", "stop_when": "Freshness and language limits are known."},
+        {"tool": "find_references", "arguments": {"project": "$project", "target": "$target"}, "why": "Enumerate modelled uses and separate same-named definitions by resolved handles.", "stop_when": "Relevant source callers and literal or dynamic uses have been inspected; a name-based floor is not an exhaustive rename set."},
+        {"tool": "impact_analysis", "arguments": {"project": "$project", "target": "$target"}, "why": "Identify downstream files and contracts affected by the rename.", "stop_when": "The rename boundary and public compatibility effects are understood before editing."},
+        {"tool": "recommend_tests", "arguments": {"project": "$project", "targets": "$changed_files"}, "when": "The authorized rename has been applied.", "why": "Select checks for consumers of the changed names.", "stop_when": "Build and relevant tests pass, and literal searches account for intended old-name occurrences."}
+      ]
+    },
+    "add_feature": {
+      "bindings": {"query": "Feature behavior or adjacent existing capability.", "feature": "feat_ handle returned by list_features or find_feature for the relevant existing slice.", "target": "Returned file or symbol handle at the proposed integration boundary.", "changed_files": "Non-empty array of files changed by the implementation."},
+      "steps": [
+        {"tool": "project_overview", "arguments": {"project": "$project"}, "why": "Learn existing entrypoints and test conventions.", "stop_when": "The implementation boundary is identified."},
+        {"tool": "list_features", "arguments": {"project": "$project"}, "why": "Find an existing behavior slice and avoid duplicating it.", "stop_when": "A relevant slice is selected, or none is found in the mapped coverage."},
+        {"tool": "feature_bundle", "arguments": {"project": "$project", "target": "$feature"}, "when": "A relevant mapped feature was found.", "why": "Inspect entrypoints, owned code, and tests together.", "stop_when": "The existing contract and extension points are understood."},
+        {"tool": "search", "arguments": {"project": "$project", "query": "$query"}, "when": "No suitable mapped feature was found.", "why": "Discover an integration point from behavior and source.", "stop_when": "The proposed integration point is supported by source evidence."},
+        {"tool": "impact_analysis", "arguments": {"project": "$project", "target": "$target"}, "why": "Check affected callers before changing the integration contract.", "stop_when": "Compatibility and scope decisions are explicit."},
+        {"tool": "recommend_tests", "arguments": {"project": "$project", "targets": "$changed_files"}, "when": "The authorized implementation exists.", "why": "Find related checks in addition to exercising the new user path.", "stop_when": "The new capability and affected existing behavior pass their applicable checks."}
+      ]
+    },
+    "before_commit": {
+      "bindings": {"changed_files": "Non-empty array covering the intended staged, unstaged, and relevant untracked patch, including deletions and both sides of renames.", "session_id": "Existing session_start identifier, if a baseline was taken."},
+      "steps": [
+        {"tool": "review_rehearsal", "arguments": {"project": "$project", "targets": "$changed_files"}, "why": "Review risk, test gaps, boundaries, and scope against the intended patch.", "stop_when": "Each evidence-backed objection is fixed or consciously reported."},
+        {"tool": "recommend_tests", "arguments": {"project": "$project", "targets": "$changed_files"}, "why": "Identify focused checks alongside repository-required gates.", "stop_when": "The relevant tests and gates have actually run and passed."},
+        {"tool": "session_end", "arguments": {"project": "$project", "session_id": "$session_id"}, "when": "A baseline exists and the changed source has been reindexed.", "why": "Inspect structural regressions relative to the baseline.", "stop_when": "New cycles and risk drift have dispositions; review the final diff before committing."}
+      ]
+    },
+    "debug_failure": {
+      "bindings": {"trace": "Observed stack trace from a reproduced application failure.", "target": "Handle of a resolved failing frame.", "code": "E_* code from a failed CodeSage tool response."},
+      "steps": [
+        {"tool": "help", "arguments": {"project": "$project", "code": "$code"}, "when": "A CodeSage tool failed.", "why": "Choose recovery based on the actual error classification.", "stop_when": "The cause is repaired and a focused retry succeeds, or the specific blocker is reported."},
+        {"tool": "daemon_stats", "arguments": {"recent": 20}, "when": "A CodeSage request is slow, saturated, cancelled, or still running.", "why": "Inspect active physical work and completed request histograms.", "stop_when": "The live request's state is known; unknown telemetry is not zero latency."},
+        {"tool": "from_trace", "arguments": {"project": "$project", "trace": "$trace"}, "when": "An application stack trace is available.", "why": "Resolve stack frames to indexed source locations.", "stop_when": "A relevant resolved frame is found, or unmodelled frames are inspected manually."},
+        {"tool": "describe", "arguments": {"project": "$project", "target": "$target"}, "when": "A failing frame resolved to an indexed entity.", "why": "Inspect the failing contract and local callers.", "stop_when": "The reproduction and source demonstrate a cause; use fix_bug only when changes are authorized."}
+      ]
+    }
+  },
+  "daemon": {
+    "description": "Operator discovery. daemon_stats is callable over MCP but omitted from tools/list. Hidden model helpers are CLI-internal; use public search and export_context for agent retrieval.",
+    "tools": {
+      "daemon_stats": {
+        "name": "daemon_stats",
+        "description": "Current daemon diagnostics: active requests and executions, admission/work state, bounded recent completions, caches, and per-tool non-cumulative wall-time histograms. Diagnostics-disabled snapshots still include work and project-cache state. Counts cover this daemon lifetime across projects.",
+        "advertised": false,
+        "call": {"tool": "daemon_stats", "arguments": {"recent": 20}},
+        "input_schema": {"type": "object", "properties": {"recent": {"type": "integer", "minimum": 0, "maximum": 256, "default": 20, "description": "Maximum completed request and execution records, independently; zero returns counters and active work only."}}},
+        "output_schema": {"type": "object", "properties": {
+          "enabled": {"type": "boolean", "description": "Whether request/execution diagnostics are enabled; false means histograms are unknown, not zero."},
+          "counters": {"type": "object", "description": "Started request/execution counts, outcomes, reuse, and active detail omissions."},
+          "gauges": {"type": "object", "description": "Active, queued, running, shared, peak, and cache measurements."},
+          "histogram_upper_bounds_ms": {"type": "array", "items": {"type": "integer"}, "description": "Inclusive upper bounds for non-cumulative histogram buckets; final u64 maximum denotes unbounded."},
+          "histogram_semantics": {"type": "string", "description": "Bucket interpretation: non-cumulative wall time, not CPU time."},
+          "tools": {"type": "object", "description": "Per-tool request/execution totals, outcomes, and request_wall_ms, execution_wall_ms, queue_ms histogram bucket counts."},
+          "active_requests": {"type": "array", "description": "Bounded live logical request records, including phase and elapsed wall time."},
+          "active_executions": {"type": "array", "description": "Bounded live physical work records; one execution can serve several requests."},
+          "recent_requests": {"type": "array", "description": "Most recent completed logical request records, limited by recent and retention."},
+          "recent_executions": {"type": "array", "description": "Most recent completed physical work records, limited by recent and retention."},
+          "retention": {"type": "object", "description": "Record and byte limits, retained bytes, and retained record counts."},
+          "overview_cache_enabled": {"type": "boolean", "description": "Whether shared overview ranking reuse is enabled."},
+          "project_cache": {"type": "object", "description": "Current project cache statistics."},
+          "work": {"type": "object", "description": "Current admission and physical-work scheduler snapshot, available even with diagnostics disabled."}
+        }}
+      },
+      "embed_texts": {"advertised": false, "audience": "CLI-internal", "description": "Reuse the resident embedding model. Requires fingerprint identity and bounded inputs. Inspect help tool=embed_texts for the live input schema."},
+      "rerank_pairs": {"advertised": false, "audience": "CLI-internal", "description": "Reuse the resident reranker. Inspect help tool=rerank_pairs for the live input schema."}
+    },
+    "commands": [
+      {"command": "codesage daemon status", "why": "Locate the daemon and check process status."},
+      {"command": "codesage daemon stats", "why": "Read the daemon's current diagnostic snapshot."},
+      {"command": "codesage doctor", "why": "Diagnose project, model, library, and hook setup."},
+      {"command": "codesage mcp --direct", "why": "Exercise single-process stdio when daemon startup is the suspected failure; do not add a second persistent registration."}
+    ]
+  }
+}

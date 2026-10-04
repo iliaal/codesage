@@ -13,7 +13,7 @@ Run from the repository under work:
 test -f .codesage/index.db && codesage status
 ```
 
-Use CodeSage only when both checks succeed. Otherwise use `rg`, or ask whether to onboard the repository when indexing would materially improve the task.
+Use indexed retrieval only when both checks succeed. Otherwise use `rg`, or ask whether to onboard the repository when indexing would materially improve the task. `help` remains available with an absolute existing directory before indexing or when the index is unavailable.
 
 Resolve the repository root to an absolute path and pass that path as `project` on every CodeSage MCP call. Do not pass a parent workspace. For work spanning multiple repositories, make separate calls per repository. If the scope is unclear, establish the target repository before searching; never fan out across all indexed projects.
 
@@ -31,6 +31,7 @@ Every tool that names an entity takes `target`, or `targets` on the tools that t
 
 ## Route MCP calls
 
+- Use `mcp__codesage__help` for tool or field semantics, error codes, measured daemon latency, and investigation recipes (`review`, `fix_bug`, `rename`, `add_feature`, `before_commit`, `debug_failure`). Combine `tool` with `field` for one input or output field; use `tool: "daemon"` for hidden and operator tools. Help works before indexing. Tool and field documentation comes from the running server's registrations and schemas. The shared [help catalog](references/help.json) supplies recovery and recipe semantics to both this skill and the compiled help tool; follow its explicit bindings and stopping conditions rather than treating a recipe as automation.
 - Start unfamiliar-project orientation with `mcp__codesage__project_overview` when its combined language, freshness, feature, risk, and convention summary replaces several narrower calls.
 - Use `mcp__codesage__describe` for one file, symbol, feature, or directory card. Follow a section's `expand` call for more detail; inspect `completeness` and `recover` when a section is unscored. An ambiguous target returns candidates without combining their facts.
 - Use `mcp__codesage__find_symbol` for exact definitions and `mcp__codesage__find_references` for callers, imports, inheritance, and type uses.

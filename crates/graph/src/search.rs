@@ -691,6 +691,7 @@ pub fn search_page(
 
     // A triggered gate can still yield no BM25 hits; reranking depends on actual fusion.
     let mut fused = false;
+    let mut lexical_fallback_reason = None;
     let mut fusion_reason = "Hybrid retrieval gate did not enable lexical lookup".to_string();
     let rows = if hybrid_gate {
         let match_expr = build_fts_match_query(&req.query);
@@ -735,10 +736,9 @@ pub fn search_page(
                     rows
                 }
                 Err(error) => {
-                    if req.explain {
-                        fusion_reason =
-                            format!("Lexical lookup failed; retained dense candidates: {error}");
-                    }
+                    fusion_reason =
+                        format!("Lexical lookup failed; retained dense candidates: {error}");
+                    lexical_fallback_reason = Some(fusion_reason.clone());
                     rows
                 }
             }
@@ -944,6 +944,7 @@ pub fn search_page(
     }
     Ok(SearchResults {
         results,
+        lexical_fallback_reason,
         confidence: Some(cliff.confidence),
         margin_pct: Some(cliff.drop_pct),
         cliff_at: Some(cliff.cut),
@@ -5822,6 +5823,94 @@ mod explanation_tests {
                 .map(|text| if text.contains("connect") { 3.0 } else { -2.0 })
                 .collect())
         })
+    }
+
+    #[test]
+    fn lexical_fallback_controls_distinguish_fusion_from_successful_zero_matches() {
+        for populated in [false, true] {
+            let db = Database::open_in_memory().unwrap();
+            if populated {
+                seed(&db);
+            }
+            for query in ["use `AuthHandler` here", "use `AbsentNeedle` here"] {
+                let mut req = request(query);
+                let plain = search_page(&db, &embedding(0.0), None, &req).unwrap();
+                req.explain = true;
+                let explained = search_page(&db, &embedding(0.0), None, &req).unwrap();
+                assert_eq!(plain.results.is_empty(), !populated);
+                let fused = populated && query.contains("AuthHandler");
+                for row in &explained.results {
+                    let fusion = &row.trace.as_ref().unwrap()[1];
+                    if fused {
+                        assert!(fusion.reason.starts_with("RRF"), "{fusion:?}");
+                    } else {
+                        assert_eq!(fusion.reason, "Lexical lookup returned no candidates");
+                    }
+                }
+                let mut explained = serde_json::to_value(explained).unwrap();
+                for row in explained["results"].as_array_mut().unwrap() {
+                    row.as_object_mut().unwrap().remove("trace");
+                }
+                let plain = serde_json::to_value(plain).unwrap();
+                assert_eq!(explained, plain);
+                assert!(plain.get("lexical_fallback_reason").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_failure_preserves_dense_pages_and_discloses_even_without_rows() {
+        let mut cases = Vec::new();
+        for (populated, offset, limit, rerank) in [
+            (false, 0, 10, false),
+            (true, 0, 10, false),
+            (true, 10, 10, false),
+            (true, 0, 0, false),
+            (true, 0, 10, true),
+        ] {
+            let db = Database::open_in_memory().unwrap();
+            if populated {
+                seed(&db);
+            }
+            let mut req = request("use `AbsentNeedle` here");
+            req.offset = Some(offset);
+            req.limit = Some(limit);
+            let dense = search_page(&db, &embedding(0.0), rerank.then(reranker), &req).unwrap();
+            let fts = codesage_storage::schema::fts_table_name(db.chunk_table_name());
+            db.execute_raw_for_tests(&format!("DROP TABLE \"{fts}\""))
+                .unwrap();
+            assert!(db.search_bm25("\"AbsentNeedle\"", 10, None, None).is_err());
+            let plain = search_page(&db, &embedding(0.0), rerank.then(reranker), &req).unwrap();
+            req.explain = true;
+            let explained = search_page(&db, &embedding(0.0), rerank.then(reranker), &req).unwrap();
+            assert_eq!(
+                serde_json::to_value(&plain.results).unwrap(),
+                serde_json::to_value(dense.results).unwrap()
+            );
+            for row in &explained.results {
+                assert!(
+                    row.trace.as_ref().unwrap()[1]
+                        .reason
+                        .contains("no such table")
+                );
+                assert_chain(row);
+            }
+            let mut explained = serde_json::to_value(explained).unwrap();
+            for row in explained["results"].as_array_mut().unwrap() {
+                row.as_object_mut().unwrap().remove("trace");
+            }
+            let plain = serde_json::to_value(plain).unwrap();
+            assert_eq!(explained, plain);
+            cases.push(plain);
+        }
+        for page in cases {
+            assert!(
+                page["lexical_fallback_reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("no such table")),
+                "BM25 SQL failure must be visible even without explain or results: {page}"
+            );
+        }
     }
 
     #[test]

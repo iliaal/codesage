@@ -7,6 +7,8 @@ use codesage_storage::Database;
 
 use crate::bundle::rust_crate_layout;
 
+mod external;
+
 #[cfg(test)]
 thread_local! {
     static CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -25,11 +27,36 @@ pub(crate) struct RustModules {
     declared: HashSet<String>,
     capped: bool,
     scopes: Mutex<HashMap<String, Vec<Symbol>>>,
+    external: Mutex<Option<external::ExternalCrates>>,
 }
 
 impl RustModules {
     pub(crate) fn capped(&self) -> bool {
         self.capped
+            || self
+                .external
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|external| external.capped)
+    }
+
+    pub(crate) fn external_definitions(
+        &self,
+        db: &Database,
+        caller: &str,
+        spelling: &str,
+    ) -> Result<Option<Vec<Symbol>>> {
+        if !caller.ends_with(".rs") {
+            return Ok(None);
+        }
+        let mut external = self
+            .external
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        external
+            .get_or_insert_with(|| external::ExternalCrates::new(db, &self.modules))
+            .resolve(db, caller, spelling)
     }
 
     pub(crate) fn qualified_target(
@@ -39,6 +66,11 @@ impl RustModules {
         spelling: &str,
         target: &Symbol,
     ) -> Result<bool> {
+        if let Some(resolved) = self.external_definitions(db, caller, spelling)? {
+            return Ok(resolved
+                .iter()
+                .any(|symbol| symbol.handle() == target.handle()));
+        }
         if self.same_crate(caller, &target.file_path) != Some(true) {
             return Ok(false);
         }

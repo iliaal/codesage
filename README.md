@@ -31,10 +31,12 @@ The rows follow the capabilities that GitNexus, SocratiCode, code-review-graph, 
 | Capability | CodeSage |
 |---|---|
 | First-call project orientation (languages, freshness, features, top risk, conventions, next calls) | ✓ via `project_overview`, one bounded response |
+| Tool, field, and error help; task recipes | ✓ via MCP `help`, including before indexing |
 | Natural-language semantic search | ✓ Jina code embeddings + optional cross-encoder reranker |
 | Symbol-level lookup (definitions, references, callers/callees, inheritance) | ✓ tree-sitter, 9 languages, exact line/column ranges |
 | File-level dependency mapping (imports / imported-by) | ✓ via `list_dependencies` |
-| One entity card (file, symbol, feature, or directory) | ✓ via `describe` and `codesage describe`, with section expansion calls |
+| One entity card (file, symbol, feature, or directory) | ✓ via `describe` and `codesage describe`, with section expansion calls and open review findings |
+| Response size and follow-up navigation | ✓ `detail`, `budget_tokens`, and ranked `next[]` MCP calls |
 | Change impact / blast-radius analysis | ✓ via `impact_analysis`, configurable depth, symbol or file target |
 | Call-flow / "who-touches-X" tracing | ✓ via `find_references` + `impact_analysis` composition |
 | Per-file risk score (churn, fix ratio, blast radius, coupling, test gap, cycles, trust boundaries) | ✓ via `assess_risk`, seven-signal blend |
@@ -58,6 +60,8 @@ The rows follow the capabilities that GitNexus, SocratiCode, code-review-graph, 
 ## Supported languages
 
 PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
+
+For Rust workspace packages on editions 2018, 2021, or 2024, call resolution follows local Cargo path dependencies, package aliases, library names, and named public re-exports. The source must match the index, and libraries must use `src/lib.rs`. Build scripts, custom library paths, optional or target-specific dependencies, and glob re-exports remain unresolved. Macro expansion is not modeled.
 
 ## Why a single Rust binary
 
@@ -196,6 +200,16 @@ codesage doctor
 ```
 
 ## ⚙️ Recipes
+
+### Navigate with MCP
+
+Call `help` with an absolute existing `project` directory to inspect a tool, field, or error code, even before you index the project. For a task recipe, pass `intent`: `review`, `fix_bug`, `rename`, `add_feature`, `before_commit`, or `debug_failure`. Recipes give you ordered calls, argument bindings, and stopping conditions. The latency price list reports observations from the running daemon; tools without measurements read `unknown`.
+
+Use `detail: "compact"` for short rows, `"standard"` for the normal payload, or `"full"` for available source snippets and risk detail. Row-returning tools accept `budget_tokens` of at least 256, approximated as four serialized UTF-8 bytes per token and capped by the tool's server limit. Read `completeness` for omissions and recovery calls; `cost.bytes` counts the final JSON payload, including its envelope. A response that cannot fit while retaining required evidence reports `cost.budget_exceeded`.
+
+Follow `next[]` for up to three ranked calls with a short `why`. The list is empty when the response offers no further step. For stale-index recovery, run the command in `index.recover` from its `cwd`. A `describe` card also shows the count, IDs, and top summaries of open plugin review findings when a findings store exists; an unreadable store reports an unscored section.
+
+### Inspect declarations and history
 
 Before applying a proposed declaration, you can call MCP `edit_check` with `project`, `file_path`, `target`, and `replacement` (the complete declaration, including its signature and body). It compares against Git HEAD and reports signature and overload changes without modifying source or the index. Proven caller breakage is currently limited to same-file Rust free functions called through explicit `self::` or `super::` paths without imports, macros, or attributes. Other callers remain unknown; run the compiler and tests after applying the edit.
 
@@ -488,6 +502,8 @@ flowchart LR
 7. Truncate to the requested limit.
 
 The reranker is optional. Set or remove it in `config.toml`; every other stage still runs without it.
+
+If an attempted BM25 lookup fails, search returns the available dense results with `lexical_fallback_reason`, including on empty pages. MCP marks the result partial and recommends `codesage index --full`; human CLI output prints a warning to stderr. A successful lexical lookup with no matches does not report a failure.
 
 Search responses retain the `confidence` field for compatibility. It describes score separation only: `high` means the largest adjacent relative score drop rounds to at least 20%, not that an answer is correct or exists. Ranking penalties and saturation can create that separation. Read `margin_pct` and `cliff_at` as properties of the returned page; `adaptive_limit` uses the same page-local drop. The name remains unchanged because consumer misinterpretation has not been measured and renaming it would break existing clients.
 

@@ -59,9 +59,9 @@ pub(super) enum Kind {
 
 impl Kind {
     /// Severity order, most severe first: a truncated page dropped rows that
-    /// exist, a bounded walk stopped early, a partial answer skipped inputs, a
-    /// clamped parameter still answered the question asked, an unscored file
-    /// lacks one term, and a floor is exact about everything it found.
+    /// exist, a bounded walk stopped early, a partial answer skipped inputs or
+    /// a retrieval source, a clamped parameter still answered the question asked,
+    /// an unscored file lacks one term, and a floor is exact about everything it found.
     const SEVERITY: [Kind; 6] = [
         Kind::Truncated,
         Kind::Bounded,
@@ -92,6 +92,7 @@ pub(super) struct Signals {
     clamps: Vec<Value>,
     reason_lists: Vec<(&'static str, Vec<Value>)>,
     coverage: bool,
+    lexical_fallback: bool,
     floor_reason: Option<&'static str>,
     stale_paths: Vec<String>,
     ambiguous: bool,
@@ -205,6 +206,12 @@ fn scan_object_at(map: &Map<String, Value>, depth: usize, out: &mut Signals) {
                 out.mark(Kind::Partial);
                 out.coverage = true;
             }
+            "lexical_fallback_reason"
+                if child.as_str().is_some_and(|reason| !reason.is_empty()) =>
+            {
+                out.mark(Kind::Partial);
+                out.lexical_fallback = true;
+            }
             "stale_files" => {
                 if let Some(items) = non_empty_array(child) {
                     out.stale_paths
@@ -291,7 +298,7 @@ fn recover(
     arguments: &Map<String, Value>,
     signals: &Signals,
 ) -> Option<Value> {
-    match kind {
+    let mut recovery = match kind {
         Kind::Truncated => {
             let mut out = Map::new();
             if let Some(total) = signals.total_results {
@@ -354,7 +361,13 @@ fn recover(
             (!out.is_empty()).then_some(Value::Object(out))
         }
         Kind::Floor => signals.floor_reason.map(|reason| json!({"reason": reason})),
+    };
+    if signals.lexical_fallback {
+        let recovery = recovery.get_or_insert_with(|| json!({}));
+        recovery["command"] = json!("codesage index --full");
+        recovery["reason"] = json!("lexical_lookup_failed");
     }
+    recovery
 }
 
 fn completeness(tool: &str, arguments: &Map<String, Value>, signals: &Signals) -> Option<Value> {
@@ -637,6 +650,15 @@ impl CodeSageServer {
         };
         if let Some(structural) = structural {
             out.insert("structural".into(), json!(structural));
+            if matches!(structural, "dirty" | "behind") {
+                out.insert(
+                    "recover".into(),
+                    json!({
+                        "command": "codesage index", "cwd": root,
+                        "why": "Refresh indexed evidence before relying on these results"
+                    }),
+                );
+            }
         }
         if let Some(semantic) = facts.semantic {
             out.insert("semantic".into(), json!(semantic));
@@ -676,7 +698,11 @@ impl CodeSageServer {
         scan(payload, &mut signals);
 
         let project = arguments.get("project").and_then(Value::as_str);
-        let index = self.index_block(project, &signals.stale_paths, tool == "describe");
+        let index = if tool == "help" {
+            None
+        } else {
+            self.index_block(project, &signals.stale_paths, tool == "describe")
+        };
         let completeness = completeness(tool, arguments, &signals);
         let target = signals.ambiguous.then(|| {
             let mut out = Map::new();
@@ -754,6 +780,72 @@ fn insert_absent(payload: &mut Map<String, Value>, key: &str, value: Value) {
     payload.insert(key.to_owned(), value);
 }
 
+pub(super) fn trimmed_schema(prefix: &str) -> Value {
+    let description = |suffix: &str| super::help::field_description(&format!("{prefix}{suffix}"));
+    json!({
+        "type": "array", "description": description(""),
+        "items": {
+            "type": "object", "required": ["field", "returned", "omitted"],
+            "properties": {
+                "field": {"type": "string", "description": description(".field")},
+                "returned": {"type": "integer", "minimum": 0, "description": description(".returned")},
+                "omitted": {"type": "integer", "minimum": 0, "description": description(".omitted")},
+                "omitted_handles": {"type": "array", "items": {"type": "string"}, "description": description(".omitted_handles")}
+            }
+        }
+    })
+}
+
+pub(super) fn shortened_schema(prefix: &str) -> Value {
+    json!({"type": "array", "description": super::help::field_description(prefix), "items": {"type": "string"}})
+}
+
+fn recovery_schema() -> Value {
+    let description =
+        |field: &str| super::help::field_description(&format!("completeness.recover.{field}"));
+    let mut properties = Map::new();
+    for field in ["tool", "command", "cwd", "reason"] {
+        properties.insert(
+            field.into(),
+            json!({"type": "string", "description": description(field)}),
+        );
+    }
+    for field in ["arguments", "requested", "applied"] {
+        properties.insert(
+            field.into(),
+            json!({"type": "object", "description": description(field)}),
+        );
+    }
+    for field in ["total", "returned"] {
+        properties.insert(
+            field.into(),
+            json!({"type": "integer", "minimum": 0, "description": description(field)}),
+        );
+    }
+    for field in [
+        "unwalked_files",
+        "partial_files",
+        "unindexed_files",
+        "no_symbol_files",
+    ] {
+        properties.insert(field.into(), json!({"type": "array", "items": {"type": "string"}, "description": description(field)}));
+    }
+    properties.insert("detail".into(), json!({"type": "string", "enum": ["compact", "standard", "full"], "description": description("detail")}));
+    properties.insert(
+        "trimmed".into(),
+        trimmed_schema("completeness.recover.trimmed"),
+    );
+    properties.insert(
+        "shortened".into(),
+        shortened_schema("completeness.recover.shortened"),
+    );
+    properties.insert("sections".into(), json!({"type": "array", "description": description("sections"), "items": {"type": "object", "properties": {
+        "section": {"type": "string", "description": description("sections.section")},
+        "recover": {"$ref": "#/properties/completeness/properties/recover", "description": description("sections.recover")}
+    }}}));
+    json!({"type": "object", "description": "Recovery preserves paging and reindex repairs together. Row and source-text budget omissions are separate from earlier evidence limitations in completeness.prior.", "properties": properties})
+}
+
 /// Schema fragment advertised on every tool's `outputSchema`.
 pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
     vec![
@@ -776,7 +868,8 @@ pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
                     "files_behind_bounded": {"const": true, "description": "`files_behind` (0 when absent) is a lower bound: the content comparison stopped at its 2,000-path cap or 500 ms budget before checking every candidate. Absent when the comparison completed."},
                     "structural": {"enum": ["behind", "dirty", "unknown"], "description": "`behind`: at least one indexed file's HEAD content differs from the index (`files_behind` counts them), or, when that comparison could not run or stopped before finding one (`files_behind_bounded`), the indexed SHA is not HEAD. `dirty`: a path in this response differs on disk from the index. `unknown`: drift could not be determined (git failed, the index carries no commit stamp, or it could not be opened). Absent when fresh."},
                     "semantic": {"enum": ["partial", "none", "unknown"], "description": "Semantic coverage of the indexed file set by the configured embedding model: none when that model has no chunks, partial when some indexed files lack chunks for it or their chunks predate the current content, unknown when a read-only describe could not measure coverage. Absent when the configured model covers every indexed file."},
-                    "dirty_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths in this response that changed on disk since indexing."}
+                    "dirty_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths in this response that changed on disk since indexing."},
+                    "recover": {"type": "object", "description": "CLI recovery for a stale index; this is not an MCP tool call and does not authorize execution.", "required": ["command", "cwd", "why"], "properties": {"command": {"const": "codesage index"}, "cwd": {"type": "string", "description": "Absolute project directory where the command runs."}, "why": {"type": "string"}}}
                 }
             }),
         ),
@@ -799,7 +892,8 @@ pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
                 "properties": {
                     "kind": {"enum": ["truncated", "bounded", "partial", "clamped", "unscored", "floor"]},
                     "kinds": {"type": "array", "items": {"enum": ["truncated", "bounded", "partial", "clamped", "unscored", "floor"]}},
-                    "recover": {"type": "object", "description": "What removes the limitation: `{total, returned, arguments}` for truncated, `{tool, arguments}` or `{command}` for bounded, `{requested, applied}` for clamped, `{command}` for unscored, the per-input reason lists for partial, `{reason}` for floor. Never prose."}
+                    "recover": recovery_schema(),
+                    "prior": {"$ref": "#/properties/completeness", "description": super::help::field_description("completeness.prior")}
                 }
             }),
         ),
@@ -807,10 +901,13 @@ pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
             "cost",
             json!({
                 "type": "object",
-                "description": "What this call spent: wall time from request receipt to response, including admission wait, and the serialized payload size before the envelope was added.",
+                "description": "Wall time from request receipt including admission wait, and final structured payload size in UTF-8 bytes (not the duplicated MCP text/structured transport).",
                 "properties": {
                     "ms": {"type": "integer", "minimum": 0},
-                    "bytes": {"type": "integer", "minimum": 0}
+                    "bytes": {"type": "integer", "minimum": 0},
+                    "detail": {"enum": ["compact", "standard", "full"]},
+                    "budget_tokens": {"type": "integer", "minimum": 0},
+                    "budget_exceeded": {"const": true, "description": "The response cannot fit without dropping its remaining result or evidence."}
                 }
             }),
         ),
@@ -891,6 +988,123 @@ mod tests {
             envelope_of(json!({"results": []}), "search", json!({})),
             json!({})
         );
+    }
+
+    #[test]
+    fn lexical_fallback_maps_cli_search_json_to_partial_mcp_pages() {
+        for populated in [false, true] {
+            let db = Database::open_in_memory().unwrap();
+            let embedding = vec![0.0; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+            if populated {
+                db.insert_chunks("src/a.rs", "rust", &[("fn a() {}", 1, 1, &embedding)])
+                    .unwrap();
+            }
+            let fts = codesage_storage::schema::fts_table_name(db.chunk_table_name());
+            for failed in [false, true] {
+                if failed {
+                    db.execute_raw_for_tests(&format!("DROP TABLE \"{fts}\""))
+                        .unwrap();
+                }
+                for explain in [false, true] {
+                    let request = codesage_protocol::SearchRequest {
+                        query: "use `AbsentNeedle` here".into(),
+                        limit: Some(10),
+                        offset: None,
+                        languages: None,
+                        paths: None,
+                        adaptive_limit: false,
+                        explain,
+                    };
+                    let page =
+                        codesage_graph::search_page(&db, &embedding, None, &request).unwrap();
+                    let cli_json: Value =
+                        serde_json::from_str(&serde_json::to_string_pretty(&page).unwrap())
+                            .unwrap();
+                    let mcp = server(true).annotate_envelope(
+                        render_with_kind(Ok(&page), "search"),
+                        "search",
+                        &Map::new(),
+                        Duration::from_millis(1),
+                    );
+                    let payload = mcp.structured_content.as_ref().unwrap();
+                    assert_eq!(
+                        payload.get("lexical_fallback_reason"),
+                        cli_json.get("lexical_fallback_reason")
+                    );
+                    assert_eq!(
+                        payload["results"].as_array().unwrap().is_empty(),
+                        !populated
+                    );
+                    if failed {
+                        assert_eq!(payload["completeness"]["kind"], "partial");
+                        assert_eq!(
+                            payload["completeness"]["recover"],
+                            json!({"reason": "lexical_lookup_failed", "command": "codesage index --full"})
+                        );
+                    } else {
+                        assert!(payload.get("completeness").is_none(), "{payload}");
+                    }
+                    let text = &mcp.content.last().unwrap().as_text().unwrap().text;
+                    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *payload);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_failure_requires_full_reindex_while_coverage_only_remains_incremental() {
+        for (coverage, lexical, command) in [
+            (true, false, "codesage index"),
+            (false, true, "codesage index --full"),
+            (true, true, "codesage index --full"),
+        ] {
+            let mut page = json!({"results": []});
+            if coverage {
+                page["_meta"] = json!({"coverage": {"indexed_files": 0}});
+            }
+            if lexical {
+                page["lexical_fallback_reason"] = json!("Lexical lookup failed: missing sidecar");
+            }
+            let envelope = envelope_of(page, "search", json!({}));
+            assert_eq!(envelope["completeness"]["kind"], "partial");
+            assert_eq!(envelope["completeness"]["recover"]["command"], command);
+            assert_eq!(
+                envelope["completeness"]["recover"].get("reason"),
+                lexical.then_some(&json!("lexical_lookup_failed"))
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_repair_survives_paging_and_combined_coverage_recovery() {
+        for coverage in [false, true] {
+            let mut page = json!({
+                "results": [],
+                "lexical_fallback_reason": "Lexical lookup failed: missing sidecar",
+                "_meta": {"truncated": true, "total_results": 50, "returned": 11}
+            });
+            if coverage {
+                page["_meta"]["coverage"] =
+                    json!({"indexed_files": 10, "semantically_indexed_files": 5});
+            }
+            let envelope = envelope_of(
+                page,
+                "search",
+                json!({"project": "/project", "query": "use `needle`", "offset": 5, "limit": 50}),
+            );
+            assert_eq!(envelope["completeness"]["kind"], "truncated");
+            assert_eq!(
+                envelope["completeness"]["kinds"],
+                json!(["truncated", "partial"])
+            );
+            let recover = &envelope["completeness"]["recover"];
+            assert_eq!(recover["total"], 50);
+            assert_eq!(recover["returned"], 11);
+            assert_eq!(recover["arguments"]["offset"], 16);
+            assert_eq!(recover["arguments"]["query"], "use `needle`");
+            assert_eq!(recover["command"], "codesage index --full");
+            assert_eq!(recover["reason"], "lexical_lookup_failed");
+        }
     }
 
     #[test]

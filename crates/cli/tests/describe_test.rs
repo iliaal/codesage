@@ -173,6 +173,133 @@ fn fixture() -> tempfile::TempDir {
 }
 
 #[test]
+fn describe_stdio_and_cli_surface_plugin_saved_findings() {
+    let root = fixture();
+    let generator = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/codesage-tools/tests/fixtures/describe_findings.py");
+    let saved = Command::new("python3")
+        .arg(generator)
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(
+        saved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    let mut server = Server::start();
+    for (target, expected_ids) in [
+        (
+            "file:src/helper.rs",
+            json!(["fnd_33333333", "fnd_11111111"]),
+        ),
+        (
+            "feat_1111111111111111",
+            json!(["fnd_33333333", "fnd_22222222", "fnd_11111111"]),
+        ),
+    ] {
+        let response = server.call("describe", json!({"project": root.path(), "target": target, "detail": "full", "sections": ["findings"]}));
+        assert_ne!(response["isError"], true, "{response}");
+        let card = &response["structuredContent"]["card"];
+        let data = &card["sections"]["findings"]["data"];
+        assert_eq!(data["ids"], expected_ids);
+        assert_eq!(data["open"], expected_ids.as_array().unwrap().len());
+        assert_eq!(
+            data["top"][0],
+            json!({"id": "fnd_33333333", "severity": "high", "title": "Helper high finding", "line": 2})
+        );
+        let command: Value = serde_json::from_slice(&cli(
+            root.path(),
+            &[
+                "describe",
+                target,
+                "--detail",
+                "full",
+                "--sections",
+                "findings",
+                "--json",
+            ],
+        ))
+        .unwrap();
+        assert_eq!(command["card"], *card);
+    }
+    let compact = server.call(
+        "describe",
+        json!({"project": root.path(), "target": "src/helper.rs", "sections": ["findings"]}),
+    );
+    let section = &compact["structuredContent"]["card"]["sections"]["findings"];
+    assert_eq!(section["data"]["open"], 2);
+    assert_eq!(section["data"]["ids"], json!(["fnd_33333333"]));
+    assert_eq!(section["completeness"]["kind"], "truncated");
+    let expand = &section["expand"];
+    let expanded = server.call(
+        expand["tool"].as_str().unwrap(),
+        expand["arguments"].clone(),
+    );
+    assert_eq!(
+        expanded["structuredContent"]["card"]["sections"]["findings"]["data"]["ids"],
+        json!(["fnd_33333333", "fnd_11111111"])
+    );
+
+    let ledger = root
+        .path()
+        .join(".codesage/findings/feat_1111111111111111.json");
+    let original: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    for transfer in [
+        json!(false),
+        json!([]),
+        json!({"finding_id":"fnd_33333333"}),
+        json!([{"feature_id":"feat_1111111111111111", "finding_id":null}]),
+    ] {
+        let mut malformed = original.clone();
+        for finding in malformed["findings"].as_array_mut().unwrap() {
+            if finding["status"] == "open" {
+                finding["ack_transferred_to"] = transfer.clone();
+            }
+        }
+        std::fs::write(&ledger, serde_json::to_vec(&malformed).unwrap()).unwrap();
+        for target in ["file:src/helper.rs", "feat_1111111111111111"] {
+            let response = server.call(
+                "describe",
+                json!({"project":root.path(), "target":target, "sections":["findings"]}),
+            );
+            assert_ne!(response["isError"], true, "{response}");
+            let card = &response["structuredContent"]["card"];
+            let section = &card["sections"]["findings"];
+            assert_eq!(section["data"], json!({"unscored":true}), "{transfer}");
+            assert!(
+                section["completeness"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("transfer metadata")
+            );
+            let command: Value = serde_json::from_slice(&cli(
+                root.path(),
+                &["describe", target, "--sections", "findings", "--json"],
+            ))
+            .unwrap();
+            assert_eq!(command["card"], *card);
+        }
+    }
+
+    std::fs::write(
+        root.path()
+            .join(".codesage/findings/feat_1111111111111111.json"),
+        "malformed",
+    )
+    .unwrap();
+    let malformed = server.call(
+        "describe",
+        json!({"project": root.path(), "target": "src/helper.rs", "sections": ["findings"]}),
+    );
+    assert_ne!(malformed["isError"], true, "{malformed}");
+    assert_eq!(
+        malformed["structuredContent"]["card"]["sections"]["findings"]["data"],
+        json!({"unscored": true})
+    );
+}
+
+#[test]
 fn describe_stdio_clones_disclose_actual_seeds_for_an_exact_symbol_handle() {
     let first = "pub fn subject(a: i32) -> i32 { if a > 0 { a + 1 } else { a - 1 } }\n";
     let fingerprinted_first = "pub fn subject(a: i32) -> i32 { let doubled = a * 2; let adjusted = doubled + 17; let squared = adjusted * adjusted; if squared > 100 { squared - 21 } else if squared > 50 { squared + 22 } else { squared % 23 } }\n";
@@ -1195,9 +1322,9 @@ fn describe_stdio_cards_cli_parity_and_every_expansion_execute() {
     );
     assert!(schema["outputSchema"]["properties"].get("card").is_some());
     for (target, section_count) in [
-        ("file:src/helper.rs", 9),
+        ("file:src/helper.rs", 8),
         ("sym:src/helper.rs#leaf", 7),
-        ("feat_1111111111111111", 5),
+        ("feat_1111111111111111", 4),
         ("dir:src", 4),
     ] {
         let arguments = json!({"project": root.path(), "target": target});
@@ -1234,7 +1361,10 @@ fn describe_stdio_cards_cli_parity_and_every_expansion_execute() {
             command["card"], content["card"],
             "CLI card parity for {target}"
         );
-        if let Some(next) = content.get("next").filter(|next| !next.is_null()) {
+        for next in content["next"]
+            .as_array()
+            .expect("describe declares next[]")
+        {
             let followed = server.call(next["tool"].as_str().unwrap(), next["arguments"].clone());
             assert_ne!(followed["isError"], true, "next for {target}: {followed}");
         }

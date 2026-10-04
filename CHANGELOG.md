@@ -1,5 +1,21 @@
 ## [Unreleased]
 
+### Added
+
+- `help` explains MCP tools, fields, recovery, investigation recipes, and measured daemon latency.
+- `describe` includes open finding IDs and ranked severity, title, and line summaries from saved plugin reviews.
+
+### Changed
+
+- MCP row tools accept `detail` and `budget_tokens`, with compact defaults for references, impact, dependencies, features, and entity cards.
+- MCP responses provide up to three ranked `next[]` calls with rationales, and stale indexes include executable recovery metadata.
+- MCP `cost.bytes` measures the final result object; every response reports cost, including legacy mode.
+
+### Fixed
+
+- Rust caller resolution follows local Cargo dependency aliases and public library re-exports across workspace crates.
+- Search reports failed lexical lookups while retaining semantic results; MCP recovery requests `codesage index --full`.
+
 ## [0.39.0] - 2026-10-03
 
 ### Added

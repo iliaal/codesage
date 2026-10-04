@@ -425,6 +425,11 @@ pub(crate) fn render_error(
         "remedy": remedy.map_or(Value::Null, |remedy| remedy.resolve(tool, arguments)),
     });
     let candidates = target_candidates(error);
+    let next = if code == ErrorCode::Ambiguous {
+        super::next::ambiguous_calls(tool, arguments, &candidates)
+    } else {
+        Vec::new()
+    };
     if !candidates.is_empty()
         && let Some(failure) = failure.as_object_mut()
     {
@@ -435,7 +440,7 @@ pub(crate) fn render_error(
         "error": failure,
         "status": code.status(),
         "complete": false,
-        "next": null,
+        "next": next,
     });
     CallToolResult::error(vec![
         ContentBlock::text(message),
@@ -772,7 +777,17 @@ mod tests {
         assert_eq!(block["error"]["code"], "E_AMBIGUOUS");
         assert_eq!(block["status"], "error");
         assert_eq!(block["complete"], false);
-        assert_eq!(block["next"], Value::Null);
+        assert_eq!(block["next"].as_array().unwrap().len(), 2);
+        for (index, handle) in ["sym:a.rs#search", "sym:crates/b.rs#Server::search"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(block["next"][index]["tool"], "describe");
+            assert_eq!(
+                block["next"][index]["arguments"],
+                json!({"project":"/p","target":handle})
+            );
+        }
         assert_eq!(
             block["error"]["remedy"],
             json!({"tool": "impact_analysis", "arguments": {

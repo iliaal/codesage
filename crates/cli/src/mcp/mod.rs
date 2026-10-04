@@ -1,8 +1,10 @@
+mod detail;
 mod diagnostics;
 mod dispatch;
 mod edit_check;
 pub(crate) mod envelope;
 pub(crate) mod error;
+mod help;
 mod next;
 mod overview_cache;
 pub(crate) mod params;
@@ -299,8 +301,9 @@ impl ServerHandler for CodeSageServer {
             .with_server_info(Implementation::new("codesage", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Structural and semantic code intelligence across multiple projects. \
-                 Every tool requires an absolute `project` path pointing at an onboarded \
-                 CodeSage project (one containing .codesage/index.db). \
+                 Pass an absolute `project` path. Indexed retrieval requires an onboarded \
+                 CodeSage project (one containing .codesage/index.db); help works in any \
+                 existing directory, and edit_check reads pinned Git HEAD without an index. \
                  Use find_symbol to locate definitions, find_references to trace callers \
                  and imports, list_dependencies for file-level dependency mapping, search \
                  for natural-language semantic code search, impact_analysis to estimate \
@@ -332,6 +335,29 @@ impl CodeSageServer {
 
 #[tool_router]
 impl CodeSageServer {
+    #[tool(
+        name = "help",
+        description = "On-demand tool and field semantics, error recovery, investigation recipes, and measured daemon latency. Select tool (optionally field), an envelope field, code, or intent; omit selectors for the catalog. tool=daemon discovers operator and hidden tools. Recipes are plans to execute with explicit bindings, not automation. Requires an absolute existing project directory; no index or model is needed.",
+        output_schema = schema_for_type::<help::HelpResult>()
+    )]
+    async fn help_tool(&self, Parameters(params): Parameters<HelpParams>) -> CallToolResult {
+        self.blocking(move |server| {
+            let result = help::project_root(Path::new(&params.project))
+                .and_then(|_| help::answer(server, &params));
+            match result {
+                Ok(result) => next::annotate(
+                    &params.project,
+                    "help",
+                    CallToolResult::structured(
+                        serde_json::to_value(result).expect("help serializes"),
+                    ),
+                ),
+                Err(error) => error::render_error("help", None, &error),
+            }
+        })
+        .await
+    }
+
     #[tool(
         name = "describe",
         description = "Compact indexed card for one file, symbol, feature, or directory. Includes test-aware facts, freshness, dependencies, features, bounded risk, and executable expand calls. Symbol cards include rationale, callers/callees, clones, hotness, and file import cycles; directory cards summarize a subtree. Ambiguous targets return candidates only. detail expands samples; sections selects facts. Deadline-cut sections are unscored with recover; no inference or writes.",

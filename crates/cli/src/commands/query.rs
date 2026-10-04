@@ -167,6 +167,9 @@ pub(crate) fn cmd_search(req: SearchRequest, json: bool) -> Result<()> {
         search_page(db, &query_embedding, rerank_fn, &req)
     })?;
 
+    if !json && let Some(reason) = &page.lexical_fallback_reason {
+        eprintln!("Warning: {reason}");
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&page)?);
     } else if page.results.is_empty() {

@@ -268,7 +268,7 @@ impl CodeSageServer {
     }
 }
 
-fn confined_project_path(root: &Path, rel: &str) -> Option<PathBuf> {
+pub(super) fn confined_project_path(root: &Path, rel: &str) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
     let rel_path = Path::new(rel);
     if rel_path.is_absolute()
@@ -292,7 +292,7 @@ fn confined_project_path(root: &Path, rel: &str) -> Option<PathBuf> {
 const MCP_TOKEN_BUDGET: usize = 8000;
 /// Approximate token cost for response caps.
 const MCP_CHARS_PER_TOKEN: usize = 4;
-const MCP_BUDGET_CHARS: usize = MCP_TOKEN_BUDGET * MCP_CHARS_PER_TOKEN;
+pub(super) const MCP_BUDGET_CHARS: usize = MCP_TOKEN_BUDGET * MCP_CHARS_PER_TOKEN;
 
 /// Scale bundle budgets monotonically with repository size; the environment can override.
 fn mcp_bundle_token_budget(file_count: usize) -> usize {
@@ -322,7 +322,22 @@ fn render_with_budget<T: serde::Serialize>(
 ) -> CallToolResult {
     match r {
         Ok(v) => {
-            let value = serde_json::to_value(&v).unwrap_or(serde_json::Value::Null);
+            let mut value = serde_json::to_value(&v).unwrap_or(serde_json::Value::Null);
+            let request = super::dispatch::current_request();
+            if let Some(request) = &request {
+                super::next::annotate_value(&request.project.to_string_lossy(), kind, &mut value);
+            }
+            let options = request
+                .as_ref()
+                .and_then(|request| super::detail::Options::parse(kind, &request.arguments).ok());
+            if let Some(options) = options {
+                super::detail::project(&mut value, options.detail);
+                if options.detail == codesage_protocol::DescribeDetail::Full
+                    && let Some(request) = &request
+                {
+                    super::detail::add_snippets(&mut value, &request.project);
+                }
+            }
             let capped = cap_to_budget_with(value, kind, budget_chars);
             // MCP requires a structured-content object; normalize arrays regardless of budget.
             let structured = match capped {
@@ -450,8 +465,11 @@ pub(super) fn rerender_json_text(result: &mut CallToolResult) {
         if let Some(text) = content.as_text()
             && serde_json::from_str::<serde_json::Value>(&text.text).is_ok()
         {
-            let compact = payload.get("tool").and_then(serde_json::Value::as_str)
-                == Some("describe")
+            let compact = payload
+                .pointer("/cost/detail")
+                .and_then(serde_json::Value::as_str)
+                == Some("compact")
+                || payload.get("tool").and_then(serde_json::Value::as_str) == Some("describe")
                 || payload.get("card").is_some();
             *content = ContentBlock::text(
                 if compact {
@@ -634,7 +652,7 @@ fn cap_to_budget_with(
     budget_chars: usize,
 ) -> serde_json::Value {
     if kind == "describe" {
-        return cap_describe(value, budget_chars.saturating_sub(2000));
+        return cap_describe(value, budget_chars);
     }
     let approx_tokens_budget = budget_chars / MCP_CHARS_PER_TOKEN;
     let hint = budget_hint(kind);
@@ -849,7 +867,7 @@ fn largest_trimmable_array(
     let mut open: Option<(String, usize)> = None;
     let mut protected: Option<(String, usize)> = None;
     for (k, v) in map {
-        if k == "_meta" || skip.iter().any(|s| s == k) {
+        if matches!(k.as_str(), "_meta" | "next") || skip.iter().any(|s| s == k) {
             continue;
         }
         let serde_json::Value::Array(arr) = v else {

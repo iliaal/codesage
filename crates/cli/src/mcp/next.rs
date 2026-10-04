@@ -1,223 +1,522 @@
-use std::path::{Component, Path};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use codesage_protocol::Handle;
 use rmcp::model::CallToolResult;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 const MAX_NEXT_BYTES: usize = 2048;
-
-/// Handle kinds a file-grained follow-up can be asked about.
-const FILE: &[&str] = &["file:"];
-
-/// Handle kinds a symbol-grained follow-up can be asked about.
-const SYMBOL: &[&str] = &["sym:"];
+const MAX_NEXT: usize = 3;
+const WIDELY_USED_REFERENCES: usize = 10;
 
 pub(super) fn schema() -> Value {
-    let mut alternatives = vec![json!({"type": "null"})];
-    for tool in [
-        "find_references",
-        "list_dependencies",
-        "find_feature",
-        "feature_bundle",
-    ] {
-        alternatives.push(json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["tool", "arguments"],
-            "properties": {
-                "tool": {"const": tool},
-                "arguments": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["project", "target"],
-                    "properties": {
-                        "project": {"type": "string"},
-                        "target": {"type": "string"}
-                    }
-                }
-            }
-        }));
-    }
     json!({
-        "description": "Optional follow-up derived from retained response evidence. Pass tool as tools/call name and arguments unchanged. Null means no supported follow-up: empty/error evidence, a delivered context bundle, or a session snapshot awaiting edits. Suggestions are read-only and terminate; they never authorize an action.",
-        "oneOf": alternatives
+        "type": "array",
+        "maxItems": MAX_NEXT,
+        "description": "Ranked calls derived from response evidence. Pass tool as tools/call name and arguments unchanged. Empty when no useful follow-up remains. Suggestions do not authorize actions. High-risk files may suggest session_start with a fresh ID; an existing snapshot waits for edits. CLI index recovery appears in index.recover instead.",
+        "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["tool", "arguments", "why"],
+            "properties": {
+                "tool": {"type": "string", "description": "Advertised MCP tool answering the remaining question."},
+                "arguments": {"type": "object", "description": "Arguments accepted by that tool, with an absolute project and evidence-derived handles or a fresh session identity."},
+                "why": {"type": "string", "pattern": "^\\S+(?:\\s+\\S+){0,8}$", "description": "Rationale in fewer than ten words."}
+            }
+        }
     })
 }
 
+pub(super) fn annotate_value(project: &str, kind: &str, payload: &mut Value) {
+    if payload.is_array() {
+        *payload = json!({"results": std::mem::take(payload)});
+    }
+    if payload.get("next").is_some() {
+        return;
+    }
+    let next = derive(project, kind, payload);
+    if let Some(object) = payload.as_object_mut() {
+        object.entry("next").or_insert_with(|| json!(next));
+    }
+}
+
 pub(super) fn annotate(project: &str, kind: &str, mut result: CallToolResult) -> CallToolResult {
-    // Failed results already carry `next: null` in their contract block.
     if result.is_error == Some(true) {
         return result;
     }
-    let Some(payload) = result.structured_content.as_mut() else {
-        return result;
-    };
-    let next = derive(project, kind, payload)
-        .filter(|next| serde_json::to_vec(next).is_ok_and(|bytes| bytes.len() <= MAX_NEXT_BYTES))
-        .unwrap_or(Value::Null);
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("next".to_owned(), next);
+    if let Some(payload) = result.structured_content.as_mut() {
+        annotate_value(project, kind, payload);
+        super::render::rerender_json_text(&mut result);
     }
-    // Keep annotation banners while replacing the JSON block clients paste.
-    super::render::rerender_json_text(&mut result);
     result
+}
+
+pub(super) fn ambiguous_calls(
+    tool: &str,
+    arguments: Option<&Map<String, Value>>,
+    candidates: &[String],
+) -> Vec<Value> {
+    let Some(arguments) = arguments else {
+        return Vec::new();
+    };
+    let Some(project) = arguments
+        .get("project")
+        .and_then(Value::as_str)
+        .filter(|project| Path::new(project).is_absolute())
+    else {
+        return Vec::new();
+    };
+    if project.len() > MAX_NEXT_BYTES
+        || (tool == "edit_check"
+            && arguments
+                .get("replacement")
+                .and_then(Value::as_str)
+                .is_some_and(|replacement| replacement.len() > MAX_NEXT_BYTES))
+    {
+        return Vec::new();
+    }
+    let mut calls = Calls {
+        project,
+        entries: Vec::new(),
+    };
+    for candidate in candidates {
+        if calls.entries.len() == MAX_NEXT {
+            break;
+        }
+        let Some(handle) = Handle::parse(candidate) else {
+            continue;
+        };
+        if tool == "edit_check" {
+            let Handle::Symbol { ref path, line, .. } = handle else {
+                continue;
+            };
+            if arguments
+                .get("file_path")
+                .and_then(Value::as_str)
+                .is_none_or(|file| Path::new(file) != Path::new(path))
+            {
+                continue;
+            }
+            let mut retry = arguments.clone();
+            retry.remove("symbol_name");
+            retry.insert("target".into(), json!(handle.to_string()));
+            retry.remove("line");
+            if let Some(line) = line {
+                retry.insert("line".into(), json!(line));
+            }
+            calls.push(
+                "edit_check",
+                Value::Object(retry),
+                "Check this declaration against the proposed replacement",
+            );
+        } else if matches!(
+            handle,
+            Handle::Symbol { .. }
+                | Handle::File { .. }
+                | Handle::Dir { .. }
+                | Handle::Feature { .. }
+        ) {
+            calls.target(
+                "describe",
+                Some(handle),
+                "Choose the intended definition before retrying",
+            );
+        }
+    }
+    calls.entries
 }
 
 fn text(value: &Value) -> Option<&str> {
     value.as_str().filter(|s| !s.is_empty() && s.len() <= 1024)
 }
 
-fn file(value: &Value) -> Option<&str> {
-    text(value).filter(|s| {
-        Path::new(s)
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-    })
+fn parsed(value: &Value) -> Option<Handle> {
+    Handle::parse(text(value)?)
 }
 
-/// A row's own handle, when it carries one the follow-up tool accepts.
-///
-/// `kinds` names the handle prefixes that answer the follow-up's question:
-/// a file-grained call takes `file:`, a symbol-grained one `sym:`. A row
-/// whose handle is a different kind falls back to its path field rather
-/// than asking one tool a question addressed to another grain.
-fn handle<'a>(value: &'a Value, kinds: &[&str]) -> Option<&'a str> {
-    let candidate = text(value)?;
-    // Handles are emitted from validated paths, but a follow-up is a call the
-    // agent may make: parse before suggesting it.
-    Handle::parse(candidate)?;
-    kinds
-        .iter()
-        .any(|kind| candidate.starts_with(kind))
-        .then_some(candidate)
+fn symbol(value: &Value) -> Option<Handle> {
+    parsed(value).filter(|handle| matches!(handle, Handle::Symbol { .. }))
 }
 
-fn first_handle<'a>(payload: &'a Value, array: &str, kinds: &[&str]) -> Option<&'a str> {
-    handle(first_field(payload, array, "handle")?, kinds)
+fn file(value: &Value) -> Option<Handle> {
+    Handle::file(text(value)?)
 }
 
-fn first_field<'a>(payload: &'a Value, array: &str, field: &str) -> Option<&'a Value> {
-    payload.get(array)?.as_array()?.iter().find_map(|row| {
-        (row.get("found") != Some(&Value::Bool(false)))
-            .then(|| row.get(field))
-            .flatten()
-    })
-}
-
-/// `field` of the innermost frame the report resolved; frames it only
-/// guessed at name no location to follow.
-fn resolved_frame<'a>(payload: &'a Value, field: &str) -> Option<&'a Value> {
-    payload.get("frames")?.as_array()?.iter().find_map(|frame| {
-        (frame.get("status").and_then(Value::as_str) == Some("resolved"))
-            .then(|| frame.get(field))
-            .flatten()
-    })
-}
-
-fn clustered_file(payload: &Value) -> Option<&Value> {
-    payload
-        .get("clustered_directories")?
-        .as_array()?
-        .iter()
-        .find_map(|cluster| {
-            cluster
-                .get("top_files")?
-                .as_array()?
+fn row_file(row: &Value) -> Option<Handle> {
+    row.get("handle")
+        .and_then(parsed)
+        .filter(|handle| matches!(handle, Handle::File { .. }))
+        .or_else(|| {
+            ["file_path", "file", "path", "entry_path", "from_file"]
                 .iter()
-                .filter(|row| row.get("found") == Some(&Value::Bool(true)))
-                .find_map(|row| row.get("file").filter(|value| file(value).is_some()))
+                .find_map(|key| row.get(key).and_then(file))
         })
 }
 
-fn derive(project: &str, kind: &str, payload: &Value) -> Option<Value> {
-    if !Path::new(project).is_absolute() || payload.get("found") == Some(&Value::Bool(false)) {
-        return None;
+fn rows<'a>(payload: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
+    payload
+        .get(field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| row.get("found") != Some(&Value::Bool(false)))
+}
+
+fn first_file(payload: &Value, field: &str) -> Option<Handle> {
+    rows(payload, field).find_map(row_file)
+}
+
+fn first_symbol(payload: &Value, field: &str) -> Option<Handle> {
+    rows(payload, field).find_map(|row| row.get("handle").and_then(symbol))
+}
+
+fn resolved_symbols(payload: &Value) -> Vec<Handle> {
+    payload
+        .pointer("/target/resolved")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            row["confidence"]
+                .as_f64()
+                .is_some_and(|confidence| confidence >= 0.8)
+        })
+        .filter_map(|row| row.get("handle").and_then(symbol))
+        .collect()
+}
+
+fn fresh_session_id() -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "next-{stamp}-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+struct Calls<'a> {
+    project: &'a str,
+    entries: Vec<Value>,
+}
+
+impl Calls<'_> {
+    fn push(&mut self, tool: &str, mut arguments: Value, why: &str) {
+        if self.entries.len() == MAX_NEXT {
+            return;
+        }
+        arguments["project"] = json!(self.project);
+        let entry = json!({"tool": tool, "arguments": arguments, "why": why});
+        if self.entries.contains(&entry) {
+            return;
+        }
+        self.entries.push(entry);
+        if !serde_json::to_vec(&self.entries).is_ok_and(|bytes| bytes.len() <= MAX_NEXT_BYTES) {
+            self.entries.pop();
+        }
     }
-    // Every follow-up names its subject with `target`, the one argument
-    // every tool in the chain takes, and prefers the row's own handle: a
-    // handle addresses the definition the row came from, where a bare name
-    // re-opens the ambiguity the row already resolved.
-    let call = |tool: &str, value: &str| json!({"tool": tool, "arguments": {"project": project, "target": value}});
-    // Each edge moves toward a bundle, which is terminal, so following next
-    // cannot cycle even when the underlying dependency graph does.
+
+    fn target(&mut self, tool: &str, target: Option<Handle>, why: &str) {
+        if let Some(target) = target {
+            self.push(tool, json!({"target": target.to_string()}), why);
+        }
+    }
+
+    fn files(&mut self, tool: &str, targets: Vec<Handle>, why: &str) {
+        let targets: Vec<_> = targets
+            .into_iter()
+            .filter(|target| {
+                matches!(
+                    target,
+                    Handle::File { .. } | Handle::Symbol { .. } | Handle::Chunk { .. }
+                )
+            })
+            .map(|target| target.to_string())
+            .collect();
+        if !targets.is_empty() {
+            self.push(tool, json!({"targets": targets}), why);
+        }
+    }
+}
+
+fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
+    let mut calls = Calls {
+        project,
+        entries: Vec::new(),
+    };
+    if !Path::new(project).is_absolute() || payload.get("found") == Some(&Value::Bool(false)) {
+        return calls.entries;
+    }
     match kind {
-        "describe" => {
-            let card = payload.get("card")?;
-            match card.get("kind")?.as_str()? {
-                "file" => Some(call("find_feature", handle(card.get("handle")?, FILE)?)),
-                "symbol" => Some(call(
-                    "find_references",
-                    handle(card.get("handle")?, SYMBOL)?,
-                )),
-                "feature" => Some(call("feature_bundle", text(card.get("handle")?)?)),
-                "dir" => Some(call(
-                    "list_dependencies",
-                    handle(card.pointer("/sections/fan_in/data/top/0/handle")?, FILE)?,
-                )),
-                _ => None,
+        "describe" | "find_references" | "find_similar"
+            if payload.pointer("/target/ambiguous") == Some(&Value::Bool(true)) =>
+        {
+            for target in resolved_symbols(payload) {
+                calls.target(
+                    "describe",
+                    Some(target),
+                    "Choose the intended definition before editing",
+                );
+            }
+        }
+        "find_symbol" if payload.pointer("/target/ambiguous") == Some(&Value::Bool(true)) => {
+            for row in rows(payload, "results") {
+                calls.target(
+                    "describe",
+                    row.get("handle").and_then(symbol),
+                    "Choose the intended definition before editing",
+                );
             }
         }
         "find_symbol" => {
-            let target = first_handle(payload, "results", SYMBOL)
-                .or_else(|| first_field(payload, "results", "qualified_name").and_then(text))
-                .or_else(|| first_field(payload, "results", "name").and_then(text))?;
-            Some(call("find_references", target))
+            let target = first_symbol(payload, "results");
+            calls.target(
+                "find_references",
+                target.clone(),
+                "Locate callers before renaming or changing behavior",
+            );
+            calls.target(
+                "export_context",
+                target,
+                "Read the implementation and surrounding context",
+            );
         }
-        "list_features" | "find_feature" => {
-            let id = first_field(payload, "results", "feature_id").and_then(text)?;
-            Some(call("feature_bundle", id))
+        "describe" => {
+            let card = &payload["card"];
+            match card["kind"].as_str() {
+                Some("file") => calls.target(
+                    "describe",
+                    card.pointer("/sections/symbols/data/top/0/handle")
+                        .and_then(symbol),
+                    "Inspect the file's most referenced symbol",
+                ),
+                Some("symbol") => calls.target(
+                    "find_references",
+                    card.get("handle").and_then(symbol),
+                    "Locate callers before renaming or changing behavior",
+                ),
+                Some("feature") => calls.target(
+                    "feature_bundle",
+                    card.get("handle")
+                        .and_then(parsed)
+                        .filter(|h| matches!(h, Handle::Feature { .. })),
+                    "Read the feature's implementation and tests",
+                ),
+                Some("dir") => calls.target(
+                    "describe",
+                    card.pointer("/sections/fan_in/data/top/0/handle")
+                        .and_then(parsed)
+                        .filter(|h| matches!(h, Handle::File { .. })),
+                    "Inspect the directory's most referenced file",
+                ),
+                _ => {}
+            }
         }
-        "list_dependencies" => {
+        "find_references" => {
+            let definitions = resolved_symbols(payload);
+            let wide = rows(payload, "results").count() >= WIDELY_USED_REFERENCES
+                || payload
+                    .pointer("/_meta/total_results")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|n| n >= WIDELY_USED_REFERENCES as u64);
+            let unique = definitions.len() == 1
+                || (payload.get("ambiguous") != Some(&Value::Bool(true))
+                    && payload.get("definition_count").and_then(Value::as_u64) == Some(1));
+            if unique && wide && payload.get("counts_floor") == Some(&Value::Bool(true)) {
+                let target = definitions.into_iter().next().or_else(|| {
+                    rows(payload, "results").find_map(|row| row.get("to").and_then(symbol))
+                });
+                calls.target(
+                    "impact_analysis",
+                    target,
+                    "Measure transitive impact beyond these reference floors",
+                );
+            } else if unique {
+                calls.target(
+                    "export_context",
+                    rows(payload, "results").find_map(|row| row.get("to").and_then(symbol)),
+                    "Read the resolved definition before changing callers",
+                );
+            }
+        }
+        "search" => {
+            let target = first_file(payload, "results");
+            if payload["confidence"] == "high" {
+                calls.target(
+                    "describe",
+                    target,
+                    "Inspect the strongest match after the relevance cliff",
+                );
+            } else {
+                calls.target(
+                    "export_context",
+                    target,
+                    "Inspect the leading match in source context",
+                );
+            }
+        }
+        "project_overview" => {
+            calls.target(
+                "assess_risk",
+                first_file(payload, "top_risk_files"),
+                "Review the highest risk file before changes",
+            );
+            calls.target(
+                "describe",
+                first_file(payload, "entrypoints"),
+                "Inspect a product entrypoint before adding behavior",
+            );
+        }
+        "assess_risk" => {
+            let target = row_file(payload);
+            calls.target(
+                "impact_analysis",
+                target.clone(),
+                "Check the blast radius before changing this file",
+            );
+            calls.files(
+                "recommend_tests",
+                target.into_iter().collect(),
+                "Select regression tests for this risky file",
+            );
+            if payload["score"].as_f64().is_some_and(|score| score >= 0.5) {
+                calls.push(
+                    "session_start",
+                    json!({"session_id": fresh_session_id()}),
+                    "Save a fresh baseline before editing",
+                );
+            }
+        }
+        "impact_analysis" => calls.files(
+            "recommend_tests",
+            rows(payload, "results")
+                .filter_map(row_file)
+                .take(3)
+                .collect(),
+            "Select tests for the affected files",
+        ),
+        "assess_risk_batch" | "assess_risk_diff" => {
+            let mut targets: Vec<_> = rows(payload, "files")
+                .filter_map(row_file)
+                .take(3)
+                .collect();
+            if targets.is_empty() {
+                targets = rows(payload, "clustered_directories")
+                    .flat_map(|cluster| rows(cluster, "top_files"))
+                    .filter_map(row_file)
+                    .take(3)
+                    .collect();
+            }
+            calls.files(
+                "review_rehearsal",
+                targets.clone(),
+                "Check review objections before committing these changes",
+            );
+            calls.files(
+                "recommend_tests",
+                targets,
+                "Select regression tests for the scored files",
+            );
+        }
+        "review_rehearsal" => {
+            let targets = rows(payload, "objections")
+                .flat_map(|objection| rows(objection, "files"))
+                .filter_map(file)
+                .take(3)
+                .collect();
+            calls.files(
+                "recommend_tests",
+                targets,
+                "Find tests addressing the remaining review objections",
+            );
+        }
+        "recommend_tests" => {
             let target = payload
-                .get("handle")
-                .and_then(|value| handle(value, FILE))
-                .or_else(|| payload.get("file_path").and_then(file))?;
-            Some(call("find_feature", target))
+                .pointer("/primary/0")
+                .and_then(file)
+                .or_else(|| first_file(payload, "reachable"))
+                .or_else(|| first_file(payload, "coupled"));
+            calls.target(
+                "export_context",
+                target,
+                "Read the recommended test before extending coverage",
+            );
         }
-        "feature_bundle" | "export_context" | "session_start" => None,
-        _ => {
-            let target = match kind {
-                "project_overview" => first_handle(payload, "top_risk_files", FILE)
-                    .or_else(|| first_handle(payload, "entrypoints", FILE))
-                    .or_else(|| first_field(payload, "top_risk_files", "file").and_then(file))
-                    .or_else(|| first_field(payload, "entrypoints", "entry_path").and_then(file)),
-                "search" => first_field(payload, "results", "file_path").and_then(file),
-                "impact_analysis" | "find_similar" => first_handle(payload, "results", FILE)
-                    .or_else(|| first_field(payload, "results", "file_path").and_then(file)),
-                "find_references" => first_field(payload, "results", "from_file").and_then(file),
-                "trace_call_path" => first_field(payload, "steps", "file_path").and_then(file),
-                "from_trace" => resolved_frame(payload, "handle")
-                    .and_then(|value| handle(value, FILE))
-                    .or_else(|| resolved_frame(payload, "file").and_then(file)),
-                "find_coupling" => first_handle(payload, "coupled", FILE)
-                    .or_else(|| first_field(payload, "coupled", "file").and_then(file)),
-                "assess_risk" => payload
-                    .get("handle")
-                    .and_then(|value| handle(value, FILE))
-                    .or_else(|| payload.get("file").and_then(file)),
-                "assess_risk_diff" => first_handle(payload, "files", FILE)
-                    .or_else(|| first_field(payload, "files", "file").and_then(file))
-                    .or_else(|| clustered_file(payload).and_then(file)),
-                "assess_risk_batch" => first_handle(payload, "files", FILE)
-                    .or_else(|| first_field(payload, "files", "file").and_then(file)),
-                "recommend_tests" => payload
-                    .pointer("/primary/0")
-                    .and_then(file)
-                    .or_else(|| first_handle(payload, "reachable", FILE))
-                    .or_else(|| first_field(payload, "reachable", "path").and_then(file))
-                    .or_else(|| first_handle(payload, "coupled", FILE))
-                    .or_else(|| first_field(payload, "coupled", "file").and_then(file)),
-                "review_rehearsal" => payload.pointer("/objections/0/files/0").and_then(file),
-                "session_end" => payload
-                    .pointer("/new_files/0")
-                    .and_then(file)
-                    .or_else(|| first_field(payload, "risk_regressions", "file").and_then(file))
-                    .or_else(|| payload.pointer("/new_cycles/0/0").and_then(file)),
-                _ => None,
-            }?;
-            Some(call("list_dependencies", target))
+        "from_trace" => {
+            let frame = rows(payload, "frames").find(|frame| frame["status"] == "resolved");
+            if let Some(frame) = frame {
+                let target = row_file(frame);
+                calls.target(
+                    "export_context",
+                    frame
+                        .get("handle")
+                        .and_then(symbol)
+                        .or_else(|| target.clone()),
+                    "Inspect the innermost resolved failure location",
+                );
+                calls.target(
+                    "assess_risk",
+                    target.clone(),
+                    "Check change risk before fixing the failure",
+                );
+                calls.files(
+                    "recommend_tests",
+                    target.into_iter().collect(),
+                    "Find regression coverage for the failing file",
+                );
+            }
         }
+        "trace_call_path" => calls.target(
+            "export_context",
+            first_symbol(payload, "steps").or_else(|| first_file(payload, "steps")),
+            "Read the implementation behind this call path",
+        ),
+        "find_similar" => calls.target(
+            "export_context",
+            first_symbol(payload, "results").or_else(|| first_file(payload, "results")),
+            "Inspect the closest clone for the same defect",
+        ),
+        "list_dependencies" => calls.target(
+            "export_context",
+            row_file(payload),
+            "Read implementation before extending these dependencies",
+        ),
+        "find_coupling" => calls.target(
+            "assess_risk",
+            first_file(payload, "coupled"),
+            "Assess the companion file likely to change",
+        ),
+        "list_features" | "find_feature" => calls.target(
+            "feature_bundle",
+            rows(payload, "results")
+                .find_map(|row| row.get("feature_id").and_then(parsed))
+                .filter(|h| matches!(h, Handle::Feature { .. })),
+            "Read the feature's implementation and tests",
+        ),
+        "session_end" => {
+            let targets = rows(payload, "risk_regressions")
+                .filter_map(row_file)
+                .chain(rows(payload, "new_files").filter_map(file))
+                .chain(
+                    rows(payload, "new_cycles")
+                        .flat_map(|cycle| cycle.as_array().into_iter().flatten())
+                        .filter_map(file),
+                )
+                .take(3)
+                .collect();
+            calls.files(
+                "review_rehearsal",
+                targets,
+                "Review changed files before committing the session",
+            );
+        }
+        "feature_bundle" | "export_context" | "edit_check" | "session_start" | "help" => {}
+        _ => {}
     }
+    calls.entries
 }
 
 #[cfg(test)]
@@ -225,80 +524,144 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unresolved_frames_and_non_relative_paths_never_become_calls() {
-        let root = "/tmp/project";
-        let resolved = json!({"frames": [{"status": "resolved", "file": "src/app.rs"}]});
-        assert_eq!(
-            derive(root, "from_trace", &resolved).unwrap()["arguments"]["target"],
-            "src/app.rs"
-        );
+    fn ambiguous_definitions_are_separate_ranked_calls() {
+        let payload = json!({"target": {"ambiguous": true}, "results": (0..4).map(|i| json!({"handle": format!("sym:src/{i}.rs#run")})).collect::<Vec<_>>()});
+        let next = derive("/tmp/project", "find_symbol", &payload);
+        assert_eq!(next.len(), 3);
+        for (i, call) in next.iter().enumerate() {
+            assert_eq!(call["tool"], "describe");
+            assert_eq!(call["arguments"]["target"], format!("sym:src/{i}.rs#run"));
+            assert!(call["why"].as_str().unwrap().split_whitespace().count() < 10);
+        }
+    }
+
+    #[test]
+    fn evidence_selects_the_open_question() {
+        for (kind, payload, tool, target) in [
+            (
+                "describe",
+                json!({"card":{"kind":"file","handle":"file:a.rs","sections":{"symbols":{"data":{"top":[{"handle":"sym:a.rs#run"}]}}}}}),
+                "describe",
+                "sym:a.rs#run",
+            ),
+            (
+                "search",
+                json!({"confidence":"high","results":[{"file_path":"a.rs"}]}),
+                "describe",
+                "file:a.rs",
+            ),
+            (
+                "find_references",
+                json!({"definition_count":1,"counts_floor":true,"results":(0..10).map(|_| json!({"to":"sym:a.rs#run"})).collect::<Vec<_>>()}),
+                "impact_analysis",
+                "sym:a.rs#run",
+            ),
+        ] {
+            let next = derive("/tmp/project", kind, &payload);
+            assert_eq!(next[0]["tool"], tool);
+            assert_eq!(next[0]["arguments"]["target"], target);
+        }
+    }
+
+    #[test]
+    fn unresolved_frames_and_invalid_handles_never_become_calls() {
         for status in ["unresolved", "ambiguous"] {
-            let frame = json!({"frames": [{"status": status, "file": "src/app.rs"}]});
-            assert!(derive(root, "from_trace", &frame).is_none());
+            assert!(
+                derive(
+                    "/tmp/project",
+                    "from_trace",
+                    &json!({"frames":[{"status":status,"file":"a.rs"}]})
+                )
+                .is_empty()
+            );
         }
-        for path in ["../secret.rs", "/tmp/secret.rs", ""] {
-            let payload = json!({"results": [{"file_path": path}]});
-            assert!(derive(root, "search", &payload).is_none());
+        for path in ["../secret.rs", "/tmp/secret.rs", "", "a\\b.rs", "a\nb.rs"] {
+            assert!(
+                derive(
+                    "/tmp/project",
+                    "search",
+                    &json!({"results":[{"file_path":path}]})
+                )
+                .is_empty()
+            );
         }
-        assert!(derive("relative-root", "from_trace", &resolved).is_none());
-    }
-
-    #[test]
-    fn a_rows_handle_scopes_the_followup_and_a_name_is_the_fallback() {
-        // The handle addresses the definition the row came from; a bare or
-        // qualified name would re-open the ambiguity the row resolved.
-        let with_handle = json!({"results": [
-            {"name": "run", "qualified_name": "Worker::run", "handle": "sym:src/w.rs#Worker::run"}
-        ]});
-        assert_eq!(
-            derive("/tmp/project", "find_symbol", &with_handle).unwrap()["arguments"]["target"],
-            "sym:src/w.rs#Worker::run"
+        assert!(
+            derive(
+                "relative",
+                "search",
+                &json!({"results":[{"file_path":"a.rs"}]})
+            )
+            .is_empty()
         );
-        let payload = json!({"results": [{"name": "run", "qualified_name": "Worker::run"}]});
-        assert_eq!(
-            derive("/tmp/project", "find_symbol", &payload).unwrap()["arguments"]["target"],
-            "Worker::run"
-        );
-        // A handle of the wrong grain is not the answer to a file-grained
-        // follow-up; the row's path is.
-        let chunk = json!({"results": [
-            {"file_path": "src/a.rs", "handle": "chunk:src/a.rs:1-9"}
-        ]});
-        assert_eq!(
-            derive("/tmp/project", "search", &chunk).unwrap(),
-            json!({"tool": "list_dependencies", "arguments": {
-                "project": "/tmp/project", "target": "src/a.rs"
-            }})
-        );
-        let risk = json!({"file": "src/a.rs", "handle": "file:src/a.rs"});
-        assert_eq!(
-            derive("/tmp/project", "assess_risk", &risk).unwrap()["arguments"]["target"],
-            "file:src/a.rs"
-        );
-        // A handle naming a path no handle would be emitted for is not one:
-        // the row's own path answers instead, and nothing escapes the root.
-        let forged = json!({"file": "src/a.rs", "handle": "file:../secret.rs"});
-        assert_eq!(
-            derive("/tmp/project", "assess_risk", &forged).unwrap()["arguments"]["target"],
-            "src/a.rs"
-        );
-        let both_forged = json!({"file": "/etc/passwd", "handle": "file:../secret.rs"});
-        assert!(derive("/tmp/project", "assess_risk", &both_forged).is_none());
-    }
-
-    #[test]
-    fn annotation_overhead_is_bounded_even_with_escaped_evidence() {
-        for name in ["ordinary".to_owned(), "\u{1}".repeat(1024)] {
-            let input = json!({"results": [{"name": name}]});
-            let before = serde_json::to_vec(&input).unwrap().len();
-            let output = annotate(
+        assert!(
+            derive(
                 "/tmp/project",
                 "find_symbol",
-                CallToolResult::structured(input),
-            );
-            let payload = output.structured_content.unwrap();
-            assert!(serde_json::to_vec(&payload).unwrap().len() <= before + MAX_NEXT_BYTES + 8);
-            assert_eq!(payload["next"].is_null(), name.len() == 1024);
+                &json!({"results":[{"handle":"file:a.rs","name":"run"}]})
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn capped_annotations_preserve_earlier_full_evidence() {
+        let mut payload = json!({"target":{"ambiguous":true},"results":(0..5).map(|i| json!({"handle":format!("sym:{}.rs#run", "é".repeat(300) + &i.to_string())})).collect::<Vec<_>>()});
+        annotate_value("/tmp/project", "find_symbol", &mut payload);
+        let next = payload["next"].clone();
+        assert!(!next.as_array().unwrap().is_empty());
+        assert!(serde_json::to_vec(&next).unwrap().len() <= MAX_NEXT_BYTES);
+        payload["results"] = json!([]);
+        annotate_value("/tmp/project", "find_symbol", &mut payload);
+        assert_eq!(payload["next"], next);
+    }
+
+    #[test]
+    fn high_risk_suggests_fresh_sessions_and_snapshots_wait_for_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().to_str().unwrap();
+        let payload = json!({"file":"a.rs","score":0.5});
+        let first = derive(root, "assess_risk", &payload);
+        let second = derive(root, "assess_risk", &payload);
+        assert_eq!(first[2]["tool"], "session_start");
+        assert_ne!(
+            first[2]["arguments"]["session_id"],
+            second[2]["arguments"]["session_id"]
+        );
+        let id = first[2]["arguments"]["session_id"].as_str().unwrap();
+        assert!(
+            id.len() < 128
+                && !id.starts_with('.')
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        );
+        assert!(!Path::new(root).join(".codesage/sessions").exists());
+        assert!(derive(root, "session_start", &json!({"session_id":id})).is_empty());
+        assert_eq!(
+            derive(root, "assess_risk", &json!({"file":"a.rs","score":0.49})).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn ambiguous_edit_retries_keep_the_complete_replacement_or_emit_nothing() {
+        let candidates = vec!["sym:a.rs#run@1".to_owned(), "sym:b.rs#run@2".to_owned()];
+        let mut arguments = json!({"project":"/tmp/project","file_path":"a.rs","target":"run","symbol_name":"run","replacement":"fn run() {}"}).as_object().unwrap().clone();
+        let next = ambiguous_calls("edit_check", Some(&arguments), &candidates);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0]["arguments"]["target"], "sym:a.rs#run@1");
+        assert_eq!(next[0]["arguments"]["line"], 1);
+        assert!(next[0]["arguments"].get("symbol_name").is_none());
+        assert_eq!(
+            next[0]["arguments"]["replacement"],
+            arguments["replacement"]
+        );
+        for replacement in [
+            "x".repeat(MAX_NEXT_BYTES + 1),
+            "\u{1}".repeat(MAX_NEXT_BYTES),
+        ] {
+            arguments.insert("replacement".into(), json!(replacement));
+            assert!(ambiguous_calls("edit_check", Some(&arguments), &candidates).is_empty());
         }
     }
 }

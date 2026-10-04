@@ -161,6 +161,7 @@ fn validate_arguments(request: &CallToolRequestParams) -> Result<(), serde_json:
         };
     }
     match request.name.as_ref() {
+        "help" => validate!(HelpParams),
         "describe" => validate!(DescribeParams),
         "project_overview" => validate!(ProjectOverviewParams),
         "review_rehearsal" => validate!(ReviewRehearsalParams),
@@ -352,7 +353,6 @@ fn client_cancelled_result(
 ) -> CallToolResult {
     control.cancel(StopReason::ClientCancelled);
     let reason = control.reason().unwrap_or(StopReason::ClientCancelled);
-    ticket.finish(reason.as_str());
     stopped_result(reason, tool, arguments, ticket)
 }
 
@@ -426,7 +426,7 @@ fn normalize_error(
     block.insert("complete".into(), json!(false));
     block.insert("phase".into(), phase);
     block.insert("work_continuing".into(), continuing);
-    block.insert("next".into(), Value::Null);
+    block.entry("next").or_insert_with(|| json!([]));
     block.insert("request_id".into(), request_id);
     block.insert("persistence_committed".into(), persisted);
     let metadata = Value::Object(block).to_string();
@@ -781,6 +781,64 @@ impl CodeSageServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let started = Instant::now();
+        let tool = request.name.to_string();
+        let arguments = request.arguments.clone().unwrap_or_default();
+        let ticket = (tool != "daemon_stats")
+            .then(|| Arc::new(self.state.diagnostics.begin_request(&tool, None)));
+        let result = self
+            .dispatch_tool_inner(request, context, ticket.clone())
+            .await;
+        let response = match result {
+            Ok(CallToolResponse::Complete(response)) => response,
+            other => {
+                if let Some(ticket) = &ticket {
+                    ticket.finish("error");
+                }
+                return other;
+            }
+        };
+        let server = self.clone();
+        let rendering_ticket = ticket.clone();
+        tokio::task::spawn_blocking(move || {
+            let cap = if matches!(tool.as_str(), "export_context" | "feature_bundle") {
+                arguments
+                    .get("project")
+                    .and_then(Value::as_str)
+                    .map_or(super::render::MCP_BUDGET_CHARS, |project| {
+                        server.bundle_budget_chars(project)
+                    })
+            } else {
+                super::render::MCP_BUDGET_CHARS
+            };
+            let response = super::detail::finish(
+                response,
+                &tool,
+                &arguments,
+                started.elapsed(),
+                cap,
+                server.state.envelope_enabled,
+            );
+            if let Some(ticket) = rendering_ticket {
+                ticket.finish(result_outcome(&response));
+            }
+            CallToolResponse::Complete(response)
+        })
+        .await
+        .map_err(|error| {
+            if let Some(ticket) = ticket {
+                ticket.finish("error");
+            }
+            ErrorData::internal_error(format!("response detail worker failed: {error}"), None)
+        })
+    }
+
+    async fn dispatch_tool_inner(
+        &self,
+        mut request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+        ticket: Option<Arc<RequestTicket>>,
+    ) -> Result<CallToolResponse, ErrorData> {
         let arguments: Arc<Map<String, Value>> =
             Arc::new(request.arguments.clone().unwrap_or_default());
         if request.name == "daemon_stats" {
@@ -811,7 +869,7 @@ impl CodeSageServer {
         }
         let tool = request.name.to_string();
         let class = class_for(&tool);
-        let ticket = Arc::new(self.state.diagnostics.begin_request(&tool, None));
+        let ticket = ticket.expect("non-diagnostic request ticket");
         let tool_name = tool.clone();
         ticket.set_class(class_name(class));
         let timeout = if class == WorkClass::Native {
@@ -825,12 +883,16 @@ impl CodeSageServer {
             Err(error) => {
                 let mut result = render_error(&tool, Some(&arguments), &error.into());
                 normalize_error(&mut result, &tool, Some(&arguments), Some(&ticket));
-                ticket.finish(result_outcome(&result));
                 return Ok(result.into());
             }
         };
+        if let Err(error) = super::detail::prepare(&tool, request.arguments.get_or_insert_default())
+        {
+            let mut result = render_mcp_error(&tool, Some(&arguments), error);
+            normalize_error(&mut result, &tool, Some(&arguments), Some(&ticket));
+            return Ok(result.into());
+        }
         if let Err(error) = validate_arguments(&request) {
-            ticket.finish("error");
             let mut result = render_mcp_error(
                 &tool,
                 Some(&arguments),
@@ -864,13 +926,17 @@ impl CodeSageServer {
                     arguments: request_arguments.clone(),
                 });
                 let server = self.clone();
-                let evidence_only = matches!(tool.as_str(), "edit_check" | "review_rehearsal");
+                let evidence_only =
+                    matches!(tool.as_str(), "edit_check" | "review_rehearsal" | "help");
+                let help_only = tool == "help";
                 let read_only = tool == "describe";
                 let project = self
                     .run_controlled(
                         preflight,
                         move || {
-                            if evidence_only {
+                            if help_only {
+                                super::help::project_root(Path::new(&raw_project))
+                            } else if evidence_only {
                                 crate::evidence_root(Path::new(&raw_project))
                             } else {
                                 let state = if read_only {
@@ -921,7 +987,6 @@ impl CodeSageServer {
         tokio::select! {
             result = operation => {
                 if let Some(reason) = control.reason() {
-                    ticket.finish(reason.as_str());
                     return Ok(stopped_result(reason, &tool_name, Some(&arguments), &ticket).into());
                 }
                 let mut result = result;
@@ -931,11 +996,6 @@ impl CodeSageServer {
                 result = self
                     .enveloped(result, &tool_name, arguments.clone(), started.elapsed())
                     .await;
-                let outcome = match &result {
-                    Ok(CallToolResponse::Complete(result)) => result_outcome(result),
-                    _ => "error",
-                };
-                ticket.finish(outcome);
                 result
             }
             () = context.ct.cancelled() => {
@@ -943,7 +1003,6 @@ impl CodeSageServer {
             }
             () = stopped(&control) => {
                 let reason = control.reason().unwrap_or(StopReason::ClientCancelled);
-                ticket.finish(reason.as_str());
                 Ok(stopped_result(reason, &tool_name, Some(&arguments), &ticket).into())
             }
         }
@@ -2009,6 +2068,13 @@ mod tests {
         let result = client_cancelled_result(&control, "project_overview", None, &request);
         assert_eq!(status(&result)["status"], "shutdown");
         assert_eq!(status(&result)["error"]["code"], "E_SHUTDOWN");
+        assert!(
+            diagnostics.snapshot(1)["recent_requests"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        request.finish(result_outcome(&result));
         let snapshot = diagnostics.snapshot(1);
         assert_eq!(snapshot["recent_requests"][0]["outcome"], "shutdown");
         assert_eq!(snapshot["counters"]["request_outcomes"]["shutdown"], 1);
@@ -2021,7 +2087,7 @@ mod tests {
 
     #[test]
     fn ranking_recomputation_disclosure_preserves_text_structured_parity() {
-        let mut result = CallToolResult::structured(json!({"top_risk_files": [], "next":null,
+        let mut result = CallToolResult::structured(json!({"top_risk_files": [], "next":[],
             "_meta":{"truncated":true}}));
         result
             .content
