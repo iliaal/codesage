@@ -127,24 +127,27 @@ def page(rows: list[tuple[str, str]], budget: int | None = None) -> tuple[list[t
     used = 0
     emitted = []
     truncated = False
+    digest = hashlib.sha256()
     for path, content in rows:
         header = (path + "\n").encode("utf-8")
-        body = (content + "\n").encode("utf-8")
-        available = len(header) + len(body) if budget is None else budget - used
+        available = len(header) if budget is None else budget - used
         if available < len(header):
+            digest.update(header[:max(0, available)])
             used += max(0, available)
             truncated = True
             break
-        count = min(len(body), available - len(header))
-        emitted.append((path, body[:count].decode("utf-8", errors="replace")))
+        body = (content + "\n").encode("utf-8")
+        count = len(body) if budget is None else min(len(body), available - len(header))
+        consumed = body[:count]
+        digest.update(header)
+        digest.update(consumed)
+        emitted.append((path, consumed.decode("utf-8", errors="replace")))
         used += len(header) + count
         if count != len(body):
             truncated = True
             break
     return emitted, {"bytes": used, "budget_bytes": budget, "truncated": truncated,
-                     "page_sha256": hashlib.sha256(b"".join(
-                         (p + "\n" + c + "\n").encode("utf-8") for p, c in rows
-                     )[:used]).hexdigest()}
+                     "page_sha256": digest.hexdigest()}
 
 
 def distinct(rows: list[tuple[str, str]], defining_file: str | None = None) -> list[tuple[str, str]]:
