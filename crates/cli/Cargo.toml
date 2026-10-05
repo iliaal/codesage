@@ -24,7 +24,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml = "1.1"
 toml_edit = "0.25"
-jsonc-parser = { version = "0.33", features = ["cst"] }
+jsonc-parser = { version = "0.34", features = ["cst"] }
 anyhow.workspace = true
 regex.workspace = true
 ignore.workspace = true
