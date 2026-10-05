@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
       # taiki-e/install-action downloads a pre-built binary, faster than
       # `cargo install --locked cargo-audit` which has to compile from source.
-      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-audit
       - run: cargo audit
