@@ -12,6 +12,7 @@ mod installer;
 mod lockfile;
 mod mcp;
 mod query_reranker;
+mod shared_model;
 mod statewatcher;
 mod util;
 
@@ -829,7 +830,7 @@ pub(crate) fn query_embedder(
             #[cfg(unix)]
             if let Some(daemon) = daemon_embed::DaemonEmbedder::connect(root, emb_config) {
                 let dim = daemon.dim();
-                return Ok((Box::new(daemon), dim));
+                return Ok((Box::new(daemon.single_attempt()), dim));
             }
             let embedder = Embedder::new(emb_config)?;
             let dim = embedder.dim();

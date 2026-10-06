@@ -983,9 +983,9 @@ fn semantic_reindex_batch_authorized(
             return Err(WorkOutcome::Failed);
         }
     };
-    let mut emb = emb_arc.lock();
-    let db = match Database::open_for_model(&config.db_path, &config.embed_config.model, emb.dim())
-    {
+    let dim = emb_arc.lock().dim();
+    let mut emb = crate::shared_model::SharedEmbedder(emb_arc);
+    let db = match Database::open_for_model(&config.db_path, &config.embed_config.model, dim) {
         Ok(db) => db,
         Err(e) => {
             tracing::warn!(error = %e, "opening DB for semantic reindex");
@@ -995,7 +995,7 @@ fn semantic_reindex_batch_authorized(
     let fingerprint = match crate::commands::index::resolved_fingerprint(
         &db,
         &config.embed_config,
-        emb.dim(),
+        dim,
     ) {
         Ok(fingerprint) => fingerprint,
         Err(e) => {
@@ -1006,7 +1006,7 @@ fn semantic_reindex_batch_authorized(
     semantic_batch_outcome(semantic_index_files(
         &config.project_root,
         &db,
-        &mut *emb,
+        &mut emb,
         files,
         &fingerprint,
         false,
@@ -1700,36 +1700,30 @@ fn run_bulk_incremental_authorized(
         }
     };
     {
-        let mut emb = emb_arc.lock();
-        let db = match Database::open_for_model(
-            &config.db_path,
-            &config.embed_config.model,
-            emb.dim(),
-        ) {
+        let dim = emb_arc.lock().dim();
+        let mut emb = crate::shared_model::SharedEmbedder(emb_arc);
+        let db = match Database::open_for_model(&config.db_path, &config.embed_config.model, dim) {
             Ok(db) => db,
             Err(e) => {
                 tracing::warn!(error = %e, "opening DB for bulk semantic incremental");
                 return WorkOutcome::Failed;
             }
         };
-        let fingerprint = match crate::commands::index::resolved_fingerprint(
-            &db,
-            &config.embed_config,
-            emb.dim(),
-        ) {
-            Ok(fingerprint) => fingerprint,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "deriving the semantic fingerprint for bulk semantic incremental"
-                );
-                return WorkOutcome::Failed;
-            }
-        };
+        let fingerprint =
+            match crate::commands::index::resolved_fingerprint(&db, &config.embed_config, dim) {
+                Ok(fingerprint) => fingerprint,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "deriving the semantic fingerprint for bulk semantic incremental"
+                    );
+                    return WorkOutcome::Failed;
+                }
+            };
         match codesage_graph::semantic_incremental_index(
             &config.project_root,
             &db,
-            &mut *emb,
+            &mut emb,
             &config.exclude_patterns,
             &fingerprint,
             false,

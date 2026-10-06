@@ -54,3 +54,68 @@ fn batch_embedding() {
         );
     }
 }
+
+#[test]
+#[ignore]
+fn reranker_run_stops_when_its_work_control_is_cancelled() {
+    use codesage_embed::reranker::Reranker;
+    use codesage_protocol::work::{StopReason, WorkControl, WorkStopped};
+    use std::time::{Duration, Instant};
+
+    let mut reranker = Reranker::new("cross-encoder/ms-marco-MiniLM-L6-v2", "cpu")
+        .expect("failed to create reranker");
+    let query = "where is the session token validated";
+    let short = [
+        "fn validate_session_token(token: &str) -> Result<Claims>",
+        "fn open_connection_pool(url: &str) -> Pool",
+    ];
+    let plain = reranker.score_pairs(query, &short).unwrap();
+
+    let control = WorkControl::new(None);
+    let scoped = {
+        let _scope = control.enter();
+        reranker.score_pairs(query, &short).unwrap()
+    };
+    assert_eq!(
+        plain, scoped,
+        "an uncancelled control must not change scores"
+    );
+
+    // One 32-row batch truncated to 512 tokens: a single long native run.
+    let long_doc = "fn handle(request: &Request) -> Response { route(request) } ".repeat(120);
+    let docs = vec![long_doc.as_str(); 32];
+    let started = Instant::now();
+    reranker.score_pairs(query, &docs).unwrap();
+    let full = started.elapsed();
+
+    let control = WorkControl::new(None);
+    let canceller = control.clone();
+    let half = full / 2;
+    let cancel = std::thread::spawn(move || {
+        std::thread::sleep(half);
+        canceller.cancel(StopReason::ClientCancelled);
+    });
+    let started = Instant::now();
+    let error = {
+        let _scope = control.enter();
+        reranker.score_pairs(query, &docs).unwrap_err()
+    };
+    let stopped_after = started.elapsed();
+    cancel.join().unwrap();
+    eprintln!("full run {full:?}, cancelled at {half:?}, returned after {stopped_after:?}");
+    assert_eq!(
+        error.downcast_ref::<WorkStopped>().unwrap().reason,
+        StopReason::ClientCancelled,
+        "{error:#}"
+    );
+    assert!(
+        stopped_after < half + (full - half) / 2 && full > Duration::from_millis(200),
+        "a terminated run must return well before a full run: {stopped_after:?} of {full:?}"
+    );
+
+    let after = reranker.score_pairs(query, &short).unwrap();
+    assert_eq!(
+        plain, after,
+        "the session must score normally after a terminated run"
+    );
+}

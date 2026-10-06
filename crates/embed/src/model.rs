@@ -1765,22 +1765,45 @@ impl Embedder {
     }
 
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.embed_batch_with_stats(texts, &mut EmbedStats::default())
+    }
+
+    /// [`Embedder::embed_batch`], recording the work done into `stats`. The
+    /// counts stay valid when the call fails or is stopped part way, so a
+    /// caller can attribute a slow or abandoned run.
+    pub fn embed_batch_with_stats(
+        &mut self,
+        texts: &[&str],
+        stats: &mut EmbedStats,
+    ) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        let plan = self.plan_batches(texts);
+        plan.run(texts, stats, |batch, stats| {
+            self.embed_planned_batch(batch, stats)
+        })
+    }
 
+    /// Split `texts` the way [`Embedder::embed_batch`] would, for a caller
+    /// that drives the batches itself through [`BatchPlan::run`] and
+    /// [`Embedder::embed_planned_batch`].
+    pub fn plan_batches(&self, texts: &[&str]) -> BatchPlan {
         let batch_size = self.batch_size.get();
-        let max_text_bytes = self.max_seq_length * BYTES_PER_TOKEN_CEILING;
-        embed_in_length_order(
+        BatchPlan::new(
             texts,
             batch_size,
-            max_text_bytes,
+            self.max_seq_length * BYTES_PER_TOKEN_CEILING,
             batch_size * DEFAULT_CHUNK_SIZE,
-            |batch| self.embed_batch_inner(batch),
         )
     }
 
-    fn embed_batch_inner(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    /// Run inference on one batch of a [`BatchPlan`], in the order given.
+    pub fn embed_planned_batch(
+        &mut self,
+        texts: &[&str],
+        stats: &mut EmbedStats,
+    ) -> Result<Vec<Vec<f32>>> {
         let encodings = self
             .tokenizer
             .encode_batch(texts.to_vec(), true)
@@ -1791,160 +1814,243 @@ impl Embedder {
 
         let mut input_ids = Vec::with_capacity(batch_size * seq_len);
         let mut attention_mask = Vec::with_capacity(batch_size * seq_len);
+        let mut tokens = 0usize;
 
         for enc in &encodings {
             input_ids.extend(enc.get_ids().iter().map(|&id| id as i64));
             attention_mask.extend(enc.get_attention_mask().iter().map(|&m| m as i64));
+            tokens += enc.get_attention_mask().iter().filter(|&&m| m != 0).count();
         }
 
         let ids_tensor = ort::value::Tensor::from_array(([batch_size, seq_len], input_ids))?;
         let mask_tensor = ort::value::Tensor::from_array(([batch_size, seq_len], attention_mask))?;
 
-        let outputs = if self.has_token_type_ids {
+        let inputs = if self.has_token_type_ids {
             let token_type_ids = vec![0i64; batch_size * seq_len];
             let type_tensor =
                 ort::value::Tensor::from_array(([batch_size, seq_len], token_type_ids))?;
-            self.session.run(ort::inputs![
+            ort::inputs![
                 "input_ids" => ids_tensor,
                 "token_type_ids" => type_tensor,
                 "attention_mask" => mask_tensor,
-            ])?
+            ]
         } else {
-            self.session.run(ort::inputs![
+            ort::inputs![
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
-            ])?
+            ]
         };
 
-        let (_shape, hidden) = outputs[0].try_extract_tensor::<f32>()?;
-
-        if self.pre_pooled {
-            let expected = batch_size
-                .checked_mul(self.dim)
-                .context("pooled output size overflow")?;
-            ensure!(
-                hidden.len() == expected,
-                "model output has {} values but a pooled [batch={batch_size}, dim={}] tensor \
-                 holds {expected}",
-                hidden.len(),
-                self.dim
-            );
-            return Ok(hidden.chunks_exact(self.dim).map(l2_normalized).collect());
-        }
-
-        // detect_dim accepts pre-pooled [batch, dim] outputs, but these loops
-        // require token-level [batch, seq, dim] data to avoid out-of-bounds access.
-        let expected = batch_size
-            .checked_mul(seq_len)
-            .and_then(|n| n.checked_mul(self.dim))
-            .context("token-level output size overflow")?;
-        if hidden.len() != expected {
-            anyhow::bail!(
-                "model output has {} values but mean/CLS pooling expects a \
-                 token-level [batch={}, seq={}, dim={}] tensor ({} values). \
-                 The configured model likely emits a pre-pooled [batch, dim] \
-                 output; pick a model whose first output is token-level hidden \
-                 states, or set pooling accordingly in .codesage/config.toml.",
-                hidden.len(),
-                batch_size,
-                seq_len,
-                self.dim,
-                expected
-            );
-        }
-
-        let mut embeddings = Vec::with_capacity(batch_size);
-
-        for (i, enc) in encodings.iter().enumerate() {
-            let pooled = match self.pooling {
-                PoolingStrategy::Mean => {
-                    let mask = enc.get_attention_mask();
-                    let mut vec = vec![0.0f32; self.dim];
-                    let mut mask_sum = 0.0f32;
-                    for (j, &m) in mask.iter().enumerate() {
-                        let m = m as f32;
-                        mask_sum += m;
-                        let offset = (i * seq_len + j) * self.dim;
-                        for k in 0..self.dim {
-                            vec[k] += hidden[offset + k] * m;
-                        }
-                    }
-                    if mask_sum > 0.0 {
-                        for v in &mut vec {
-                            *v /= mask_sum;
-                        }
-                    }
-                    vec
-                }
-                PoolingStrategy::Cls => {
-                    let offset = i * seq_len * self.dim;
-                    hidden[offset..offset + self.dim].to_vec()
-                }
-            };
-
-            embeddings.push(l2_normalized(&pooled));
-        }
-
+        let (dim, pooling, pre_pooled) = (self.dim, self.pooling, self.pre_pooled);
+        let embeddings = crate::run_control::run_session(&mut self.session, inputs, |outputs| {
+            let (_shape, hidden) = outputs[0].try_extract_tensor::<f32>()?;
+            pool_hidden(hidden, &encodings, seq_len, dim, pooling, pre_pooled)
+        })?;
+        stats.tokens += tokens;
+        stats.padded_tokens += batch_size * seq_len;
         Ok(embeddings)
     }
+}
+
+/// Work one [`Embedder::embed_batch_with_stats`] call performed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedStats {
+    /// Internal batches the texts were split into.
+    pub planned_batches: usize,
+    /// Internal batches whose inference completed.
+    pub completed_batches: usize,
+    /// Non-padding tokens across completed batches.
+    pub tokens: usize,
+    /// Rows times padded sequence length across completed batches: the
+    /// tokens inference actually paid for.
+    pub padded_tokens: usize,
+}
+
+fn pool_hidden(
+    hidden: &[f32],
+    encodings: &[tokenizers::Encoding],
+    seq_len: usize,
+    dim: usize,
+    pooling: PoolingStrategy,
+    pre_pooled: bool,
+) -> Result<Vec<Vec<f32>>> {
+    let batch_size = encodings.len();
+    if pre_pooled {
+        let expected = batch_size
+            .checked_mul(dim)
+            .context("pooled output size overflow")?;
+        ensure!(
+            hidden.len() == expected,
+            "model output has {} values but a pooled [batch={batch_size}, dim={}] tensor \
+             holds {expected}",
+            hidden.len(),
+            dim
+        );
+        return Ok(hidden.chunks_exact(dim).map(l2_normalized).collect());
+    }
+
+    // detect_dim accepts pre-pooled [batch, dim] outputs, but these loops
+    // require token-level [batch, seq, dim] data to avoid out-of-bounds access.
+    let expected = batch_size
+        .checked_mul(seq_len)
+        .and_then(|n| n.checked_mul(dim))
+        .context("token-level output size overflow")?;
+    if hidden.len() != expected {
+        anyhow::bail!(
+            "model output has {} values but mean/CLS pooling expects a \
+             token-level [batch={}, seq={}, dim={}] tensor ({} values). \
+             The configured model likely emits a pre-pooled [batch, dim] \
+             output; pick a model whose first output is token-level hidden \
+             states, or set pooling accordingly in .codesage/config.toml.",
+            hidden.len(),
+            batch_size,
+            seq_len,
+            dim,
+            expected
+        );
+    }
+
+    let mut embeddings = Vec::with_capacity(batch_size);
+
+    for (i, enc) in encodings.iter().enumerate() {
+        let pooled = match pooling {
+            PoolingStrategy::Mean => {
+                let mask = enc.get_attention_mask();
+                let mut vec = vec![0.0f32; dim];
+                let mut mask_sum = 0.0f32;
+                for (j, &m) in mask.iter().enumerate() {
+                    let m = m as f32;
+                    mask_sum += m;
+                    let offset = (i * seq_len + j) * dim;
+                    for k in 0..dim {
+                        vec[k] += hidden[offset + k] * m;
+                    }
+                }
+                if mask_sum > 0.0 {
+                    for v in &mut vec {
+                        *v /= mask_sum;
+                    }
+                }
+                vec
+            }
+            PoolingStrategy::Cls => {
+                let offset = i * seq_len * dim;
+                hidden[offset..offset + dim].to_vec()
+            }
+        };
+
+        embeddings.push(l2_normalized(&pooled));
+    }
+
+    Ok(embeddings)
 }
 
 /// Bytes of source text one token covers at most, for bounding how much of a
 /// text the sequence cap can reach.
 const BYTES_PER_TOKEN_CEILING: usize = 3;
 
-/// Embed `texts` in batches ordered by byte length, returning vectors in
-/// input order. Batches pad to their longest member, so grouping similar
-/// lengths cuts padded compute; byte length tracks token count well enough
-/// to order by. A batch holds at most `batch_size` texts and, counting each
-/// at most `max_text_bytes` (what the sequence cap can reach), at most
-/// `max_batch_bytes` of padded input, so batches of long texts shrink
-/// instead of multiplying attention memory.
+/// How [`Embedder::embed_batch`] splits a set of texts into internal batches.
+/// Batches are ordered by byte length: they pad to their longest member, so
+/// grouping similar lengths cuts padded compute, and byte length tracks token
+/// count well enough to order by. A batch holds at most `batch_size` texts
+/// and, counting each at most `max_text_bytes` (what the sequence cap can
+/// reach), at most `max_batch_bytes` of padded input, so batches of long
+/// texts shrink instead of multiplying attention memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchPlan {
+    batches: Vec<Vec<usize>>,
+    texts: usize,
+}
+
+impl BatchPlan {
+    pub fn new(
+        texts: &[&str],
+        batch_size: usize,
+        max_text_bytes: usize,
+        max_batch_bytes: usize,
+    ) -> Self {
+        let mut order: Vec<usize> = (0..texts.len()).collect();
+        order.sort_by_key(|&i| texts[i].len());
+
+        // Ascending order makes each candidate the batch's longest member.
+        let mut batches = Vec::new();
+        let mut start = 0;
+        while start < order.len() {
+            let mut end = start + 1;
+            while end < order.len() {
+                let rows = end + 1 - start;
+                let longest = texts[order[end]].len().min(max_text_bytes);
+                if rows > batch_size || rows * longest > max_batch_bytes {
+                    break;
+                }
+                end += 1;
+            }
+            batches.push(order[start..end].to_vec());
+            start = end;
+        }
+        Self {
+            batches,
+            texts: texts.len(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.batches.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    /// Embed every batch through `embed`, returning vectors in input order.
+    /// `texts` must be the slice the plan was made from. A stopped
+    /// `WorkControl` ends the loop before the next batch.
+    pub fn run(
+        &self,
+        texts: &[&str],
+        stats: &mut EmbedStats,
+        mut embed: impl FnMut(&[&str], &mut EmbedStats) -> Result<Vec<Vec<f32>>>,
+    ) -> Result<Vec<Vec<f32>>> {
+        ensure!(
+            texts.len() == self.texts,
+            "batch plan covers {} texts, {} were supplied",
+            self.texts,
+            texts.len()
+        );
+        stats.planned_batches += self.batches.len();
+        let mut slots: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        for batch in &self.batches {
+            codesage_protocol::work::checkpoint()?;
+            let batch_texts: Vec<&str> = batch.iter().map(|&i| texts[i]).collect();
+            let embeddings = embed(&batch_texts, stats)?;
+            stats.completed_batches += 1;
+            ensure!(
+                embeddings.len() == batch.len(),
+                "embedder produced {} vectors for {} texts",
+                embeddings.len(),
+                batch.len()
+            );
+            for (&i, embedding) in batch.iter().zip(embeddings) {
+                slots[i] = Some(embedding);
+            }
+        }
+        Ok(slots
+            .into_iter()
+            .map(|v| v.expect("every text belongs to exactly one batch"))
+            .collect())
+    }
+}
+
+#[cfg(test)]
 fn embed_in_length_order(
     texts: &[&str],
     batch_size: usize,
     max_text_bytes: usize,
     max_batch_bytes: usize,
-    mut embed: impl FnMut(&[&str]) -> Result<Vec<Vec<f32>>>,
+    stats: &mut EmbedStats,
+    embed: impl FnMut(&[&str], &mut EmbedStats) -> Result<Vec<Vec<f32>>>,
 ) -> Result<Vec<Vec<f32>>> {
-    let mut order: Vec<usize> = (0..texts.len()).collect();
-    order.sort_by_key(|&i| texts[i].len());
-
-    // Ascending order makes each candidate the batch's longest member.
-    let mut batches: Vec<&[usize]> = Vec::new();
-    let mut start = 0;
-    while start < order.len() {
-        let mut end = start + 1;
-        while end < order.len() {
-            let rows = end + 1 - start;
-            let longest = texts[order[end]].len().min(max_text_bytes);
-            if rows > batch_size || rows * longest > max_batch_bytes {
-                break;
-            }
-            end += 1;
-        }
-        batches.push(&order[start..end]);
-        start = end;
-    }
-
-    let mut slots: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
-    for batch in batches {
-        let batch_texts: Vec<&str> = batch.iter().map(|&i| texts[i]).collect();
-        let embeddings = embed(&batch_texts)?;
-        ensure!(
-            embeddings.len() == batch.len(),
-            "embedder produced {} vectors for {} texts",
-            embeddings.len(),
-            batch.len()
-        );
-        for (&i, embedding) in batch.iter().zip(embeddings) {
-            slots[i] = Some(embedding);
-        }
-    }
-    Ok(slots
-        .into_iter()
-        .map(|v| v.expect("every text belongs to exactly one batch"))
-        .collect())
+    BatchPlan::new(texts, batch_size, max_text_bytes, max_batch_bytes).run(texts, stats, embed)
 }
 
 fn l2_normalized(vector: &[f32]) -> Vec<f32> {
@@ -2165,16 +2271,19 @@ mod tests {
     fn length_ordered_batches_return_vectors_in_input_order() {
         let texts = ["ccc", "a", "eeeee", "bb", "dddd"];
         let mut batches = Vec::new();
-        let out = embed_in_length_order(&texts, 2, usize::MAX, usize::MAX, |batch| {
-            batches.push(batch.iter().map(|t| t.to_string()).collect::<Vec<_>>());
-            Ok(batch.iter().map(|t| vec![t.len() as f32]).collect())
-        })
-        .unwrap();
+        let mut stats = EmbedStats::default();
+        let out =
+            embed_in_length_order(&texts, 2, usize::MAX, usize::MAX, &mut stats, |batch, _| {
+                batches.push(batch.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+                Ok(batch.iter().map(|t| vec![t.len() as f32]).collect())
+            })
+            .unwrap();
         assert_eq!(
             batches,
             [vec!["a", "bb"], vec!["ccc", "dddd"], vec!["eeeee"]]
         );
         assert_eq!(out, [vec![3.0], vec![1.0], vec![5.0], vec![2.0], vec![4.0]]);
+        assert_eq!((stats.planned_batches, stats.completed_batches), (3, 3));
     }
 
     #[test]
@@ -2182,7 +2291,7 @@ mod tests {
         let long = "x".repeat(40);
         let texts = ["aaaa", "bbbb", "cccc", "dddd", long.as_str(), long.as_str()];
         let mut sizes = Vec::new();
-        embed_in_length_order(&texts, 4, 30, 60, |batch| {
+        embed_in_length_order(&texts, 4, 30, 60, &mut EmbedStats::default(), |batch, _| {
             sizes.push(batch.len());
             Ok(batch.iter().map(|_| vec![0.0]).collect())
         })
@@ -2192,21 +2301,62 @@ mod tests {
         assert_eq!(sizes, [4, 2]);
 
         let mut sizes = Vec::new();
-        embed_in_length_order(&[long.as_str()], 4, 100, 10, |batch| {
-            sizes.push(batch.len());
-            Ok(vec![vec![0.0]])
-        })
+        embed_in_length_order(
+            &[long.as_str()],
+            4,
+            100,
+            10,
+            &mut EmbedStats::default(),
+            |batch, _| {
+                sizes.push(batch.len());
+                Ok(vec![vec![0.0]])
+            },
+        )
         .unwrap();
         assert_eq!(sizes, [1], "a text over the budget still embeds alone");
     }
 
     #[test]
     fn length_ordered_batches_reject_a_short_batch() {
-        let err = embed_in_length_order(&["a", "b"], 2, usize::MAX, usize::MAX, |_| {
-            Ok(vec![vec![0.0]])
-        })
+        let err = embed_in_length_order(
+            &["a", "b"],
+            2,
+            usize::MAX,
+            usize::MAX,
+            &mut EmbedStats::default(),
+            |_, _| Ok(vec![vec![0.0]]),
+        )
         .unwrap_err();
         assert!(err.to_string().contains("1 vectors for 2 texts"), "{err}");
+    }
+
+    #[test]
+    fn length_ordered_batches_stop_when_the_work_control_is_cancelled() {
+        use codesage_protocol::work::{StopReason, WorkControl, WorkStopped};
+
+        let control = WorkControl::new(None);
+        let _scope = control.enter();
+        let mut stats = EmbedStats::default();
+        let mut calls = 0;
+        let err = embed_in_length_order(
+            &["a", "bb", "ccc", "dddd"],
+            2,
+            usize::MAX,
+            usize::MAX,
+            &mut stats,
+            |batch, _| {
+                calls += 1;
+                control.cancel(StopReason::ClientCancelled);
+                Ok(batch.iter().map(|_| vec![0.0]).collect())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1, "the batch after the cancellation must not run");
+        assert_eq!(
+            err.downcast_ref::<WorkStopped>().unwrap().reason,
+            StopReason::ClientCancelled
+        );
+        assert_eq!((stats.planned_batches, stats.completed_batches), (2, 1));
     }
 
     #[test]

@@ -94,15 +94,7 @@ struct ModelEntry<T> {
 
 type ModelMap<T> = Mutex<HashMap<String, ModelEntry<T>>>;
 
-fn model_lock<T>(mutex: &Mutex<T>) -> Result<parking_lot::MutexGuard<'_, T>> {
-    loop {
-        codesage_protocol::work::checkpoint()?;
-        if let Some(guard) = mutex.try_lock_for(Duration::from_millis(25)) {
-            codesage_protocol::work::checkpoint()?;
-            return Ok(guard);
-        }
-    }
-}
+use crate::shared_model::{model_lock, run_plan_fairly};
 
 /// Hold the map lock only for lookup; load under the per-key lock to prevent duplicate sessions.
 fn get_or_load_slot<T, F>(map: &ModelMap<T>, key: String, load: F) -> Result<Arc<Mutex<T>>>
@@ -1255,6 +1247,30 @@ impl CodeSageServer {
         expected_fingerprint: Option<&str>,
         texts: &[String],
     ) -> Result<EmbedTextsResult> {
+        let started = Instant::now();
+        let mut stats = codesage_embed::model::EmbedStats::default();
+        let mut timing = EmbedTiming::default();
+        let result = self.embed_texts_inner(
+            project,
+            model,
+            expected_fingerprint,
+            texts,
+            &mut stats,
+            &mut timing,
+        );
+        log_embed_execution(project, model, texts, &stats, &timing, started, &result);
+        result
+    }
+
+    fn embed_texts_inner(
+        &self,
+        project: &str,
+        model: &str,
+        expected_fingerprint: Option<&str>,
+        texts: &[String],
+        stats: &mut codesage_embed::model::EmbedStats,
+        timing: &mut EmbedTiming,
+    ) -> Result<EmbedTextsResult> {
         let state = self.resolve_project(project)?;
         state.model_authorization().scope(|| {
             let config = self.semantic_embedding_config(&state)?;
@@ -1267,20 +1283,31 @@ impl CodeSageServer {
                 );
             }
             let embedder_arc = self.get_or_load_embedder(config)?;
-            let mut embedder = model_lock(&embedder_arc)?;
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let embedder = model_lock(&embedder_arc)?;
+            timing.ready = Some(Instant::now());
             let dim = embedder.dim();
-            let fingerprint = session_fingerprint(config, &embedder)?;
+            let fingerprint = session_fingerprint(config, &embedder);
+            let plan = embedder.plan_batches(&refs);
+            parking_lot::MutexGuard::unlock_fair(embedder);
+            let fingerprint = fingerprint?;
             check_expected_fingerprint(
                 expected_fingerprint,
                 fingerprint.as_str(),
                 texts.is_empty(),
             )?;
-            let embeddings = if texts.is_empty() {
-                Vec::new()
-            } else {
-                let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-                embedder.embed_batch(&refs)?
-            };
+            // Every batch locks this same `Arc`. Eviction only removes a pool
+            // entry, nothing writes a new `Embedder` into an existing slot, and
+            // an `Embedder`'s dimension and execution provider never change, so
+            // this fingerprint covers every batch.
+            let embeddings = run_plan_fairly(
+                &embedder_arc,
+                &plan,
+                &refs,
+                stats,
+                &mut timing.batch_lock_wait,
+                |embedder, batch, stats| embedder.embed_planned_batch(batch, stats),
+            )?;
             Ok(EmbedTextsResult {
                 model: config.model.clone(),
                 dim,
@@ -1374,6 +1401,83 @@ impl CodeSageServer {
             )
         })
     }
+}
+
+#[derive(Default)]
+struct EmbedTiming {
+    /// When the pooled embedder was first locked for planning.
+    ready: Option<Instant>,
+    /// Time spent re-taking the pooled embedder for each internal batch.
+    batch_lock_wait: Duration,
+}
+
+/// One line per `embed_texts` execution so a slow or abandoned run can be
+/// attributed. `ready_ms` covers project resolution, any cold model load, and
+/// the first wait for the pooled embedder; it is absent when the call failed
+/// first. `lock_wait_ms` adds the waits to re-take it for each batch.
+fn log_embed_execution(
+    project: &str,
+    model: &str,
+    texts: &[String],
+    stats: &codesage_embed::model::EmbedStats,
+    timing: &EmbedTiming,
+    started: Instant,
+    result: &Result<EmbedTextsResult>,
+) {
+    let bytes: usize = texts.iter().map(String::len).sum();
+    let ready_ms = timing
+        .ready
+        .map(|at| at.saturating_duration_since(started).as_millis());
+    let lock_wait_ms = timing.batch_lock_wait.as_millis();
+    let elapsed_ms = started.elapsed().as_millis();
+    let error = match result {
+        Ok(_) if texts.is_empty() => {
+            tracing::debug!(project, model, elapsed_ms, "embed_texts probe answered");
+            return;
+        }
+        Ok(_) => {
+            tracing::info!(
+                project,
+                model,
+                texts = texts.len(),
+                bytes,
+                batches = stats.completed_batches,
+                tokens = stats.tokens,
+                padded_tokens = stats.padded_tokens,
+                ready_ms,
+                lock_wait_ms,
+                elapsed_ms,
+                outcome = "success",
+                "embed_texts execution finished"
+            );
+            return;
+        }
+        Err(error) => error,
+    };
+    let stopped = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<codesage_protocol::work::WorkStopped>());
+    let (outcome, stop_reason) = match stopped {
+        Some(stopped) => ("stopped", Some(format!("{:?}", stopped.reason))),
+        None => ("error", None),
+    };
+    tracing::warn!(
+        project,
+        model,
+        texts = texts.len(),
+        bytes,
+        batches = stats.completed_batches,
+        planned_batches = stats.planned_batches,
+        tokens = stats.tokens,
+        padded_tokens = stats.padded_tokens,
+        ready_ms,
+        lock_wait_ms,
+        elapsed_ms,
+        outcome,
+        stop_reason,
+        error = %format!("{error:#}"),
+        "embed_texts execution finished"
+    );
 }
 
 /// Config failures disable semantic tools but preserve structural queries.

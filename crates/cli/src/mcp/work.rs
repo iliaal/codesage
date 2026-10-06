@@ -728,6 +728,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_native_calls_alternate_between_projects() {
+        let coordinator = WorkCoordinator::new(WorkLimits::default()).unwrap();
+        let control = WorkControl::new(None);
+        let native = |project: &'static str| {
+            let coordinator = coordinator.clone();
+            let control = control.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .acquire_execution(Path::new(project), WorkClass::Native, &control)
+                    .await
+            })
+        };
+        let a1 = native("/a").await.unwrap().unwrap();
+        let a2 = native("/a");
+        wait_queued(&coordinator, 1).await;
+        let b1 = native("/b");
+        wait_queued(&coordinator, 2).await;
+        drop(a1);
+        let b1 = tokio::time::timeout(Duration::from_secs(1), b1)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!a2.is_finished(), "the other project's call runs first");
+        let b2 = native("/b");
+        wait_queued(&coordinator, 2).await;
+        drop(b1);
+        let a2 = tokio::time::timeout(Duration::from_secs(1), a2)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !b2.is_finished(),
+            "a project does not take two calls in a row"
+        );
+        drop(a2);
+        drop(b2.await.unwrap().unwrap());
+        assert_eq!(coordinator.snapshot().projects, 0);
+    }
+
+    #[tokio::test]
     async fn project_blocked_head_does_not_reserve_global_capacity() {
         let mut limits = coordinator().inner.limits;
         limits.analysis.running = 2;

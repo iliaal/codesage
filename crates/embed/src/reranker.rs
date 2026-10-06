@@ -67,26 +67,29 @@ impl Reranker {
         let ids_tensor = ort::value::Tensor::from_array(([batch_size, seq_len], input_ids))?;
         let mask_tensor = ort::value::Tensor::from_array(([batch_size, seq_len], attention_mask))?;
 
-        let outputs = if self.has_token_type_ids {
+        let inputs = if self.has_token_type_ids {
             let type_tensor =
                 ort::value::Tensor::from_array(([batch_size, seq_len], token_type_ids_vec))?;
-            self.session.run(ort::inputs![
+            ort::inputs![
                 "input_ids" => ids_tensor,
                 "token_type_ids" => type_tensor,
                 "attention_mask" => mask_tensor,
-            ])?
+            ]
         } else {
-            self.session.run(ort::inputs![
+            ort::inputs![
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
-            ])?
+            ]
         };
 
-        let (shape, logits) = outputs[0].try_extract_tensor::<f32>()?;
-        if !self.shape_logged.swap(true, Ordering::Relaxed) {
-            tracing::info!(output_shape = ?&shape[..], "reranker output shape detected");
-        }
-        Ok(extract_relevance_scores(&shape[..], logits, batch_size))
+        let shape_logged = &self.shape_logged;
+        crate::run_control::run_session(&mut self.session, inputs, |outputs| {
+            let (shape, logits) = outputs[0].try_extract_tensor::<f32>()?;
+            if !shape_logged.swap(true, Ordering::Relaxed) {
+                tracing::info!(output_shape = ?&shape[..], "reranker output shape detected");
+            }
+            Ok(extract_relevance_scores(&shape[..], logits, batch_size))
+        })
     }
 }
 
@@ -106,6 +109,7 @@ where
     let mut all_scores = Vec::with_capacity(documents.len());
 
     for batch in documents.chunks(batch_size) {
+        codesage_protocol::work::checkpoint()?;
         let scores = score_batch(batch)?;
         anyhow::ensure!(
             scores.len() == batch.len(),

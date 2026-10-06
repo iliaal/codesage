@@ -1,5 +1,16 @@
 ## [Unreleased]
 
+### Added
+
+- Non-empty `embed_texts` executions log the project, model, text count, bytes, batch and token counts, wait time, elapsed time, and outcome to the daemon log.
+
+### Fixed
+
+- A cancelled or timed-out daemon search, `embed_texts`, or `rerank_pairs` request stops between batches and terminates its in-flight ONNX run instead of holding the shared model.
+- Index runs of different projects alternate on the daemon's embedding model; `codesage index` sends at most 256 texts or 2 MiB per daemon embedding call instead of up to 4,096 texts.
+- The file watcher holds the daemon's shared embedding model only while each embedding batch runs, not for a whole reindex pass.
+- `codesage index` retries a daemon embedding call that timed out, was cancelled, or found the daemon saturated up to twice within 240 s before embedding that batch privately; once a batch keeps timing out, or two consecutive batches stay saturated through their retries, the rest of the run embeds privately.
+
 ## [0.40.0] - 2026-10-03
 
 ### Added

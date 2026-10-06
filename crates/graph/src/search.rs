@@ -863,7 +863,7 @@ pub fn search_page(
         && (!fused || fused_rerank_enabled())
     {
         let weight_override = fused.then_some(RERANK_WEIGHT_SHORT_ID);
-        apply_reranking(&mut rerank, &req.query, &mut results, weight_override);
+        apply_reranking(&mut rerank, &req.query, &mut results, weight_override)?;
     }
     finish_trace_stage(
         &mut results,
@@ -2501,20 +2501,27 @@ fn adaptive_rerank_weight_enabled() -> bool {
 }
 
 /// Return whether reranking succeeded; failures retain scores/order and warn.
+/// A stopped request is an error, not a degraded ranking.
 /// weight_override bypasses query-shape weighting for opt-in fused reranking.
 fn apply_reranking(
     rerank: &mut RerankFn<'_>,
     query: &str,
     results: &mut [SearchResult],
     weight_override: Option<f32>,
-) -> bool {
+) -> Result<bool> {
     if results.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     let docs: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
     let ce_scores = match rerank(query, &docs) {
         Ok(s) => s,
+        Err(e)
+            if e.chain()
+                .any(|cause| cause.is::<codesage_protocol::work::WorkStopped>()) =>
+        {
+            return Err(e);
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -2526,7 +2533,7 @@ fn apply_reranking(
                 "rerank_blend",
                 "Cross-encoder failed; retained pre-rerank score",
             );
-            return false;
+            return Ok(false);
         }
     };
 
@@ -2560,7 +2567,7 @@ fn apply_reranking(
         }
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-    true
+    Ok(true)
 }
 
 pub(crate) fn annotate_with_symbols(db: &Database, results: &mut [SearchResult]) -> Result<()> {
@@ -3203,12 +3210,15 @@ mod hybrid_tests {
 
         let mut kept = vec![mk("src/reg.rs", 0.95), mk("src/lib.rs", 0.35)];
         let mut rerank: RerankFn = Box::new(ce);
-        assert!(apply_reranking(
-            &mut rerank,
-            "ColdFusion::register",
-            &mut kept,
-            Some(RERANK_WEIGHT_SHORT_ID),
-        ));
+        assert!(
+            apply_reranking(
+                &mut rerank,
+                "ColdFusion::register",
+                &mut kept,
+                Some(RERANK_WEIGHT_SHORT_ID),
+            )
+            .unwrap()
+        );
         assert_eq!(
             kept[0].file_path, "src/reg.rs",
             "fused winner should survive at the SHORT_ID weight"
@@ -3216,12 +3226,15 @@ mod hybrid_tests {
 
         let mut lost = vec![mk("src/reg.rs", 0.95), mk("src/lib.rs", 0.35)];
         let mut rerank: RerankFn = Box::new(ce);
-        assert!(apply_reranking(
-            &mut rerank,
-            "ColdFusion::register",
-            &mut lost,
-            Some(RERANK_WEIGHT_NATLANG),
-        ));
+        assert!(
+            apply_reranking(
+                &mut rerank,
+                "ColdFusion::register",
+                &mut lost,
+                Some(RERANK_WEIGHT_NATLANG),
+            )
+            .unwrap()
+        );
         assert_eq!(
             lost[0].file_path, "src/lib.rs",
             "same disagreement should flip the order at the natural-language weight"
@@ -4239,7 +4252,7 @@ mod rerank_blend_tests {
                 .map(|d| if *d == "doc b" { 10.0 } else { 0.0 })
                 .collect())
         });
-        assert!(apply_reranking(&mut rerank, QUERY, &mut results, None));
+        assert!(apply_reranking(&mut rerank, QUERY, &mut results, None).unwrap());
 
         let w = RERANK_WEIGHT_NATLANG;
         assert_eq!(results[0].file_path, "b.rs");
@@ -4266,7 +4279,7 @@ mod rerank_blend_tests {
             mk("c.rs", "doc c", 0.1),
         ];
         let mut rerank: RerankFn = Box::new(|_q, docs| Ok(vec![3.25; docs.len()]));
-        assert!(apply_reranking(&mut rerank, QUERY, &mut results, None));
+        assert!(apply_reranking(&mut rerank, QUERY, &mut results, None).unwrap());
 
         let order: Vec<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
         assert_eq!(order, ["a.rs", "b.rs", "c.rs"]);
@@ -4287,10 +4300,28 @@ mod rerank_blend_tests {
     fn rerank_error_leaves_results_untouched() {
         let mut results = vec![mk("a.rs", "doc a", 0.9), mk("b.rs", "doc b", 0.5)];
         let mut rerank: RerankFn = Box::new(|_q, _docs| anyhow::bail!("ORT unavailable"));
-        assert!(!apply_reranking(&mut rerank, QUERY, &mut results, None));
+        assert!(!apply_reranking(&mut rerank, QUERY, &mut results, None).unwrap());
         assert_eq!(results[0].file_path, "a.rs");
         assert!((results[0].score - 0.9).abs() < 1e-6);
         assert!((results[1].score - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_stopped_rerank_stops_the_search_instead_of_degrading() {
+        use codesage_protocol::work::{StopReason, WorkStopped};
+
+        let mut results = vec![mk("a.rs", "doc a", 0.9), mk("b.rs", "doc b", 0.5)];
+        let mut rerank: RerankFn = Box::new(|_q, _docs| {
+            Err(anyhow::Error::new(WorkStopped {
+                reason: StopReason::DeadlineExceeded,
+            })
+            .context("native inference stopped"))
+        });
+        let error = apply_reranking(&mut rerank, QUERY, &mut results, None).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WorkStopped>().unwrap().reason,
+            StopReason::DeadlineExceeded
+        );
     }
 }
 
@@ -6028,7 +6059,7 @@ mod explanation_tests {
     fn reranker_trace_keeps_raw_normalized_and_blend_weight() {
         let mut rows = vec![row("a.rs", "a", 0.8), row("b.rs", "b", 0.4)];
         let mut rerank: RerankFn<'_> = Box::new(|_, _| Ok(vec![-4.0, 6.0]));
-        apply_reranking(&mut rerank, "auth", &mut rows, Some(0.25));
+        apply_reranking(&mut rerank, "auth", &mut rows, Some(0.25)).unwrap();
         let a = rows.iter().find(|r| r.file_path == "a.rs").unwrap();
         let trace = a.trace.as_ref().unwrap().last().unwrap();
         assert_eq!(trace.before, Some(0.8));
@@ -6046,7 +6077,7 @@ mod explanation_tests {
     fn reranker_failure_explains_why_scores_are_retained() {
         let mut rows = vec![row("a.rs", "a", 0.8)];
         let mut rerank: RerankFn<'_> = Box::new(|_, _| anyhow::bail!("inference unavailable"));
-        assert!(!apply_reranking(&mut rerank, "auth", &mut rows, None));
+        assert!(!apply_reranking(&mut rerank, "auth", &mut rows, None).unwrap());
         let trace = rows[0].trace.as_ref().unwrap().last().unwrap();
         assert_eq!(trace.stage, "rerank_blend");
         assert!(trace.reason.contains("failed"));

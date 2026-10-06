@@ -3,6 +3,7 @@ pub mod config;
 pub mod fingerprint;
 pub mod model;
 pub mod reranker;
+mod run_control;
 
 /// Expose the NVIDIA library-directory discovery result to the doctor command without
 /// leaking the internal cache type.
