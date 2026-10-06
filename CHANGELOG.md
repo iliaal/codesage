@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.41.0] - 2026-10-06
+
 ### Added
 
 - Non-empty `embed_texts` executions log the project, model, text count, bytes, batch and token counts, wait time, elapsed time, and outcome to the daemon log.
@@ -1243,5 +1245,7 @@ Initial public release.
 
 [0.39.0]: https://github.com/iliaal/codesage/releases/tag/v0.39.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.40.0...HEAD
 [0.40.0]: https://github.com/iliaal/codesage/releases/tag/v0.40.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.41.0...HEAD
+[0.41.0]: https://github.com/iliaal/codesage/releases/tag/v0.41.0
