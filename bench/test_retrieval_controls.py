@@ -117,6 +117,52 @@ class RetrievalControlsTest(unittest.TestCase):
         self.assertEqual(charge["bytes"], 8)
         self.assertEqual(emitted[0][0], "a.py")
 
+    def test_page_hash_matches_raw_byte_prefix_at_every_boundary(self):
+        for rows in ([], [("a.py", "")],
+                     [("é.py", "α🙂"), ("é.py", "again\n"), ("b.py", "")]):
+            serialized = b"".join((p + "\n" + c + "\n").encode() for p, c in rows)
+            for budget in (None, *range(len(serialized) + 2)):
+                with self.subTest(rows=rows, budget=budget):
+                    emitted, charge = controls.page(rows, budget)
+                    prefix = serialized if budget is None else serialized[:budget]
+                    self.assertEqual(charge, {
+                        "bytes": len(prefix), "budget_bytes": budget,
+                        "truncated": len(prefix) < len(serialized),
+                        "page_sha256": hashlib.sha256(prefix).hexdigest(),
+                    })
+                    expected = []
+                    offset = 0
+                    for path, content in rows:
+                        header = (path + "\n").encode()
+                        body = (content + "\n").encode()
+                        offset += len(header)
+                        if offset > len(prefix):
+                            break
+                        expected.append((path, prefix[offset:offset + len(body)].decode(
+                            "utf-8", errors="replace")))
+                        offset += len(body)
+                    self.assertEqual(emitted, expected)
+
+    def test_page_does_not_visit_rows_after_truncation(self):
+        class GuardedRows(list):
+            def __iter__(self):
+                yield self[0]
+                raise AssertionError("row outside the byte budget was visited")
+
+        rows = GuardedRows([("a.py", "alpha"), ("b.py", "unused")])
+        emitted, charge = controls.page(rows, 8)
+        self.assertEqual(emitted, [("a.py", "alp")])
+        self.assertEqual(charge["page_sha256"], hashlib.sha256(b"a.py\nalp").hexdigest())
+
+    def test_partial_path_does_not_encode_content(self):
+        class UnusedContent(str):
+            def __add__(self, other):
+                raise AssertionError("content after a partial path was encoded")
+
+        emitted, charge = controls.page([("é.py", UnusedContent("unused"))], 1)
+        self.assertEqual(emitted, [])
+        self.assertEqual(charge["page_sha256"], hashlib.sha256(b"\xc3").hexdigest())
+
     def test_seeded_uniform_file_order_uses_actual_chunks(self):
         chunks = {f"{i}.py": [f"chunk-{i}-a", f"chunk-{i}-b"] for i in range(20)}
         first = controls.placebo_rows(chunks, "case-a", 0)
