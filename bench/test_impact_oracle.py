@@ -56,6 +56,26 @@ stripped = oracle.strip_js(source)
 check("Target" in stripped and "/ divisor" in stripped, "object braces and division remain code")
 check("LiteralOnly" not in stripped, "template tail remains literal after object expression")
 
+# A heredoc/nowdoc closing label is a delimiter, not an executable reference.
+for opener in ("<<<Target", '<<<"Target"', "<<<'Target'"):
+    for indent in ("", "    ", "\t"):
+        source = f"<?php $text = {opener}\n{indent}LiteralOnly\n{indent}Target; After();\n"
+        stripped = oracle.strip_php(source)
+        check("Target" not in stripped, f"{opener}, {indent!r}: closing label excluded")
+        check("LiteralOnly" not in stripped, f"{opener}, {indent!r}: body excluded")
+        check("; After();" in stripped, f"{opener}, {indent!r}: trailing code preserved")
+        check(len(stripped) == len(source), f"{opener}, {indent!r}: source positions preserved")
+        check(
+            [i for i, ch in enumerate(stripped) if ch == "\n"]
+            == [i for i, ch in enumerate(source) if ch == "\n"],
+            f"{opener}, {indent!r}: line positions preserved",
+        )
+
+source = "<?php $text = <<<'Target'\nTargetSuffix\nTarget; Target();\n"
+stripped = oracle.strip_php(source)
+check(stripped.count("Target") == 1 and "Target();" in stripped,
+      "longer identifiers in literal body do not terminate it; real trailing call survives")
+
 # Unsupported text must not be usable as code-only truth through the dispatcher.
 try:
     oracle.strip_for("comment.py", '# Target\ntext = "Target"\n')
@@ -106,6 +126,8 @@ with tempfile.TemporaryDirectory(prefix="impact-oracle-supported-") as td:
         "use.php": "<?php Target();\n",
         "noise.js": '// Target\nconst title = "Target";\n',
         "noise.php": '<?php /* Target */ $title = "Target";\n',
+        "heredoc.php": "<?php $text = <<<Target\nplain text\nTarget;\n",
+        "nowdoc.php": "<?php $text = <<<'Target'\nplain text\nTarget;\n",
     })
     # Only the external CodeSage boundary is simulated; the CLI reads real source
     # files and SQLite index and computes its own text-derived reference sets.
@@ -130,11 +152,11 @@ with tempfile.TemporaryDirectory(prefix="impact-oracle-supported-") as td:
         symbol = report["Target"]
         check(symbol["code_truth"] == ["use.php", "use.ts"],
               "code-only truth includes executable interpolation and PHP calls only")
-        check(symbol["raw_truth"] == ["noise.js", "noise.php", "use.php", "use.ts"],
+        check(symbol["raw_truth"] == ["heredoc.php", "noise.js", "noise.php", "nowdoc.php", "use.php", "use.ts"],
               "raw truth retains literal mentions but excludes defining file")
         check(symbol["precision"] == 2 / 3 and symbol["recall"] == 1,
               "supported code-only precision and recall reflect executable references")
-        check(symbol["raw_precision"] == 1 and symbol["raw_recall"] == 3 / 4,
+        check(symbol["raw_precision"] == 1 and symbol["raw_recall"] == 3 / 6,
               "raw scoring remains distinct from code-only scoring")
         check(report["TOTAL"]["code_truth"] == 2 and report["TOTAL"]["code_hit"] == 2
               and report["TOTAL"]["precision"] == 2 / 3 and report["TOTAL"]["recall"] == 1,

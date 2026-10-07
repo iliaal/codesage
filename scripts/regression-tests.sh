@@ -568,6 +568,7 @@ run_python_suite() {
 run_python_suite "$repo_root/scripts/tests"
 run_python_suite "$repo_root/plugins/codesage-tools/tests"
 python3 "$repo_root/bench/test_bench_fixes.py"
+python3 "$repo_root/bench/test_impact_oracle.py"
 python3 "$repo_root/bench/test_retrieval_controls.py"
 python3 "$repo_root/bench/test_compare_runs.py"
 python3 "$repo_root/bench/test_self_eval.py"

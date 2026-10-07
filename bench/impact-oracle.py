@@ -211,7 +211,9 @@ def strip_php(src: str) -> str:
                 ident = m.group(2)
                 end = re.compile(r"^[ \t]*" + re.escape(ident) + r"\b", re.M)
                 em = end.search(src, i + m.end())
-                stop = em.start() if em else n
+                # The closing label is part of the literal, but punctuation
+                # and executable code after it must still be scanned.
+                stop = em.end() if em else n
                 for ch in src[i:stop]:
                     out.append("\n" if ch == "\n" else " ")
                 i = stop
