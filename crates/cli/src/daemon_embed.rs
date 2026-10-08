@@ -735,6 +735,58 @@ pub(crate) mod tests {
         codesage_graph::SemanticFingerprint::with_artifact_digest(&config, 4, "digest-a")
     }
 
+    // Keep the fixture compatible with Rust versions before fetch_update's
+    // replacement, try_update, without suppressing deprecation diagnostics.
+    fn take_stall(counter: &std::sync::atomic::AtomicUsize) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let mut remaining = counter.load(SeqCst);
+        while let Some(next) = remaining.checked_sub(1) {
+            match counter.compare_exchange(remaining, next, SeqCst, SeqCst) {
+                Ok(_) => return true,
+                Err(current) => remaining = current,
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn stall_counter_does_not_wrap_or_consume_an_empty_counter() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let counter = AtomicUsize::new(0);
+        assert!(!take_stall(&counter));
+        assert_eq!(counter.load(SeqCst), 0);
+        counter.store(1, SeqCst);
+        assert!(take_stall(&counter));
+        assert!(!take_stall(&counter));
+        assert_eq!(counter.load(SeqCst), 0);
+        counter.store(usize::MAX, SeqCst);
+        assert!(take_stall(&counter));
+        assert_eq!(counter.load(SeqCst), usize::MAX - 1);
+    }
+
+    #[test]
+    fn stall_counter_consumes_each_slot_once_across_threads() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let counter = AtomicUsize::new(1000);
+        let consumed = AtomicUsize::new(0);
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    start.wait();
+                    while take_stall(&counter) {
+                        consumed.fetch_add(1, SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(consumed.load(SeqCst), 1000);
+        assert_eq!(counter.load(SeqCst), 0);
+    }
+
     impl ServerHandler for FakeDaemon {
         fn get_info(&self) -> ServerConfig {
             ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -763,15 +815,6 @@ pub(crate) mod tests {
                 cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
                 return Ok(CallToolResult::error(vec![ContentBlock::text("cancelled")]).into());
             }
-            let take = |counter: &std::sync::atomic::AtomicUsize| {
-                counter
-                    .fetch_update(
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                        |n| n.checked_sub(1),
-                    )
-                    .is_ok()
-            };
             if !texts.is_empty() {
                 self.requests
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -780,7 +823,7 @@ pub(crate) mod tests {
                     .unwrap()
                     .push((texts.len(), texts.iter().map(String::len).sum()));
             }
-            if !texts.is_empty() && take(&self.stall) {
+            if !texts.is_empty() && take_stall(&self.stall) {
                 context.ct.cancelled().await;
                 return Ok(CallToolResult::error(vec![ContentBlock::text("cancelled")]).into());
             }
