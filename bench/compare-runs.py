@@ -184,10 +184,16 @@ class MultiValue(list):
 def parse_failure_count(value, where: str) -> int:
     if value is None:
         return 0
+    bad = Refused(f"{where}: meta.search_failures is not a nonnegative integer ({value!r})")
+    if isinstance(value, bool):
+        raise bad
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        raise Refused(f"{where}: meta.search_failures is not an integer ({value!r})")
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise bad
+    if count < 0 or (isinstance(value, float) and value != count):
+        raise bad
+    return count
 
 
 def split_of(case_id: str, salt: str) -> str:
@@ -483,10 +489,12 @@ def load_records(paths: list[Path], *, allow_partial: bool) -> tuple[dict, dict[
                 "provenance": dict(file_meta["provenance"]),
             }, "_input_path": str(path)} if controlled else rec
         for k, v in file_meta.items():
-            if k not in meta:
+            if k == "search_failures":
+                # Validate each input before aggregation, including the first,
+                # so invalid counts cannot cancel another file's failures.
+                meta[k] = meta.get(k, 0) + parse_failure_count(v, str(path))
+            elif k not in meta:
                 meta[k] = v
-            elif k == "search_failures":
-                meta[k] = parse_failure_count(meta[k], "merged meta") + parse_failure_count(v, str(path))
             elif meta[k] != v:
                 prior = list(meta[k]) if isinstance(meta[k], MultiValue) else [meta[k]]
                 seen = {json.dumps(x, sort_keys=True): x for x in [*prior, v]}
