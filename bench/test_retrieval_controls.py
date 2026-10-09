@@ -10,6 +10,8 @@ import importlib.util
 import io
 import json
 import os
+import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -35,6 +37,13 @@ def load(filename, name):
 runner = load("codesage-bench-runner", "control_runner")
 compare = load("compare-runs.py", "control_compare")
 self_eval = load("self-eval.py", "control_self_eval")
+
+
+def real_rg():
+    binary = shutil.which("rg")
+    if binary is None:
+        raise RuntimeError("retrieval-control tests require ripgrep (rg) on PATH")
+    return str(Path(binary).resolve())
 
 
 def fixture_runtime():
@@ -199,10 +208,11 @@ class RetrievalControlsTest(unittest.TestCase):
         config.write_text("--max-count=1\n")
         empty_config = self.root / "empty-rg-config"
         empty_config.write_text("")
+        rg_binary = real_rg()
         with patch.dict(os.environ, {"RIPGREP_CONFIG_PATH": str(empty_config)}):
-            baseline, _ = controls.run_rg(self.root, ["a.py", "b.py"], "needle", "/usr/bin/rg")
+            baseline, _ = controls.run_rg(self.root, ["a.py", "b.py"], "needle", rg_binary)
         with patch.dict(os.environ, {"RIPGREP_CONFIG_PATH": str(config)}):
-            rows, evidence = controls.run_rg(self.root, ["a.py", "b.py"], "needle", "/usr/bin/rg")
+            rows, evidence = controls.run_rg(self.root, ["a.py", "b.py"], "needle", rg_binary)
         self.assertIn("--no-config", evidence["command"])
         self.assertEqual(rows, baseline)
         emitted, cost = controls.page(rows, 25)
@@ -634,7 +644,8 @@ class RetrievalControlsTest(unittest.TestCase):
         )
         binary.chmod(0o755)
         rg = caller / rg_name
-        rg.write_text('#!/bin/sh\nexec /usr/bin/rg "$@"\n')
+        # Resolve before the identity tests replace PATH with their own rg wrapper.
+        rg.write_text(f'#!/bin/sh\nexec {shlex.quote(real_rg())} "$@"\n')
         rg.chmod(0o755)
         for name in {codesage_name, rg_name, decoy.name}:
             project_binary = self.root / name
@@ -675,6 +686,18 @@ class RetrievalControlsTest(unittest.TestCase):
 
     def test_default_executables_resolve_relative_path_entries_once(self):
         self.exercise_executable_identity("path")
+
+    def test_rg_fixture_supports_nonstandard_path_with_shell_characters(self):
+        bin_dir = self.root / "ripgrep's bin"
+        bin_dir.mkdir()
+        shutil.copy2(real_rg(), bin_dir / "rg")
+        with patch.dict(os.environ, {"PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}):
+            self.exercise_executable_identity("path")
+
+    def test_missing_real_rg_is_an_error_not_a_skipped_check(self):
+        with patch.dict(os.environ, {"PATH": str(self.root / "missing-bin")}):
+            with self.assertRaisesRegex(RuntimeError, "require ripgrep .* on PATH"):
+                real_rg()
 
     def test_absolute_executable_identity_remains_accepted(self):
         self.exercise_executable_identity("absolute")
