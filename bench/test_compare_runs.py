@@ -469,7 +469,32 @@ check(lsame["features"] == ["cpu", "cuda"] and not isinstance(lsame["features"],
       f"merge: equal list values stay a plain list ({lsame['features']!r})")
 bad_count = write("env-badcount.json", recs_b, meta={**meta_base, "search_failures": "many"})
 rc, out, err = run(["--baseline", str(a), "--candidate", str(bad_count), "--bootstrap", "200"])
-check(rc == 2 and "meta.search_failures is not an integer ('many')" in err, f"failures: non-integer count exits 2 (rc={rc})")
+check(rc == 2 and "meta.search_failures is not a nonnegative integer ('many')" in err, f"failures: non-integer count exits 2 (rc={rc})")
+# Invalid counts must never become zero or cancel failures from another input.
+for bad_value in (-1, -0.5, 0.5, True, False, float("inf"), float("-inf"), float("nan")):
+    bad_count = write("env-invalid-count.json", recs_b,
+                      meta={**meta_base, "search_failures": bad_value})
+    for flags in ([], ["--allow-failures", "--exclude-failed", "--allow-mismatch"]):
+        rc, out, err = run(["--baseline", str(a), "--candidate", str(bad_count),
+                            "--bootstrap", "200", *flags])
+        check(rc == 2 and "REFUSED" in err and "meta.search_failures" in err,
+              f"failures: invalid {bad_value!r} refused with {flags} (rc={rc})")
+        check("ACCEPT" not in out, "failures: invalid metadata produces no verdict")
+
+negative = write("env-negative-count.json", recs_b[:30],
+                 meta={**meta_base, "search_failures": -3})
+positive = write("env-positive-count.json", recs_b[30:],
+                 meta={**meta_base, "search_failures": 3})
+for inputs in ((negative, positive), (positive, negative)):
+    rc, out, err = run(["--baseline", str(a), "--candidate", *map(str, inputs),
+                        "--bootstrap", "200"])
+    check(rc == 2 and str(negative) in err and "meta.search_failures" in err,
+          f"failures: negative cannot cancel another input's failures ({inputs}, rc={rc})")
+
+for value, expected in ((None, 0), (0, 0), (3, 3), (3.0, 3), ("3", 3)):
+    check(cmp.parse_failure_count(value, "compatibility") == expected,
+          f"failures: legacy integral count {value!r} remains supported")
+
 ghost = write("env-ghost.json", recs_b, meta={**meta_base, "search_failures": 3})
 rc, out, err = run(["--baseline", str(a), "--candidate", str(ghost), "--bootstrap", "200", "--exclude-failed"])
 check(rc == 2 and "search failures recorded (baseline 0, candidate 3)" in err and "cannot locate them" in err,
