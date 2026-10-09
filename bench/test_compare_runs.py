@@ -845,7 +845,8 @@ check(ndb_row.endswith("| 0.8000 | — |  |") and "=base" not in ndb_row,
       f"ablation: valid arm has no =base and no delta against an invalid baseline (got {ndb_row!r})")
 check("## Invalid runs" in abl_text and f"- `{run_corpus.name}/baseline`" in abl_text, "ablation: invalid runs section lists the arm")
 check("search_failures" in abl.METRIC_KEYS, "ablation: search_failures is a tracked metric key")
-check(abl.invalid_reason(0, {"search_failures": "0"}) is None
+valid_ablation_metrics = {"miss_rate": "0.2", "median_first": "1", "r5": "0.8", "r10": "0.8"}
+check(abl.invalid_reason(0, valid_ablation_metrics) is None
       and abl.invalid_reason(3, {}) == "INVALID (runner rc=3, no METRICS)"
       and abl.invalid_reason(1, {}) == "INVALID (runner rc=1, no METRICS)"
       and abl.invalid_reason(1, {"r10": "0.5"}) == "INVALID (runner rc=1)"
@@ -866,6 +867,40 @@ def run_ablation(argv: list[str]) -> tuple[int, str]:
         sys.argv = old
     return rc, out.getvalue()
 
+
+# A nonempty METRICS comment is not evidence of a valid comparison.
+for key in ("miss_rate", "r5", "r10"):
+    for value in ("NaN", "inf", "-inf", "no-data", "", "-0.1", "1.1"):
+        malformed = {**valid_ablation_metrics, key: value}
+        check(abl.invalid_reason(0, malformed) is not None,
+              f"ablation: rejects invalid {key}={value!r}")
+for key in valid_ablation_metrics:
+    incomplete = {k: v for k, v in valid_ablation_metrics.items() if k != key}
+    check(abl.invalid_reason(0, incomplete) is not None,
+          f"ablation: rejects missing {key}")
+for value in ("0", "-1", "1.5", "NaN", "inf", "no-data", ""):
+    check(abl.invalid_reason(0, {**valid_ablation_metrics, "median_first": value}) is not None,
+          f"ablation: rejects invalid median_first={value!r}")
+check(abl.invalid_reason(0, {"miss_rate": "1", "r5": "0", "r10": "0", "median_first": "MISS"}) is None,
+      "ablation: all-miss scorecards remain valid")
+check(abl.invalid_reason(0, {**valid_ablation_metrics, "mean_tokens_to_hit": "12"}) is None,
+      "ablation: token metrics remain optional")
+
+malformed_runner = tmp / "malformed-runner.py"
+for malformed in ({"search_failures": "0"}, {**valid_ablation_metrics, "r10": "NaN"}):
+    comment = "<!-- METRICS: " + " ".join(f"{k}={v}" for k, v in malformed.items()) + " -->"
+    malformed_runner.write_text(f"print({comment!r})\n")
+    rc, text = run_ablation([str(run_corpus), "--runner", str(malformed_runner), "--arms", "rrf_k_30"])
+    check(rc == 1 and "## Invalid runs" in text,
+          f"ablation: malformed scorecards fail the sweep ({malformed})")
+    check("## No measurable effect" not in text and "rrf_k_30  =base" not in text,
+          "ablation: identical malformed scorecards are never reported inert")
+    with contextlib.redirect_stderr(io.StringIO()):
+        _, differed, compared_counts, invalid_list = abl.run_sweep(
+            [run_corpus], ["baseline", "rrf_k_30"], malformed_runner, "codesage", 10
+        )
+    check(not differed and compared_counts["rrf_k_30"] == 0 and len(invalid_list) == 2,
+          "ablation: malformed arms are excluded from comparison counts")
 
 crash_runner = tmp / "crash-runner.py"
 crash_runner.write_text(
