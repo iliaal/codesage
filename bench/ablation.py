@@ -35,9 +35,9 @@ runs them, detects they produced metrics identical to baseline on every corpus
 where both arm and baseline ran validly, and WARNS that the knob may be
 unwired — so you never read a null result as "the knob doesn't matter."
 
-An arm whose runner crashed, timed out, printed no METRICS line, or reported
-search failures is INVALID: it is excluded from every comparison, listed under
-"Invalid runs", and makes the sweep exit 1.
+An arm whose runner crashed, timed out, printed missing or malformed retrieval
+METRICS, or reported search failures is INVALID: it is excluded from every
+comparison, listed under "Invalid runs", and makes the sweep exit 1.
 
 Usage:
   ./ablation.py corpus1.yaml [corpus2.yaml ...] \
@@ -49,6 +49,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import subprocess
@@ -102,8 +103,8 @@ INVALID_KEY = "_invalid"
 def invalid_reason(rc: int, metrics: dict[str, str]) -> str | None:
     """Why an arm's numbers must not be compared, or None when they may be.
 
-    Any crash, timeout, missing METRICS line, or failed search invalidates the
-    arm; a `{}` metrics dict must never pass as a (blank) signature.
+    Any crash, timeout, missing/malformed retrieval METRICS, or failed search
+    invalidates the arm; nonempty metadata alone is not a valid signature.
     """
     if not metrics:
         return f"INVALID (runner rc={rc}, no METRICS)"
@@ -113,6 +114,17 @@ def invalid_reason(rc: int, metrics: dict[str, str]) -> str | None:
         return f"INVALID ({n} search failures)"
     if rc != 0:
         return f"INVALID (runner rc={rc})"
+    for key in ("miss_rate", "r5", "r10"):
+        raw = metrics.get(key)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return f"INVALID (missing or malformed {key})"
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            return f"INVALID ({key} must be finite and between 0 and 1)"
+    median = metrics.get("median_first", "")
+    if median != "MISS" and re.fullmatch(r"[1-9][0-9]*", median) is None:
+        return "INVALID (median_first must be a positive integer or MISS)"
     return None
 
 
@@ -312,7 +324,7 @@ def main() -> int:
         lines.append("## Invalid runs")
         lines.append("")
         lines.append(
-            "These arms crashed, timed out, produced no METRICS line, or had "
+            "These arms crashed, timed out, produced missing or malformed METRICS, or had "
             "failed `codesage search` calls. Their numbers are excluded from "
             "every comparison above; fix the runner, index, or daemon and rerun."
         )
