@@ -36,6 +36,11 @@ from typing import Any
 TOOL_PREFIX = "mcp__codesage__"
 
 
+def _utf8_size(text: str) -> int:
+    """Measure UTF-8 payload bytes, replacing invalid lone surrogates."""
+    return len(text.encode("utf-8", errors="replace"))
+
+
 def iter_transcripts(root: Path, min_mtime: float) -> list[Path]:
     """All `*.jsonl` under `root/*/` modified at or after `min_mtime`."""
     out: list[Path] = []
@@ -95,7 +100,7 @@ def extract_calls(transcript: Path) -> list[dict[str, Any]]:
                     tool = name[len(TOOL_PREFIX):]
                     tid = c.get("id")
                     inp = c.get("input") or {}
-                    inp_bytes = len(json.dumps(inp))
+                    inp_bytes = _utf8_size(json.dumps(inp))
                     pending[tid] = {
                         "tool": tool,
                         "input_bytes": inp_bytes,
@@ -107,7 +112,7 @@ def extract_calls(transcript: Path) -> list[dict[str, Any]]:
                         continue
                     partial = pending.pop(tid)
                     text = _flatten_result(c.get("content"))
-                    partial["output_bytes"] = len(text)
+                    partial["output_bytes"] = _utf8_size(text)
                     partial["output_text"] = text
                     out.append(partial)
     return out
@@ -171,9 +176,9 @@ def rule_group_by_directory(text: str) -> int:
     """
     data = _safe_json(text)
     if data is None:
-        return len(text)
+        return _utf8_size(text)
     if isinstance(data, list):
-        return len(json.dumps(_compress_file_array(data)))
+        return _utf8_size(json.dumps(_compress_file_array(data)))
     if isinstance(data, dict):
         out: dict[str, Any] = {}
         touched = False
@@ -186,9 +191,9 @@ def rule_group_by_directory(text: str) -> int:
             else:
                 out[k] = v
         if not touched:
-            return len(text)
-        return len(json.dumps(out))
-    return len(text)
+            return _utf8_size(text)
+        return _utf8_size(json.dumps(out))
+    return _utf8_size(text)
 
 
 def rule_dedupe_repeated_strings(text: str) -> int:
@@ -201,7 +206,7 @@ def rule_dedupe_repeated_strings(text: str) -> int:
     """
     data = _safe_json(text)
     if data is None:
-        return len(text)
+        return _utf8_size(text)
 
     def collect_notes(arr: list[Any]) -> tuple[dict[str, int], int]:
         counts: dict[str, int] = defaultdict(int)
@@ -251,14 +256,14 @@ def rule_dedupe_repeated_strings(text: str) -> int:
             else:
                 compressed[k] = v
         if not touched:
-            return len(text)
-        return len(json.dumps(compressed))
+            return _utf8_size(text)
+        return _utf8_size(json.dumps(compressed))
     if isinstance(data, list):
         new = apply(data)
         if new is None:
-            return len(text)
-        return len(json.dumps(new))
-    return len(text)
+            return _utf8_size(text)
+        return _utf8_size(json.dumps(new))
+    return _utf8_size(text)
 
 
 def rule_collapse_adjacent_refs(text: str) -> int:
@@ -269,10 +274,10 @@ def rule_collapse_adjacent_refs(text: str) -> int:
     """
     data = _safe_json(text)
     if not isinstance(data, list) or len(data) < 3:
-        return len(text)
+        return _utf8_size(text)
     for item in data:
         if not (isinstance(item, dict) and ("file" in item or "file_path" in item) and "line" in item):
-            return len(text)
+            return _utf8_size(text)
 
     def key(item: dict) -> tuple[str, int]:
         return (item.get("file") or item.get("file_path") or "", int(item.get("line") or 0))
@@ -298,7 +303,7 @@ def rule_collapse_adjacent_refs(text: str) -> int:
         else:
             compressed.extend(items[i: j + 1])
         i = j + 1
-    return len(json.dumps(compressed))
+    return _utf8_size(json.dumps(compressed))
 
 
 def rule_middle_truncate(text: str, threshold: int = 4096, keep: int = 1024) -> int:
@@ -306,7 +311,7 @@ def rule_middle_truncate(text: str, threshold: int = 4096, keep: int = 1024) -> 
     with a `<... N bytes elided ...>` marker in the middle. Targets long
     snippets (`search`, `export_context`).
     """
-    n = len(text)
+    n = _utf8_size(text)
     if n <= threshold:
         return n
     middle_marker = f"<... {n - 2 * keep} bytes elided ...>"
