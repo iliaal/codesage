@@ -15,7 +15,7 @@ class OnboardBinaryTests(unittest.TestCase):
             root = Path(directory)
             project = root / "different project"
             project.mkdir()
-            (project / ".git").mkdir()
+            subprocess.run(["git", "init", "-q", str(project)], check=True)
             binary = root / "tools with spaces" / "codesage"
             binary.parent.mkdir()
             log = root / "calls.jsonl"
@@ -39,7 +39,7 @@ with open(os.environ["CALL_LOG"], "a") as stream:
                    "CALL_LOG": str(log)}
             result = subprocess.run(
                 ["bash", str(SCRIPT), str(project), "--codesage-bin",
-                 "tools with spaces/codesage", "--device", "cpu", "--no-hint"],
+                 "tools with spaces/codesage", "--device", "cpu"],
                 cwd=root, env=env, capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -51,6 +51,11 @@ with open(os.environ["CALL_LOG"], "a") as stream:
             self.assertEqual(operations[0][2], ["init"])
             self.assertTrue(all(row[1] == str(project) for row in operations))
             self.assertEqual((project / ".codesage/config.toml").read_text(), 'device = "cpu"\n')
+            hint = (project / ".claude/CLAUDE.md").read_text()
+            self.assertLess(len(hint.splitlines()), 15)
+            project_line = next(line for line in hint.splitlines()
+                                if line.startswith("Project argument (JSON string): "))
+            self.assertEqual(json.loads(project_line.split(": ", 1)[1]), str(project))
 
 
 if __name__ == "__main__":

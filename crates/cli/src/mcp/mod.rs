@@ -1009,7 +1009,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "session_start",
-        description = "Save the indexed structural baseline before authorized edits, using a distinct session_id for concurrent sessions. Reusing an ID replaces its baseline. Pair with session_end after refreshing the index to inspect graph changes. Use project_overview for orientation without persisting a snapshot.",
+        description = "Save current structural state before authorized edits, using a distinct session_id for concurrent sessions. Reusing an ID replaces its baseline. Inspect index.structural for overlay or dirty fallback. Pair with session_end to inspect graph changes. Use project_overview for orientation without persisting a snapshot.",
         output_schema = schema_for_type::<SessionStartReport>()
     )]
     async fn session_start_tool(
@@ -1146,7 +1146,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "session_end",
-        description = "Compare current indexed structure with a session_start baseline: cycles, risk changes, and added or removed files. Refresh the index after edits before comparing. Requires the matching saved session_id; the baseline remains available for repeated comparisons. Use review_rehearsal for patch objections without a baseline.",
+        description = "Compare current structural state with a session_start baseline: cycles, risk changes, and added or removed files. Inspect index.structural for overlay or dirty fallback. Requires the matching saved session_id; the baseline remains available for repeated comparisons. Use review_rehearsal for patch objections without a baseline.",
         output_schema = schema_for_type::<SessionDiff>()
     )]
     async fn session_end_tool(

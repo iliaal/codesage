@@ -123,12 +123,18 @@ fn stdio_help_covers_advertised_tools_fields_errors_recipes_and_measured_prices(
     ))
     .unwrap();
     let words = regex::Regex::new(r"[\p{L}\p{N}_]+(?:['’][\p{L}\p{N}_]+)*").unwrap();
+    assert_eq!(catalog["catalog"]["routing"], documentation["routing"]);
     assert_eq!(
         documentation["tools"].as_object().unwrap().len(),
         tools.len()
     );
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
+        assert!(
+            include_str!("../../../plugins/codesage-tools/skills/codesage-retrieval/SKILL.md")
+                .contains(&format!("`mcp__codesage__{name}`")),
+            "advertised tool {name} must have a generated skill route"
+        );
         let description = tool["description"].as_str().unwrap();
         let count = words.find_iter(description).count();
         assert!((1..=60).contains(&count), "{name}: {count} words");

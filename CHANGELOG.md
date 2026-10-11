@@ -3,6 +3,7 @@
 ### Changed
 
 - MCP tool descriptions use at most 60 words; `help` retains detailed field semantics, limitations, and recovery guidance.
+- The retrieval skill and MCP help share routing, freshness, recovery, and cost guidance; onboarding hints and the prompt override point to the skill.
 
 ### Security
 

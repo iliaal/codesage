@@ -182,6 +182,7 @@ pub(super) fn answer(server: &CodeSageServer, params: &HelpParams) -> anyhow::Re
         result.catalog = Some(json!({
             "tools": tools.iter().filter(|tool| !super::HIDDEN_TOOLS.contains(&tool.name.as_ref())).map(|tool| tool.name.as_ref()).collect::<Vec<_>>(),
             "hidden_tools": super::HIDDEN_TOOLS,
+            "routing": CATALOG["routing"],
             "operator_tools": ["daemon_stats"],
             "fields": super::envelope::schema_properties().iter().map(|(name, _)| *name).chain(["next", "_meta", "error", "status", "phase", "work_continuing", "request_id", "persistence_committed", "complete"]).collect::<Vec<_>>(),
             "codes": CATALOG["errors"].as_object().unwrap().keys().collect::<Vec<_>>(),
