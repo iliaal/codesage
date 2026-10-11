@@ -423,7 +423,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "project_overview",
-        description = "Orient once at session start: languages, index freshness, features, entrypoints, risk, boundaries, and test conventions. Uses indexed facts without model inference. Use describe for one entity; use search to locate behavior. Refresh stale structural evidence before relying on it.",
+        description = "Orient once at session start: languages, freshness, features, entrypoints, risk, boundaries, and test conventions. Uses structural facts and indexed history without model inference. Use describe for one entity; use search to locate behavior. Inspect freshness and overlay evidence before relying on results.",
         output_schema = schema_for_type::<ProjectOverview>()
     )]
     async fn project_overview_tool(
