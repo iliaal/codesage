@@ -43,5 +43,5 @@ tempfile = "3"
 getrandom = "0.4"
 hex.workspace = true
 libc = "0.2"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["event", "fs", "net", "process"] }
 socket2 = "0.6"

@@ -19,6 +19,44 @@ fn connect(path: &Path) -> io::Result<BlockingStream> {
     Ok(BlockingStream::from(socket))
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn legacy_peer_matches(path: &Path, pid: i32, version: &str) -> io::Result<bool> {
+    let mut stream = connect(path)?;
+    let peer = rustix::net::sockopt::socket_peercred(&stream)?;
+    if peer.pid.as_raw_nonzero().get() != pid || peer.uid != rustix::process::getuid() {
+        return Ok(false);
+    }
+    stream.set_read_timeout(Some(CONTROL_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONTROL_TIMEOUT))?;
+    stream.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"codesage-daemon-control\",\"version\":\"1\"}}}\n")?;
+    let mut reply = Vec::new();
+    let deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
+    let mut buffer = [0; 4096];
+    while reply.len() < 64 * 1024 {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "legacy daemon handshake timed out")
+            })?;
+        stream.set_read_timeout(Some(remaining))?;
+        let limit = (64 * 1024 - reply.len()).min(buffer.len());
+        let count = stream.read(&mut buffer[..limit])?;
+        if count == 0 {
+            break;
+        }
+        if let Some(end) = buffer[..count].iter().position(|byte| *byte == b'\n') {
+            reply.extend_from_slice(&buffer[..=end]);
+            break;
+        }
+        reply.extend_from_slice(&buffer[..count]);
+    }
+    let response: serde_json::Value = serde_json::from_slice(&reply)?;
+    Ok(response["id"] == 1
+        && response["result"]["serverInfo"]["name"] == "codesage"
+        && response["result"]["serverInfo"]["version"] == version)
+}
+
 pub(super) fn socket_may_be_live(path: &Path) -> bool {
     match connect(path) {
         Ok(_) => true,

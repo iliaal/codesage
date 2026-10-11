@@ -342,31 +342,41 @@ mod unix {
             println!("stopped daemon (pid {})", pid);
             return Ok(());
         }
-        // SAFETY: kill is async-signal-safe.
-        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            bail!("failed to SIGTERM pid {}: {}", pid, err);
+        #[cfg(target_os = "linux")]
+        {
+            tokio::task::spawn_blocking(move || {
+                let handle = signal_legacy_daemon(&paths, pid_record)?;
+                let timeout = rustix::event::Timespec {
+                    tv_sec: 10,
+                    tv_nsec: 0,
+                };
+                let mut poll = [rustix::event::PollFd::new(
+                    &handle,
+                    rustix::event::PollFlags::IN,
+                )];
+                if rustix::event::poll(&mut poll, Some(&timeout))? == 0 {
+                    bail!("daemon (pid {pid}) did not exit within 10s of SIGTERM");
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            println!("stopped daemon (pid {})", pid);
+            Ok(())
         }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if !pid_alive(pid) {
-                println!("stopped daemon (pid {})", pid);
-                return Ok(());
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        bail!(
-            "daemon (pid {}) did not exit within 10s of SIGTERM; \
-             send SIGKILL manually if needed",
-            pid
-        )
+        #[cfg(not(target_os = "linux"))]
+        bail!("legacy daemon identity cannot be authenticated")
     }
 
     pub(crate) async fn run_daemon(runtime_dir: Option<PathBuf>) -> Result<()> {
         let paths = DaemonPaths::for_current_exe(runtime_dir)?;
         prepare_runtime_dir(&paths.runtime_dir)?;
 
+        if super::control::socket_may_be_live(&paths.control) {
+            bail!(
+                "codesage MCP daemon control endpoint is already listening at {}",
+                paths.control.display()
+            );
+        }
         if UnixStream::connect(&paths.socket).await.is_ok() {
             bail!(
                 "codesage MCP daemon is already listening at {}",
@@ -1206,18 +1216,11 @@ mod unix {
                         }
                         continue;
                     }
-                    // SAFETY: kill is async-signal-safe.
-                    let rc = unsafe { libc::kill(record.pid, libc::SIGTERM) };
-                    if rc == 0 {
-                        tracing::info!(
-                            stale_pid = record.pid,
-                            pidfile = %sibling.display(),
-                            "reaped stale-version codesage daemon to reclaim its model memory"
-                        );
-                    } else {
+                    #[cfg(target_os = "linux")]
+                    if let Err(error) = signal_legacy_daemon(&sibling_paths, record) {
                         tracing::warn!(
                             stale_pid = record.pid,
-                            error = %io::Error::last_os_error(),
+                            %error,
                             "failed to SIGTERM stale-version codesage daemon"
                         );
                     }
@@ -1276,11 +1279,7 @@ mod unix {
         }
         #[cfg(target_os = "linux")]
         {
-            if let Some(expected_start) = record.start_time_ticks {
-                return process_start_time_ticks(record.pid) == Some(expected_start)
-                    && legacy_pid_looks_like_daemon(record.pid, paths);
-            }
-            legacy_pid_looks_like_daemon(record.pid, paths)
+            legacy_daemon_handle(paths, record).is_some()
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1301,24 +1300,46 @@ mod unix {
     }
 
     #[cfg(target_os = "linux")]
-    fn legacy_pid_looks_like_daemon(pid: i32, paths: &DaemonPaths) -> bool {
-        let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
-            return false;
-        };
-        let args: Vec<String> = cmdline
-            .split(|b| *b == 0)
-            .filter(|part| !part.is_empty())
-            .map(|part| String::from_utf8_lossy(part).into_owned())
-            .collect();
-        if !args.iter().any(|arg| arg == "daemon") {
-            return false;
+    fn legacy_daemon_handle(paths: &DaemonPaths, record: DaemonPid) -> Option<rustix::fd::OwnedFd> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        if super::control::socket_may_be_live(&paths.control) {
+            return None;
         }
-        args.windows(2).any(|pair| {
-            pair[0] == "--runtime-dir" && Path::new(pair[1].as_str()) == paths.runtime_dir.as_path()
-        }) || args.iter().any(|arg| {
-            arg.strip_prefix("--runtime-dir=")
-                .is_some_and(|dir| Path::new(dir) == paths.runtime_dir.as_path())
-        })
+        let pid = rustix::process::Pid::from_raw(record.pid)?;
+        let handle = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()?;
+        if record
+            .start_time_ticks
+            .is_some_and(|expected| process_start_time_ticks(record.pid) != Some(expected))
+        {
+            return None;
+        }
+        let key = paths.pid.file_stem()?.to_str()?.strip_prefix("mcp-")?;
+        let (version, _) = key.rsplit_once('-')?;
+        let proc_exe = PathBuf::from(format!("/proc/{}/exe", record.pid));
+        let exe = fs::read_link(&proc_exe).ok()?;
+        let metadata = fs::metadata(&proc_exe).ok()?;
+        let mut matches = daemon_key_from_metadata(&exe, &metadata, version) == key;
+        // A replaced installation remains accessible through /proc while its old inode is running.
+        if !matches && let Some(original) = exe.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+            let original = PathBuf::from(OsString::from_vec(original.to_vec()));
+            matches = daemon_key_from_metadata(&original, &metadata, version) == key;
+        }
+        if !matches
+            || !super::control::legacy_peer_matches(&paths.socket, record.pid, version).ok()?
+        {
+            return None;
+        }
+        Some(handle)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn signal_legacy_daemon(paths: &DaemonPaths, record: DaemonPid) -> Result<rustix::fd::OwnedFd> {
+        let handle = legacy_daemon_handle(paths, record)
+            .context("legacy daemon identity changed or could not be authenticated")?;
+        rustix::process::pidfd_send_signal(&handle, rustix::process::Signal::TERM)
+            .context("sending SIGTERM to authenticated legacy daemon")?;
+        Ok(handle)
     }
 
     /// Exit status for a finished stdio-proxy direction: a copy error means
@@ -1501,8 +1522,15 @@ mod unix {
         }
 
         // A rebuild changes the executable key; still find the previous build for status/stop.
-        for dir in valid_dirs {
+        for dir in &valid_dirs {
             if let Some(paths) = scan_live_daemon(dir) {
+                return Ok(paths);
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        for dir in valid_dirs {
+            if let Some(paths) = scan_unverified_legacy_daemon(dir) {
                 return Ok(paths);
             }
         }
@@ -1559,26 +1587,49 @@ mod unix {
         newest.map(|(_, paths)| paths)
     }
 
+    #[cfg(any(test, not(target_os = "linux")))]
+    fn scan_unverified_legacy_daemon(dir: &Path) -> Option<DaemonPaths> {
+        for entry in fs::read_dir(dir).ok()?.flatten() {
+            let Some(paths) = paths_from_pid_file(&entry.path()) else {
+                continue;
+            };
+            let Some(record) = read_daemon_pid_file(&paths.pid) else {
+                continue;
+            };
+            if record.control_nonce.is_none()
+                && pid_alive(record.pid)
+                && super::control::socket_may_be_live(&paths.socket)
+            {
+                return Some(paths);
+            }
+        }
+        None
+    }
+
     fn daemon_key_for_exe(exe: &Path) -> Result<String> {
         let meta = fs::metadata(exe).with_context(|| format!("reading {}", exe.display()))?;
+        Ok(daemon_key_from_metadata(
+            exe,
+            &meta,
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
+    fn daemon_key_from_metadata(exe: &Path, meta: &fs::Metadata, version: &str) -> String {
         let modified = meta
             .modified()
             .unwrap_or(SystemTime::UNIX_EPOCH)
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let mut hasher = Fnv64::new();
-        hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+        hasher.update(version.as_bytes());
         hasher.update(exe.to_string_lossy().as_bytes());
         hasher.update(&meta.dev().to_le_bytes());
         hasher.update(&meta.ino().to_le_bytes());
         hasher.update(&meta.len().to_le_bytes());
         hasher.update(&modified.as_secs().to_le_bytes());
         hasher.update(&modified.subsec_nanos().to_le_bytes());
-        Ok(format!(
-            "{}-{:016x}",
-            env!("CARGO_PKG_VERSION"),
-            hasher.finish()
-        ))
+        format!("{}-{:016x}", version, hasher.finish())
     }
 
     /// FNV-1a keeps runtime keys deterministic across toolchains, unlike DefaultHasher.
@@ -1819,6 +1870,19 @@ mod unix {
             fs::write(&pid_file, std::process::id().to_string()).unwrap();
 
             assert!(scan_live_daemon(dir.path()).is_none());
+        }
+
+        #[test]
+        fn legacy_discovery_retains_reachable_unverified_records_for_a_manual_notice() {
+            let dir = tempfile::tempdir().unwrap();
+            let pid_file = dir.path().join("mcp-0.0.1-legacy.pid");
+            fs::write(&pid_file, std::process::id().to_string()).unwrap();
+            let listener =
+                std::os::unix::net::UnixListener::bind(pid_file.with_extension("sock")).unwrap();
+            let found = scan_unverified_legacy_daemon(dir.path()).unwrap();
+            assert_eq!(found.pid, pid_file);
+            drop(listener);
+            assert!(scan_unverified_legacy_daemon(dir.path()).is_none());
         }
 
         #[test]

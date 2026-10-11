@@ -19,11 +19,26 @@ impl Drop for Process {
 }
 
 fn command(runtime: &Path, action: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_codesage"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codesage"))
         .args(["daemon", action, "--runtime-dir"])
         .arg(runtime)
-        .output()
-        .unwrap()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("daemon {action} exceeded its process-test deadline: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn daemon(runtime: &Path) -> (Process, PathBuf) {
@@ -222,6 +237,7 @@ fn daemon_stop_preserves_linux_legacy_start_time_validation() {
     let runtime = tempfile::tempdir_in("/tmp").unwrap();
     let (mut daemon, pid_file) = daemon(runtime.path());
     let original = fs::read_to_string(&pid_file).unwrap();
+    fs::remove_file(pid_file.with_extension("ctl")).unwrap();
     let start = original
         .lines()
         .find_map(|line| line.strip_prefix("start_time_ticks="))
@@ -252,4 +268,173 @@ fn daemon_stop_preserves_linux_legacy_start_time_validation() {
         "{output:?}"
     );
     assert!(waiter.join().unwrap().success());
+}
+
+#[test]
+fn daemon_start_preserves_live_control_when_mcp_socket_is_missing() {
+    use std::os::unix::fs::MetadataExt;
+
+    let runtime = tempfile::tempdir_in("/tmp").unwrap();
+    let (mut first, pid_file) = daemon(runtime.path());
+    let record = fs::read_to_string(&pid_file).unwrap();
+    let control = pid_file.with_extension("ctl");
+    let inode = fs::metadata(&control).unwrap().ino();
+    fs::remove_file(pid_file.with_extension("sock")).unwrap();
+    let output = command(runtime.path(), "run");
+    assert!(
+        !output.status.success(),
+        "second daemon replaced live control endpoint: {output:?}"
+    );
+    assert_eq!(fs::metadata(&control).unwrap().ino(), inode);
+    assert_eq!(fs::read_to_string(&pid_file).unwrap(), record);
+    assert!(first.0.try_wait().unwrap().is_none());
+    let output = command(runtime.path(), "stop");
+    assert!(
+        output.status.success(),
+        "original daemon lost its shutdown endpoint: {output:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("stopped daemon"));
+    assert!(first.0.wait().unwrap().success());
+}
+
+#[test]
+fn daemon_stop_rejects_nonce_stripping_from_a_current_daemon() {
+    let runtime = tempfile::tempdir_in("/tmp").unwrap();
+    let (mut daemon, pid_file) = daemon(runtime.path());
+    let original = fs::read_to_string(&pid_file).unwrap();
+    let stripped = original
+        .lines()
+        .filter(|line| !line.starts_with("control_nonce="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&pid_file, stripped).unwrap();
+    let output = command(runtime.path(), "stop");
+    assert!(
+        daemon.0.try_wait().unwrap().is_none(),
+        "removing the nonce downgraded current-daemon authorization"
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(!command(runtime.path(), "status").status.success());
+    fs::write(&pid_file, original).unwrap();
+    assert!(command(runtime.path(), "stop").status.success());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn daemon_stop_rejects_spoofed_daemon_argv_and_correct_start_time() {
+    let runtime = tempfile::tempdir_in("/tmp").unwrap();
+    let (mut daemon, pid_file) = daemon(runtime.path());
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    for extension in ["sock", "ctl"] {
+        fs::remove_file(pid_file.with_extension(extension)).unwrap();
+    }
+    let mut sentinel = Process(
+        Command::new("python3")
+            .args([
+                "-c",
+                "import time; time.sleep(60)",
+                "daemon",
+                "--runtime-dir",
+            ])
+            .arg(runtime.path())
+            .spawn()
+            .unwrap(),
+    );
+    let stat = fs::read_to_string(format!("/proc/{}/stat", sentinel.0.id())).unwrap();
+    let start = stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap();
+    fs::write(
+        &pid_file,
+        format!("pid={}\nstart_time_ticks={start}\n", sentinel.0.id()),
+    )
+    .unwrap();
+    let output = command(runtime.path(), "stop");
+    assert!(
+        sentinel.0.try_wait().unwrap().is_none(),
+        "spoofed daemon argv authorized a signal to Python"
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(!command(runtime.path(), "status").status.success());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn daemon_stop_requires_the_legacy_socket_to_belong_to_the_recorded_process() {
+    let runtime = tempfile::tempdir_in("/tmp").unwrap();
+    let (mut daemon, pid_file) = daemon(runtime.path());
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    for extension in ["sock", "ctl"] {
+        fs::remove_file(pid_file.with_extension(extension)).unwrap();
+    }
+    let _listener = UnixListener::bind(pid_file.with_extension("sock")).unwrap();
+    let mut sentinel = Process(
+        Command::new(env!("CARGO_BIN_EXE_codesage"))
+            .args(["mcp", "--direct"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let stat = fs::read_to_string(format!("/proc/{}/stat", sentinel.0.id())).unwrap();
+    let start = stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap();
+    fs::write(
+        &pid_file,
+        format!("pid={}\nstart_time_ticks={start}\n", sentinel.0.id()),
+    )
+    .unwrap();
+    let output = command(runtime.path(), "stop");
+    assert!(
+        sentinel.0.try_wait().unwrap().is_none(),
+        "a matching executable authorized signalling the wrong socket owner"
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(!command(runtime.path(), "status").status.success());
+}
+
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn daemon_stop_reports_unverified_legacy_daemon_after_executable_key_changes() {
+    let runtime = tempfile::tempdir_in("/tmp").unwrap();
+    let (mut daemon, pid_file) = daemon(runtime.path());
+    let original = fs::read_to_string(&pid_file).unwrap();
+    let legacy_pid = runtime.path().join("mcp-0.0.1-legacy.pid");
+    fs::write(&legacy_pid, format!("{}\n", daemon.0.id())).unwrap();
+    fs::remove_file(&pid_file).unwrap();
+    fs::rename(
+        pid_file.with_extension("sock"),
+        legacy_pid.with_extension("sock"),
+    )
+    .unwrap();
+    let output = command(runtime.path(), "stop");
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("legacy daemon identity cannot be authenticated"),
+        "{output:?}"
+    );
+    assert!(daemon.0.try_wait().unwrap().is_none());
+    assert!(legacy_pid.with_extension("sock").exists());
+    assert!(!command(runtime.path(), "status").status.success());
+    fs::rename(
+        legacy_pid.with_extension("sock"),
+        pid_file.with_extension("sock"),
+    )
+    .unwrap();
+    fs::remove_file(legacy_pid).unwrap();
+    fs::write(pid_file, original).unwrap();
+    assert!(command(runtime.path(), "stop").status.success());
 }
