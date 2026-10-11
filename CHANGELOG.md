@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- The MCP usage scorecard reports zero directory or reference compression savings when no rows are grouped.
+
 ## [0.42.0] - 2026-10-11
 
 ### Added
