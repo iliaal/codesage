@@ -2195,6 +2195,7 @@ mod context_export_tests {
 
     fn visible(name: &str, file: &str, visibility: Option<Visibility>) -> Symbol {
         Symbol {
+            kind: SymbolKind::Function,
             visibility,
             ..symbol(name, name, file)
         }
