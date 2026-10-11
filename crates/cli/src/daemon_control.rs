@@ -83,7 +83,7 @@ pub(super) fn request(
     stream.write_all(&message)?;
     let mut response = [0];
     stream.read_exact(&mut response)?;
-    if response != [b'+'] {
+    if response != *b"+" {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "daemon identity mismatch",
