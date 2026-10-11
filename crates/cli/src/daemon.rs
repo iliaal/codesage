@@ -1874,6 +1874,26 @@ mod unix {
 
         #[test]
         fn legacy_discovery_retains_reachable_unverified_records_for_a_manual_notice() {
+            const CHILD: &str = "CODESAGE_TEST_ISOLATED_LEGACY_DISCOVERY";
+            if std::env::var_os(CHILD).is_none() {
+                // Concurrent test forks can retain the listener until exec, past its parent's drop.
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "daemon::unix::tests::legacy_discovery_retains_reachable_unverified_records_for_a_manual_notice",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, "1")
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "isolated discovery test failed: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
             let dir = tempfile::tempdir().unwrap();
             let pid_file = dir.path().join("mcp-0.0.1-legacy.pid");
             fs::write(&pid_file, std::process::id().to_string()).unwrap();
