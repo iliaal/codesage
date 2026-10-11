@@ -343,7 +343,7 @@ PYEOF
 	grep -Fq 'Claude Code plugin refresh failed; release not pushed.' "${tmp}/release-script-claude-refresh-failure.out"
 
 	local daemon_calls daemon_failure expected_calls actual_calls daemon_status scenario
-	local target_version installed_version mcp_mode expected_error install_before install_after
+	local target_version installed_version mcp_mode expected_error install_before install_after old_install_fd old_install_path
 	daemon_calls="${tmp}/daemon-calls"
 	mkdir -p target/release
 	cat >target/release/codesage <<'EOF'
@@ -448,6 +448,7 @@ EOF
 			;;
 		esac
 		install_before="$(sha256sum "${fake_bin}/codesage")"
+		exec {old_install_fd}<"${fake_bin}/codesage"
 		: >"${daemon_calls}"
 		daemon_status=0
 		printf 'n\n' | FAIL_DAEMON_COMMAND="${daemon_failure}" DAEMON_CALLS_FILE="${daemon_calls}" \
@@ -489,7 +490,20 @@ EOF
 		if [[ "${scenario}" == stale-target ]]; then
 			install_after="$(sha256sum "${fake_bin}/codesage")"
 			[[ "${install_after}" == "${install_before}" ]]
+		else
+			old_install_path="$(readlink "/proc/$$/fd/${old_install_fd}")"
+			if [[ "${old_install_path}" != "${fake_bin}/codesage (deleted)" ]]; then
+				printf 'release replacement changed the retired executable pathname: %s\n' "${old_install_path}" >&2
+				return 1
+			fi
+			if [[ "${scenario}" == wrong-install ]]; then
+				install_after="$(sha256sum "${fake_bin}/codesage.old-pre-1.2.4")"
+				[[ "${install_after%% *}" == "${install_before%% *}" ]]
+			else
+				[[ ! -e "${fake_bin}/codesage.old-pre-1.2.4" ]]
+			fi
 		fi
+		exec {old_install_fd}<&-
 	done
 	cd "$repo_root"
 }

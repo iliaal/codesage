@@ -12,6 +12,7 @@
 ### Fixed
 
 - Call paths, impact, and test reachability exclude unrelated language namesakes and C calls attributed to C++ methods while retaining C/C++ and JavaScript/TypeScript interoperability.
+- Local release installation preserves executable identity so Linux daemons from older versions stop successfully during upgrade.
 
 ### Security
 

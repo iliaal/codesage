@@ -291,8 +291,13 @@ if [[ -n "$local_install" && -w "$local_install" ]]; then
 		backup="${local_install}.old-pre-${VERSION}"
 		echo
 		echo "Refreshing local install at $local_install ..."
-		mv "$local_install" "$backup"
-		cp target/release/codesage "$local_install"
+		# Legacy daemon identity includes the running executable's original pathname.
+		cp -p "${local_install}" "${backup}"
+		staged_install="$(mktemp "${local_install}.new.XXXXXX")"
+		if ! { cp -p target/release/codesage "${staged_install}" && mv -f "${staged_install}" "${local_install}"; }; then
+			rm -f "${staged_install}"
+			die "could not replace the installed binary; original install is at ${backup}"
+		fi
 		installed_version="$("$local_install" --version)" ||
 			die "could not check the installed binary version; original install is at ${backup}"
 		installed_version="${installed_version%%$'\n'*}"
