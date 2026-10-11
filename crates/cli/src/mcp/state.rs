@@ -281,6 +281,7 @@ pub(crate) struct CodeSageServerState {
     pub(super) diagnostics: super::diagnostics::Diagnostics,
     pub(super) work: super::work::WorkCoordinator,
     pub(super) overview_cache: super::overview_cache::OverviewCache,
+    pub(super) overlay_cache: super::overlay::OverlayCache,
     pub(super) overview_cache_enabled: bool,
     /// Per-project drift and semantic coverage behind the response envelope's
     /// `index` block, recomputed at most once per generation or TTL.
@@ -648,6 +649,7 @@ impl CodeSageServerState {
             work: super::work::WorkCoordinator::new(super::work::WorkLimits::default())
                 .expect("built-in work limits are valid"),
             overview_cache: super::overview_cache::OverviewCache::default(),
+            overlay_cache: super::overlay::OverlayCache::default(),
             overview_cache_enabled: std::env::var("CODESAGE_OVERVIEW_CACHE").as_deref() != Ok("0"),
             index_facts: super::envelope::IndexFactsCache::default(),
             envelope_enabled: super::envelope::enabled_from(
@@ -1060,12 +1062,12 @@ impl CodeSageServer {
     }
 
     pub(super) fn open_structural_db_for(&self, state: &ProjectState) -> Result<Database> {
-        Database::open_existing(&state.db_path)
+        Database::open_read_only(&state.db_path)
     }
 
     fn open_context_db_for(&self, state: &ProjectState) -> Result<Database> {
         let config = self.semantic_embedding_config(state)?;
-        Database::open_for_existing_model(&state.db_path, &config.model)
+        Database::open_read_only_for_existing_model(&state.db_path, &config.model)
     }
 
     // Real-binary integration tests cannot use cfg(test) fakes. Honor seeded vectors only
@@ -1210,6 +1212,22 @@ impl CodeSageServer {
     {
         let state = self.resolve_project(project)?;
         let db = self.open_structural_db_for(&state)?;
+        let _snapshot = db.read_snapshot()?;
+        let root = state
+            .db_path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("could not derive project root from db path"))?;
+        self.prepare_overlay(root, &db)?;
+        f(&db)
+    }
+
+    pub(super) fn with_indexed_project_db<F, R>(&self, project: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&Database) -> Result<R>,
+    {
+        let state = self.resolve_project_read_only(project)?;
+        let db = self.open_structural_db_for(&state)?;
         f(&db)
     }
 
@@ -1225,6 +1243,8 @@ impl CodeSageServer {
             .parent()
             .and_then(|p| p.parent())
             .ok_or_else(|| anyhow::anyhow!("could not derive project root from db path"))?;
+        let _snapshot = db.read_snapshot()?;
+        self.prepare_overlay(root, &db)?;
         f(root, &db)
     }
 
@@ -1234,6 +1254,13 @@ impl CodeSageServer {
     {
         let state = self.resolve_project(project)?;
         let db = self.open_context_db_for(&state)?;
+        let _snapshot = db.read_snapshot()?;
+        let root = state
+            .db_path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("could not derive project root from db path"))?;
+        self.prepare_overlay(root, &db)?;
         f(&db)
     }
 
@@ -1365,6 +1392,7 @@ impl CodeSageServer {
     where
         F: FnOnce(&Database, &[f32], Option<codesage_graph::RerankFn<'_>>) -> Result<R>,
     {
+        super::overlay::clear();
         let state = self.resolve_project(project)?;
         state.model_authorization().scope(|| {
             self.maybe_start_watcher(&state, true);

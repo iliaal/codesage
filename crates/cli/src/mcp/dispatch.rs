@@ -523,8 +523,10 @@ impl CodeSageServer {
         hooks.reached(SnapshotStage::BeforePin);
         let _snapshot = db.read_snapshot()?;
         hooks.reached(SnapshotStage::AfterPin);
+        let overlay = self.prepare_overlay(root, &db)?;
         let after = self.snapshot_generation(root, &path, &request.control)?;
-        let changed = !cached.stable
+        let changed = overlay
+            || !cached.stable
             || before.as_ref() != Some(&cached.generation)
             || before != after
             || !db.path_still_matches_open_file(&state.db_path)?;
@@ -1088,6 +1090,7 @@ impl CodeSageServer {
         request.control.set_work_lease(Arc::downgrade(&erased));
         drop(erased);
         tokio::task::spawn_blocking(move || {
+            let _overlay_scope = super::overlay::ReportScope::enter();
             let _scope = request.control.enter();
             let _request_scope = BlockingRequestScope::enter(request.clone());
             let phase = if request.class == WorkClass::Native {

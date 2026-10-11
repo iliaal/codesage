@@ -250,9 +250,9 @@ fn file_stat(_: &std::fs::Metadata) -> Option<FileStat> {
     None
 }
 
-type HashObservation = (String, Option<CachedFileHash>, bool, u64);
+pub type HashObservation = (String, Option<CachedFileHash>, bool, u64);
 
-fn hash_indexable_file(
+pub fn hash_indexable_file(
     root: &Path,
     relative: &Path,
     cached: Option<&CachedFileHash>,

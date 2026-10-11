@@ -33,6 +33,21 @@ struct TypeInfo {
 }
 
 impl JavaTypeContext {
+    pub fn from_sources(sources: &[(&str, &[u8])]) -> Result<Self> {
+        ensure!(
+            sources.len() < 50_000,
+            "Java declaration discovery reached its 50000-file limit"
+        );
+        let mut context = Self::default();
+        for (path, source) in sources {
+            std::str::from_utf8(source)
+                .with_context(|| format!("Java source is not UTF-8: {path}"))?;
+            let parsed = parse_file_tolerant(source, Language::Java)?;
+            context.insert(path, &parsed.tree, source);
+        }
+        Ok(context)
+    }
+
     pub fn from_files(root: &Path, paths: &[String]) -> Result<Self> {
         ensure!(
             paths.len() < 50_000,

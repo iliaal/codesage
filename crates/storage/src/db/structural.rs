@@ -474,6 +474,9 @@ impl Database {
     }
 
     pub fn fingerprint_cache_key(&self) -> Option<String> {
+        if self.has_structural_overlay().unwrap_or(true) {
+            return None;
+        }
         self.conn
             .path()
             .filter(|p| !p.is_empty())

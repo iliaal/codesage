@@ -1892,6 +1892,10 @@ pub struct SessionSnapshot {
     pub created_at: i64,
     pub file_count: u32,
     pub symbol_count: u32,
+    /// Indexed paths replaced with current working-tree structural facts.
+    /// Git history retains its indexed window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structural_overlay_paths: Vec<String>,
     /// Sorted full list of indexed file paths. Required to detect new /
     /// removed files in the diff. On a 10k-file repo this serializes to
     /// ~500 KB; sessions GC is deferred to a follow-up.

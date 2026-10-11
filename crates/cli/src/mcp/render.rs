@@ -8,7 +8,7 @@ use super::CodeSageServer;
 impl CodeSageServer {
     /// Scale bundle budgets by indexed file count; failed counts use the mid-tier default.
     pub(super) fn bundle_budget_chars(&self, project: &str) -> usize {
-        let tokens = match self.with_project_db(project, |db| db.file_count()) {
+        let tokens = match self.with_indexed_project_db(project, |db| db.file_count()) {
             Ok(count) => mcp_bundle_token_budget(count),
             Err(_) => mcp_bundle_token_budget(1000),
         };
@@ -31,10 +31,14 @@ impl CodeSageServer {
         r: Result<T>,
         kind: &str,
     ) -> CallToolResult {
-        super::next::annotate(
-            project,
-            kind,
-            self.annotate_staleness_mode(project, render_with_kind(r, kind), true),
+        let overlay = super::overlay::current();
+        super::overlay::annotate(
+            super::next::annotate(
+                project,
+                kind,
+                self.annotate_staleness_mode(project, render_with_kind(r, kind), true),
+            ),
+            overlay,
         )
     }
 
@@ -46,13 +50,17 @@ impl CodeSageServer {
         kind: &str,
         allow_coverage: bool,
     ) -> CallToolResult {
+        let overlay = super::overlay::current();
         let rendered = render_with_kind(r, kind);
         let covered = if allow_coverage {
             self.annotate_coverage(project, kind, rendered)
         } else {
             rendered
         };
-        super::next::annotate(project, kind, self.annotate_staleness(project, covered))
+        super::overlay::annotate(
+            super::next::annotate(project, kind, self.annotate_staleness(project, covered)),
+            overlay,
+        )
     }
 
     /// [`Self::render`] with an explicit char budget (context-bundle tools).
@@ -63,10 +71,14 @@ impl CodeSageServer {
         kind: &str,
         budget_chars: usize,
     ) -> CallToolResult {
-        super::next::annotate(
-            project,
-            kind,
-            self.annotate_staleness(project, render_with_budget(r, kind, budget_chars)),
+        let overlay = super::overlay::current();
+        super::overlay::annotate(
+            super::next::annotate(
+                project,
+                kind,
+                self.annotate_staleness(project, render_with_budget(r, kind, budget_chars)),
+            ),
+            overlay,
         )
     }
 
@@ -101,7 +113,8 @@ impl CodeSageServer {
         }) {
             return result;
         }
-        let counts = match self.with_project_db(project, |db| db.file_counts_by_language()) {
+        let counts = match self.with_indexed_project_db(project, |db| db.file_counts_by_language())
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::debug!(error = %e, "coverage annotation skipped");
@@ -116,7 +129,7 @@ impl CodeSageServer {
                 if model.is_empty() {
                     return None;
                 }
-                self.with_project_db(project, |db| db.semantic_file_count_for_model(&model))
+                self.with_indexed_project_db(project, |db| db.semantic_file_count_for_model(&model))
                     .ok()
             })
         } else {
@@ -179,6 +192,11 @@ impl CodeSageServer {
         mut result: CallToolResult,
         read_only: bool,
     ) -> CallToolResult {
+        if super::overlay::current()
+            .is_some_and(|report| report.state == codesage_graph::overlay::OverlayState::Overlay)
+        {
+            return result;
+        }
         if result.is_error == Some(true) || !staleness_enabled() {
             return result;
         }

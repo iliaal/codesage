@@ -57,11 +57,19 @@ const SEEDS: [u64; MINHASH_K] = {
     s
 };
 
-fn collect_preorder(root: &Node, kinds: &mut Vec<u16>, leaves: &mut usize) {
+fn collect_preorder(
+    root: &Node,
+    kinds: &mut Vec<u16>,
+    leaves: &mut usize,
+    control: Option<&codesage_protocol::work::WorkControl>,
+) -> Option<()> {
     // Heap traversal avoids overflowing rayon worker stacks on deep ASTs.
     // Reverse child insertion preserves the pre-order trigram sequence.
     let mut stack: Vec<Node> = vec![*root];
     while let Some(node) = stack.pop() {
+        if kinds.len().is_multiple_of(1024) {
+            control.map_or(Ok(()), |control| control.check()).ok()?;
+        }
         kinds.push(node.kind_id());
         let mut cursor = node.walk();
         let children: Vec<Node> = node.children(&mut cursor).collect();
@@ -71,12 +79,19 @@ fn collect_preorder(root: &Node, kinds: &mut Vec<u16>, leaves: &mut usize) {
             stack.extend(children.into_iter().rev());
         }
     }
+    Some(())
 }
 
 /// MinHash of a pre-order node-kind sequence, hashing consecutive trigrams.
-fn minhash(kinds: &[u16]) -> Fingerprint {
+fn minhash(
+    kinds: &[u16],
+    control: Option<&codesage_protocol::work::WorkControl>,
+) -> Option<Fingerprint> {
     let mut mins = [u64::MAX; MINHASH_K];
-    for w in kinds.windows(3) {
+    for (n, w) in kinds.windows(3).enumerate() {
+        if n.is_multiple_of(256) {
+            control.map_or(Ok(()), |control| control.check()).ok()?;
+        }
         let v = ((w[0] as u64) << 32) | ((w[1] as u64) << 16) | (w[2] as u64);
         for i in 0..MINHASH_K {
             let h = splitmix64(v ^ SEEDS[i]);
@@ -85,19 +100,26 @@ fn minhash(kinds: &[u16]) -> Fingerprint {
             }
         }
     }
-    mins
+    Some(mins)
 }
 
 /// Fingerprint a single definition subtree. `None` when the body is too small
 /// to fingerprint reliably (see [`MIN_LEAF_NODES`]).
 pub fn fingerprint_def(def: &Node) -> Option<(Fingerprint, usize)> {
+    fingerprint_def_with_control(def, None)
+}
+
+fn fingerprint_def_with_control(
+    def: &Node,
+    control: Option<&codesage_protocol::work::WorkControl>,
+) -> Option<(Fingerprint, usize)> {
     let mut kinds = Vec::new();
     let mut leaves = 0usize;
-    collect_preorder(def, &mut kinds, &mut leaves);
+    collect_preorder(def, &mut kinds, &mut leaves, control)?;
     if leaves < MIN_LEAF_NODES || kinds.len() < 3 {
         return None;
     }
-    Some((minhash(&kinds), leaves))
+    Some((minhash(&kinds, control)?, leaves))
 }
 
 /// Fingerprint every function/method definition in a parsed file. Reuses the
@@ -108,18 +130,54 @@ pub fn file_fingerprints(
     source: &[u8],
     language: Language,
 ) -> Vec<FunctionFingerprint> {
+    file_fingerprints_with_control(tree, source, language, None)
+}
+
+pub fn file_fingerprints_cancellable(
+    tree: &Tree,
+    source: &[u8],
+    language: Language,
+) -> anyhow::Result<Vec<FunctionFingerprint>> {
+    let control = codesage_protocol::work::current();
+    codesage_protocol::work::checkpoint()?;
+    let result = file_fingerprints_with_control(tree, source, language, control.as_ref());
+    codesage_protocol::work::checkpoint()?;
+    Ok(result)
+}
+
+fn file_fingerprints_with_control(
+    tree: &Tree,
+    source: &[u8],
+    language: Language,
+    control: Option<&codesage_protocol::work::WorkControl>,
+) -> Vec<FunctionFingerprint> {
     let spec = crate::extract::symbol_query_for(language);
     let kind_map = crate::extract::kind_map_for(language);
 
     let root = tree.root_node();
     let dead = crate::preproc::DeadRegions::scan(root, source, language);
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&spec.query, root, source);
+    let mut progress = |_: &tree_sitter::QueryCursorState| {
+        if control.is_some_and(|control| control.check().is_err()) {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let mut matches = cursor.matches_with_options(
+        &spec.query,
+        root,
+        source,
+        tree_sitter::QueryCursorOptions::new().progress_callback(&mut progress),
+    );
 
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
     while let Some(m) = matches.next() {
+        if control.is_some_and(|control| control.check().is_err()) {
+            break;
+        }
         let Some(kind) = kind_map(m.pattern_index) else {
             continue;
         };
@@ -153,7 +211,7 @@ pub fn file_fingerprints(
         if seen.contains(&key) {
             continue;
         }
-        let Some((fp, leaves)) = fingerprint_def(&def) else {
+        let Some((fp, leaves)) = fingerprint_def_with_control(&def, control) else {
             continue;
         };
         seen.insert(key);

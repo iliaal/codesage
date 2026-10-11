@@ -784,6 +784,9 @@ impl Database {
     }
 
     pub fn chunks_for_file(&self, file_path: &str) -> Result<Vec<RawSearchRow>> {
+        if let Some(chunks) = self.overlay_source_chunks(file_path)? {
+            return Ok(chunks);
+        }
         if self.chunk_table.is_empty() {
             return Ok(Vec::new());
         }

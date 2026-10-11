@@ -13,19 +13,19 @@ use rayon::prelude::*;
 
 use codesage_parser::discover::{DiscoveryReport, discover_files_report_with_cache};
 use codesage_parser::extract::{extract_symbols, file_is_test_by_syntax};
-use codesage_parser::fingerprint::{FunctionFingerprint, file_fingerprints};
+use codesage_parser::fingerprint::{FunctionFingerprint, file_fingerprints_cancellable};
 use codesage_parser::parse::{ParsedTree, parse_file_tolerant};
 use codesage_parser::references::extract_references;
 use codesage_parser::source::read_indexable_file;
 
 #[derive(Debug)]
-struct ParsedFile {
-    info: FileInfo,
-    symbols: Vec<Symbol>,
-    refs: Vec<Reference>,
-    python_bindings: PythonBindings,
-    fingerprints: Vec<FunctionFingerprint>,
-    boundaries: Vec<TrustBoundary>,
+pub(crate) struct ParsedFile {
+    pub(crate) info: FileInfo,
+    pub(crate) symbols: Vec<Symbol>,
+    pub(crate) refs: Vec<Reference>,
+    pub(crate) python_bindings: PythonBindings,
+    pub(crate) fingerprints: Vec<FunctionFingerprint>,
+    pub(crate) boundaries: Vec<TrustBoundary>,
     /// The tree carried `ERROR` / `MISSING` nodes; everything outside them
     /// was still extracted.
     degraded: bool,
@@ -39,16 +39,25 @@ fn parse_one(
     let snapshot = read_indexable_file(root, Path::new(&file_info.path))
         .with_context(|| format!("reading {}", file_info.path))?
         .with_context(|| format!("{} exceeds the indexable file size cap", file_info.path))?;
-    let source = snapshot.bytes;
-    let ParsedTree { tree, degraded } = parse_file_tolerant(&source, file_info.language)
+    let mut info = file_info.clone();
+    info.content_hash = snapshot.content_hash;
+    parse_source(&info, &snapshot.bytes, java_context)
+}
+
+pub(crate) fn parse_source(
+    file_info: &FileInfo,
+    source: &[u8],
+    java_context: &JavaTypeContext,
+) -> Result<ParsedFile> {
+    codesage_protocol::work::checkpoint()?;
+    let ParsedTree { tree, degraded } = parse_file_tolerant(source, file_info.language)
         .with_context(|| format!("parsing {}", file_info.path))?;
     // The discovery path heuristic and the parser's file-level verdict answer
     // the same question; either one makes the whole file test code, so the
     // stored `files.is_test` carries both rather than the path alone.
     let mut info = file_info.clone();
-    info.content_hash = snapshot.content_hash;
-    info.is_test |= file_is_test_by_syntax(&tree, &source, info.language);
-    let mut symbols = extract_symbols(&tree, &source, info.language, &info.path)
+    info.is_test |= file_is_test_by_syntax(&tree, source, info.language);
+    let mut symbols = extract_symbols(&tree, source, info.language, &info.path)
         .with_context(|| format!("extracting symbols from {}", info.path))?;
     // Every definition in a test file is test code; the parser's own marks
     // (cfg(test), @Test, describe(...)) add symbol-level detail on top.
@@ -57,24 +66,27 @@ fn parse_one(
             symbol.is_test = true;
         }
     }
-    let mut refs = extract_references(&tree, &source, info.language, &info.path)
+    codesage_protocol::work::checkpoint()?;
+    let mut refs = extract_references(&tree, source, info.language, &info.path)
         .with_context(|| format!("extracting references from {}", info.path))?;
     dedupe_refs(&mut refs);
-    populate_from_symbol(&symbols, &mut refs);
+    populate_from_symbol(&symbols, &mut refs)?;
     let python_bindings = if info.language == codesage_protocol::Language::Python {
-        codesage_parser::python_bindings::extract_python_bindings(&tree, &source, &refs, &symbols)
+        codesage_parser::python_bindings::extract_python_bindings(&tree, source, &refs, &symbols)
     } else {
         PythonBindings::default()
     };
-    let fingerprints = file_fingerprints(&tree, &source, info.language);
+    codesage_protocol::work::checkpoint()?;
+    let fingerprints = file_fingerprints_cancellable(&tree, source, info.language)?;
     let boundaries = derive_from_tree_with_context(
         &refs,
         info.language,
         &tree,
-        &source,
+        source,
         &info.path,
         java_context,
     );
+    codesage_protocol::work::checkpoint()?;
     Ok(ParsedFile {
         info,
         symbols,
@@ -92,7 +104,7 @@ fn dedupe_refs(refs: &mut Vec<Reference>) {
     refs.retain(|r| seen.insert((r.to_name.clone(), r.kind, r.line, r.col)));
 }
 
-fn fingerprint_inputs(p: &ParsedFile) -> Vec<FingerprintInput<'_>> {
+pub(crate) fn fingerprint_inputs(p: &ParsedFile) -> Vec<FingerprintInput<'_>> {
     p.fingerprints
         .iter()
         .map(|f| FingerprintInput {
@@ -107,11 +119,12 @@ fn fingerprint_inputs(p: &ParsedFile) -> Vec<FingerprintInput<'_>> {
 }
 
 /// Assign the innermost enclosing symbol; unowned references retain `None`.
-fn populate_from_symbol(symbols: &[Symbol], refs: &mut [Reference]) {
+fn populate_from_symbol(symbols: &[Symbol], refs: &mut [Reference]) -> Result<()> {
     if symbols.is_empty() {
-        return;
+        return Ok(());
     }
     for r in refs.iter_mut() {
+        codesage_protocol::work::checkpoint()?;
         let position = (r.line, r.col);
         let mut best: Option<&Symbol> = None;
         for s in symbols {
@@ -131,6 +144,7 @@ fn populate_from_symbol(symbols: &[Symbol], refs: &mut [Reference]) {
             r.from_symbol = Some(s.qualified_name.clone());
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

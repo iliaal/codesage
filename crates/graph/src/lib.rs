@@ -12,6 +12,7 @@ mod impact;
 mod import_graph;
 mod index;
 mod lookups;
+pub mod overlay;
 mod overview;
 mod python_bindings;
 mod rehearsal;

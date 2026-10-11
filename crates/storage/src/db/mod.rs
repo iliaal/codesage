@@ -23,12 +23,14 @@ mod features;
 mod git_authors;
 mod git_hist;
 mod hash_cache;
+mod overlay;
 mod semantic;
 mod structural;
 
 pub use git_hist::{
     CoChangeRow, CoChangeWrite, GitFileRow, ONE_OFF_RANK_MULTIPLIER, RECURRING_SPAN_SECS,
 };
+pub use overlay::StructuralOverlayFile;
 pub use semantic::{RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes};
 pub use structural::{FingerprintInput, ImportPairs, StoredFingerprint};
 
@@ -108,7 +110,7 @@ pub struct Database {
 }
 
 pub struct ReadSnapshot<'a> {
-    _transaction: rusqlite::Transaction<'a>,
+    _transaction: Option<rusqlite::Transaction<'a>>,
 }
 
 /// An unsupported VFS cannot attest that this connection still names its opened file.
@@ -712,15 +714,19 @@ impl Database {
             .query_row("PRAGMA data_version", [], |row| row.get(0))?)
     }
 
-    /// Pin all subsequent reads until the returned guard drops.
+    /// Pin reads until this guard drops, or reuse an existing transaction owned
+    /// by the caller. A nested guard does not extend that transaction's lifetime.
     pub fn read_snapshot(&self) -> Result<ReadSnapshot<'_>> {
         codesage_protocol::work::checkpoint()?;
+        if !self.conn.is_autocommit() {
+            return Ok(ReadSnapshot { _transaction: None });
+        }
         let transaction = self.conn.unchecked_transaction()?;
         transaction.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
             row.get::<_, i64>(0)
         })?;
         Ok(ReadSnapshot {
-            _transaction: transaction,
+            _transaction: Some(transaction),
         })
     }
 
@@ -797,6 +803,7 @@ impl Database {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(path, flags)?;
         install_work_control(&conn)?;
+        conn.execute_batch("PRAGMA temp_store = MEMORY")?;
         // Opening is lazy: probe before handing back a handle whose first WAL
         // read may fail because it cannot initialize the required sidecars.
         if let Err(error) = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {

@@ -574,6 +574,7 @@ pub fn extract_references(
     language: Language,
     file_path: &str,
 ) -> Result<Vec<Reference>> {
+    codesage_protocol::work::checkpoint()?;
     let kind_map = ref_kind_map_for(language);
     let spec = ref_query_for(language);
     let query = &spec.query;
@@ -582,7 +583,23 @@ pub fn extract_references(
     let root = tree.root_node();
     let dead = crate::preproc::DeadRegions::scan(root, source, language);
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(query, root, source);
+    let control = codesage_protocol::work::current();
+    let mut progress = |_: &tree_sitter::QueryCursorState| {
+        if control
+            .as_ref()
+            .is_some_and(|control| control.check().is_err())
+        {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let mut matches = cursor.matches_with_options(
+        query,
+        root,
+        source,
+        tree_sitter::QueryCursorOptions::new().progress_callback(&mut progress),
+    );
     let rhs_idx = spec.rhs_idx;
 
     // Receiver filtering needs all same-file import bindings before judging matches.
@@ -593,6 +610,7 @@ pub fn extract_references(
     }
     let mut pending = Vec::new();
     while let Some(m) = matches.next() {
+        codesage_protocol::work::checkpoint()?;
         let Some(ref_cap) = m.captures().iter().find(|c| c.index == name_idx) else {
             continue;
         };
@@ -636,6 +654,7 @@ pub fn extract_references(
 
     let mut refs = Vec::new();
     for p in &pending {
+        codesage_protocol::work::checkpoint()?;
         let Some(kind) = kind_map(p.pattern) else {
             continue;
         };
@@ -772,6 +791,7 @@ pub fn extract_references(
         });
     }
 
+    codesage_protocol::work::checkpoint()?;
     Ok(refs)
 }
 

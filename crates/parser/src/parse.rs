@@ -37,6 +37,7 @@ pub struct ParsedTree {
 /// load) is an error. C and C++ export macros are neutralized first
 /// (`export_macro.rs`).
 pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTree> {
+    codesage_protocol::work::checkpoint()?;
     let mut parser = Parser::new();
     parser.set_language(&ts_language(language))?;
     // Every extractor reads node text from the original `source`; the
@@ -47,9 +48,25 @@ pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTr
         Language::Cpp => crate::export_macro::neutralize(source),
         _ => None,
     };
-    let tree = parser
-        .parse(neutralized.as_deref().unwrap_or(source), None)
-        .ok_or_else(|| anyhow::anyhow!("tree-sitter parsing failed"))?;
+    let input = neutralized.as_deref().unwrap_or(source);
+    let control = codesage_protocol::work::current();
+    let mut progress = |_: &tree_sitter::ParseState| {
+        if control
+            .as_ref()
+            .is_some_and(|control| control.check().is_err())
+        {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let tree = parser.parse_with_options(
+        &mut |offset, _| input.get(offset..).unwrap_or_default(),
+        None,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+    );
+    codesage_protocol::work::checkpoint()?;
+    let tree = tree.ok_or_else(|| anyhow::anyhow!("tree-sitter parsing failed"))?;
     let degraded = tree.root_node().has_error();
     Ok(ParsedTree { tree, degraded })
 }

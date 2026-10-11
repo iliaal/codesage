@@ -250,6 +250,7 @@ pub fn extract_symbols(
     language: Language,
     file_path: &str,
 ) -> Result<Vec<Symbol>> {
+    codesage_protocol::work::checkpoint()?;
     let kind_map = kind_map_for(language);
 
     let spec = symbol_query_for(language);
@@ -260,7 +261,23 @@ pub fn extract_symbols(
     let root = tree.root_node();
     let dead = crate::preproc::DeadRegions::scan(root, source, language);
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(query, root, source);
+    let control = codesage_protocol::work::current();
+    let mut progress = |_: &tree_sitter::QueryCursorState| {
+        if control
+            .as_ref()
+            .is_some_and(|control| control.check().is_err())
+        {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let mut matches = cursor.matches_with_options(
+        query,
+        root,
+        source,
+        tree_sitter::QueryCursorOptions::new().progress_callback(&mut progress),
+    );
 
     let file_namespace = match language {
         Language::Php => find_php_namespace(&root, source),
@@ -276,6 +293,7 @@ pub fn extract_symbols(
     let mut seen_rows = std::collections::HashSet::new();
 
     while let Some(m) = matches.next() {
+        codesage_protocol::work::checkpoint()?;
         let Some(kind) = kind_map(m.pattern_index) else {
             continue;
         };
@@ -383,6 +401,7 @@ pub fn extract_symbols(
         }
     }
 
+    codesage_protocol::work::checkpoint()?;
     Ok(symbols)
 }
 

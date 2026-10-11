@@ -598,7 +598,7 @@ impl CodeSageServer {
 
     /// Index generation. Equal values mean two responses describe the same
     /// index state, and are only meaningful within one daemon's lifetime.
-    fn index_generation(&self, root: &Path, db_path: &Path) -> Option<u64> {
+    pub(super) fn index_generation(&self, root: &Path, db_path: &Path) -> Option<u64> {
         let control = codesage_protocol::work::WorkControl::new(None);
         // The probe stats the index and reads `PRAGMA data_version` on the
         // cache's own read-only connection; it holds no execution lease.
@@ -698,11 +698,43 @@ impl CodeSageServer {
         scan(payload, &mut signals);
 
         let project = arguments.get("project").and_then(Value::as_str);
-        let index = if tool == "help" {
+        let overlay_evidence = payload
+            .get("_meta")
+            .and_then(|meta| meta.get("working_tree_overlay"));
+        let mut index = if tool == "help" {
             None
         } else {
-            self.index_block(project, &signals.stale_paths, tool == "describe")
+            self.index_block(project, &signals.stale_paths, tool != "search")
         };
+        if let Some(overlay) = overlay_evidence {
+            let block = index.get_or_insert_with(|| json!({}));
+            block["structural"] = overlay["state"].clone();
+            block["dirty_paths"] = overlay["dirty_paths"].clone();
+            block["overlay"] = overlay.clone();
+            if block.get("semantic").is_none() {
+                block["semantic"] = json!("indexed");
+            }
+            block["history"] = json!("indexed");
+            if matches!(
+                tool,
+                "feature_bundle"
+                    | "find_feature"
+                    | "list_features"
+                    | "describe"
+                    | "review_rehearsal"
+                    | "project_overview"
+            ) {
+                block["features"] = json!("indexed");
+            }
+            if overlay["state"] == "overlay" {
+                if let Some(block) = block.as_object_mut() {
+                    block.remove("recover");
+                }
+            } else if let Some(project) = project {
+                block["recover"] = json!({"command": "codesage index", "cwd": project,
+                    "why": "The bounded working-tree overlay could not be completed; these are indexed facts"});
+            }
+        }
         let completeness = completeness(tool, arguments, &signals);
         let target = signals.ambiguous.then(|| {
             let mut out = Map::new();
@@ -866,9 +898,12 @@ pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
                     "head": {"type": "string", "description": "Short SHA the structural index was built against."},
                     "files_behind": {"type": "integer", "minimum": 1, "description": "Indexed files whose content at HEAD differs from the indexed content, plus supported source files committed since indexing. Absent when none do, including when HEAD has moved by commits that touched nothing indexed."},
                     "files_behind_bounded": {"const": true, "description": "`files_behind` (0 when absent) is a lower bound: the content comparison stopped at its 2,000-path cap or 500 ms budget before checking every candidate. Absent when the comparison completed."},
-                    "structural": {"enum": ["behind", "dirty", "unknown"], "description": "`behind`: at least one indexed file's HEAD content differs from the index (`files_behind` counts them), or, when that comparison could not run or stopped before finding one (`files_behind_bounded`), the indexed SHA is not HEAD. `dirty`: a path in this response differs on disk from the index. `unknown`: drift could not be determined (git failed, the index carries no commit stamp, or it could not be opened). Absent when fresh."},
-                    "semantic": {"enum": ["partial", "none", "unknown"], "description": "Semantic coverage of the indexed file set by the configured embedding model: none when that model has no chunks, partial when some indexed files lack chunks for it or their chunks predate the current content, unknown when a read-only describe could not measure coverage. Absent when the configured model covers every indexed file."},
-                    "dirty_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths in this response that changed on disk since indexing."},
+                    "structural": {"enum": ["behind", "dirty", "unknown", "overlay"], "description": "`overlay`: current structural facts for changed indexed files, within 50 files, 2 MiB, and 500 ms; embeddings, feature membership, and history retain indexed evidence. `dirty`: changed files exist but an overlay was unavailable; inspect overlay.reason and dirty_paths. `behind`: indexed HEAD content differs. `unknown`: drift could not be determined. Absent when fresh."},
+                    "semantic": {"enum": ["partial", "none", "unknown", "indexed"], "description": "Semantic coverage of the indexed file set by the configured embedding model: none when that model has no chunks, partial when some indexed files lack current chunks, unknown when coverage could not be measured, indexed when a structural overlay leaves embeddings unchanged. Absent when the configured model covers every indexed file."},
+                    "dirty_paths": {"type": "array", "items": {"type": "string"}, "description": "Indexed paths known to differ on disk. overlay.checked_all=false means enumeration was incomplete."},
+                    "overlay": {"type": "object", "description": "Bounded working-tree preparation: state, dirty_paths, checked_all, elapsed_ms, and optional fallback reason."},
+                    "history": {"enum": ["indexed"], "description": "Git history was not recomputed by the working-tree overlay."},
+                    "features": {"enum": ["indexed"], "description": "Feature membership remains indexed; source and structural facts use the overlay."},
                     "recover": {"type": "object", "description": "CLI recovery for a stale index; this is not an MCP tool call and does not authorize execution.", "required": ["command", "cwd", "why"], "properties": {"command": {"const": "codesage index"}, "cwd": {"type": "string", "description": "Absolute project directory where the command runs."}, "why": {"type": "string"}}}
                 }
             }),

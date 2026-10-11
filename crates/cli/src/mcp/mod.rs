@@ -7,6 +7,7 @@ pub(crate) mod error;
 pub(crate) mod framing;
 mod help;
 mod next;
+mod overlay;
 mod overview_cache;
 pub(crate) mod params;
 mod render;
@@ -262,7 +263,12 @@ impl CodeSageServer {
             return self.controlled_blocking(request, f).await;
         }
         let this = self.clone();
-        match tokio::task::spawn_blocking(move || f(&this)).await {
+        match tokio::task::spawn_blocking(move || {
+            let _overlay_scope = overlay::ReportScope::enter();
+            f(&this)
+        })
+        .await
+        {
             Ok(result) => result,
             Err(join_err) => {
                 tracing::error!(error = %join_err, "MCP tool handler panicked");
@@ -384,13 +390,15 @@ impl CodeSageServer {
                     None
                 };
                 let _snapshot = db.read_snapshot()?;
+                let overlay = server.prepare_overlay(root, db)?;
                 let ranking = match ranking {
                     Some((generation, ranking))
-                        if server.state.overview_cache.snapshot_matches(
-                            root,
-                            db,
-                            &generation,
-                        )? =>
+                        if !overlay
+                            && server.state.overview_cache.snapshot_matches(
+                                root,
+                                db,
+                                &generation,
+                            )? =>
                     {
                         Some(ranking)
                     }

@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- Structural MCP queries include bounded working-tree edits to indexed files before reindexing, with explicit overlay or stale-index evidence.
+
 ### Changed
 
 - MCP tool descriptions use at most 60 words; `help` retains detailed field semantics, limitations, and recovery guidance.
