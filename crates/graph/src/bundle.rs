@@ -51,14 +51,14 @@ fn is_symbol_header_line(line: &str) -> bool {
 
 /// Add source line numbers at read time, leaving stored embeddings unchanged.
 /// Skip augmentation headers only when anchored by this chunk's file path.
-fn number_chunk_lines(content: &str, file_path: &str, start_line: u32) -> String {
+fn number_chunk_lines(content: &str, file_path: &str, start_line: u32, augmented: bool) -> String {
     if content.is_empty() {
         return String::new();
     }
     let lines: Vec<&str> = content.lines().collect();
     let mut idx = 0;
     let header_anchor = format!("# {file_path}");
-    if lines.first() == Some(&header_anchor.as_str()) {
+    if augmented && lines.first() == Some(&header_anchor.as_str()) {
         idx = 1;
         while idx < lines.len() && is_symbol_header_line(lines[idx]) {
             idx += 1;
@@ -84,13 +84,19 @@ fn number_chunk_lines(content: &str, file_path: &str, start_line: u32) -> String
     out
 }
 
-fn finalize_bundle(mut bundle: ContextBundle) -> ContextBundle {
+fn finalize_bundle(db: &Database, mut bundle: ContextBundle) -> Result<ContextBundle> {
     if bundle_line_numbers_enabled() {
+        let raw_paths: HashSet<_> = db.structural_overlay_paths()?.into_iter().collect();
         for r in bundle.primary.iter_mut().chain(bundle.related.iter_mut()) {
-            r.content = number_chunk_lines(&r.content, &r.file_path, r.start_line);
+            r.content = number_chunk_lines(
+                &r.content,
+                &r.file_path,
+                r.start_line,
+                !raw_paths.contains(&r.file_path),
+            );
         }
     }
-    bundle
+    Ok(bundle)
 }
 
 pub fn export_context(
@@ -152,14 +158,17 @@ pub fn export_context(
         )?;
     }
 
-    Ok(finalize_bundle(ContextBundle {
-        bounded,
-        found: true,
-        target_description: format!("query: {query}"),
-        primary,
-        related,
-        symbol_definitions: symbol_defs,
-    }))
+    finalize_bundle(
+        db,
+        ContextBundle {
+            bounded,
+            found: true,
+            target_description: format!("query: {query}"),
+            primary,
+            related,
+            symbol_definitions: symbol_defs,
+        },
+    )
 }
 
 /// Resolve an entity bundle without inference; only unresolved text returns `None`.
@@ -268,14 +277,17 @@ pub fn export_context_for_target(
             } else {
                 false
             };
-            finalize_bundle(ContextBundle {
-                bounded,
-                found: true,
-                target_description: format!("{}: {input}", target.kind),
-                primary,
-                related,
-                symbol_definitions: definitions,
-            })
+            finalize_bundle(
+                db,
+                ContextBundle {
+                    bounded,
+                    found: true,
+                    target_description: format!("{}: {input}", target.kind),
+                    primary,
+                    related,
+                    symbol_definitions: definitions,
+                },
+            )?
         }
         TargetKind::Text => unreachable!("text returned before requiring an entity"),
     };
@@ -386,14 +398,17 @@ fn symbol_bundle(
         )?;
     }
 
-    Ok(finalize_bundle(ContextBundle {
-        bounded,
-        found: true,
-        target_description: format!("symbol: {sym_name}"),
-        primary,
-        related,
-        symbol_definitions: defs,
-    }))
+    finalize_bundle(
+        db,
+        ContextBundle {
+            bounded,
+            found: true,
+            target_description: format!("symbol: {sym_name}"),
+            primary,
+            related,
+            symbol_definitions: defs,
+        },
+    )
 }
 
 /// Build a [`ContextBundle`] from a feature's curated files and symbol graph.
@@ -581,14 +596,17 @@ fn build_feature_bundle(
         }
     }
 
-    Ok(finalize_bundle(ContextBundle {
-        found: true,
-        target_description: format!("feature: {} ({})", feature.title, feature.feature_id),
-        bounded,
-        primary,
-        related,
-        symbol_definitions,
-    }))
+    finalize_bundle(
+        db,
+        ContextBundle {
+            found: true,
+            target_description: format!("feature: {} ({})", feature.title, feature.feature_id),
+            bounded,
+            primary,
+            related,
+            symbol_definitions,
+        },
+    )
 }
 
 /// Add a covering chunk, leaving first-chunk fallback to the caller on a miss.
@@ -599,11 +617,7 @@ fn add_chunk_at_line(
     out: &mut Vec<SearchResult>,
     seen: &mut HashSet<(String, u32)>,
 ) -> Result<()> {
-    let chunks = db.chunks_for_file(file_path)?;
-    let Some(c) = chunks
-        .into_iter()
-        .find(|c| c.start_line <= line && c.end_line >= line)
-    else {
+    let Some(c) = chunk_at_line(db, file_path, line)? else {
         return Ok(());
     };
     let key = (c.file_path.clone(), c.start_line);
@@ -1515,10 +1529,7 @@ fn add_related_from_file(
     out: &mut Vec<SearchResult>,
     seen: &mut HashSet<(String, u32)>,
 ) -> Result<()> {
-    let chunks = db.chunks_for_file(file_path)?;
-    let best = chunks
-        .into_iter()
-        .find(|c| c.start_line <= line && c.end_line >= line);
+    let best = chunk_at_line(db, file_path, line)?;
     if let Some(c) = best {
         let key = (c.file_path.clone(), c.start_line);
         if seen.insert(key) {
@@ -1537,6 +1548,20 @@ fn add_related_from_file(
         }
     }
     Ok(())
+}
+
+fn chunk_at_line(
+    db: &Database,
+    path: &str,
+    line: u32,
+) -> Result<Option<codesage_storage::RawSearchRow>> {
+    if let Some(chunk) = db.overlay_source_chunk_at_line(path, line)? {
+        return Ok(Some(chunk));
+    }
+    Ok(db
+        .chunks_for_file(path)?
+        .into_iter()
+        .find(|chunk| chunk.start_line <= line && chunk.end_line >= line))
 }
 
 #[cfg(test)]
@@ -1997,7 +2022,7 @@ mod line_number_tests {
     #[test]
     fn numbers_body_after_augmentation_header() {
         let content = "# app/Svc.php\n# App\\Svc (class)\n<?php\nclass Svc {}";
-        let out = number_chunk_lines(content, "app/Svc.php", 10);
+        let out = number_chunk_lines(content, "app/Svc.php", 10, true);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "# app/Svc.php");
         assert_eq!(lines[1], "# App\\Svc (class)");
@@ -2008,7 +2033,7 @@ mod line_number_tests {
     #[test]
     fn numbers_from_line_one_when_no_header() {
         let content = "fn main() {\n    let x = 1;\n}";
-        let out = number_chunk_lines(content, "src/main.rs", 42);
+        let out = number_chunk_lines(content, "src/main.rs", 42, true);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "  42 | fn main() {");
         assert_eq!(lines[1], "  43 |     let x = 1;");
@@ -2018,7 +2043,7 @@ mod line_number_tests {
     #[test]
     fn source_comment_resembling_header_is_not_stripped() {
         let content = "# app/x.py\n# cleanup (later)\nx = 1";
-        let out = number_chunk_lines(content, "app/x.py", 5);
+        let out = number_chunk_lines(content, "app/x.py", 5, true);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "# app/x.py");
         assert_eq!(lines[1], "   5 | # cleanup (later)");
@@ -2028,15 +2053,24 @@ mod line_number_tests {
     #[test]
     fn header_anchor_must_match_this_files_path() {
         let content = "# not a path\ncode";
-        let out = number_chunk_lines(content, "app/x.py", 1);
+        let out = number_chunk_lines(content, "app/x.py", 1, true);
         assert_eq!(out.lines().next().unwrap(), "   1 | # not a path");
     }
 
     #[test]
     fn preserves_trailing_newline_shape() {
-        assert!(number_chunk_lines("a\nb\n", "f.rs", 1).ends_with("b\n"));
-        assert!(!number_chunk_lines("a\nb", "f.rs", 1).ends_with('\n'));
-        assert_eq!(number_chunk_lines("", "f.rs", 1), "");
+        assert!(number_chunk_lines("a\nb\n", "f.rs", 1, true).ends_with("b\n"));
+        assert!(!number_chunk_lines("a\nb", "f.rs", 1, true).ends_with('\n'));
+        assert_eq!(number_chunk_lines("", "f.rs", 1, true), "");
+    }
+
+    #[test]
+    fn raw_source_path_and_symbol_comments_keep_their_line_numbers() {
+        let content = "# app/x.py\n# changed (function)\ndef changed(): pass\n";
+        assert_eq!(
+            number_chunk_lines(content, "app/x.py", 1, false),
+            "   1 | # app/x.py\n   2 | # changed (function)\n   3 | def changed(): pass\n"
+        );
     }
 
     #[test]
@@ -2046,6 +2080,119 @@ mod line_number_tests {
         assert!(!is_symbol_header_line("# cleanup (later)"));
         assert!(!is_symbol_header_line("not a comment"));
         assert!(!is_symbol_header_line("# no parens here"));
+    }
+}
+
+#[cfg(test)]
+mod overlay_source_tests {
+    use super::*;
+    use codesage_protocol::python::PythonBindings;
+    use codesage_protocol::{FileInfo, Language, SymbolKind};
+    use codesage_storage::db::StructuralOverlayFile;
+
+    fn overlay(source: &str, definition_line: u32) -> (tempfile::TempDir, Database) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("index.db");
+        let file = FileInfo {
+            path: "app/x.py".into(),
+            language: Language::Python,
+            content_hash: "indexed".into(),
+            is_test: false,
+        };
+        let writer = Database::open(&path).unwrap();
+        writer.upsert_file(&file).unwrap();
+        drop(writer);
+        let reader = Database::open_read_only(&path).unwrap();
+        let definition = Symbol {
+            name: "changed".into(),
+            qualified_name: "changed".into(),
+            kind: SymbolKind::Function,
+            file_path: file.path.clone(),
+            line_start: definition_line,
+            line_end: source.lines().count() as u32,
+            col_start: 0,
+            col_end: 0,
+            rationale: Vec::new(),
+            visibility: None,
+            is_test: false,
+            overloaded: false,
+        };
+        reader
+            .install_structural_overlay(
+                &[file.path.clone()],
+                &[StructuralOverlayFile {
+                    file: &file,
+                    symbols: &[definition],
+                    references: &[],
+                    python_bindings: &PythonBindings::default(),
+                    fingerprints: &[],
+                    trust_boundaries: &[],
+                    interpretation: "current",
+                    source,
+                }],
+            )
+            .unwrap();
+        (directory, reader)
+    }
+
+    #[test]
+    fn late_overlay_symbol_and_body_line_export_fit_ordinary_budget() {
+        let source = format!(
+            "{}def changed():\n    return 42\n",
+            "# preceding commentary\n".repeat(1500)
+        );
+        let (_directory, db) = overlay(&source, 1501);
+        for target in ["changed", "app/x.py:1502", "chunk:app/x.py:1501-1502"] {
+            let request = ExportRequest::from_target(target.into(), false, 5, false, false);
+            let bundle = export_context_for_target(&db, &request).unwrap().unwrap();
+            assert!(bundle.found, "{target}");
+            assert_eq!(bundle.primary.len(), 1, "{target}");
+            assert!(bundle.primary[0].start_line <= 1501);
+            assert_eq!(bundle.primary[0].end_line, 1502);
+            assert!(
+                bundle.primary[0]
+                    .content
+                    .ends_with("1501 | def changed():\n1502 |     return 42\n")
+            );
+            assert!(serde_json::to_vec(&bundle).unwrap().len() < 16_000);
+        }
+    }
+
+    #[test]
+    fn raw_overlay_path_comment_is_numbered_as_source() {
+        let (_directory, db) = overlay("# app/x.py\ndef changed(): pass\n", 2);
+        let request = ExportRequest::from_target("file:app/x.py".into(), false, 5, false, false);
+        let bundle = export_context_for_target(&db, &request).unwrap().unwrap();
+        let contents = bundle
+            .primary
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<String>();
+        assert_eq!(contents, "   1 | # app/x.py\n   2 | def changed(): pass\n");
+    }
+
+    #[test]
+    fn overlay_definition_at_chunk_boundary_retains_its_body() {
+        let prefixes = ["#\n".repeat(63), format!("#{}\n", "x".repeat(2000))];
+        for prefix in prefixes {
+            let line = prefix.lines().count() as u32 + 1;
+            let source = format!("{prefix}def changed():\n    return '{}'\n", "y".repeat(80));
+            let (_directory, db) = overlay(&source, line);
+            for target in ["changed".into(), format!("app/x.py:{}", line + 1)] {
+                let request = ExportRequest::from_target(target, false, 5, false, false);
+                let bundle = export_context_for_target(&db, &request).unwrap().unwrap();
+                assert_eq!(bundle.primary.len(), 1);
+                let chunk = &bundle.primary[0];
+                assert_eq!(chunk.start_line, line);
+                assert_eq!(chunk.end_line, line + 1);
+                assert!(chunk.content.contains("def changed():"));
+                assert!(
+                    chunk
+                        .content
+                        .contains(&format!("return '{}'", "y".repeat(80)))
+                );
+            }
+        }
     }
 }
 

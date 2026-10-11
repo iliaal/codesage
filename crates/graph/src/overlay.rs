@@ -55,6 +55,8 @@ pub struct WorkingTreeOverlayCache {
 impl WorkingTreeOverlayCache {
     /// Install request-local structural rows for edits to already indexed files.
     /// Unknown generations deliberately disable reuse between requests.
+    /// Removing the last indexed C++ dialect activator falls back when a bounded
+    /// walk finds another candidate, including ignored or oversized sources.
     pub fn apply(&mut self, root: &Path, db: &Database, generation: Option<u64>) -> OverlayReport {
         self.apply_with_budget(root, db, generation, PREPARATION_BUDGET)
     }
@@ -179,6 +181,9 @@ impl WorkingTreeOverlayCache {
             bail!(reason);
         }
         let mut affected_paths = report.dirty_paths.clone();
+        if indexed_saw_cpp && !saw_cpp && files.iter().any(|file| file.path.ends_with(".h")) {
+            verify_no_cpp_dialect_candidates(root)?;
+        }
         for file in files.iter().filter(|file| {
             indexed_saw_cpp != saw_cpp && file.path.ends_with(".h") && !deleted.contains(&file.path)
         }) {
@@ -313,6 +318,42 @@ impl WorkingTreeOverlayCache {
         report.state = OverlayState::Overlay;
         Ok(())
     }
+}
+
+fn verify_no_cpp_dialect_candidates(root: &Path) -> Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited = 0;
+    while let Some(directory) = pending.pop() {
+        codesage_protocol::work::checkpoint()?;
+        for entry in std::fs::read_dir(&directory)? {
+            codesage_protocol::work::checkpoint()?;
+            visited += 1;
+            ensure!(
+                visited <= 16_384,
+                "header dialect context exceeds 16384 directory entries; run codesage index"
+            );
+            let entry = entry?;
+            if entry.file_name().as_encoded_bytes().starts_with(b".") {
+                continue;
+            }
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(is_unambiguous_cpp_extension)
+            {
+                bail!(
+                    "header dialect requires codesage index: remaining C++ candidate {}",
+                    entry.path().strip_prefix(root)?.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -531,6 +572,10 @@ mod tests {
         );
         let mut cache = WorkingTreeOverlayCache::default();
         std::fs::remove_file(root.path().join("marker.cpp")).unwrap();
+        std::fs::write(root.path().join(".hidden.cpp"), "void hidden() {}").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("outside.cpp"), "void outside() {}").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
         let db = Database::open_read_only(&path).unwrap();
         let report = cache.apply(root.path(), &db, Some(1));
         assert_eq!(report.state, OverlayState::Overlay, "{report:?}");
@@ -667,5 +712,97 @@ mod tests {
             db.all_files_with_id_and_language().unwrap()[0].2,
             Language::Cpp
         );
+    }
+
+    #[test]
+    fn remaining_oversized_cpp_candidate_prevents_false_header_downgrade() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("subject.h"), "class Widget {};").unwrap();
+        std::fs::write(root.path().join("marker.cpp"), "void marker() {}").unwrap();
+        std::fs::File::create(root.path().join("oversized.cpp"))
+            .unwrap()
+            .set_len(16 * 1024 * 1024)
+            .unwrap();
+        let path = root.path().join("index.sqlite");
+        let writer = Database::open(&path).unwrap();
+        let stats = crate::full_index(root.path(), &writer, &[], false).unwrap();
+        assert_eq!(stats.files_indexed, 2);
+        assert_eq!(stats.files_failed, 0);
+        drop(writer);
+        std::fs::remove_file(root.path().join("marker.cpp")).unwrap();
+
+        let db = Database::open_read_only(&path).unwrap();
+        let report = WorkingTreeOverlayCache::default().apply(root.path(), &db, Some(1));
+        assert_eq!(report.state, OverlayState::Dirty, "{report:?}");
+        assert_eq!(report.dirty_paths, ["marker.cpp"]);
+        assert!(report.checked_all);
+        assert!(
+            report
+                .reason
+                .unwrap()
+                .contains("remaining C++ candidate oversized.cpp")
+        );
+        assert!(!db.has_structural_overlay().unwrap());
+        assert_eq!(
+            db.find_symbols("Widget", Some(codesage_protocol::SymbolKind::Class))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let writer = Database::open(&path).unwrap();
+        crate::full_index(root.path(), &writer, &[], false).unwrap();
+        assert_eq!(
+            writer
+                .find_symbols("Widget", Some(codesage_protocol::SymbolKind::Class))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn deeply_nested_java_falls_back_on_a_small_stack_and_normal_edits_still_overlay() {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let (root, path) = indexed(&[("Subject.java", "class Subject {}")]);
+                let depth = 1000;
+                std::fs::write(
+                    root.path().join("Subject.java"),
+                    format!("{}{}", "class A { ".repeat(depth), "}".repeat(depth)),
+                )
+                .unwrap();
+                let mut cache = WorkingTreeOverlayCache::default();
+                let db = Database::open_read_only(&path).unwrap();
+                let report = cache.apply(root.path(), &db, Some(1));
+                assert_eq!(report.state, OverlayState::Dirty, "{report:?}");
+                assert!(
+                    report
+                        .reason
+                        .unwrap()
+                        .contains("Java syntax nesting exceeds 128 levels")
+                );
+                assert!(!db.has_structural_overlay().unwrap());
+                assert_eq!(db.find_symbols("Subject", None).unwrap().len(), 1);
+
+                std::fs::write(
+                    root.path().join("Subject.java"),
+                    "class Subject { class Inner {} }",
+                )
+                .unwrap();
+                let db = Database::open_read_only(&path).unwrap();
+                let report = cache.apply(root.path(), &db, Some(1));
+                assert_eq!(report.state, OverlayState::Overlay, "{report:?}");
+                assert_eq!(
+                    db.find_symbols("Inner", Some(codesage_protocol::SymbolKind::Class))
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

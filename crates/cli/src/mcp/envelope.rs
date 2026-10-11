@@ -707,9 +707,20 @@ impl CodeSageServer {
             self.index_block(project, &signals.stale_paths, tool != "search")
         };
         if let Some(overlay) = overlay_evidence {
+            let mut dirty_paths = signals.stale_paths.clone();
+            dirty_paths.extend(
+                overlay["dirty_paths"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned),
+            );
+            dirty_paths.sort();
+            dirty_paths.dedup();
             let block = index.get_or_insert_with(|| json!({}));
             block["structural"] = overlay["state"].clone();
-            block["dirty_paths"] = overlay["dirty_paths"].clone();
+            block["dirty_paths"] = json!(dirty_paths);
             block["overlay"] = overlay.clone();
             if block.get("semantic").is_none() {
                 block["semantic"] = json!("indexed");
@@ -718,6 +729,7 @@ impl CodeSageServer {
             if matches!(
                 tool,
                 "feature_bundle"
+                    | "export_context"
                     | "find_feature"
                     | "list_features"
                     | "describe"
@@ -898,7 +910,7 @@ pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
                     "head": {"type": "string", "description": "Short SHA the structural index was built against."},
                     "files_behind": {"type": "integer", "minimum": 1, "description": "Indexed files whose content at HEAD differs from the indexed content, plus supported source files committed since indexing. Absent when none do, including when HEAD has moved by commits that touched nothing indexed."},
                     "files_behind_bounded": {"const": true, "description": "`files_behind` (0 when absent) is a lower bound: the content comparison stopped at its 2,000-path cap or 500 ms budget before checking every candidate. Absent when the comparison completed."},
-                    "structural": {"enum": ["behind", "dirty", "unknown", "overlay"], "description": "`overlay`: current structural facts for changed indexed files, within 50 files, 2 MiB, and 500 ms; embeddings, feature membership, and history retain indexed evidence. `dirty`: changed files exist but an overlay was unavailable; inspect overlay.reason and dirty_paths. `behind`: indexed HEAD content differs. `unknown`: drift could not be determined. Absent when fresh."},
+                    "structural": {"enum": ["behind", "dirty", "unknown", "overlay"], "description": "`overlay`: current structural facts for changed indexed files, with at most 50 affected files, 2 MiB of source, and a cooperative 500 ms preparation budget; embeddings, feature membership, and history retain indexed evidence. `dirty`: an overlay was unavailable; inspect overlay.reason and known dirty_paths. `behind`: indexed HEAD content differs. `unknown`: drift could not be determined. Absent when fresh."},
                     "semantic": {"enum": ["partial", "none", "unknown", "indexed"], "description": "Semantic coverage of the indexed file set by the configured embedding model: none when that model has no chunks, partial when some indexed files lack current chunks, unknown when coverage could not be measured, indexed when a structural overlay leaves embeddings unchanged. Absent when the configured model covers every indexed file."},
                     "dirty_paths": {"type": "array", "items": {"type": "string"}, "description": "Indexed paths known to differ on disk. overlay.checked_all=false means enumeration was incomplete."},
                     "overlay": {"type": "object", "description": "Bounded working-tree preparation: state, dirty_paths, checked_all, elapsed_ms, and optional fallback reason."},

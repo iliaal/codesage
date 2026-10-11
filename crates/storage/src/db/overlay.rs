@@ -29,6 +29,17 @@ const TABLES: &[(&str, &str)] = &[
 ];
 
 impl Database {
+    pub fn get_indexed_file_hash(&self, path: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT content_hash FROM main.files WHERE path = ?1",
+                [path],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn overlay_file_infos(&self) -> Result<Vec<FileInfo>> {
         let mut statement = self.conn.prepare(
             "SELECT path, language, content_hash, is_test FROM main.files ORDER BY path",
@@ -107,9 +118,15 @@ impl Database {
                 // A spent overlay deadline must not prevent undoing TEMP writes.
                 let cleanup = codesage_protocol::work::WorkControl::new(None);
                 let _cleanup = cleanup.enter();
-                self.conn
+                if let Err(rollback) = self
+                    .conn
                     .execute_batch("ROLLBACK TO structural_overlay; RELEASE structural_overlay")
-                    .context("rolling back failed structural overlay")?;
+                {
+                    return Err(error.context(format!(
+                        "rolling back failed structural overlay: {rollback}; read snapshot active: {}",
+                        self.read_snapshot_active()
+                    )));
+                }
                 Err(error)
             }
         }
@@ -357,21 +374,109 @@ impl Database {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        Ok(Some(
-            source
-                .into_iter()
-                .map(|(content, language)| RawSearchRow {
-                    retrieval: Default::default(),
-                    file_path: path.to_owned(),
-                    language,
-                    start_line: 1,
-                    end_line: content.lines().count().max(1) as u32,
-                    content,
-                    distance: 0.0,
-                })
-                .collect(),
-        ))
+        let Some((content, language)) = source else {
+            return Ok(Some(Vec::new()));
+        };
+        Ok(Some(source_chunks(path, &language, &content)))
     }
+
+    pub fn overlay_source_chunk_at_line(
+        &self,
+        path: &str,
+        line: u32,
+    ) -> Result<Option<RawSearchRow>> {
+        if line == 0 || !self.has_structural_overlay()? {
+            return Ok(None);
+        }
+        let source: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT content, language FROM temp.__overlay_sources WHERE path = ?1",
+                [path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((content, language)) = source else {
+            return Ok(None);
+        };
+        let lines: Vec<_> = content.split_inclusive('\n').collect();
+        let requested = line as usize - 1;
+        if requested >= lines.len() {
+            return Ok(None);
+        }
+        let definition_start = self
+            .symbols_for_file(path)?
+            .into_iter()
+            .filter(|symbol| symbol.line_start <= line && line <= symbol.line_end)
+            .min_by_key(|symbol| symbol.line_end - symbol.line_start)
+            .map_or(requested, |symbol| {
+                symbol.line_start.saturating_sub(1) as usize
+            });
+        let prefix = &lines[definition_start..requested];
+        let start =
+            if prefix.len() < 32 && prefix.iter().map(|line| line.len()).sum::<usize>() < 512 {
+                definition_start
+            } else {
+                requested
+            };
+        let mut end = start;
+        let mut bytes = 0;
+        while end < lines.len() && end - start < 64 {
+            let size = lines[end].len();
+            if end > requested && bytes + size > 2048 {
+                break;
+            }
+            bytes += size;
+            end += 1;
+        }
+        Ok(Some(RawSearchRow {
+            retrieval: Default::default(),
+            file_path: path.to_owned(),
+            language,
+            start_line: start as u32 + 1,
+            end_line: end as u32,
+            content: lines[start..end].concat(),
+            distance: 0.0,
+        }))
+    }
+}
+
+fn source_chunks(path: &str, language: &str, content: &str) -> Vec<RawSearchRow> {
+    const CHUNK_BYTES: usize = 2048;
+    const CHUNK_LINES: u32 = 64;
+    let mut chunks = Vec::new();
+    let mut chunk_start = 0;
+    let mut byte = 0;
+    let mut start_line = 1;
+    let mut last_line = 1;
+    let mut push = |start: usize, end: usize, first: u32, last: u32| {
+        chunks.push(RawSearchRow {
+            retrieval: Default::default(),
+            file_path: path.to_owned(),
+            language: language.to_owned(),
+            start_line: first,
+            end_line: last,
+            content: content[start..end].to_owned(),
+            distance: 0.0,
+        });
+    };
+    for (index, line) in content.split_inclusive('\n').enumerate() {
+        let line_number = index as u32 + 1;
+        if byte > chunk_start
+            && (byte - chunk_start + line.len() > CHUNK_BYTES
+                || line_number - start_line >= CHUNK_LINES)
+        {
+            push(chunk_start, byte, start_line, line_number - 1);
+            chunk_start = byte;
+            start_line = line_number;
+        }
+        byte += line.len();
+        last_line = line_number;
+    }
+    if byte > chunk_start || content.is_empty() {
+        push(chunk_start, byte, start_line, last_line);
+    }
+    chunks
 }
 
 fn next_id(id: &mut i64) -> Result<i64> {
@@ -521,6 +626,14 @@ mod tests {
             [symbol("clean.py", "clean")]
         );
         assert_eq!(db.file_id_for_path("dirty.py").unwrap(), original_id);
+        assert_eq!(
+            db.get_file_hash("dirty.py").unwrap().as_deref(),
+            Some("edited")
+        );
+        assert_eq!(
+            db.get_indexed_file_hash("dirty.py").unwrap().as_deref(),
+            Some("indexed")
+        );
         assert_eq!(db.file_id_for_path("deleted.py").unwrap(), None);
         let refs = db.find_references("clean", None).unwrap();
         assert_eq!(refs.len(), 1);
@@ -650,6 +763,7 @@ mod tests {
         let path = temp.path().join("index.db");
         seed(&path);
         let db = Database::open_read_only(&path).unwrap();
+        let _snapshot = db.read_snapshot().unwrap();
         let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = steps.clone();
         db.conn
@@ -658,13 +772,30 @@ mod tests {
                 Some(move || count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 800),
             )
             .unwrap();
-        assert!(
-            db.install_structural_overlay(&["dirty.py".into()], &[])
-                .is_err()
-        );
+        let error = db
+            .install_structural_overlay(&["dirty.py".into()], &[])
+            .unwrap_err();
         crate::db::install_work_control(&db.conn).unwrap();
+        assert!(
+            error.chain().any(|cause| matches!(
+                cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::OperationInterrupted
+            )),
+            "{error:#}"
+        );
         assert!(steps.load(std::sync::atomic::Ordering::Relaxed) > 800);
         assert!(!db.has_structural_overlay().unwrap());
+        assert!(!db.read_snapshot_active());
+        let writer = Database::open(&path).unwrap();
+        writer
+            .conn
+            .execute(
+                "UPDATE main.symbols SET name = 'changed' WHERE name = 'clean'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.find_symbols("changed", None).unwrap().len(), 1);
         assert_eq!(db.find_symbols("old", None).unwrap().len(), 1);
         assert_eq!(
             db.conn
@@ -705,5 +836,34 @@ mod tests {
         assert!(!reader.has_structural_overlay().unwrap());
         assert_eq!(reader.find_symbols("old", None).unwrap().len(), 1);
         assert_eq!(reader.find_symbols("changed", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn source_chunks_preserve_line_ranges_and_late_definition() {
+        let source = format!(
+            "{}def changed():\n    return 42\n",
+            "# preceding commentary\n".repeat(1500)
+        );
+        let chunks = source_chunks("app/x.py", "python", &source);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.content.as_str())
+                .collect::<String>(),
+            source
+        );
+        assert!(chunks.iter().all(|chunk| chunk.content.len() <= 2048));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.end_line - chunk.start_line < 64)
+        );
+        for adjacent in chunks.windows(2) {
+            assert_eq!(adjacent[0].end_line + 1, adjacent[1].start_line);
+        }
+        let last = chunks.last().unwrap();
+        assert!(last.start_line <= 1501);
+        assert_eq!(last.end_line, 1502);
+        assert!(last.content.ends_with("def changed():\n    return 42\n"));
     }
 }

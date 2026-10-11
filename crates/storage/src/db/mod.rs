@@ -730,6 +730,10 @@ impl Database {
         })
     }
 
+    pub fn read_snapshot_active(&self) -> bool {
+        !self.conn.is_autocommit()
+    }
+
     /// Open/create a structural handle without selecting a semantic chunk table.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = open_connection(path, true)?;

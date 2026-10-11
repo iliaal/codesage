@@ -32,10 +32,9 @@ pub struct ParsedTree {
     pub degraded: bool,
 }
 
-/// Parse one source file and report whether the parse was degraded. Only a
-/// parser that returns no tree at all (cancelled, or the language failed to
-/// load) is an error. C and C++ export macros are neutralized first
-/// (`export_macro.rs`).
+/// Parse one source file and report whether the parse was degraded. Missing
+/// trees, cancellation, and Java nesting beyond the extractor's safe depth are
+/// errors. C and C++ export macros are neutralized first (`export_macro.rs`).
 pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTree> {
     codesage_protocol::work::checkpoint()?;
     let mut parser = Parser::new();
@@ -67,8 +66,38 @@ pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTr
     );
     codesage_protocol::work::checkpoint()?;
     let tree = tree.ok_or_else(|| anyhow::anyhow!("tree-sitter parsing failed"))?;
+    if language == Language::Java {
+        validate_java_depth(&tree)?;
+    }
     let degraded = tree.root_node().has_error();
     Ok(ParsedTree { tree, degraded })
+}
+
+fn validate_java_depth(tree: &Tree) -> Result<()> {
+    // Java declaration-context extraction recursively visits nested types.
+    const MAX_JAVA_SYNTAX_DEPTH: usize = 128;
+    let mut cursor = tree.walk();
+    let mut depth = 0;
+    loop {
+        codesage_protocol::work::checkpoint()?;
+        if cursor.goto_first_child() {
+            depth += 1;
+            anyhow::ensure!(
+                depth <= MAX_JAVA_SYNTAX_DEPTH,
+                "Java syntax nesting exceeds {MAX_JAVA_SYNTAX_DEPTH} levels"
+            );
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Ok(());
+            }
+            depth -= 1;
+        }
+    }
 }
 
 /// Decode only the node's byte range so invalid UTF-8 cannot shift offsets

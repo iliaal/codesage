@@ -824,19 +824,50 @@ fn high_risk_session_advice_preserves_existing_baselines() {
 fn stale_index_recovery_is_a_cli_command_and_legacy_keeps_array_contract() {
     let project = tempfile::tempdir().unwrap();
     fixture(project.path());
-    std::fs::write(
-        project.path().join("src/helper.rs"),
-        "pub fn inner() -> u32 { 8 }\n",
-    )
-    .unwrap();
     for mode in [None, Some("legacy")] {
         let mut server = Server::start_with_envelope(mode);
+        std::fs::write(
+            project.path().join("src/helper.rs"),
+            "pub fn edited_inner() -> u32 { 8 }\n",
+        )
+        .unwrap();
+        let current = server.call(
+            project.path(),
+            "find_symbol",
+            json!({"target":"edited_inner"}),
+        );
+        assert_ne!(current["isError"], true, "{current}");
+        let payload = &current["structuredContent"];
+        assert!(payload["next"].is_array());
+        assert_eq!(payload["results"][0]["name"], "edited_inner");
+        if mode.is_none() {
+            assert_eq!(payload["index"]["structural"], "overlay");
+            assert!(payload["index"].get("recover").is_none());
+        } else {
+            assert!(payload.get("index").is_none());
+            assert_eq!(payload["_meta"]["working_tree_overlay"]["state"], "overlay");
+        }
+        std::fs::write(
+            project.path().join("src/helper.rs"),
+            format!(
+                "pub fn edited_inner() -> u32 {{ 8 }}\n// {}\n",
+                "x".repeat(2 * 1024 * 1024)
+            ),
+        )
+        .unwrap();
         let result = server.call(project.path(), "find_symbol", json!({"target":"inner"}));
         assert_ne!(result["isError"], true, "{result}");
         let payload = &result["structuredContent"];
         assert!(payload["next"].is_array());
+        assert_eq!(payload["results"][0]["name"], "inner", "{payload}");
         if mode.is_none() {
             assert_eq!(payload["index"]["structural"], "dirty");
+            assert!(
+                payload["index"]["overlay"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("source bytes")
+            );
             assert_eq!(payload["index"]["recover"]["command"], "codesage index");
             assert_eq!(payload["index"]["recover"]["cwd"], json!(project.path()));
         } else {

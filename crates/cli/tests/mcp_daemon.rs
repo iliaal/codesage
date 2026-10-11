@@ -2170,11 +2170,21 @@ fn warm_overview_keeps_git_freshness_and_working_file_annotations_live() {
         .as_str()
         .expect("fresh overview head_sha")
         .to_string();
-    let changed = cold["top_risk_files"][0]["file"]
-        .as_str()
-        .expect("ranked fixture file")
-        .to_string();
-    append_line(&project.path().join(&changed), "");
+    let original = cold["top_risk_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| {
+            row["file"]
+                .as_str()
+                .is_some_and(|file| file.ends_with(".rs"))
+        })
+        .expect("ranked Rust fixture file");
+    let changed = original["file"].as_str().unwrap().to_string();
+    append_line(
+        &project.path().join(&changed),
+        "use std::fs;\nuse std::process;\nuse std::env;\npub fn live_overlay_definition() {}",
+    );
     run_git(project.path(), &["add", "--", &changed]);
     run_git(project.path(), &["commit", "-qm", "advance head"]);
 
@@ -2190,17 +2200,46 @@ fn warm_overview_keeps_git_freshness_and_working_file_annotations_live() {
         warm["freshness"]["structural_kind"], "behind_head",
         "{warm}"
     );
+    assert_eq!(warm["index"]["structural"], "overlay", "{warm}");
     assert!(
-        warm["_meta"]["stale_files"]
+        warm["index"]["dirty_paths"]
             .as_array()
             .is_some_and(|files| files.iter().any(|file| file.as_str() == Some(&changed))),
-        "warm rendering must hash current files after serving cached ranking rows: {warm}"
+        "warm overview must disclose the overlaid file: {warm}"
     );
-    let stats = daemon_stats(&mut session, 4, 256);
+    let refreshed = warm["top_risk_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["file"] == changed)
+        .unwrap();
+    assert!(
+        refreshed["score"].as_f64().unwrap() > original["score"].as_f64().unwrap() + 0.05,
+        "overlay risk must replace cached risk: before={original}, after={refreshed}"
+    );
+    let definition = call_mcp_tool(
+        &mut session,
+        4,
+        "find_symbol",
+        serde_json::json!({"project": project.path(), "target":"live_overlay_definition"}),
+    );
+    assert_eq!(definition["results"][0]["file_path"], changed);
+    assert_eq!(definition["index"]["structural"], "overlay");
+    let stats = daemon_stats(&mut session, 5, 256);
     assert_eq!(
         overview_ranking_executions(&stats),
         1,
-        "Git and working-tree refresh must not invalidate database-derived ranking: {stats}"
+        "the persisted-index ranking may stay cached while overlay ranking is recomputed: {stats}"
+    );
+    assert!(
+        stats["recent_executions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["tool"] == "project_overview"
+                && row["work_class"] == "analysis"
+                && row["outcome"] == "success"),
+        "overlay ranking must run through bounded analysis work: {stats}"
     );
 }
 

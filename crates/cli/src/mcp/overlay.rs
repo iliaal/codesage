@@ -86,6 +86,15 @@ impl CodeSageServer {
             None => WorkingTreeOverlayCache::default().apply(root, db, generation),
         };
         let active = report.state == OverlayState::Overlay;
+        codesage_protocol::work::checkpoint()?;
+        anyhow::ensure!(
+            db.read_snapshot_active(),
+            "working-tree overlay lost its pinned read snapshot: {}",
+            report
+                .reason
+                .as_deref()
+                .unwrap_or("snapshot is no longer active")
+        );
         anyhow::ensure!(
             active || !db.has_structural_overlay()?,
             "failed overlay could not be rolled back; retry the query"

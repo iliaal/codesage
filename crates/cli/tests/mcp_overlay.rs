@@ -28,6 +28,7 @@ impl Server {
         let mut child = Command::new(env!("CARGO_BIN_EXE_codesage"))
             .args(["mcp", "--direct"])
             .env("CODESAGE_WATCH", "0")
+            .env("CODESAGE_BUNDLE_LINE_NUMBERS", "1")
             .env_remove("CODESAGE_ENVELOPE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -259,6 +260,12 @@ fn edited_symbols_references_graph_bundles_and_sessions_use_current_source() {
         card["card"]["sections"]["references"]["data"]["callers_total"], 1,
         "{card}"
     );
+    let file_card = server.call(root, "describe", json!({"target":"file:src/leaf.rs"}));
+    assert_overlay(&file_card);
+    assert_eq!(
+        file_card["card"]["sections"]["identity"]["data"]["indexed"]["dirty"], true,
+        "{file_card}"
+    );
     for tool in ["assess_risk", "assess_risk_batch", "assess_risk_diff"] {
         let args = if tool == "assess_risk" {
             json!({"target":"src/leaf.rs"})
@@ -287,6 +294,14 @@ fn edited_symbols_references_graph_bundles_and_sessions_use_current_source() {
         "{bundle}"
     );
     assert_eq!(bundle["index"]["features"], "indexed");
+    let feature_export = server.call(
+        root,
+        "export_context",
+        json!({"target":"feat_1111111111111111", "include_callees":true}),
+    );
+    assert_overlay(&feature_export);
+    assert_eq!(feature_export["index"]["features"], "indexed");
+    assert_eq!(feature_export["primary"], bundle["primary"]);
     let exported = server.call(
         root,
         "export_context",
@@ -416,6 +431,287 @@ fn over_bound_queries_disclose_indexed_fallback_without_partial_results() {
         );
         assert_eq!(value["results"].as_array().unwrap().len(), count);
     }
+    assert_eq!(
+        std::fs::read(root.join(".codesage/index.db")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn cached_overview_directory_and_session_rankings_use_changed_risk() {
+    let dir = fixture();
+    let root = dir.path();
+    cli(root, &["git-index", "--full"]);
+    let mut server = Server::start();
+    let clean = server.call(root, "project_overview", json!({}));
+    let old_score = clean["top_risk_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["file"] == "src/leaf.rs")
+        .unwrap()["score"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        clean["top_risk_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["file"] == "src/gone.rs")
+    );
+    server.call(
+        root,
+        "session_start",
+        json!({"session_id":"ranking-before"}),
+    );
+    let clean_directory = server.call(root, "describe", json!({"target":"dir:src"}));
+    assert_eq!(
+        clean_directory["card"]["sections"]["risk"]["data"]["scored"],
+        3
+    );
+
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub mod leaf;\nuse leaf::old_leaf;\npub fn caller() { old_leaf(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/leaf.rs"),
+        "use std::fs;\nuse std::process;\nuse std::env;\npub fn old_leaf() {}\n",
+    )
+    .unwrap();
+    std::fs::remove_file(root.join("src/gone.rs")).unwrap();
+    let risk = server.call(root, "assess_risk", json!({"target":"src/leaf.rs"}));
+    assert_overlay(&risk);
+    let current_score = risk["score"].as_f64().unwrap();
+    assert!(
+        current_score > old_score + 0.05,
+        "before={old_score}, current={risk}"
+    );
+
+    let current = server.call(root, "project_overview", json!({}));
+    assert_overlay(&current);
+    let ranking = current["top_risk_files"].as_array().unwrap();
+    assert_eq!(ranking.len(), 2, "{current}");
+    assert!(ranking.iter().all(|row| row["file"] != "src/gone.rs"));
+    assert_eq!(
+        ranking
+            .iter()
+            .find(|row| row["file"] == "src/leaf.rs")
+            .unwrap()["score"],
+        risk["score"]
+    );
+
+    let directory = server.call(root, "describe", json!({"target":"dir:src"}));
+    assert_overlay(&directory);
+    let directory_risk = &directory["card"]["sections"]["risk"]["data"];
+    assert_eq!(directory_risk["scored"], 2, "{directory}");
+    let expected_mean = ranking
+        .iter()
+        .map(|row| row["score"].as_f64().unwrap())
+        .sum::<f64>()
+        / 2.0;
+    assert!(
+        (directory_risk["mean"].as_f64().unwrap() - expected_mean).abs() < 1e-9,
+        "{directory}"
+    );
+
+    let after = server.call(root, "session_start", json!({"session_id":"ranking-after"}));
+    assert_overlay(&after);
+    let snapshot: Value = serde_json::from_slice(
+        &std::fs::read(root.join(".codesage/sessions/ranking-after.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["top_risk_files"], current["top_risk_files"]);
+    let diff = server.call(root, "session_end", json!({"session_id":"ranking-before"}));
+    assert_overlay(&diff);
+    assert!(
+        diff["risk_regressions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["file"] == "src/leaf.rs" && row["after"] == risk["score"]),
+        "{diff}"
+    );
+}
+
+#[test]
+fn edited_test_calls_change_recommendations_and_rehearsal_evidence() {
+    let dir = fixture();
+    let root = dir.path();
+    std::fs::create_dir(root.join("tests")).unwrap();
+    std::fs::write(
+        root.join("src/before.php"),
+        "<?php function before_target() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/after.php"),
+        "<?php function after_target() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("tests/FlowTest.php"),
+        "<?php function test_flow() { before_target(); }\n",
+    )
+    .unwrap();
+    cli(root, &["index", "--no-semantic"]);
+    let mut server = Server::start();
+    let before = server.call(
+        root,
+        "recommend_tests",
+        json!({"targets":["src/before.php"]}),
+    );
+    assert_eq!(before["reachable"].as_array().unwrap().len(), 1, "{before}");
+    assert_eq!(before["reachable"][0]["path"], "tests/FlowTest.php");
+    assert_eq!(before["reachable"][0]["via"], "src/before.php");
+    let before_other = server.call(
+        root,
+        "recommend_tests",
+        json!({"targets":["src/after.php"]}),
+    );
+    assert_eq!(before_other["reachable"], json!([]));
+
+    std::fs::write(
+        root.join("tests/FlowTest.php"),
+        "<?php function test_flow() { after_target(); }\n",
+    )
+    .unwrap();
+    let removed = server.call(
+        root,
+        "recommend_tests",
+        json!({"targets":["src/before.php"]}),
+    );
+    assert_overlay(&removed);
+    assert_eq!(removed["reachable"], json!([]), "{removed}");
+    let added = server.call(
+        root,
+        "recommend_tests",
+        json!({"targets":["src/after.php"]}),
+    );
+    assert_overlay(&added);
+    assert_eq!(added["reachable"].as_array().unwrap().len(), 1, "{added}");
+    assert_eq!(added["reachable"][0]["path"], "tests/FlowTest.php");
+    assert_eq!(added["reachable"][0]["via"], "src/after.php");
+    assert_eq!(added["reachable"][0]["distance"], 1);
+    let note = "Reachable tests (call/import edges): tests/FlowTest.php";
+    let removed_rehearsal = server.call(
+        root,
+        "review_rehearsal",
+        json!({"targets":["src/before.php"]}),
+    );
+    assert_overlay(&removed_rehearsal);
+    assert!(
+        !removed_rehearsal["summary_notes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(note)),
+        "{removed_rehearsal}"
+    );
+    let added_rehearsal = server.call(
+        root,
+        "review_rehearsal",
+        json!({"targets":["src/after.php"]}),
+    );
+    assert_overlay(&added_rehearsal);
+    assert!(
+        added_rehearsal["summary_notes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(note)),
+        "{added_rehearsal}"
+    );
+}
+
+#[test]
+fn overlay_bundles_keep_late_target_bodies_and_number_raw_path_comments() {
+    let dir = fixture();
+    let root = dir.path();
+    std::fs::create_dir(root.join("app")).unwrap();
+    std::fs::write(root.join("app/x.py"), "def before():\n    pass\n").unwrap();
+    cli(root, &["index", "--no-semantic"]);
+    let mut server = Server::start();
+    for prefix in [
+        "# Padding that must not displace the requested declaration.\n".repeat(800),
+        "# pad\n".repeat(63),
+    ] {
+        let line = prefix.lines().count() + 1;
+        std::fs::write(
+            root.join("app/x.py"),
+            format!("{prefix}def late_function():\n    return 'current late body'\n"),
+        )
+        .unwrap();
+        for target in [
+            "sym:app/x.py#late_function".to_string(),
+            format!("app/x.py:{}", line + 1),
+        ] {
+            let bundle = server.call(root, "export_context", json!({"target":target}));
+            assert_overlay(&bundle);
+            assert!(
+                bundle["primary"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["content"]
+                        .as_str()
+                        .is_some_and(|source| source.contains("def late_function():")
+                            && source.contains("return 'current late body'"))),
+                "{bundle}"
+            );
+        }
+    }
+    std::fs::write(
+        root.join("app/x.py"),
+        "# app/x.py\ndef changed():\n    pass\n",
+    )
+    .unwrap();
+    let bundle = server.call(root, "export_context", json!({"target":"file:app/x.py"}));
+    assert_overlay(&bundle);
+    let source = bundle["primary"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["content"].as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(source.contains("   1 | # app/x.py\n"), "{bundle}");
+    assert!(source.contains("   2 | def changed():\n"), "{bundle}");
+    assert!(source.contains("   3 |     pass\n"), "{bundle}");
+}
+
+#[test]
+fn deep_java_falls_back_without_losing_the_mcp_process() {
+    let dir = fixture();
+    let root = dir.path();
+    std::fs::write(root.join("Subject.java"), "class Subject {}\n").unwrap();
+    cli(root, &["index", "--no-semantic"]);
+    let before = std::fs::read(root.join(".codesage/index.db")).unwrap();
+    let mut server = Server::start();
+    std::fs::write(root.join("Subject.java"), "class Current {}\n").unwrap();
+    let current = server.call(root, "find_symbol", json!({"target":"Current"}));
+    assert_overlay(&current);
+    assert_eq!(current["results"][0]["name"], "Current");
+
+    std::fs::write(
+        root.join("Subject.java"),
+        format!("{}{}", "class A { ".repeat(200), "}".repeat(200)),
+    )
+    .unwrap();
+    let bounded = server.call(root, "find_symbol", json!({"target":"Subject"}));
+    assert_eq!(bounded["index"]["structural"], "dirty", "{bounded}");
+    assert_eq!(bounded["index"]["dirty_paths"], json!(["Subject.java"]));
+    assert!(
+        bounded["index"]["overlay"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Java syntax nesting exceeds 128 levels"),
+        "{bounded}"
+    );
+    assert_eq!(bounded["results"][0]["name"], "Subject");
+    std::fs::write(root.join("Subject.java"), "class After {}\n").unwrap();
+    let after = server.call(root, "find_symbol", json!({"target":"After"}));
+    assert_overlay(&after);
+    assert_eq!(after["results"][0]["name"], "After");
     assert_eq!(
         std::fs::read(root.join(".codesage/index.db")).unwrap(),
         before

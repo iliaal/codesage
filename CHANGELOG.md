@@ -13,6 +13,7 @@
 
 - Call paths, impact, and test reachability exclude unrelated language namesakes and C calls attributed to C++ methods while retaining C/C++ and JavaScript/TypeScript interoperability.
 - Local release installation preserves executable identity so Linux daemons from older versions stop successfully during upgrade.
+- Java parsing rejects syntax nesting beyond 128 levels before recursive analysis can overflow the worker stack.
 
 ### Security
 

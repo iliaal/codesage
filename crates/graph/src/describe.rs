@@ -325,7 +325,7 @@ impl Builder<'_> {
         self.section("identity", self.own_expansion("identity"), budget, |b| {
             let language = b.db.all_files_with_id_and_language()?.into_iter().find(|(_, p, _)| p == path).map(|(_, _, l)| l);
             let source = read_regular(b.root, path, MAX_READ)?;
-            let dirty = b.db.get_file_hash(path)?.is_none_or(|hash| hash != codesage_parser::discover::content_hash(&source));
+            let dirty = b.db.get_indexed_file_hash(path)?.is_none_or(|hash| hash != codesage_parser::discover::content_hash(&source));
             let head = b.db.get_structural_index_state()?.map(|(sha, _)| sha);
             let is_test = b.file_is_test(path);
             let interpretation = b.db.file_interpretation_matches(path, crate::STRUCTURAL_INTERPRETATION);
