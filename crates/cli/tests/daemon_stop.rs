@@ -167,7 +167,8 @@ fn daemon_stop_rejects_replaced_pid_without_signalling_either_process() {
         "mismatched record stopped the daemon"
     );
     fs::write(&pid_file, original).unwrap();
-    assert!(command(runtime.path(), "stop").status.success());
+    let output = command(runtime.path(), "stop");
+    assert!(output.status.success(), "{output:?}");
 }
 
 #[test]
@@ -436,5 +437,6 @@ fn daemon_stop_reports_unverified_legacy_daemon_after_executable_key_changes() {
     .unwrap();
     fs::remove_file(legacy_pid).unwrap();
     fs::write(pid_file, original).unwrap();
-    assert!(command(runtime.path(), "stop").status.success());
+    let output = command(runtime.path(), "stop");
+    assert!(output.status.success(), "{output:?}");
 }

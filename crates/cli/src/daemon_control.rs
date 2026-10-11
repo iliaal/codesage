@@ -2,7 +2,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::net::UnixStream as BlockingStream,
     path::Path,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -93,15 +93,46 @@ pub(super) fn request(
 }
 
 pub(super) fn stop(path: &Path, pid: i32, nonce: [u8; 32]) -> io::Result<()> {
-    let mut stream = request(path, pid, nonce, true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let mut byte = [0];
-    match stream.read(&mut byte)? {
-        0 => Ok(()),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unexpected shutdown response",
-        )),
+    let stream = request(path, pid, nonce, true)?;
+    wait_for_shutdown(stream, Duration::from_secs(10))
+}
+
+fn wait_for_shutdown(mut stream: BlockingStream, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "daemon shutdown timed out"))?;
+        let timeout = rustix::event::Timespec::try_from(remaining).map_err(io::Error::other)?;
+        let mut poll = [rustix::event::PollFd::new(
+            &stream,
+            rustix::event::PollFlags::IN,
+        )];
+        // macOS rejects socket-option changes after the acknowledged peer exits.
+        match rustix::event::poll(&mut poll, Some(&timeout)) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "daemon shutdown timed out",
+                ));
+            }
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+        let mut byte = [0];
+        match stream.read(&mut byte) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected shutdown response",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -133,4 +164,50 @@ pub(super) async fn accept(
         Ok((message[0] == b'!').then_some(stream))
     })
     .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_wait_accepts_an_already_closed_peer() {
+        let (stream, peer) = BlockingStream::pair().unwrap();
+        stream.set_read_timeout(Some(CONTROL_TIMEOUT)).unwrap();
+        drop(peer);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        wait_for_shutdown(stream, Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn shutdown_wait_rejects_unexpected_data() {
+        let (stream, mut peer) = BlockingStream::pair().unwrap();
+        peer.write_all(b"x").unwrap();
+        drop(peer);
+        assert_eq!(
+            wait_for_shutdown(stream, Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn shutdown_wait_times_out_while_the_peer_remains_open() {
+        let (stream, _peer) = BlockingStream::pair().unwrap();
+        let timeout = Duration::from_millis(20);
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_shutdown(stream, timeout).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() >= timeout);
+    }
 }

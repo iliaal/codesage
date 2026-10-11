@@ -30,6 +30,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test -p codesage --bin codesage daemon::control::tests
       - run: cargo test -p codesage --test daemon_stop
 
   fmt:
