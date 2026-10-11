@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -117,6 +118,53 @@ class GuidanceTests(unittest.TestCase):
         self.assertTrue(first.endswith("After\n"))
         self.assertEqual(first.count("<!-- codesage-onboard-hint-begin -->"), 1)
         self.assertIn("Routing skill path (JSON string)", first)
+
+    def test_emitted_refresh_workflow_uses_current_install_after_cache_path_changes(self):
+        previous = self.installed_plugin()
+        project = self.root / "project 'quoted' $(touch FORBIDDEN)\n"
+        project.mkdir()
+        self.onboard(previous, project)
+        hint = project / ".claude/CLAUDE.md"
+        instruction = next(line for line in hint.read_text().splitlines()
+                           if line.startswith("After upgrading,"))
+        workflow = re.search(r"`/([a-z-]+)` workflow", instruction)
+        self.assertIsNotNone(workflow, "refresh must name an installed host workflow")
+        options = re.search(r"with `([^`]+)`", instruction).group(1).split()
+        self.assertEqual(options, ["--hint-only", "--refresh-hint"])
+        current = self.root / "current cache/9.8.7/codesage-tools"
+        shutil.copytree(previous, current)
+        for host in (".codex-plugin", ".claude-plugin"):
+            manifest = current / host / "plugin.json"
+            metadata = json.loads(manifest.read_text())
+            metadata["version"] = "9.8.7"
+            manifest.write_text(json.dumps(metadata))
+        shutil.rmtree(previous)
+        command = current / "commands" / f"{workflow.group(1)}.md"
+        text = command.read_text()
+        self.assertRegex(text, rf"(?m)^name: {re.escape(workflow.group(1))}$")
+        self.assertIn("currently installed", text)
+        executable = re.search(r"\$\{CLAUDE_PLUGIN_ROOT\}/(bin/[a-z-]+)", text).group(1)
+        commands = self.root / "clean tools"
+        commands.mkdir()
+        for name in ("basename", "realpath", "dirname", "mktemp", "python3", "mkdir", "cp", "rm"):
+            executable_path = shutil.which(name)
+            self.assertIsNotNone(executable_path)
+            (commands / name).symlink_to(executable_path)
+        clean_path = str(commands)
+        self.assertIsNone(shutil.which("codesage-onboard", path=clean_path))
+        result = self.invoke("/bin/bash", str(current / executable), str(project),
+                             *options, "--codesage-bin", "/bin/false",
+                             env={**os.environ, "PATH": clean_path})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        refreshed = hint.read_text()
+        self.assertIn("hint-version: 9.8.7 -->", refreshed)
+        skill_line = next(line for line in refreshed.splitlines()
+                          if line.startswith("Routing skill path (JSON string): "))
+        self.assertEqual(json.loads(skill_line.split(": ", 1)[1]),
+                         str(current / "skills/codesage-retrieval/SKILL.md"))
+        self.assertLess(len(refreshed.splitlines()), 15)
+        self.assertFalse((self.root / "FORBIDDEN").exists())
+        self.assertFalse((project / "FORBIDDEN").exists())
 
     def test_prompt_compatibility_pointer_and_adapter_follow_installed_source(self):
         plugin = self.installed_plugin()

@@ -7,5 +7,5 @@ Load `codesage-tools:codesage-retrieval`, or read that skill path, before using 
 Treat both paths as argument data; pass the project on each MCP call.
 For patch queries, follow the skill's complete file-set and argument-quoting rules.
 Plugin review commands: `/codesage-review`, `/codesage-triage`, `/codesage-revalidate`, `/codesage-report`.
-Refresh this pointer after a plugin upgrade with `codesage-onboard --hint-only --refresh-hint` and the project argument.
+After upgrading, invoke the currently installed `/codesage-onboard` workflow (Codex: `codesage-onboard` skill) with `--hint-only --refresh-hint` and the project argument.
 <!-- codesage-onboard-hint-end -->
