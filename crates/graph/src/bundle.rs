@@ -2119,7 +2119,7 @@ mod overlay_source_tests {
         };
         reader
             .install_structural_overlay(
-                &[file.path.clone()],
+                std::slice::from_ref(&file.path),
                 &[StructuralOverlayFile {
                     file: &file,
                     symbols: &[definition],
