@@ -338,7 +338,7 @@ impl CodeSageServer {
 impl CodeSageServer {
     #[tool(
         name = "help",
-        description = "On-demand tool and field semantics, error recovery, investigation recipes, and measured daemon latency. Select tool (optionally field), an envelope field, code, or intent; omit selectors for the catalog. tool=daemon discovers operator and hidden tools. Recipes are plans to execute with explicit bindings, not automation. Requires an absolute existing project directory; no index or model is needed.",
+        description = "Explain tool or field semantics, recovery, investigation recipes, and measured daemon latency. Use when arguments or evidence need interpretation; use describe for facts about code. Requires an absolute existing project directory, without an index or model. Select tool=daemon for operator tools.",
         output_schema = schema_for_type::<help::HelpResult>()
     )]
     async fn help_tool(&self, Parameters(params): Parameters<HelpParams>) -> CallToolResult {
@@ -361,7 +361,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "describe",
-        description = "Compact indexed card for one file, symbol, feature, or directory. Includes test-aware facts, freshness, dependencies, features, bounded risk, and executable expand calls. Symbol cards include rationale, callers/callees, clones, hotness, and file import cycles; directory cards summarize a subtree. Ambiguous targets return candidates only. detail expands samples; sections selects facts. Deadline-cut sections are unscored with recover; no inference or writes.",
+        description = "Inspect one indexed file, symbol, feature, or directory: facts, dependencies, tests, risk, and follow-up calls. Use project_overview for project orientation or export_context for source bundles. Ambiguous targets return candidates; unavailable sections disclose recovery.",
         output_schema = schema_for_type::<DescribeResult>()
     )]
     async fn describe_tool(
@@ -415,7 +415,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "project_overview",
-        description = "First-call orientation for a project: one bounded response with languages and file/symbol counts, index freshness (structural drift vs git HEAD + semantic coverage), mapped feature summary by kind, a sample of entrypoints (routes/CLI/services/libraries), the top-risk files, trust-boundary clusters, the test-file naming conventions per language, and suggested next CodeSage calls for common intents. Aggregates indexed facts and computes risk analysis, reusing a shared ranking when the index is unchanged; no semantic search or model inference. Call this once at the start of a session to orient before reaching for `search`/`find_symbol`/`assess_risk`. `top_risk_files` is empty until git history is indexed; `freshness.structural_kind` of `behind_head`/`unrelated_ancestor` means structural results may be stale (re-run `codesage index`).",
+        description = "Orient once at session start: languages, index freshness, features, entrypoints, risk, boundaries, and test conventions. Uses indexed facts without model inference. Use describe for one entity; use search to locate behavior. Refresh stale structural evidence before relying on it.",
         output_schema = schema_for_type::<ProjectOverview>()
     )]
     async fn project_overview_tool(
@@ -446,7 +446,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "review_rehearsal",
-        description = "Predict the objections a reviewer will likely raise against a patch, BEFORE committing. Input is the patch's file list (e.g. `git diff --name-only`). Returns severity-ranked objections — missing tests, high-risk files, wide blast radius, fix-prone files, churn hotspots, import cycles touched, trust-boundary expansion (≥3 boundaries), feature-test gaps (changed a feature's core files but none of its mapped tests), and scope-spread when a patch touches many unrelated feature areas — each with concrete evidence and the files it concerns, plus paste-ready `summary_notes` (objection counts + risk summary + the exact tests to run). Pure composition of `assess_risk_diff`, `recommend_tests`, index-drift, and feature mapping — read-only, no AI prose. Use as the last step before a commit: fix or consciously accept each objection. `file_paths` must be non-empty: an empty list is rejected (the CLI's stdin/working-tree fallback does not exist over MCP).",
+        description = "Review an explicit patch file set before committing: ranked objections about risk, tests, cycles, boundaries, and scope, with evidence and suggested checks. Use assess_risk_diff for risk alone. Inspect each objection against the actual patch; this read-only analysis does not run tests.",
         output_schema = schema_for_type::<ReviewRehearsal>()
     )]
     async fn review_rehearsal_tool(
@@ -480,7 +480,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "edit_check",
-        description = "Check a complete proposed replacement declaration before writing it. Parses against a pinned Git HEAD, reports signature argument counts, visibility, and same-scope overload changes, and lists only provably incompatible HEAD callers. Currently caller proof covers explicit self::/super:: paths to Rust free functions without macros, attributes, or imports; other supported source languages receive syntax diffs and explicit unknowns. Only the selected file is scanned. This is not a compilation or safety verdict. Does not write source or the index; reports working-file divergence from HEAD. Ambiguous .h dialects are refused.",
+        description = "Check a complete replacement declaration against pinned Git HEAD before writing. Reports signature changes, proven incompatible callers where supported, and explicit unknowns. Requires Git, without an index. Use find_references for broader caller discovery. Does not compile, write source, or establish safety.",
         output_schema = schema_for_type::<codesage_graph::edit_check::EditCheckReport>()
     )]
     async fn edit_check_tool(
@@ -507,7 +507,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_symbol",
-        description = "Find symbol definitions (functions, classes, methods, structs, traits, enums) by name. Returns exact file path, line number, and kind. **Prefer this over Grep/ripgrep for any code-identifier lookup** — one call returns the definition, while grepping for a function name often produces many false hits (call sites, comments, other namespaces) that cost extra Read calls to disambiguate. Use partial names for broad search or qualified names ('MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match. For the inverse question (who calls / imports / instantiates this symbol?) use `find_references`. When present, `rationale[]` carries `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments attached to the definition — read these before refactoring or renaming so the agent doesn't drop a constraint the author wrote down. Currently extracted for Rust and Python.",
+        description = "Locate indexed definitions by name or target, with source locations, kinds, and author rationale. Use find_references for uses of a symbol; use search when its name is unknown. Inspect ambiguous matches before choosing a definition.",
         output_schema = schema_for_type::<FindSymbolResults>()
     )]
     async fn find_symbol_tool(
@@ -532,7 +532,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_references",
-        description = "Find all references to a symbol across the codebase. **Prefer this over Grep for 'where is X called / imported / instantiated?'** — returns structured {file, line, kind, from_symbol} rows with the reference type (call/import/import_binding/inheritance/instantiation/type_hint) already classified — `import` names the module (`./foo.js`) while `import_binding` names the symbol that import introduces (`Foo`) and, in JS/TS, each module export reached through an imported binding (`axios.CancelToken`, `typeof mod.X`, TS `ns.Type`), so a JS/TS file that imports a symbol and only uses it as `Foo.method()`, `x instanceof Foo`, or `mod.Foo` still appears — instead of raw grep hits that mix definitions, comments, and string literals together. `from_symbol` names the enclosing symbol that makes each reference (the caller), so you get caller→callee edges without re-deriving them from line numbers; it is null for references at file scope (e.g. top-level imports) or in files with no extracted symbols. For the definition itself use `find_symbol`; for transitive blast radius (callers of callers) use `impact_analysis`. Edges come from name-based extraction, so `counts_floor: true` always: an empty `results` means no reference was FOUND, not that none exists (dynamic dispatch, reflection, callbacks, and macro-generated calls leave no edge); `definition_count` / `ambiguous` / `note` say when the rows are the union across several same-named definitions.",
+        description = "Find indexed calls, imports, and other references to a symbol. Results are name-based evidence and may combine same-named definitions; missing rows do not prove absence. Use find_symbol for definitions or impact_analysis for transitive dependents.",
         output_schema = schema_for_type::<FindReferencesResults>()
     )]
     async fn find_references_tool(
@@ -557,7 +557,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_similar",
-        description = "Find functions/methods structurally similar to a named one (near-clone detection via MinHash over AST shape; identifiers and literals are ignored). Even an exact symbol handle seeds all fingerprints sharing its bare name; target describes input resolution, not seed uniqueness. Use before editing a function to find its copies so a fix lands everywhere, to spot divergent forks of a helper, or to locate copy-paste during review. Returns {name, file_path, line_start, line_end, kind, jaccard} ranked by similarity (1.0 = structurally identical body). Test files are excluded. Tune `min_jaccard` up for exact clones, down for looser matches. `min_jaccard` outside [0, 1] is clamped and `limit` over 100 is capped; either adjustment is reported under `_meta.clamps` as requested-vs-applied.",
+        description = "Find structurally similar functions or methods before applying a fix across copies. Matches AST shape, ignoring identifiers and literals; same-named definitions share the seed set. Use search for semantic similarity or find_symbol for exact definitions. Test files are excluded.",
         output_schema = schema_for_type::<FindSimilarResults>()
     )]
     async fn find_similar_tool(
@@ -586,7 +586,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "list_dependencies",
-        description = "List immediate (single-hop) import/include dependencies for a file: what THIS file imports and which other files import THIS file. Use when the question is 'what does this file depend on?' or 'who imports this file?'. For 'what breaks if I change this?' use `impact_analysis` (walks multiple hops, ranks by distance). For per-symbol callers/callees use `find_references` (per-symbol grain, not per-file).",
+        description = "List a file's immediate imports and importers. Use for direct file dependencies; use find_references for symbol uses or impact_analysis for transitive dependents. Results describe indexed relationships, not an exhaustive runtime dependency graph.",
         output_schema = schema_for_type::<DependencyEntry>()
     )]
     async fn list_dependencies_tool(
@@ -610,7 +610,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "search",
-        description = "Semantic code search (embedding-based + cross-encoder reranking). **Prefer this over Grep when you don't know the exact symbol name** — useful for queries like 'where is auth handled', 'error handling in the session pipeline', 'database connection pooling', 'where do we validate inputs'. Grep needs the literal token already; `search` lets the agent ask by intent. For exact identifier lookups with a known name, use `find_symbol` or `find_references` instead. `paths` filters are applied after bounded KNN retrieval so large MCP calls stay responsive; recall is approximate when a filter excludes many near-neighbor chunks. Each page carries `confidence` (`high` / `low`), `margin_pct`, and `cliff_at` describing the largest relative score drop in the returned rows (ranking flatness, not whether the answer exists); pass `adaptive_limit: true` to truncate at that cliff when `confidence` is `high`. Pass `explain: true` for each row's score transitions and dense/BM25/reranker signals; ranking stays unchanged.",
+        description = "Locate code by behavior or intent using embeddings and optional reranking. Use find_symbol for known definitions or find_references for known uses. Path filtering has approximate recall. Ranking confidence describes score separation, not correctness or proof of absence.",
         output_schema = schema_for_type::<SearchResults>()
     )]
     async fn search_tool(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
@@ -717,7 +717,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "trace_call_path",
-        description = "Shortest call chain from one symbol to another: how does `from` end up calling `to`? Breadth-first over resolved callee edges; each step names the symbol, its file:line, and `call_line` in the PREVIOUS step's body. Use for `how does request input reach this exec/query/write?` or to orient in an unfamiliar callstack. Read `note` and `bounded`: `bounded: true` means a search or resolution limit omitted evidence, so a missing chain may exist and a found chain may have an omitted shorter alternative. Raising `max_depth` only helps depth limits, not resolution limits. `max_depth` over 6 is capped to 6 and reported under `_meta.clamps` as requested-vs-applied; the `codesage trace` CLI can search deeper. Direction matters: this walks callee edges forward from `from`, so swap the arguments to ask the reverse question. `counts_floor: true` always: edges are resolved name-based calls, so `found: false` means no path via those edges, never that no path exists.",
+        description = "Trace a forward call chain between two symbols through resolved indexed edges. Use impact_analysis for reverse dependents or from_trace for an observed stack trace. Missing paths do not prove absence; bounded searches may omit paths or shorter alternatives.",
         output_schema = schema_for_type::<CallPathReport>()
     )]
     async fn trace_call_path_tool(
@@ -744,7 +744,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "from_trace",
-        description = "Map a pasted stack trace or sanitizer report onto indexed symbols. Paste it verbatim; Python, PHP (incl. Xdebug), Rust, Java, Go, Node/JS, and gdb/ASan/UBSan are detected per line (Kotlin parses as Java, but a frame naming a `.kt` file is always `unresolved`: Kotlin is not indexed). `frames` are innermost-first: `frames[0]` is the innermost frame of stack 0, each with the indexed `file`:`line` and the `symbol` whose definition spans it. Chained reports split into stacks (`stack`, `stacks`, `root_cause_first`): Java's deepest `Caused by:` is stack 0 with `Suppressed:` blocks last; Python's first traceback, ASan's access stack, Go's `[running]` goroutine, and each Rust panicking thread are stack 0 in printed order. Frames are marked, not guessed: `unresolved` = file outside the index or nothing matched; `ambiguous` = path suffix or qualified name matched several entries, or only a bare name matched (a lead, not a location), listed in `candidates` (max 10, or 5 for a frame with no file; `candidates_total` has the count) with `symbol` empty. `resolved` may carry `symbol: null` between definitions (`with_symbol` counts the rest). PHP `#N file(line): func()` frames give the CALL SITE of `func`, so `symbol` is `func`'s definition, not the function spanning `line`. `format: \"unknown\"`, `parsed: 0` means nothing was recognized. Long traces are cut twice: `limit` (default and ceiling 50) sets `frames` and the resolved/ambiguous/unresolved counts — see `note`; the response budget may cut `frames` further — see `_meta.truncated`. Only `parsed` counts the whole input. Follow up with `find_references` or `trace_call_path` on the resolved symbols.",
+        description = "Map a pasted stack trace or sanitizer report to indexed source locations. Frames disclose resolved, ambiguous, or unresolved matches. Use trace_call_path to investigate graph paths between symbols; use find_references for callers. Paste the original trace without rewriting it.",
         output_schema = schema_for_type::<FromTraceReport>()
     )]
     async fn from_trace_tool(
@@ -776,7 +776,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "impact_analysis",
-        description = "Estimate which files are affected by changing a symbol or file. Walks the **reverse** reference graph up to `depth` hops (default 2) — i.e., callers/importers of the target and transitively their callers/importers — reports affected files in `results` ranked by distance and reference count. **Multi-hop blast radius from the target outward to its dependents.** `results` is `[]` for leaf files nothing imports/calls. Opt-in extras (all default off): `include_forward` adds the target's own forward dependencies in `forward_dependencies`; `include_siblings` adds same-file symbols in `sibling_symbols`; `limit` caps `results` (sets `truncated`); `summary_only` drops per-reason detail and attaches a `summary` rollup for wide blast radii. For single-hop importer/importee of one file use `list_dependencies`; for raw call sites of a specific symbol use `find_references`. `counts_floor: true` always: reverse edges come from name-based extraction, so every count is a floor and an empty `results` means no dependents were found, not that none exist.",
+        description = "Find transitive callers and importers affected by changing a symbol or file. Walks reverse indexed references. Use list_dependencies for immediate file imports or find_references for individual uses. Missing dependents do not prove absence; inspect completeness before treating the result as exhaustive.",
         output_schema = schema_for_type::<ImpactReport>()
     )]
     async fn impact_analysis_tool(
@@ -815,7 +815,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "export_context",
-        description = "Build a curated context bundle from the shared target grammar or free-form text, with symbol definitions and optional caller/callee code. Exact entities resolve before inference; ambiguous entities return E_AMBIGUOUS with candidate handles, and entity misses return E_NOT_FOUND. File and directory targets read stored chunks in path/line order; chunk targets read stored chunks overlapping their line range. Feature, route, and command targets use mapped feature files; if entry-symbol and stored-chunk lookup yield no definitions, exports collect available Entry/Owned definitions up to limit. Only a Text resolution uses semantic search. An entity without stored chunks still returns found:true and available structural definitions. A missing symbol forced through deprecated is_symbol returns found:false. Symbol entries carry rationale[] extracted from Rust and Python author comments; preserve these in synthesis.",
+        description = "Bundle source and definitions for an entity or free-form question, optionally with callers and callees. Exact entities resolve before model inference; text uses semantic search. Use describe for a compact fact card or feature_bundle for a mapped feature. Resolve ambiguity with returned handles.",
         output_schema = schema_for_type::<ContextBundle>()
     )]
     async fn export_context_tool(
@@ -857,7 +857,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_coupling",
-        description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d); a pair whose shared commits span under 30 days ranks at half its weight so recurring pairs come first. Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Response is `{found: bool, coupled: [...], file_indexed: bool, file_commits: u32, note?: string}` — check `found` (false when the file has no git-history row), then read `coupled` for the ranked list. Each row carries `recurrence` (distinct 90-day calendar windows the pair co-changed in; informational, a boundary straddle can read 2), `span_days` (oldest to newest shared commit), `recurring` (span_days >= 30), `p_cochange` = P(row file changes | this file changes) and `p_reverse` = P(this file changes | row file changes), both lower bounds (commits touching >30 files add no pair evidence but count in the denominator); a high `p_cochange` with low `p_reverse` means this file depends on the other, not vice versa. The older spellings `confidence` / `reverse_confidence` carry the same values and are removed in the next minor. Trust `recurring` rows over one-offs (one mass commit). When `coupled` is empty, `note` disambiguates: file never indexed vs. file has history but no pair above the min-count=3 threshold vs. path shape mismatch; when any row has `span_known: false` (indexed before recurrence tracking) `note` says to run `git-index --full`; when no row is recurring, `note` says whether the history is too short to show recurrence or the coupling is short-burst evidence. Index into `.coupled`, not the response directly. For the patch-level question 'which tests should I run after editing these files?' use `recommend_tests` instead (resolves test conventions + co-change in one call). For the single-file risk score that already folds in coupling pressure use `assess_risk`.",
+        description = "Find files that historically change with one file, ranked by decayed co-change evidence. Use recommend_tests for patch test selection or assess_risk for a combined risk score. Missing history is unmeasured; recurring pairs offer stronger evidence than one-off changes.",
         output_schema = schema_for_type::<CouplingReport>()
     )]
     async fn find_coupling_tool(
@@ -884,7 +884,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk",
-        description = "Risk score for changing one file: blends seven signals — churn percentile, fix ratio, blast radius (depth-2 reverse deps), historical coupling, test-gap, import-cycle membership, and trust-boundary count — into a 0..1 score. Response carries `score`, `notes[]`, the `trust_boundaries[]` list, `top_symbols[]` (up to 5 product symbols inside the file ranked by line count + resolved product-caller count + cycle membership; a row carries `shared: true` when same-named definitions in that same file share its count, `bounded: true` when resolution was capped and the count is a name-based upper bound), and `cycle_files[]` when the file sits in an import cycle. Notes are paste-ready for PR descriptions: the `crosses N trust boundaries` line fires when ≥3 boundaries cross, and the `in import cycle of N files` line names up to five members. `unscored: true` (present only when true) means this file has no git-history row, so the churn, fix-ratio, and coupling terms — 0.59 of the composite weight — were never measured: `score` then covers structural signals only and a low value is absence of evidence, not evidence of safety (brand-new file, path excluded from git indexing, `codesage git-index` never run, or history outside the indexed window). Pass `verbose: true` to also get the per-signal decomposition (`churn_score`, `churn_percentile`, `fix_ratio`, `total_commits`, `fix_count`, `dependent_files`, `coupled_files`, `test_gap`, `in_cycle`, `cycle_size`) and `top_coupled[]`; the default omits them. Use BEFORE writing a patch to calibrate caution and BEFORE submitting to flag concerns. For per-file scoring across N files in one call use `assess_risk_batch`; for patch-level aggregation (max/mean, summary_notes, cycles touching the patch) use `assess_risk_diff`.",
+        description = "Assess one file's change risk from history and structural signals. Missing history leaves a partial score, not evidence of safety. Use assess_risk_batch for independent file scores or assess_risk_diff for patch rollups. Inspect the evidence before deciding which checks to run.",
         output_schema = schema_for_type::<RiskAssessment>()
     )]
     async fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> CallToolResult {
@@ -912,7 +912,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk_diff",
-        description = "Aggregate risk for a SET of files (the file list of a patch or PR). Returns per-file entries (same shape as `assess_risk`, including its `verbose` gating) plus rollups: max_score, mean_score, max_risk_file, and lists of files in each risk category (test_gap, hotspot, fix-heavy, wide blast radius). max_score/mean_score/max_risk_file cover only the files whose git history was measured: a file with no git-history row (`unscored: true` on its entry) is listed in `unscored_files`, left out of those aggregates, and named in a summary note, so a patch cannot read as calm because its riskiest file has no indexed history. `scored_file_count` is the mean's denominator; 0 means nothing was scored and max/mean are 0.00 by convention, not measurements. Use BEFORE submitting a patch: if max_score is high or any test_gap_files or unscored_files exist, add tests, split the patch, or flag concerns. summary_notes are paste-ready for a PR description. On large patches that touch ≥5 files from one directory, per-file entries for that directory move from `files` into a `clustered_directories[]` entry (top-3 by score preserved in detail, rest by name); rollup arrays still list every clustered file by name, so cross-referencing still works. `cycles_touching_patch[]` lists import cycles (files that mutually depend via import/include/inheritance/trait_use) that include at least one patch file, each with `members`, `size`, and `max_churn_file` (best refactor target). Honest caveat: we can't distinguish cycles the patch introduced from cycles that already existed; phrase PR feedback as 'this patch touches an existing cycle' unless you've verified the base branch.",
+        description = "Aggregate risk across an explicit patch file set, including hotspots, test gaps, unscored files, and touched import cycles. Use assess_risk_batch for independent scores without patch rollups. Touched cycles may predate the patch; compare the base before claiming a new cycle.",
         output_schema = schema_for_type::<RiskDiffAssessment>()
     )]
     async fn assess_risk_diff_tool(
@@ -945,7 +945,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk_batch",
-        description = "Risk score for EACH of N files, returned per-file with no patch-level aggregation. Use when you have a list of files (impact analysis output, coupling neighbours, the files of a feature you're touching one-by-one) and want each individual score — cuts the per-file MCP round-trip overhead vs calling `assess_risk` N times. Each entry is a RiskAssessment with the same shape as `assess_risk`, including its `verbose` gating of the decomposition scalars and `top_coupled` and its `unscored: true` marker for files with no git-history row (unmeasured history terms, not a low-risk verdict). There is no cross-file aggregate here to distort, so read `unscored` per entry. The response also includes a top-level `_legend` short-code map: when ≥3 files in the batch share a categorical note (test-gap, no-git-history), per-file `notes[]` entries are aliased to short codes (e.g. `\"T\"`, `\"NG\"`) and the legend resolves them. For patch-level aggregation (max/mean, hotspot/test-gap rollups, cycles), use `assess_risk_diff` instead — they answer different questions.",
+        description = "Score each file in a set independently, without patch aggregation. Use assess_risk for one file or assess_risk_diff for patch rollups and touched cycles. Inspect each file's unscored marker; missing history does not imply low risk.",
         output_schema = schema_for_type::<RiskBatchAssessment>()
     )]
     async fn assess_risk_batch_tool(
@@ -978,7 +978,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "recommend_tests",
-        description = "Tests an agent should run after editing the given files. Returns `primary` (sibling tests resolved by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go — high confidence, always run these), `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions; entries carry `span_days` and `recurring`; only the top 20 co-change partners per changed file are consulted, and a note names files where more existed), and `reachable` (test files that reach one of the input files through resolved call/import edges within 2 hops; each entry carries `path`, `distance`, `edge_count`, and `via` = the changed file it reaches, in the index's spelling, which may differ from the spelling passed; sorted by distance, then edge_count desc, then path; `reachable_total` is the pre-cap count and the list is capped at 50 with `reachable_capped: true` when more exist; never repeats a `primary` or `coupled` entry). Changed files that are themselves tests are listed in `primary` and walked for tests that extend or call them (a base test class or helper under `tests/` reaches its subclasses); a `.phpt` has no grammar, so it is listed but not walked and does not cap. The walk spends one pool of resolution steps (default 1,500,000) under one wall-clock deadline (default 5 s), overridable with `CODESAGE_REACH_BUDGET` / `CODESAGE_REACH_DEADLINE_MS` in the daemon's environment. The pool is drawn in request order: each input may spend everything left except a floor (100,000 steps) reserved for every input still queued behind it, so put the files you care about first: later inputs are the ones that land in `unwalked_files` when it runs out. `reach_walk_capped: true` means the answer is incomplete — `unwalked_files` (no walk at all), `partial_files` (walk cut short), `unindexed_files` (a supported-language path the index does not hold: a new file, a path that is not repo-relative, or one excluded by `[index] exclude_patterns`), `no_symbol_files` (indexed but defines nothing) — and `reachable` is then a lower bound while `unmodelled` carries no information. `unsupported_files` (no parser for the extension: CHANGELOG.md, lockfiles, config) are skipped without capping the answer; a request of only such files returns the co-change bucket plus that note, with `indexed_test_files` and `unmodelled` at 0. When `indexed_test_files` is 0 the walk never ran and `reachable` is a lower bound; the skipped walk alone does not set `reach_walk_capped`. Two spellings of one path (`./src/x.php`, `src/x.php`) are one input, reported as first spelled. Otherwise `unmodelled` / `indexed_test_files` = the indexed test files in none of the three buckets over the total — the graph cannot vouch for them either way, so a large ratio means the buckets are a lower bound, not the full suite. Empty result means no test files in the index for these paths. Use AFTER making a change to know which subset of tests to actually run. Pair with `assess_risk_diff` on the same file list for the patch-level risk rollup (test-gap files, hotspot list, paste-ready summary notes).",
+        description = "Recommend tests for changed files using naming conventions, co-change history, and bounded graph reachability. Put priority inputs first because they share a walk budget. Use assess_risk_diff for patch risk. These recommendations are a lower bound, not permission to skip required suites.",
         output_schema = schema_for_type::<TestRecommendations>()
     )]
     async fn recommend_tests_tool(
@@ -1009,7 +1009,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "session_start",
-        description = "Snapshot the project's structural state at the START of an editing session. Persists the full snapshot (file count, symbol count, full file list, all import cycles, and the top-50 highest-risk files with scores) to `.codesage/sessions/<session_id>.json`, but returns only a compact summary plus `snapshot_path` over MCP so the wire response is never budget-truncated. Pair with `session_end` using the same `session_id` to detect new cycles, removed/added files, or risk regressions on hot files introduced during the session. `session_id` defaults to \"default\" — use a distinct id when running multiple parallel sessions. Re-running `session_start` overwrites the snapshot (useful for resetting a baseline mid-session).",
+        description = "Save the indexed structural baseline before authorized edits, using a distinct session_id for concurrent sessions. Reusing an ID replaces its baseline. Pair with session_end after refreshing the index to inspect graph changes. Use project_overview for orientation without persisting a snapshot.",
         output_schema = schema_for_type::<SessionStartReport>()
     )]
     async fn session_start_tool(
@@ -1044,7 +1044,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "list_features",
-        description = "List feature slices in the project, optionally filtered by kind, language, or tag. A feature is a behavior-keyed bundle (entrypoint + owned files + context + tests + trust boundaries) — e.g. \"Laravel route POST /api/login\", \"Rust binary `codesage`\", \"php-src extension `iconv`\", \"CMake binary `myapp`\". Use this to discover the agent-facing surface area of the project before deep-diving into a specific slice. Pair with `find_feature` (file → features) and `assess_risk` (per-file scoring inside a feature). `limit` 0 means no limit (same as the CLI); a `limit` over 500 is capped and reported under `_meta.clamps` as requested-vs-applied.",
+        description = "Discover mapped behavior slices, filtered by kind, language, or tag. Each feature groups entrypoints, owned files, context, tests, and trust boundaries. Use find_feature to locate a file's features or feature_bundle to read a selected slice.",
         output_schema = schema_for_type::<FeatureListResults>()
     )]
     async fn list_features_tool(
@@ -1091,7 +1091,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_feature",
-        description = "Features that include the given file in any role (entry, owned, context, or test). Use to answer \"what feature owns src/auth/login.php?\" — returns the matching feature records with their full file lists, tags, and trust boundaries. Empty result means no mapped feature claims this file (common: not every file belongs to a feature slice). For the curated code bundle of a matched feature (entry + owned + tests + context wrapped for LLM consumption) call `feature_bundle` with the `feature_id`.",
+        description = "Find mapped features containing a file as entrypoint, owned code, context, or test. An empty result means no mapped feature claims the file. Use list_features to discover slices or feature_bundle to read a matched feature.",
         output_schema = schema_for_type::<FeatureListResults>()
     )]
     async fn find_feature_tool(
@@ -1115,7 +1115,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "feature_bundle",
-        description = "Curated code bundle for one feature_id. Same shape as `export_context` but anchored on the feature's already-resolved file list (entry + owned + tests + context) instead of semantic search results. `primary[]` carries chunks from owned/entry files, `related[]` carries tests and context. Set `include_callers` / `include_callees` to also expand the entry symbol's callers/callees into `related[]` (reuses the symbol graph used by `export_context`). Use after `list_features` / `find_feature` to get all the code an agent needs to review or modify the slice in one MCP call — avoids fan-out Read calls per file. Empty bundle with `target_description` ending `(not found)` means the feature_id doesn't exist — that case also sets top-level `found: false`, so check the flag rather than substring-matching. Empty bundle with `found: true` means the feature exists but no files have been semantically indexed yet (run `codesage index`).",
+        description = "Read source and definitions for a mapped feature's entrypoints, owned files, tests, and context. Use list_features or find_feature to discover the feature; use export_context for other targets. Inspect found and completeness before treating an empty bundle as a missing feature.",
         output_schema = schema_for_type::<ContextBundle>()
     )]
     async fn feature_bundle_tool(
@@ -1146,7 +1146,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "session_end",
-        description = "Diff the current structural state against the snapshot saved by `session_start` (matched by `session_id`, default \"default\"). Returns `pass: bool` (true when no new import cycles were introduced AND no top-risk file regressed by ≥ 0.10), plus `new_cycles`, `resolved_cycles`, `risk_regressions` (per-file before/after/delta), `new_files`, `removed_files`, and `summary_notes` ready to paste into a PR description. Errors when the snapshot file is missing — call `session_start` first. Snapshot file is left in place after the diff so the same id can be re-diffed.",
+        description = "Compare current indexed structure with a session_start baseline: cycles, risk changes, and added or removed files. Refresh the index after edits before comparing. Requires the matching saved session_id; the baseline remains available for repeated comparisons. Use review_rehearsal for patch objections without a baseline.",
         output_schema = schema_for_type::<SessionDiff>()
     )]
     async fn session_end_tool(

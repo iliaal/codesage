@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- MCP tool descriptions use at most 60 words; `help` retains detailed field semantics, limitations, and recovery guidance.
+
 ### Security
 
 - MCP closes input connections when a JSONL frame exceeds 16 MiB, including unterminated frames, across direct stdio, the shim, and daemon sockets.

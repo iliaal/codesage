@@ -1,0 +1,322 @@
+{
+  "before": {
+    "captured_at": "2026-10-11T08:34:47.097999+00:00",
+    "binary_sha256": "0ebfbfcde65b8631d673681d4d1b8bd038a669b7ebdd67ec5f4ba5d8dbeb1fb9",
+    "tools_list_sha256": "fd07334e7e5185812699866eb7394c9a001e4ef23fb4e0d3b3be6eceb150da68",
+    "tokenizer": "cl100k_base",
+    "tiktoken_version": "0.8.0",
+    "measurement": "Sum of separately encoded descriptions and canonical compact inputSchema JSON for every advertised tool. Excludes names, output schemas, annotations, transport, and host-specific serialization. This is a reproducible tokenizer measurement, not a host billing count.",
+    "tool_count": 24,
+    "description_tokens": 5770,
+    "input_schema_tokens": 9146,
+    "tools": [
+      {
+        "name": "assess_risk",
+        "description_tokens": 419,
+        "input_schema_tokens": 396,
+        "input_schema_sha256": "0ed5b88321e203e935838e6b3fc0ac12755b73b99d37fc3e3ac91cbe295f6885"
+      },
+      {
+        "name": "assess_risk_batch",
+        "description_tokens": 252,
+        "input_schema_tokens": 467,
+        "input_schema_sha256": "f888ebc4ca87fbd935e4b1ddbef2443aef2115260772a2eb6aac907763a9f1f2"
+      },
+      {
+        "name": "assess_risk_diff",
+        "description_tokens": 383,
+        "input_schema_tokens": 396,
+        "input_schema_sha256": "e8f1c4cbc58c3c887fcec06fab6814def057b43a40a65b1e4355e904c5990cf9"
+      },
+      {
+        "name": "describe",
+        "description_tokens": 89,
+        "input_schema_tokens": 347,
+        "input_schema_sha256": "5808788a7588b2a99d7a572e0ce3e0473ddc5d46d61ddaa129df55a9e10d12a8"
+      },
+      {
+        "name": "edit_check",
+        "description_tokens": 115,
+        "input_schema_tokens": 335,
+        "input_schema_sha256": "97783146ecedadee6fe479f3d5cb451f330970be12245e16607347cff910f4f7"
+      },
+      {
+        "name": "export_context",
+        "description_tokens": 161,
+        "input_schema_tokens": 413,
+        "input_schema_sha256": "a7d7cc3d5bec5f71f3c48e2fe8a5be7ebe63a3467c3508d66fae2edb067b1194"
+      },
+      {
+        "name": "feature_bundle",
+        "description_tokens": 211,
+        "input_schema_tokens": 406,
+        "input_schema_sha256": "a4922b26b4a138cb2f23944fbf2393348cce97549d309fa2452b9da47ff2b450"
+      },
+      {
+        "name": "find_coupling",
+        "description_tokens": 454,
+        "input_schema_tokens": 405,
+        "input_schema_sha256": "edf184dd998028ba23506b257e46ab5c82b564627f7151ae8360073be9ec3aa0"
+      },
+      {
+        "name": "find_feature",
+        "description_tokens": 104,
+        "input_schema_tokens": 357,
+        "input_schema_sha256": "6f11b85957d15126d18182a96ccd75e2384fe96d291f6ad34a1c30ba7c25190a"
+      },
+      {
+        "name": "find_references",
+        "description_tokens": 327,
+        "input_schema_tokens": 555,
+        "input_schema_sha256": "ea63ab58946a2faf44a996c7d988a14e12706831d2506622a0b8140e07d67f5f"
+      },
+      {
+        "name": "find_similar",
+        "description_tokens": 181,
+        "input_schema_tokens": 394,
+        "input_schema_sha256": "d8ee03124d722d2041bc0e38b3a472564b1f0932b7bf167286029b64fce7946b"
+      },
+      {
+        "name": "find_symbol",
+        "description_tokens": 208,
+        "input_schema_tokens": 374,
+        "input_schema_sha256": "2d39581ab2ce4db83f4afba59b91d7f5d54aa9147c7d3b2a2f58ae4fdffffd04"
+      },
+      {
+        "name": "from_trace",
+        "description_tokens": 426,
+        "input_schema_tokens": 351,
+        "input_schema_sha256": "a1fc51751290bb51792068fec71411a61ea01980b34d5658b08da8330c119dcb"
+      },
+      {
+        "name": "help",
+        "description_tokens": 75,
+        "input_schema_tokens": 195,
+        "input_schema_sha256": "f6a5026dd797836a58e1a4f04f92f4d13f9cba8734560c2ecdcf023499b9a81a"
+      },
+      {
+        "name": "impact_analysis",
+        "description_tokens": 237,
+        "input_schema_tokens": 541,
+        "input_schema_sha256": "d3a87d5f227d75a5555a9873418d7ae535b028214970febf8aa9dd9e4189a200"
+      },
+      {
+        "name": "list_dependencies",
+        "description_tokens": 91,
+        "input_schema_tokens": 356,
+        "input_schema_sha256": "bf5639515b4f345b9976d8513cb7f932e403bed83f8f937e012242266af5db8e"
+      },
+      {
+        "name": "list_features",
+        "description_tokens": 163,
+        "input_schema_tokens": 661,
+        "input_schema_sha256": "16d12e6b8442a2b3555952a726bed609ccb4ff69290cf3a5ea8a9eef3cd496fc"
+      },
+      {
+        "name": "project_overview",
+        "description_tokens": 183,
+        "input_schema_tokens": 248,
+        "input_schema_sha256": "613021828406cb8c64c651a4ead3bfa50b3633e5a94ffffc661def594c022e13"
+      },
+      {
+        "name": "recommend_tests",
+        "description_tokens": 748,
+        "input_schema_tokens": 347,
+        "input_schema_sha256": "afe0d9e39525a00037c1fbc6cfc35f1b0b2fc15a3e9c1479dff8dc422a1287c7"
+      },
+      {
+        "name": "review_rehearsal",
+        "description_tokens": 207,
+        "input_schema_tokens": 373,
+        "input_schema_sha256": "9c8a9aef67d05b572837cfe2357d2b20a35859e00ff70d203c0fc1a96d7b3f94"
+      },
+      {
+        "name": "search",
+        "description_tokens": 223,
+        "input_schema_tokens": 538,
+        "input_schema_sha256": "52ca42c31799d47bc8c56ff587d67c108a1a0e076d2b7086afcd375f85769429"
+      },
+      {
+        "name": "session_end",
+        "description_tokens": 134,
+        "input_schema_tokens": 229,
+        "input_schema_sha256": "7cdab4230ea12a8d72e7b461e0666e3275c8627c8dae0d71ad950cb86783e03b"
+      },
+      {
+        "name": "session_start",
+        "description_tokens": 155,
+        "input_schema_tokens": 116,
+        "input_schema_sha256": "85ed494a0abc68e8f984af61b67d943d44e6ecefb7dde61e51d30d5df380429b"
+      },
+      {
+        "name": "trace_call_path",
+        "description_tokens": 224,
+        "input_schema_tokens": 346,
+        "input_schema_sha256": "42c46470fc015d0cc27e76941bf88414570ac80687c21329058c04ccac63dff1"
+      }
+    ],
+    "total_tokens": 14916
+  },
+  "after": {
+    "captured_at": "2026-10-11T08:38:46.319742+00:00",
+    "binary_sha256": "1dfd000e8d9542e4940c7a572ec066b21e8bc58ed924c7a7cc51d8299f875253",
+    "tools_list_sha256": "8f19a639fe889fc8d22c12c6b89001eb66aed595afa0c5e9987546e44216ceb2",
+    "tokenizer": "cl100k_base",
+    "tiktoken_version": "0.8.0",
+    "measurement": "Sum of separately encoded descriptions and canonical compact inputSchema JSON for every advertised tool. Excludes names, output schemas, annotations, transport, and host-specific serialization. This is a reproducible tokenizer measurement, not a host billing count.",
+    "tool_count": 24,
+    "description_tokens": 1213,
+    "input_schema_tokens": 9146,
+    "tools": [
+      {
+        "name": "assess_risk",
+        "description_tokens": 55,
+        "input_schema_tokens": 396,
+        "input_schema_sha256": "0ed5b88321e203e935838e6b3fc0ac12755b73b99d37fc3e3ac91cbe295f6885"
+      },
+      {
+        "name": "assess_risk_batch",
+        "description_tokens": 50,
+        "input_schema_tokens": 467,
+        "input_schema_sha256": "f888ebc4ca87fbd935e4b1ddbef2443aef2115260772a2eb6aac907763a9f1f2"
+      },
+      {
+        "name": "assess_risk_diff",
+        "description_tokens": 57,
+        "input_schema_tokens": 396,
+        "input_schema_sha256": "e8f1c4cbc58c3c887fcec06fab6814def057b43a40a65b1e4355e904c5990cf9"
+      },
+      {
+        "name": "describe",
+        "description_tokens": 50,
+        "input_schema_tokens": 347,
+        "input_schema_sha256": "5808788a7588b2a99d7a572e0ce3e0473ddc5d46d61ddaa129df55a9e10d12a8"
+      },
+      {
+        "name": "edit_check",
+        "description_tokens": 53,
+        "input_schema_tokens": 335,
+        "input_schema_sha256": "97783146ecedadee6fe479f3d5cb451f330970be12245e16607347cff910f4f7"
+      },
+      {
+        "name": "export_context",
+        "description_tokens": 52,
+        "input_schema_tokens": 413,
+        "input_schema_sha256": "a7d7cc3d5bec5f71f3c48e2fe8a5be7ebe63a3467c3508d66fae2edb067b1194"
+      },
+      {
+        "name": "feature_bundle",
+        "description_tokens": 53,
+        "input_schema_tokens": 406,
+        "input_schema_sha256": "a4922b26b4a138cb2f23944fbf2393348cce97549d309fa2452b9da47ff2b450"
+      },
+      {
+        "name": "find_coupling",
+        "description_tokens": 51,
+        "input_schema_tokens": 405,
+        "input_schema_sha256": "edf184dd998028ba23506b257e46ab5c82b564627f7151ae8360073be9ec3aa0"
+      },
+      {
+        "name": "find_feature",
+        "description_tokens": 44,
+        "input_schema_tokens": 357,
+        "input_schema_sha256": "6f11b85957d15126d18182a96ccd75e2384fe96d291f6ad34a1c30ba7c25190a"
+      },
+      {
+        "name": "find_references",
+        "description_tokens": 47,
+        "input_schema_tokens": 555,
+        "input_schema_sha256": "ea63ab58946a2faf44a996c7d988a14e12706831d2506622a0b8140e07d67f5f"
+      },
+      {
+        "name": "find_similar",
+        "description_tokens": 49,
+        "input_schema_tokens": 394,
+        "input_schema_sha256": "d8ee03124d722d2041bc0e38b3a472564b1f0932b7bf167286029b64fce7946b"
+      },
+      {
+        "name": "find_symbol",
+        "description_tokens": 45,
+        "input_schema_tokens": 374,
+        "input_schema_sha256": "2d39581ab2ce4db83f4afba59b91d7f5d54aa9147c7d3b2a2f58ae4fdffffd04"
+      },
+      {
+        "name": "from_trace",
+        "description_tokens": 49,
+        "input_schema_tokens": 351,
+        "input_schema_sha256": "a1fc51751290bb51792068fec71411a61ea01980b34d5658b08da8330c119dcb"
+      },
+      {
+        "name": "help",
+        "description_tokens": 53,
+        "input_schema_tokens": 195,
+        "input_schema_sha256": "f6a5026dd797836a58e1a4f04f92f4d13f9cba8734560c2ecdcf023499b9a81a"
+      },
+      {
+        "name": "impact_analysis",
+        "description_tokens": 52,
+        "input_schema_tokens": 541,
+        "input_schema_sha256": "d3a87d5f227d75a5555a9873418d7ae535b028214970febf8aa9dd9e4189a200"
+      },
+      {
+        "name": "list_dependencies",
+        "description_tokens": 43,
+        "input_schema_tokens": 356,
+        "input_schema_sha256": "bf5639515b4f345b9976d8513cb7f932e403bed83f8f937e012242266af5db8e"
+      },
+      {
+        "name": "list_features",
+        "description_tokens": 49,
+        "input_schema_tokens": 661,
+        "input_schema_sha256": "16d12e6b8442a2b3555952a726bed609ccb4ff69290cf3a5ea8a9eef3cd496fc"
+      },
+      {
+        "name": "project_overview",
+        "description_tokens": 53,
+        "input_schema_tokens": 248,
+        "input_schema_sha256": "613021828406cb8c64c651a4ead3bfa50b3633e5a94ffffc661def594c022e13"
+      },
+      {
+        "name": "recommend_tests",
+        "description_tokens": 53,
+        "input_schema_tokens": 347,
+        "input_schema_sha256": "afe0d9e39525a00037c1fbc6cfc35f1b0b2fc15a3e9c1479dff8dc422a1287c7"
+      },
+      {
+        "name": "review_rehearsal",
+        "description_tokens": 56,
+        "input_schema_tokens": 373,
+        "input_schema_sha256": "9c8a9aef67d05b572837cfe2357d2b20a35859e00ff70d203c0fc1a96d7b3f94"
+      },
+      {
+        "name": "search",
+        "description_tokens": 46,
+        "input_schema_tokens": 538,
+        "input_schema_sha256": "52ca42c31799d47bc8c56ff587d67c108a1a0e076d2b7086afcd375f85769429"
+      },
+      {
+        "name": "session_end",
+        "description_tokens": 57,
+        "input_schema_tokens": 229,
+        "input_schema_sha256": "7cdab4230ea12a8d72e7b461e0666e3275c8627c8dae0d71ad950cb86783e03b"
+      },
+      {
+        "name": "session_start",
+        "description_tokens": 51,
+        "input_schema_tokens": 116,
+        "input_schema_sha256": "85ed494a0abc68e8f984af61b67d943d44e6ecefb7dde61e51d30d5df380429b"
+      },
+      {
+        "name": "trace_call_path",
+        "description_tokens": 45,
+        "input_schema_tokens": 346,
+        "input_schema_sha256": "42c46470fc015d0cc27e76941bf88414570ac80687c21329058c04ccac63dff1"
+      }
+    ],
+    "total_tokens": 10359
+  },
+  "source_baseline": "cb0ff7a93e0585d833f5ec0ee7c79e61aaaea8ce",
+  "schema_tokens_without_prose_annotations": 2857,
+  "target_total_tokens": 1500,
+  "target_status": "Not achieved: validation schemas alone contain 2857 tokens after removing description, title, and examples in memory. Public schemas are unchanged."
+}

@@ -138,6 +138,7 @@ pub(super) fn answer(server: &CodeSageServer, params: &HelpParams) -> anyhow::Re
                 result.subject = Some(json!({
                     "name": name,
                     "description": tool.description,
+                    "semantics": CATALOG["tools"][name]["semantics"].as_str().or(tool.description.as_deref()),
                     "advertised": !super::HIDDEN_TOOLS.contains(&name.as_str()),
                     "input_schema": input,
                     "output_fields": output.as_ref().and_then(|schema| schema["properties"].as_object()).map(|fields| fields.keys().collect::<Vec<_>>()).unwrap_or_default(),

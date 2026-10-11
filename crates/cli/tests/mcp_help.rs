@@ -118,7 +118,21 @@ fn stdio_help_covers_advertised_tools_fields_errors_recipes_and_measured_prices(
         assert!(help["inputSchema"]["properties"].get(field).is_some());
     }
     let catalog = success(server.call("help", json!({"project": root})));
+    let documentation: Value = serde_json::from_str(include_str!(
+        "../../../plugins/codesage-tools/skills/codesage-retrieval/references/help.json"
+    ))
+    .unwrap();
+    let words = regex::Regex::new(r"[\p{L}\p{N}_]+(?:['’][\p{L}\p{N}_]+)*").unwrap();
+    assert_eq!(
+        documentation["tools"].as_object().unwrap().len(),
+        tools.len()
+    );
     for tool in tools {
+        let name = tool["name"].as_str().unwrap();
+        let description = tool["description"].as_str().unwrap();
+        let count = words.find_iter(description).count();
+        assert!((1..=60).contains(&count), "{name}: {count} words");
+        assert_eq!(documentation["tools"][name]["description"], description);
         assert!(
             catalog["catalog"]["tools"]
                 .as_array()
@@ -128,7 +142,34 @@ fn stdio_help_covers_advertised_tools_fields_errors_recipes_and_measured_prices(
         let response = success(server.call("help", json!({"project": root, "tool": tool["name"]})));
         assert_eq!(response["subject"]["name"], tool["name"]);
         assert_eq!(response["subject"]["description"], tool["description"]);
+        assert_eq!(
+            response["subject"]["semantics"], documentation["tools"][name]["semantics"],
+            "full semantics must survive the help response budget for {name}"
+        );
+        assert!(
+            response["subject"]["semantics"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
         assert_eq!(response["subject"]["input_schema"], tool["inputSchema"]);
+    }
+    for (tool, retained) in [
+        ("recommend_tests", "The pool is drawn in request order"),
+        ("find_coupling", "both lower bounds"),
+        (
+            "trace_call_path",
+            "Raising `max_depth` only helps depth limits",
+        ),
+        ("edit_check", "not a compilation or safety verdict"),
+        ("from_trace", "Only `parsed` counts the whole input"),
+        ("search", "ranking flatness, not whether the answer exists"),
+    ] {
+        assert!(
+            documentation["tools"][tool]["semantics"]
+                .as_str()
+                .unwrap()
+                .contains(retained)
+        );
     }
     for intent in [
         "review",
