@@ -40,5 +40,8 @@ notify.workspace = true
 tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
+getrandom = "0.4"
+hex.workspace = true
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
+socket2 = "0.6"

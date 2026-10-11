@@ -5,6 +5,10 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 #[cfg(unix)]
+#[path = "daemon_control.rs"]
+mod control;
+
+#[cfg(unix)]
 mod unix {
     use std::{
         ffi::OsString,
@@ -43,7 +47,7 @@ mod unix {
     /// Match the waiter's three-round cap while allowing a live child a slow start.
     const SPAWNER_WAIT_CAP: Duration = START_TIMEOUT.saturating_mul(3);
 
-    /// Leave room within `daemon stop`'s 10-second SIGTERM window for cleanup.
+    /// Leave room within `daemon stop`'s 10-second window for cleanup.
     const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
     /// A panicking timestamp writer leaves the previous value intact, so poison recovery is safe.
@@ -126,6 +130,7 @@ mod unix {
     struct DaemonPaths {
         runtime_dir: PathBuf,
         socket: PathBuf,
+        control: PathBuf,
         lock: PathBuf,
         pid: PathBuf,
         log: PathBuf,
@@ -135,6 +140,7 @@ mod unix {
     struct DaemonPid {
         pid: i32,
         start_time_ticks: Option<u64>,
+        control_nonce: Option<[u8; 32]>,
     }
 
     impl DaemonPaths {
@@ -156,6 +162,7 @@ mod unix {
             })?;
             Ok(Self {
                 socket,
+                control: runtime_dir.join(format!("mcp-{key}.ctl")),
                 lock: runtime_dir.join(format!("mcp-{key}.lock")),
                 pid: runtime_dir.join(format!("mcp-{key}.pid")),
                 log: runtime_dir.join(format!("mcp-{key}.log")),
@@ -218,7 +225,7 @@ mod unix {
         };
         if !daemon_pid_file_matches(&paths, pid_record) {
             println!(
-                "not running (pid file references stale or non-daemon pid {}; left over from a previous run)",
+                "not running (pid file references stale or unverified daemon pid {})",
                 pid_record.pid
             );
             std::process::exit(1);
@@ -299,7 +306,7 @@ mod unix {
         Ok(())
     }
 
-    /// `codesage daemon stop`: SIGTERM the running daemon and wait
+    /// `codesage daemon stop`: authenticate the running daemon and wait
     /// (bounded) for it to exit + clean up its socket/pid files.
     pub(crate) async fn run_daemon_stop(runtime_dir: Option<PathBuf>) -> Result<()> {
         let paths = existing_daemon_paths(runtime_dir)?;
@@ -309,14 +316,32 @@ mod unix {
         };
         if !daemon_pid_file_matches(&paths, pid_record) {
             println!(
-                "not running (pid file references stale or non-daemon pid {}); cleaning stale files",
+                "not running (pid file references stale or unverified daemon pid {})",
                 pid_record.pid
             );
-            let _ = fs::remove_file(&paths.pid);
-            let _ = fs::remove_file(&paths.socket);
+            #[cfg(not(target_os = "linux"))]
+            if pid_record.control_nonce.is_none() {
+                println!(
+                    "legacy daemon identity cannot be authenticated; verify the process before stopping it manually"
+                );
+            }
+            if !super::control::socket_may_be_live(&paths.socket)
+                && !super::control::socket_may_be_live(&paths.control)
+            {
+                let _ = fs::remove_file(&paths.pid);
+                let _ = fs::remove_file(&paths.socket);
+                let _ = fs::remove_file(&paths.control);
+            }
             return Ok(());
         }
         let pid = pid_record.pid;
+        if let Some(nonce) = pid_record.control_nonce {
+            tokio::task::spawn_blocking(move || super::control::stop(&paths.control, pid, nonce))
+                .await?
+                .context("requesting authenticated daemon shutdown")?;
+            println!("stopped daemon (pid {})", pid);
+            return Ok(());
+        }
         // SAFETY: kill is async-signal-safe.
         let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
         if rc != 0 {
@@ -361,7 +386,18 @@ mod unix {
         let listener = listener?;
         fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("setting permissions on {}", paths.socket.display()))?;
-        write_daemon_pid(&paths.pid)?;
+        if paths.control.exists() {
+            fs::remove_file(&paths.control).with_context(|| {
+                format!("removing stale control socket {}", paths.control.display())
+            })?;
+        }
+        let control_listener = UnixListener::bind(&paths.control)
+            .with_context(|| format!("binding {}", paths.control.display()))?;
+        fs::set_permissions(&paths.control, fs::Permissions::from_mode(0o600))?;
+        let pid_record = write_daemon_pid(&paths.pid)?;
+        let control_nonce = pid_record
+            .control_nonce
+            .context("missing daemon control nonce")?;
 
         // Reap older builds only after our runtime files exist; otherwise models remain duplicated.
         reap_stale_version_daemons(&paths);
@@ -422,9 +458,28 @@ mod unix {
 
         // Retain tasks so shutdown can drain in-flight responses.
         let mut clients: JoinSet<()> = JoinSet::new();
+        let mut _stop_connection = None;
 
         let shutdown_reason = loop {
             tokio::select! {
+                accepted = control_listener.accept() => {
+                    match accepted {
+                        Ok((stream, _)) => {
+                            match super::control::accept(stream, our_uid, pid_record.pid, control_nonce).await {
+                                Ok(Some(stream)) => {
+                                    _stop_connection = Some(stream);
+                                    break "authenticated stop";
+                                }
+                                Ok(None) => {}
+                                Err(error) => tracing::debug!(%error, "daemon control request rejected"),
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "accepting daemon control request failed");
+                            sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
                 accepted = listener.accept() => {
                     // Retry accept failures without dropping existing clients; delay prevents a persistent-error spin.
                     let (stream, _) = match accepted {
@@ -577,6 +632,7 @@ mod unix {
         // other daemon keys may share it.
         let _ = fs::remove_file(&paths.socket);
         let _ = fs::remove_file(&paths.pid);
+        let _ = fs::remove_file(&paths.control);
 
         // Runtime drop joins running `spawn_blocking` work, which abort_all cannot cancel.
         // Exit directly so wedged ONNX/SQLite calls cannot hold shutdown past its deadline.
@@ -1022,22 +1078,26 @@ mod unix {
         }
     }
 
-    fn write_daemon_pid(pid_path: &Path) -> Result<()> {
+    fn write_daemon_pid(pid_path: &Path) -> Result<DaemonPid> {
         let pid = i32::try_from(std::process::id()).context("current pid does not fit i32")?;
+        let mut nonce = [0; 32];
+        getrandom::fill(&mut nonce)
+            .map_err(|error| anyhow::anyhow!("generating daemon nonce: {error}"))?;
         let record = DaemonPid {
             pid,
             start_time_ticks: process_start_time_ticks(pid),
+            control_nonce: Some(nonce),
         };
-        let contents = match record.start_time_ticks {
-            Some(start_time_ticks) => {
-                format!(
-                    "pid={}\nstart_time_ticks={}\n",
-                    record.pid, start_time_ticks
-                )
-            }
-            None => format!("{}\n", record.pid),
-        };
-        fs::write(pid_path, contents).with_context(|| format!("writing {}", pid_path.display()))
+        let mut contents = format!("pid={}\ncontrol_nonce={}\n", record.pid, hex::encode(nonce));
+        if let Some(start) = record.start_time_ticks {
+            contents.push_str(&format!("start_time_ticks={start}\n"));
+        }
+        let mut file =
+            tempfile::NamedTempFile::new_in(pid_path.parent().context("pid file has no parent")?)?;
+        file.write_all(contents.as_bytes())?;
+        file.persist(pid_path)
+            .with_context(|| format!("writing {}", pid_path.display()))?;
+        Ok(record)
     }
 
     fn read_daemon_pid_file(pid_path: &Path) -> Option<DaemonPid> {
@@ -1054,6 +1114,7 @@ mod unix {
                 return Some(DaemonPid {
                     pid,
                     start_time_ticks: None,
+                    control_nonce: None,
                 });
             }
             return None;
@@ -1061,6 +1122,7 @@ mod unix {
 
         let mut pid = None;
         let mut start_time_ticks = None;
+        let mut control_nonce = None;
         for line in contents.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -1070,7 +1132,12 @@ mod unix {
                     pid = value.trim().parse::<i32>().ok().filter(|pid| *pid > 0);
                 }
                 "start_time_ticks" => {
-                    start_time_ticks = value.trim().parse::<u64>().ok();
+                    start_time_ticks = Some(value.trim().parse::<u64>().ok()?);
+                }
+                "control_nonce" => {
+                    let mut nonce = [0; 32];
+                    hex::decode_to_slice(value.trim(), &mut nonce).ok()?;
+                    control_nonce = Some(nonce);
                 }
                 _ => {}
             }
@@ -1078,6 +1145,7 @@ mod unix {
         Some(DaemonPid {
             pid: pid?,
             start_time_ticks,
+            control_nonce,
         })
     }
 
@@ -1116,7 +1184,11 @@ mod unix {
             let validated = daemon_pid_file_matches(&sibling_paths, record);
             match sibling_reap_action(validated, our_start, record.start_time_ticks) {
                 SiblingReapAction::CleanupFiles => {
-                    cleanup_sibling_runtime_files(&sibling);
+                    if !super::control::socket_may_be_live(&sibling_paths.socket)
+                        && !super::control::socket_may_be_live(&sibling_paths.control)
+                    {
+                        cleanup_sibling_runtime_files(&sibling);
+                    }
                 }
                 SiblingReapAction::Leave => {
                     tracing::debug!(
@@ -1126,6 +1198,14 @@ mod unix {
                     );
                 }
                 SiblingReapAction::Reap => {
+                    if let Some(nonce) = record.control_nonce {
+                        if let Err(error) =
+                            super::control::request(&sibling_paths.control, record.pid, nonce, true)
+                        {
+                            tracing::warn!(%error, stale_pid = record.pid, "authenticated stale-version shutdown failed");
+                        }
+                        continue;
+                    }
                     // SAFETY: kill is async-signal-safe.
                     let rc = unsafe { libc::kill(record.pid, libc::SIGTERM) };
                     if rc == 0 {
@@ -1178,23 +1258,33 @@ mod unix {
 
     fn cleanup_sibling_runtime_files(pidfile: &Path) {
         let _ = fs::remove_file(pidfile);
-        for ext in ["sock", "lock"] {
+        for ext in ["sock", "ctl", "lock"] {
             let _ = fs::remove_file(pidfile.with_extension(ext));
         }
     }
 
     fn daemon_pid_matches_process(paths: &DaemonPaths, record: DaemonPid) -> bool {
+        if let Some(nonce) = record.control_nonce {
+            #[cfg(target_os = "linux")]
+            if record
+                .start_time_ticks
+                .is_some_and(|expected| process_start_time_ticks(record.pid) != Some(expected))
+            {
+                return false;
+            }
+            return super::control::request(&paths.control, record.pid, nonce, false).is_ok();
+        }
         #[cfg(target_os = "linux")]
         {
             if let Some(expected_start) = record.start_time_ticks {
-                return process_start_time_ticks(record.pid) == Some(expected_start);
+                return process_start_time_ticks(record.pid) == Some(expected_start)
+                    && legacy_pid_looks_like_daemon(record.pid, paths);
             }
             legacy_pid_looks_like_daemon(record.pid, paths)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = record;
-            daemon_socket_reachable(paths)
+            false
         }
     }
 
@@ -1208,11 +1298,6 @@ mod unix {
     #[cfg(not(target_os = "linux"))]
     fn process_start_time_ticks(_pid: i32) -> Option<u64> {
         None
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn daemon_socket_reachable(paths: &DaemonPaths) -> bool {
-        std::os::unix::net::UnixStream::connect(&paths.socket).is_ok()
     }
 
     #[cfg(target_os = "linux")]
@@ -1435,6 +1520,7 @@ mod unix {
         }
         Some(DaemonPaths {
             socket: runtime_dir.join(format!("mcp-{key}.sock")),
+            control: runtime_dir.join(format!("mcp-{key}.ctl")),
             lock: runtime_dir.join(format!("mcp-{key}.lock")),
             pid: runtime_dir.join(format!("mcp-{key}.pid")),
             log: runtime_dir.join(format!("mcp-{key}.log")),
@@ -1736,8 +1822,17 @@ mod unix {
         }
 
         #[test]
+        fn malformed_control_nonce_cannot_fall_back_to_legacy_pid_validation() {
+            assert!(
+                parse_daemon_pid_file("pid=123\nstart_time_ticks=456\ncontrol_nonce=invalid\n")
+                    .is_none()
+            );
+            assert!(parse_daemon_pid_file("pid=123\ncontrol_nonce=\n").is_none());
+        }
+
+        #[test]
         #[cfg(target_os = "linux")]
-        fn scan_live_daemon_requires_matching_structured_start_time() {
+        fn scan_live_daemon_rejects_non_daemon_with_matching_start_time() {
             let dir = tempfile::tempdir().unwrap();
             let pid_file = dir.path().join("mcp-9.9.9-deadbeefdeadbeef.pid");
             let pid = i32::try_from(std::process::id()).unwrap();
@@ -1748,8 +1843,10 @@ mod unix {
                 format!("pid={pid}\nstart_time_ticks={start_time}\n"),
             )
             .unwrap();
-            let found = scan_live_daemon(dir.path()).expect("matching pid record should be live");
-            assert_eq!(found.pid, pid_file);
+            assert!(
+                scan_live_daemon(dir.path()).is_none(),
+                "start time alone cannot authenticate a legacy daemon"
+            );
 
             fs::write(
                 &pid_file,
@@ -2010,6 +2107,7 @@ mod unix {
         fn test_daemon_paths(dir: &Path) -> DaemonPaths {
             DaemonPaths {
                 socket: dir.join("mcp-test.sock"),
+                control: dir.join("mcp-test.ctl"),
                 lock: dir.join("mcp-test.lock"),
                 pid: dir.join("mcp-test.pid"),
                 log: dir.join("mcp-test.log"),

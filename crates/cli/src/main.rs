@@ -588,7 +588,7 @@ enum DaemonAction {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(0..=256))]
         recent: u16,
     },
-    /// Send SIGTERM to the running daemon and wait for it to exit
+    /// Authenticate the running daemon, request shutdown, and wait for cleanup
     Stop,
 }
 

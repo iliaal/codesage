@@ -16,6 +16,7 @@
 ### Security
 
 - MCP closes input connections when a JSONL frame exceeds 16 MiB, including unterminated frames, across direct stdio, the shim, and daemon sockets.
+- `codesage daemon stop` authenticates new Unix daemons with a per-start nonce before shutdown, preventing replaced PID files from signalling unrelated processes.
 
 ## [0.41.0] - 2026-10-06
 
