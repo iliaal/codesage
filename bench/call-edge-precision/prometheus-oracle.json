@@ -1,0 +1,104 @@
+{
+  "head": "25d678b5021ca12c0c5cdb24046a182b6ca999df",
+  "hashes_sha256": {
+    "web/ui/mantine-ui/src/lib/formatFloatValue.ts": "c788d25a7ad3a2eab91cfb6fb91acd06b8620995fd15f91f497d89ee1c5d70d0",
+    "model/textparse/promparse.go": "02e97428ba326928e943e75cb0e02aea0afad4acd34dd52c86f9bca9ef6681ef",
+    "web/ui/mantine-ui/src/lib/formatSeries.ts": "5162c1ff33489d52da4ee1033419bfae78f04e1ec5c16e841abf4dc78c148690",
+    "discovery/ionos/server.go": "494d1d671cd33acb27d97bb08fa35115be6b0cc51dfc6d22eee8d3f63b679fa8",
+    "web/ui/mantine-ui/src/lib/escapeString.ts": "b61ebeeb1f3ff9edf42d18ee6ef5289d32a56e744ebffa0b3e328d83910f8996",
+    "web/ui/mantine-ui/src/promql/utils.ts": "f6ddae669268df28bd1e1ba3cb983b9a30b571b66432fd3d1f124f2f1b7f1723",
+    "web/ui/mantine-ui/src/components/ErrorBoundary.tsx": "f634d53bb7f3979a33a4384772c989f75d9989d227b4406ad1028b86e3f90ac5",
+    "promql/engine.go": "73cdadcd59f24db9f7ee727f1ab33bdc927a07f6c86df44a9cd8018bd02c87d5"
+  },
+  "edges": [
+    {
+      "from_file": "web/ui/mantine-ui/src/lib/formatFloatValue.ts",
+      "from_symbol": "parsePrometheusFloat",
+      "line": 8,
+      "call": "parseFloat(str)",
+      "candidate": "sym:model/textparse/promparse.go#parseFloat@529",
+      "label": "false",
+      "actual_target": "JavaScript global parseFloat",
+      "evidence": "The complete 21-line TypeScript module has no imports or parseFloat binding. The Go function belongs to package textparse and has signature (string) (float64, error), not the global JavaScript numeric parser. No language bridge appears."
+    },
+    {
+      "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+      "from_symbol": "formatSeries",
+      "lines": [
+        17,
+        23
+      ],
+      "call": "Object.entries(...).filter(...).map(...).join(\", \")",
+      "candidate": "sym:discovery/ionos/server.go#join@163",
+      "label": "false",
+      "actual_target": "JavaScript Array.prototype.join",
+      "evidence": "The receiver is the array returned by map on Object.entries. Go join is a package-local function called directly in the Go service-discovery code. Its separate signature takes []string and a separator."
+    },
+    {
+      "from_file": "web/ui/mantine-ui/src/components/ErrorBoundary.tsx",
+      "from_symbol": "ErrorBoundary.componentDidCatch",
+      "line": 26,
+      "call": "console.error(\"Uncaught error:\", error, errorInfo)",
+      "candidate": "sym:promql/engine.go#evaluator.error@1160",
+      "label": "false",
+      "actual_target": "JavaScript console.error",
+      "evidence": "The receiver is console; imports are React and UI packages. The Go candidate is a method of evaluator."
+    },
+    {
+      "from_file": "model/textparse/promparse.go",
+      "from_symbol": "PromParser.parseMetricSuffix",
+      "line": 476,
+      "call": "parseFloat(yoloString(p.l.buf()))",
+      "candidate": "sym:model/textparse/promparse.go#parseFloat@529",
+      "label": "true",
+      "evidence": "Direct same-package call to the package function; no lexical parseFloat binding exists in parseMetricSuffix. The pair of return values matches assignment to p.val and err."
+    },
+    {
+      "from_file": "discovery/ionos/server.go",
+      "from_symbol": "serverDiscovery.refresh",
+      "lines": [
+        126,
+        135
+      ],
+      "call": "join(ips, metaLabelSeparator); join(nicIPs, metaLabelSeparator)",
+      "candidate": "sym:discovery/ionos/server.go#join@163",
+      "label": "true",
+      "evidence": "Direct calls to a same-file package function taking []string and separator; no local join binding shadows it."
+    },
+    {
+      "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+      "from_symbol": "formatSeries",
+      "lines": [
+        14,
+        16,
+        22
+      ],
+      "call": "escapeString(labels.__name__); escapeString(v)",
+      "candidate": "sym:web/ui/mantine-ui/src/lib/escapeString.ts#escapeString@2",
+      "label": "true",
+      "evidence": "Named import at line 5 binds escapeString from ./escapeString. The unrelated same-name export in ../promql/utils at line 283 is not imported as escapeString by this module."
+    },
+    {
+      "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+      "from_symbol": "formatSeries",
+      "lines": [
+        14,
+        16,
+        22
+      ],
+      "call": "escapeString(labels.__name__); escapeString(v)",
+      "candidate": "sym:web/ui/mantine-ui/src/promql/utils.ts#escapeString@283",
+      "label": "false",
+      "evidence": "The module imports other functions from promql/utils; escapeString is explicitly imported from ./escapeString. A file-level import heuristic must not confuse their identities. This is a separate same-language import-binding limitation if observed."
+    },
+    {
+      "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+      "from_symbol": "formatSeries",
+      "line": 13,
+      "call": "metricContainsExtendedCharset(labels.__name__ || \"\")",
+      "candidate": "sym:web/ui/mantine-ui/src/promql/utils.ts#metricContainsExtendedCharset@275",
+      "label": "true",
+      "evidence": "Named import at lines 1-4 explicitly binds the function from ../promql/utils."
+    }
+  ]
+}

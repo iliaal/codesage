@@ -3,8 +3,8 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use codesage_protocol::{
-    ContextBundle, ExportRequest, ReferenceKind, SearchRequest, SearchResult, Symbol,
-    SymbolSummary, TargetKind, TargetResolution, Visibility,
+    ContextBundle, ExportRequest, Language, ReferenceKind, SearchRequest, SearchResult, Symbol,
+    SymbolKind, SymbolSummary, TargetKind, TargetResolution, Visibility,
 };
 use codesage_storage::Database;
 
@@ -846,6 +846,9 @@ pub(crate) fn resolve_callee_definitions_with_modules(
         }
         module_qualified = true;
     }
+    let caller_language =
+        codesage_parser::detect::detect_language(std::path::Path::new(caller_file));
+    all_candidates.retain(|symbol| language_admits(caller_file, caller_language, symbol));
     let total_candidates = all_candidates.len();
     let candidates: Vec<Symbol> = all_candidates
         .into_iter()
@@ -905,6 +908,29 @@ pub(crate) fn resolve_callee_definitions_with_modules(
         })
         .collect();
     Ok(filtered)
+}
+
+fn language_admits(caller_file: &str, caller: Option<Language>, symbol: &Symbol) -> bool {
+    let Some(caller) = caller else { return true };
+    let Some(target) =
+        codesage_parser::detect::detect_language(std::path::Path::new(&symbol.file_path))
+    else {
+        return true;
+    };
+    if caller_file.ends_with(".c") && symbol.kind == SymbolKind::Method {
+        return false;
+    }
+    // Shared headers and emitted JavaScript preserve these source-language
+    // boundaries. Other FFI bindings need evidence beyond a matching name.
+    caller == target
+        || matches!(
+            (caller, target),
+            (Language::C | Language::Cpp, Language::C | Language::Cpp)
+                | (
+                    Language::JavaScript | Language::TypeScript,
+                    Language::JavaScript | Language::TypeScript
+                )
+        )
 }
 
 /// Whether a reference in `caller_file` may name `sym` under its recorded

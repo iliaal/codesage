@@ -1,0 +1,404 @@
+{
+  "date": "2026-10-11",
+  "bead": "cs-0lhl",
+  "base": "cb0ff7a93e0585d833f5ec0ee7c79e61aaaea8ce",
+  "candidate": "compatible language and C method gates in bundle.rs",
+  "workload": {
+    "repository": "https://github.com/prometheus/prometheus",
+    "head": "25d678b5021ca12c0c5cdb24046a182b6ca999df",
+    "files": 951,
+    "symbols": 13590,
+    "references": 120614,
+    "failed_files": 0,
+    "degraded_files": 1,
+    "coverage_unchanged": true
+  },
+  "performance": {
+    "profile": "debug, graph API, complete in-memory index; concurrent development load; not a general performance claim",
+    "query_set": "three impact queries per pass",
+    "preregistered_gate": "no added filesystem/database reads/cache; median growth <=20%, or absolute growth <5000us",
+    "baseline_passes": [
+      {
+        "pass": 0,
+        "us": 13765
+      },
+      {
+        "pass": 1,
+        "us": 12488
+      },
+      {
+        "pass": 2,
+        "us": 32818
+      },
+      {
+        "pass": 3,
+        "us": 21826
+      },
+      {
+        "pass": 4,
+        "us": 17534
+      },
+      {
+        "pass": 5,
+        "us": 26501
+      },
+      {
+        "pass": 6,
+        "us": 17593
+      },
+      {
+        "pass": 7,
+        "us": 22113
+      },
+      {
+        "pass": 8,
+        "us": 10445
+      },
+      {
+        "pass": 9,
+        "us": 11705
+      },
+      {
+        "pass": 10,
+        "us": 13777
+      }
+    ],
+    "candidate_passes": [
+      {
+        "pass": 0,
+        "us": 18341
+      },
+      {
+        "pass": 1,
+        "us": 11558
+      },
+      {
+        "pass": 2,
+        "us": 22845
+      },
+      {
+        "pass": 3,
+        "us": 14827
+      },
+      {
+        "pass": 4,
+        "us": 11026
+      },
+      {
+        "pass": 5,
+        "us": 18964
+      },
+      {
+        "pass": 6,
+        "us": 24011
+      },
+      {
+        "pass": 7,
+        "us": 11709
+      },
+      {
+        "pass": 8,
+        "us": 11590
+      },
+      {
+        "pass": 9,
+        "us": 12923
+      },
+      {
+        "pass": 10,
+        "us": 15672
+      }
+    ],
+    "baseline_warm_median_us": 17563.5,
+    "candidate_warm_median_us": 13875,
+    "gate_passed": true
+  },
+  "real_edges": [
+    {
+      "caller": "web/ui/mantine-ui/src/lib/formatFloatValue.ts",
+      "impact": false,
+      "oracle": "false",
+      "raw_calls": 1,
+      "target": "sym:model/textparse/promparse.go#parseFloat",
+      "to": false,
+      "trace": false
+    },
+    {
+      "caller": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+      "impact": false,
+      "oracle": "false",
+      "raw_calls": 2,
+      "target": "sym:discovery/ionos/server.go#join",
+      "to": false,
+      "trace": false
+    },
+    {
+      "caller": "web/ui/mantine-ui/src/components/ErrorBoundary.tsx",
+      "impact": false,
+      "oracle": "false",
+      "raw_calls": 1,
+      "target": "sym:promql/engine.go#evaluator.error",
+      "to": false,
+      "trace": false
+    },
+    {
+      "caller": "model/textparse/promparse.go",
+      "impact": null,
+      "oracle": "true",
+      "raw_calls": 1,
+      "target": "sym:model/textparse/promparse.go#parseFloat",
+      "to": true,
+      "trace": true
+    },
+    {
+      "caller": "discovery/ionos/server.go",
+      "impact": null,
+      "oracle": "true",
+      "raw_calls": 2,
+      "target": "sym:discovery/ionos/server.go#join",
+      "to": true,
+      "trace": true
+    },
+    {
+      "caller": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+      "impact": true,
+      "oracle": "true",
+      "raw_calls": 3,
+      "target": "sym:web/ui/mantine-ui/src/lib/escapeString.ts#escapeString",
+      "to": false,
+      "trace": true
+    },
+    {
+      "caller": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+      "impact": true,
+      "oracle": "false",
+      "raw_calls": 3,
+      "target": "sym:web/ui/mantine-ui/src/promql/utils.ts#escapeString",
+      "to": false,
+      "trace": true
+    },
+    {
+      "caller": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+      "impact": true,
+      "oracle": "true",
+      "raw_calls": 1,
+      "target": "sym:web/ui/mantine-ui/src/promql/utils.ts#metricContainsExtendedCharset",
+      "to": true,
+      "trace": true
+    }
+  ],
+  "panel": [
+    {
+      "id": "python_parameter_shadow",
+      "impact": false,
+      "oracle": "unknown",
+      "raw_calls": 1,
+      "to": false,
+      "trace": false
+    },
+    {
+      "id": "python_import_shadow",
+      "impact": false,
+      "oracle": "false",
+      "raw_calls": 1,
+      "to": false,
+      "trace": false
+    },
+    {
+      "id": "python_local_shadow",
+      "impact": false,
+      "oracle": "false",
+      "raw_calls": 1,
+      "to": false,
+      "trace": false
+    },
+    {
+      "id": "python_dict_builtin",
+      "impact": false,
+      "oracle": "false",
+      "raw_calls": 1,
+      "to": false,
+      "trace": false
+    },
+    {
+      "id": "python_bare_method_decoy",
+      "impact": false,
+      "oracle": "false",
+      "raw_calls": 1,
+      "to": false,
+      "trace": false
+    },
+    {
+      "id": "python_chained_receiver",
+      "impact": false,
+      "oracle": "unknown",
+      "raw_calls": 1,
+      "to": false,
+      "trace": false
+    },
+    {
+      "id": "python_self",
+      "impact": null,
+      "oracle": "true",
+      "raw_calls": 1,
+      "to": true,
+      "trace": true
+    },
+    {
+      "id": "python_class",
+      "impact": null,
+      "oracle": "true",
+      "raw_calls": 1,
+      "to": true,
+      "trace": true
+    },
+    {
+      "id": "python_bare_import",
+      "impact": true,
+      "oracle": "true",
+      "raw_calls": 1,
+      "to": true,
+      "trace": true
+    },
+    {
+      "id": "python_recursion",
+      "impact": null,
+      "oracle": "true",
+      "raw_calls": 2,
+      "to": true,
+      "trace": true
+    },
+    {
+      "id": "python_scoped_rebinding",
+      "impact": true,
+      "oracle": "true",
+      "raw_calls": 1,
+      "to": true,
+      "trace": true
+    },
+    {
+      "id": "javascript_parameter_shadow",
+      "impact": true,
+      "oracle": "unknown",
+      "raw_calls": 1,
+      "to": true,
+      "trace": true
+    },
+    {
+      "id": "javascript_local_shadow",
+      "impact": true,
+      "oracle": "false",
+      "raw_calls": 1,
+      "to": true,
+      "trace": true
+    },
+    {
+      "id": "javascript_map_builtin",
+      "impact": true,
+      "oracle": "false",
+      "raw_calls": 1,
+      "to": false,
+      "trace": true
+    },
+    {
+      "id": "javascript_import_export",
+      "impact": true,
+      "oracle": "true",
+      "raw_calls": 1,
+      "to": true,
+      "trace": true
+    },
+    {
+      "id": "c_cpp_method_decoy",
+      "impact": false,
+      "oracle": "false",
+      "raw_calls": 1,
+      "to": false,
+      "trace": false
+    },
+    {
+      "id": "cpp_receiver",
+      "impact": null,
+      "oracle": "true",
+      "raw_calls": 1,
+      "to": true,
+      "trace": true
+    },
+    {
+      "id": "rust_go_decoy",
+      "impact": false,
+      "oracle": "false",
+      "raw_calls": 1,
+      "to": false,
+      "trace": false
+    },
+    {
+      "id": "rust_builtin_method",
+      "impact": true,
+      "oracle": "false",
+      "raw_calls": 1,
+      "to": false,
+      "trace": true
+    },
+    {
+      "id": "go_receiver_decoy",
+      "impact": false,
+      "oracle": "unknown",
+      "raw_calls": 1,
+      "to": false,
+      "trace": false
+    },
+    {
+      "id": "go_local_positive",
+      "impact": null,
+      "oracle": "true",
+      "raw_calls": 1,
+      "to": true,
+      "trace": true
+    },
+    {
+      "id": "rust_local_positive",
+      "impact": null,
+      "oracle": "true",
+      "raw_calls": 1,
+      "to": true,
+      "trace": true
+    }
+  ],
+  "parity": {
+    "cases": 22,
+    "observations": [
+      "initial",
+      "repeated",
+      "database reopened",
+      "caller newline edit then incremental index",
+      "independent full rebuild"
+    ],
+    "all_equal": true,
+    "additional_regression": "replace then restore Go target; raw rows, trace, impact and reachable-test answers checked after incremental index and full rebuild"
+  },
+  "disposition": {
+    "adopt": [
+      "compatible source-language gate before ambiguity counting",
+      "reject C source calls to C++ methods; preserve C++ headers"
+    ],
+    "non_adoption": [
+      "JavaScript import-binding association and lexical receiver scope need persisted per-call facts; blanket file/name rules lose real calls",
+      "Map and Option receiver identity needs value/type evidence; method-name blacklist rejected"
+    ],
+    "remaining": [
+      "JavaScript local shadow false to/trace/impact",
+      "JavaScript callable parameter unknown but guessed to/trace/impact",
+      "JavaScript Map.get false trace/impact",
+      "Rust Option.map false trace/impact",
+      "Prometheus imported escapeString resolves to both imported-file homonyms for trace/impact; to is absent"
+    ],
+    "limits": [
+      "bounded independently labeled panel, not global soundness or corpus prevalence",
+      "arbitrary FFI unresolved",
+      "same-file impact not applicable",
+      "find_references to handle requires stronger evidence than trace/impact",
+      "no donor tests or type inference copied"
+    ]
+  }
+}

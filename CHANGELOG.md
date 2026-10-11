@@ -5,6 +5,10 @@
 - MCP tool descriptions use at most 60 words; `help` retains detailed field semantics, limitations, and recovery guidance.
 - The retrieval skill and MCP help share routing, freshness, recovery, and cost guidance; onboarding hints and the prompt override point to the skill.
 
+### Fixed
+
+- Call paths, impact, and test reachability exclude unrelated language namesakes and C calls attributed to C++ methods while retaining C/C++ and JavaScript/TypeScript interoperability.
+
 ### Security
 
 - MCP closes input connections when a JSONL frame exceeds 16 MiB, including unterminated frames, across direct stdio, the shim, and daemon sockets.
