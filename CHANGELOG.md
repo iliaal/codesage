@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.42.0] - 2026-10-11
+
 ### Added
 
 - Structural MCP queries include bounded working-tree edits to indexed files before reindexing, with explicit overlay or stale-index evidence.
@@ -1268,5 +1270,7 @@ Initial public release.
 
 [0.40.0]: https://github.com/iliaal/codesage/releases/tag/v0.40.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.41.0...HEAD
 [0.41.0]: https://github.com/iliaal/codesage/releases/tag/v0.41.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.42.0...HEAD
+[0.42.0]: https://github.com/iliaal/codesage/releases/tag/v0.42.0
