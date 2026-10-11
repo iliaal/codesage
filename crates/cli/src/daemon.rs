@@ -680,7 +680,11 @@ mod unix {
 
         // Bound pre-initialize silence too: the post-handshake idle check cannot reap these peers.
         // Zero disables both ceilings.
-        let serve_fut = server.serve_with_ct(tracked, cancellation);
+        let (read, write) = tokio::io::split(tracked);
+        let serve_fut = server.serve_with_ct(
+            (crate::mcp::framing::FrameReader::new(read), write),
+            cancellation,
+        );
         let service = if idle_max.is_zero() {
             serve_fut
                 .await
@@ -1248,11 +1252,7 @@ mod unix {
         let mut stdout = tokio::io::stdout();
 
         let stdin_to_socket = async {
-            let res = if let Some(dp) = default_project.as_ref() {
-                crate::mcp::pump_lines_injecting(&mut stdin, &mut socket_write, dp.clone()).await
-            } else {
-                copy(&mut stdin, &mut socket_write).await.map(|_| ())
-            };
+            let res = crate::mcp::pump_lines(&mut stdin, &mut socket_write, default_project).await;
             let _ = socket_write.shutdown().await;
             res
         };
@@ -1277,6 +1277,7 @@ mod unix {
             res = &mut stdin_to_socket => {
                 if let Err(e) = &res {
                     tracing::warn!(error = %e, "MCP client stdin closed with error");
+                    std::process::exit(1);
                 }
                 let code = proxy_exit_code(&res);
                 // Stdin EOF: drain in-flight server response, then exit.

@@ -1479,6 +1479,43 @@ pub(crate) mod tests {
         assert_eq!(sizes.iter().map(|&(count, _)| count).sum::<usize>(), 300);
     }
 
+    #[tokio::test]
+    async fn maximum_escaped_daemon_batch_fits_the_mcp_frame_limit() {
+        use tokio::io::AsyncReadExt;
+
+        let text = "\u{1}".repeat(DAEMON_CALL_MAX_BYTES / DAEMON_CALL_MAX_TEXTS);
+        let texts = vec![text; DAEMON_CALL_MAX_TEXTS];
+        let lens: Vec<_> = texts.iter().map(String::len).collect();
+        let (batches, oversize) = plan_embed_batches(
+            &lens,
+            MAX_MCP_EMBED_TEXT_BYTES,
+            DAEMON_CALL_MAX_BYTES,
+            DAEMON_CALL_MAX_TEXTS,
+        );
+        assert!(oversize.is_empty());
+        assert_eq!(batches.len(), 1);
+        assert_eq!(lens.iter().sum::<usize>(), DAEMON_CALL_MAX_BYTES);
+        let request = json!({
+            "jsonrpc":"2.0", "id":u64::MAX, "method":"tools/call",
+            "params": {"name":"embed_texts", "arguments": {
+                "project": format!("/{}", "\u{1}".repeat(4096)),
+                "model":"jinaai/jina-embeddings-v2-base-code",
+                "fingerprint": fp_a().as_str(), "texts": texts
+            }}
+        });
+        let mut wire = serde_json::to_vec(&request).unwrap();
+        assert!(wire.len() > 6 * DAEMON_CALL_MAX_BYTES);
+        assert!(wire.len() <= crate::mcp::framing::MAX_FRAME_BYTES);
+        wire.push(b'\n');
+        let mut input = crate::mcp::framing::FrameReader::new(wire.as_slice());
+        let mut received = Vec::new();
+        input.read_to_end(&mut received).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&received).unwrap(),
+            request
+        );
+    }
+
     #[test]
     fn daemon_calls_stay_within_the_per_call_byte_cap() {
         let text = "x".repeat(40_000);

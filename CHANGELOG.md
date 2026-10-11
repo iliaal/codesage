@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Security
+
+- MCP closes input connections when a JSONL frame exceeds 16 MiB, including unterminated frames, across direct stdio, the shim, and daemon sockets.
+
 ## [0.41.0] - 2026-10-06
 
 ### Added

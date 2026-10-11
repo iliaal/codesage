@@ -79,6 +79,8 @@ The daemon shares the indexed risk ranking across `project_overview` and `sessio
 
 The daemon is a same-UID co-trust boundary, not a same-UID isolation boundary. Its socket is private to the Unix user and checks peer credentials, but any process running as that user can ask the daemon to open any onboarded project index. Run untrusted agents under a separate Unix user when project isolation matters. MCP calls are agent-safety capped; CLI commands remain operator tools and can request larger limits or file lists.
 
+MCP input frames are limited to 16 MiB (16,777,216 bytes) before parsing, default-project injection, or forwarding. This applies to direct stdio, the stdio shim, and daemon sockets. The LF delimiter is excluded; CR and JSON escape bytes count. EOF also enforces the limit; daemon socket EOF retains its existing session-cancellation behavior. Default-project injection must also produce a frame within the limit. On the first excess byte, the connection closes without draining the rest or dispatching that frame; stdio exits with status 1 and logs the limit to stderr, while the daemon logs the error and continues serving other clients. Split large requests into smaller calls. Built-in indexing and reranking batches fit even with maximum JSON escaping. Response sizes are governed by their existing tool budgets, independently of this input limit.
+
 For Linux CPU inference, install the runtime described in [CPU setup](#cpu-setup-linux). CUDA also needs the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup)); on Apple Silicon, set `device = "coreml"` instead (see [CoreML setup](#coreml-setup-macos)). Each host needs its matching build and runtime dependencies.
 
 ## 📊 Benchmarks

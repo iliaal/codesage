@@ -4,6 +4,7 @@ mod dispatch;
 mod edit_check;
 pub(crate) mod envelope;
 pub(crate) mod error;
+pub(crate) mod framing;
 mod help;
 mod next;
 mod overview_cache;
@@ -1243,20 +1244,26 @@ fn inject_into_message(v: &mut serde_json::Value, default: &str) -> bool {
     true
 }
 
-/// Forward newline-delimited JSON-RPC, supplying the default project on tools/call.
-pub(crate) async fn pump_lines_injecting<R, W>(
+/// Forward bounded JSONL, supplying the optional default project on tools/call.
+pub(crate) async fn pump_lines<R, W>(
     reader: R,
     mut writer: W,
-    default_project: String,
+    default_project: Option<String>,
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let mut lines = BufReader::new(reader).lines();
+    let mut lines = BufReader::new(framing::FrameReader::new(reader)).lines();
     while let Some(line) = lines.next_line().await? {
-        let out = inject_default_project_line(&line, &default_project);
+        let out = match &default_project {
+            Some(project) => inject_default_project_line(&line, project),
+            None => line,
+        };
+        if out.len() > framing::MAX_FRAME_BYTES {
+            return Err(framing::oversized_frame());
+        }
         writer.write_all(out.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
@@ -1265,44 +1272,31 @@ where
 }
 
 pub async fn run_mcp_server(default_project: Option<String>) -> Result<()> {
-    match default_project {
-        Some(dp) => {
-            let (mut feed, server_read) = tokio::io::duplex(64 * 1024);
-            tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                let _ = pump_lines_injecting(tokio::io::stdin(), &mut feed, dp).await;
-                let _ = feed.shutdown().await;
-            });
-            let server = CodeSageServer::new();
-            let code = match server.serve((server_read, tokio::io::stdout())).await {
-                Ok(service) => match service.waiting().await {
-                    Ok(_) => 0,
-                    Err(e) => {
-                        tracing::error!(error = %e, "MCP server stopped");
-                        1
-                    }
-                },
-                Err(e) => {
-                    tracing::error!(error = %e, "MCP server error");
-                    1
-                }
-            };
-            // Tokio's stdin read cannot be cancelled; runtime drop could wait forever.
-            std::process::exit(code);
+    let (mut feed, server_read) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        if let Err(error) = pump_lines(tokio::io::stdin(), &mut feed, default_project).await {
+            tracing::error!(%error, "MCP input rejected");
+            std::process::exit(1);
         }
-        None => {
-            let server = CodeSageServer::new();
-            let service = server
-                .serve(rmcp::transport::io::stdio())
-                .await
-                .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
-            service
-                .waiting()
-                .await
-                .map_err(|e| anyhow::anyhow!("MCP server stopped: {e}"))?;
+        let _ = feed.shutdown().await;
+    });
+    let server = CodeSageServer::new();
+    let code = match server.serve((server_read, tokio::io::stdout())).await {
+        Ok(service) => match service.waiting().await {
+            Ok(_) => 0,
+            Err(e) => {
+                tracing::error!(error = %e, "MCP server stopped");
+                1
+            }
+        },
+        Err(e) => {
+            tracing::error!(error = %e, "MCP server error");
+            1
         }
-    }
-    Ok(())
+    };
+    // Tokio's stdin read cannot be cancelled; runtime drop could wait forever.
+    std::process::exit(code);
 }
 
 #[cfg(test)]
