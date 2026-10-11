@@ -45,7 +45,7 @@ fn trace(db: &Database, from: &str, to: &str) -> bool {
         &CallPathRequest {
             from: from.into(),
             to: to.into(),
-            max_depth: 4,
+            max_depth: 1,
         },
     )
     .unwrap()
@@ -178,6 +178,108 @@ fn incompatible_homonym_does_not_hide_a_genuine_c_definition() {
     assert!(!trace(&db, "entry", "sym:decoy.go#helper"));
     assert!(impact(&db, "sym:helper.c#helper", "caller.c"));
     assert!(!impact(&db, "sym:decoy.go#helper", "caller.c"));
+}
+
+#[test]
+fn semantic_caller_edit_replaces_edges_before_restoration() {
+    let caller = |name: &str| {
+        format!(
+            "#include \"first.h\"\n#include \"second.h\"\nint entry(void) {{ return {name}(); }}\n"
+        )
+    };
+    let initial = caller("first");
+    let (root, db) = project(&[
+        ("caller.c", &initial),
+        ("first.h", "int first(void);\n"),
+        ("first.c", "int first(void) { return 1; }\n"),
+        ("second.h", "int second(void);\n"),
+        ("second.c", "int second(void) { return 2; }\n"),
+        (
+            "tests/caller_test.c",
+            "int entry(void);\nvoid test_entry(void) { entry(); }\n",
+        ),
+    ]);
+    let snapshot = |db: &Database| {
+        let mut observed = serde_json::Map::new();
+        for name in ["first", "second"] {
+            let handle = format!("sym:{name}.c#{name}");
+            let references = find_references(
+                db,
+                &FindReferencesRequest {
+                    symbol_name: name.into(),
+                    kind: Some(ReferenceKind::Call),
+                },
+            )
+            .unwrap();
+            let calls: Vec<_> = references
+                .results
+                .iter()
+                .filter(|row| row.from_file == "caller.c")
+                .map(|row| serde_json::json!({"line": row.line, "to": row.to}))
+                .collect();
+            let reachable: Vec<_> = recommend_tests_with_reachability(
+                db,
+                &[format!("{name}.c")],
+                &ReachabilityOptions::default(),
+            )
+            .unwrap()
+            .reachable
+            .into_iter()
+            .map(|test| test.path)
+            .collect();
+            observed.insert(
+                name.into(),
+                serde_json::json!({
+                    "calls": calls, "trace": trace(db, "entry", &handle),
+                    "impact": impact(db, &handle, "caller.c"), "reachable": reachable,
+                }),
+            );
+        }
+        serde_json::Value::Object(observed)
+    };
+    let assert_active = |state: &serde_json::Value, active: &str| {
+        for name in ["first", "second"] {
+            let expected = name == active;
+            assert_eq!(state[name]["trace"], expected, "{state}");
+            assert_eq!(state[name]["impact"], expected, "{state}");
+            assert_eq!(
+                state[name]["calls"],
+                if expected {
+                    serde_json::json!([{"line": 3, "to": format!("sym:{name}.c#{name}")}])
+                } else {
+                    serde_json::json!([])
+                },
+                "{state}"
+            );
+            assert_eq!(
+                state[name]["reachable"],
+                if expected {
+                    serde_json::json!(["tests/caller_test.c"])
+                } else {
+                    serde_json::json!([])
+                },
+                "{state}"
+            );
+        }
+    };
+    let before = snapshot(&db);
+    assert_active(&before, "first");
+    assert_eq!(before, snapshot(&db));
+    let mut phases = serde_json::Map::from_iter([("before".into(), before.clone())]);
+    for (phase, active) in [("changed", "second"), ("restored", "first")] {
+        std::fs::write(root.path().join("caller.c"), caller(active)).unwrap();
+        incremental_index(root.path(), &db, &[], false).unwrap();
+        let observed = snapshot(&db);
+        assert_active(&observed, active);
+        assert_eq!(observed, snapshot(&db), "warm {phase}");
+        let rebuilt = Database::open_in_memory().unwrap();
+        full_index(root.path(), &rebuilt, &[], false).unwrap();
+        assert_eq!(observed, snapshot(&rebuilt), "rebuilt {phase}");
+        phases.insert(phase.into(), observed);
+    }
+    assert_ne!(phases["before"], phases["changed"]);
+    assert_eq!(phases["before"], phases["restored"]);
+    println!("semantic_edit={}", serde_json::Value::Object(phases));
 }
 
 #[test]

@@ -38,8 +38,10 @@ controls. These are source labels, independent of CodeSage's returned edges.
 
 `prometheus-oracle.json` pins eight inspected source files and eight independently
 labeled edge groups. The executable checks their hashes before indexing. It
-compares resolved identities through `find_references`, trace, and impact;
-same-file impact is inapplicable because impact excludes the changed file.
+compares resolved identities through `find_references`, one-edge traces with
+exact endpoint handles and callsite lines, and depth-one impact reasons at the
+labeled callsites. Same-file impact is inapplicable because impact excludes
+the changed file. A found transitive path does not count as a direct edge.
 `cases.json` contains the complete receiver panel. A separate source reviewer
 classified the cases and corrected an invalid Rust example, an unspecified
 Python external import, and a recursion control that only exercised its caller.
@@ -70,26 +72,39 @@ exports, a C++ receiver, and Go/Rust local calls. Existing Python tests cover
 the larger import-order and binding panel.
 
 Prometheus exposes another remaining limitation: `formatSeries.ts` explicitly
-imports `escapeString` from `lib/escapeString.ts`, but the unrelated homonym in
-`promql/utils.ts` also receives trace/impact edges because other names are
-imported from that file. The genuine `escapeString` trace survives, while its
-`to` handle remains absent because the candidates are ambiguous. This is not
-fixed or counted as a successful false-edge rejection.
+imports `escapeString` from `lib/escapeString.ts`, but the homonym in
+`promql/utils.ts` also receives a false direct edge at line 14 and direct impact
+reasons at lines 14, 16, and 22. The genuine `escapeString` direct edge survives,
+while its `to` handle remains absent because the candidates are ambiguous.
+Separately, the path from `formatSeries` through `maybeQuoteLabelName` to
+`utils.escapeString` is genuine: its two calls occur at lines 16 and 288.
+The evaluation records both legs separately. That legitimate indirect path
+does not establish the false direct edge and must survive a later binding fix.
+`formatSeries.ts` can therefore legitimately remain a dependent of the utils
+file. Whole-file impact membership is not the oracle for this false direct
+call; only the labeled `escapeString` callsite reasons are compared.
 
-`results.json` records measured outcomes and costs. The panel checks repeated,
-reopened, edited, and empty-rebuild parity. Regular `callee_language_test`
-regressions additionally exercise bundles and test reachability with a genuine
-dependent test and an unrelated Go target; they replace the Go declaration
-and restore it before checking incremental results against a clean rebuild.
+`results.json` records measured outcomes and costs. The receiver panel checks
+repeated, reopened, whitespace-edited, and empty-rebuild parity. Those edits
+preserve graph answers and do not prove changed-edge invalidation. The regular
+`semantic_caller_edit_replaces_edges_before_restoration` regression changes
+the warmed caller from `first()` to `second()`, queries that changed state,
+then restores `first()` and queries again. Reference target identities, direct
+trace, impact, and reachable tests must all switch and restore; each state
+must equal an independent full rebuild. A negative control that withheld
+incremental indexing failed on the stale `first()` edge before restoration.
+Other regular regressions cover bundles and cross-language test reachability.
 Raw name-reference rows remain available. Graph absence is not proof of
 unreachability, and arbitrary FFI calls remain unmodeled.
 
 The full Prometheus index retained 951 files, 13,590 symbols, and 120,614
 references, with zero failed files and one degraded parse both before and
-after the change. The three-query warm median was 17.564 ms before and 13.875 ms
-after, across ten repetitions in debug builds. This passes the preregistered
-bound; concurrent development load and the small query set prevent a general
-speedup claim. All four real-workload true edge groups retained their trace;
+after the change. Replaying baseline and candidate with the corrected direct
+oracle gave three-query warm medians of 12.813 ms and 15.864 ms, respectively,
+across ten repetitions in debug builds. The 23.8% relative increase exceeded
+the 20% branch of the preregistered gate; the 3.052 ms absolute increase passed
+its below-5-ms allowance. Concurrent development load and the small query set
+prevent a general performance claim. All four true edge groups retained their direct trace;
 three cross-language false groups were rejected and the same-language import
 homonym remained, as described above.
 

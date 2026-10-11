@@ -89,7 +89,8 @@
       "call": "escapeString(labels.__name__); escapeString(v)",
       "candidate": "sym:web/ui/mantine-ui/src/promql/utils.ts#escapeString@283",
       "label": "false",
-      "evidence": "The module imports other functions from promql/utils; escapeString is explicitly imported from ./escapeString. A file-level import heuristic must not confuse their identities. This is a separate same-language import-binding limitation if observed."
+      "legitimate_indirect_via": "sym:web/ui/mantine-ui/src/promql/utils.ts#maybeQuoteLabelName",
+      "evidence": "At the labeled direct callsites escapeString is explicitly imported from ./escapeString. A direct edge to utils.escapeString is false. Separately, formatSeries calls maybeQuoteLabelName at lines 16/22, which calls utils.escapeString at line 288: that indirect path is genuine and must not be mistaken for a false direct edge."
     },
     {
       "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",

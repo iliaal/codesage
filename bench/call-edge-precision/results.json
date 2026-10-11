@@ -2,7 +2,7 @@
   "date": "2026-10-11",
   "bead": "cs-0lhl",
   "base": "cb0ff7a93e0585d833f5ec0ee7c79e61aaaea8ce",
-  "candidate": "compatible language and C method gates in bundle.rs",
+  "candidate": "1e9a152 product gates, corrected direct-edge oracle and semantic edit invalidation",
   "workload": {
     "repository": "https://github.com/prometheus/prometheus",
     "head": "25d678b5021ca12c0c5cdb24046a182b6ca999df",
@@ -20,349 +20,1424 @@
     "baseline_passes": [
       {
         "pass": 0,
-        "us": 13765
+        "us": 10825
       },
       {
         "pass": 1,
-        "us": 12488
+        "us": 14718
       },
       {
         "pass": 2,
-        "us": 32818
+        "us": 10648
       },
       {
         "pass": 3,
-        "us": 21826
+        "us": 16436
       },
       {
         "pass": 4,
-        "us": 17534
+        "us": 10234
       },
       {
         "pass": 5,
-        "us": 26501
+        "us": 9479
       },
       {
         "pass": 6,
-        "us": 17593
+        "us": 19547
       },
       {
         "pass": 7,
-        "us": 22113
+        "us": 26513
       },
       {
         "pass": 8,
-        "us": 10445
+        "us": 23026
       },
       {
         "pass": 9,
-        "us": 11705
+        "us": 10907
       },
       {
         "pass": 10,
-        "us": 13777
+        "us": 10817
       }
     ],
     "candidate_passes": [
       {
         "pass": 0,
-        "us": 18341
+        "us": 11228
       },
       {
         "pass": 1,
-        "us": 11558
+        "us": 14726
       },
       {
         "pass": 2,
-        "us": 22845
+        "us": 12385
       },
       {
         "pass": 3,
-        "us": 14827
+        "us": 29235
       },
       {
         "pass": 4,
-        "us": 11026
+        "us": 18140
       },
       {
         "pass": 5,
-        "us": 18964
+        "us": 17002
       },
       {
         "pass": 6,
-        "us": 24011
+        "us": 24708
       },
       {
         "pass": 7,
-        "us": 11709
+        "us": 12021
       },
       {
         "pass": 8,
-        "us": 11590
+        "us": 11283
       },
       {
         "pass": 9,
-        "us": 12923
+        "us": 27434
       },
       {
         "pass": 10,
-        "us": 15672
+        "us": 10407
       }
     ],
-    "baseline_warm_median_us": 17563.5,
-    "candidate_warm_median_us": 13875,
-    "gate_passed": true
+    "baseline_warm_median_us": 12812.5,
+    "candidate_warm_median_us": 15864,
+    "gate_passed": true,
+    "relative_growth_pct": 23.816585365853648,
+    "absolute_growth_us": 3051.5,
+    "relative_20_pct_gate_passed": false,
+    "absolute_under_5_ms_allowance_passed": true
   },
   "real_edges": [
     {
       "caller": "web/ui/mantine-ui/src/lib/formatFloatValue.ts",
-      "impact": false,
+      "calls": [
+        {
+          "from": "sym:web/ui/mantine-ui/src/lib/formatFloatValue.ts#parsePrometheusFloat",
+          "from_file": "web/ui/mantine-ui/src/lib/formatFloatValue.ts",
+          "from_symbol": "parsePrometheusFloat",
+          "kind": "call",
+          "line": 8,
+          "to_name": "parseFloat"
+        }
+      ],
+      "direct_impact_reasons": [],
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": false,
+        "steps": []
+      },
+      "legitimate_indirect_path": null,
       "oracle": "false",
-      "raw_calls": 1,
+      "oracle_scope": "direct call at labeled source lines",
       "target": "sym:model/textparse/promparse.go#parseFloat",
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:web/ui/mantine-ui/src/lib/formatFloatValue.ts#parsePrometheusFloat"
+            },
+            {
+              "handle": "sym:model/textparse/promparse.go#parseFloat",
+              "call_line": 8
+            }
+          ]
+        },
+        "direct_impact_reasons": [
+          {
+            "kind": "call",
+            "line": 8,
+            "via_symbol": "parseFloat"
+          }
+        ]
+      }
     },
     {
       "caller": "web/ui/mantine-ui/src/lib/formatSeries.ts",
-      "impact": false,
+      "calls": [
+        {
+          "from": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries",
+          "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+          "from_symbol": "formatSeries",
+          "kind": "call",
+          "line": 17,
+          "to_name": "join"
+        },
+        {
+          "from": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries",
+          "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+          "from_symbol": "formatSeries",
+          "kind": "call",
+          "line": 23,
+          "to_name": "join"
+        }
+      ],
+      "direct_impact_reasons": [],
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": true,
+        "steps": []
+      },
+      "legitimate_indirect_path": null,
       "oracle": "false",
-      "raw_calls": 2,
+      "oracle_scope": "direct call at labeled source lines",
       "target": "sym:discovery/ionos/server.go#join",
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries"
+            },
+            {
+              "handle": "sym:discovery/ionos/server.go#join",
+              "call_line": 17
+            }
+          ]
+        },
+        "direct_impact_reasons": [
+          {
+            "kind": "call",
+            "line": 17,
+            "via_symbol": "join"
+          },
+          {
+            "kind": "call",
+            "line": 23,
+            "via_symbol": "join"
+          }
+        ]
+      }
     },
     {
       "caller": "web/ui/mantine-ui/src/components/ErrorBoundary.tsx",
-      "impact": false,
+      "calls": [
+        {
+          "from": "sym:web/ui/mantine-ui/src/components/ErrorBoundary.tsx#ErrorBoundary.componentDidCatch",
+          "from_file": "web/ui/mantine-ui/src/components/ErrorBoundary.tsx",
+          "from_symbol": "ErrorBoundary.componentDidCatch",
+          "kind": "call",
+          "line": 26,
+          "to_name": "error"
+        }
+      ],
+      "direct_impact_reasons": [],
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": false,
+        "steps": []
+      },
+      "legitimate_indirect_path": null,
       "oracle": "false",
-      "raw_calls": 1,
+      "oracle_scope": "direct call at labeled source lines",
       "target": "sym:promql/engine.go#evaluator.error",
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:web/ui/mantine-ui/src/components/ErrorBoundary.tsx#ErrorBoundary.componentDidCatch"
+            },
+            {
+              "handle": "sym:promql/engine.go#evaluator.error",
+              "call_line": 26
+            }
+          ]
+        },
+        "direct_impact_reasons": [
+          {
+            "kind": "call",
+            "line": 26,
+            "via_symbol": "error"
+          }
+        ]
+      }
     },
     {
       "caller": "model/textparse/promparse.go",
-      "impact": null,
+      "calls": [
+        {
+          "from": "sym:model/textparse/promparse.go#PromParser.parseMetricSuffix",
+          "from_file": "model/textparse/promparse.go",
+          "from_symbol": "PromParser.parseMetricSuffix",
+          "kind": "call",
+          "line": 476,
+          "to": "sym:model/textparse/promparse.go#parseFloat",
+          "to_name": "parseFloat"
+        }
+      ],
+      "direct_impact_reasons": null,
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:model/textparse/promparse.go#PromParser.parseMetricSuffix"
+          },
+          {
+            "handle": "sym:model/textparse/promparse.go#parseFloat",
+            "call_line": 476
+          }
+        ]
+      },
+      "legitimate_indirect_path": null,
       "oracle": "true",
-      "raw_calls": 1,
+      "oracle_scope": "direct call at labeled source lines",
       "target": "sym:model/textparse/promparse.go#parseFloat",
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:model/textparse/promparse.go#PromParser.parseMetricSuffix"
+            },
+            {
+              "handle": "sym:model/textparse/promparse.go#parseFloat",
+              "call_line": 476
+            }
+          ]
+        },
+        "direct_impact_reasons": null
+      }
     },
     {
       "caller": "discovery/ionos/server.go",
-      "impact": null,
+      "calls": [
+        {
+          "from": "sym:discovery/ionos/server.go#serverDiscovery.refresh",
+          "from_file": "discovery/ionos/server.go",
+          "from_symbol": "serverDiscovery.refresh",
+          "kind": "call",
+          "line": 126,
+          "to": "sym:discovery/ionos/server.go#join",
+          "to_name": "join"
+        },
+        {
+          "from": "sym:discovery/ionos/server.go#serverDiscovery.refresh",
+          "from_file": "discovery/ionos/server.go",
+          "from_symbol": "serverDiscovery.refresh",
+          "kind": "call",
+          "line": 135,
+          "to": "sym:discovery/ionos/server.go#join",
+          "to_name": "join"
+        }
+      ],
+      "direct_impact_reasons": null,
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:discovery/ionos/server.go#serverDiscovery.refresh"
+          },
+          {
+            "handle": "sym:discovery/ionos/server.go#join",
+            "call_line": 126
+          }
+        ]
+      },
+      "legitimate_indirect_path": null,
       "oracle": "true",
-      "raw_calls": 2,
+      "oracle_scope": "direct call at labeled source lines",
       "target": "sym:discovery/ionos/server.go#join",
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:discovery/ionos/server.go#serverDiscovery.refresh"
+            },
+            {
+              "handle": "sym:discovery/ionos/server.go#join",
+              "call_line": 126
+            }
+          ]
+        },
+        "direct_impact_reasons": null
+      }
     },
     {
       "caller": "web/ui/mantine-ui/src/lib/formatSeries.ts",
-      "impact": true,
+      "calls": [
+        {
+          "from": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries",
+          "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+          "from_symbol": "formatSeries",
+          "kind": "call",
+          "line": 14,
+          "to_name": "escapeString"
+        },
+        {
+          "from": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries",
+          "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+          "from_symbol": "formatSeries",
+          "kind": "call",
+          "line": 16,
+          "to_name": "escapeString"
+        },
+        {
+          "from": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries",
+          "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+          "from_symbol": "formatSeries",
+          "kind": "call",
+          "line": 22,
+          "to_name": "escapeString"
+        }
+      ],
+      "direct_impact_reasons": [
+        {
+          "kind": "call",
+          "line": 14,
+          "via_symbol": "escapeString"
+        },
+        {
+          "kind": "call",
+          "line": 16,
+          "via_symbol": "escapeString"
+        },
+        {
+          "kind": "call",
+          "line": 22,
+          "via_symbol": "escapeString"
+        }
+      ],
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries"
+          },
+          {
+            "handle": "sym:web/ui/mantine-ui/src/lib/escapeString.ts#escapeString",
+            "call_line": 14
+          }
+        ]
+      },
+      "legitimate_indirect_path": null,
       "oracle": "true",
-      "raw_calls": 3,
+      "oracle_scope": "direct call at labeled source lines",
       "target": "sym:web/ui/mantine-ui/src/lib/escapeString.ts#escapeString",
       "to": false,
-      "trace": true
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries"
+            },
+            {
+              "handle": "sym:web/ui/mantine-ui/src/lib/escapeString.ts#escapeString",
+              "call_line": 14
+            }
+          ]
+        },
+        "direct_impact_reasons": [
+          {
+            "kind": "call",
+            "line": 14,
+            "via_symbol": "escapeString"
+          },
+          {
+            "kind": "call",
+            "line": 16,
+            "via_symbol": "escapeString"
+          },
+          {
+            "kind": "call",
+            "line": 22,
+            "via_symbol": "escapeString"
+          }
+        ]
+      }
     },
     {
       "caller": "web/ui/mantine-ui/src/lib/formatSeries.ts",
-      "impact": true,
+      "calls": [
+        {
+          "from": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries",
+          "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+          "from_symbol": "formatSeries",
+          "kind": "call",
+          "line": 14,
+          "to_name": "escapeString"
+        },
+        {
+          "from": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries",
+          "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+          "from_symbol": "formatSeries",
+          "kind": "call",
+          "line": 16,
+          "to_name": "escapeString"
+        },
+        {
+          "from": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries",
+          "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+          "from_symbol": "formatSeries",
+          "kind": "call",
+          "line": 22,
+          "to_name": "escapeString"
+        }
+      ],
+      "direct_impact_reasons": [
+        {
+          "kind": "call",
+          "line": 14,
+          "via_symbol": "escapeString"
+        },
+        {
+          "kind": "call",
+          "line": 16,
+          "via_symbol": "escapeString"
+        },
+        {
+          "kind": "call",
+          "line": 22,
+          "via_symbol": "escapeString"
+        }
+      ],
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries"
+          },
+          {
+            "handle": "sym:web/ui/mantine-ui/src/promql/utils.ts#escapeString",
+            "call_line": 14
+          }
+        ]
+      },
+      "legitimate_indirect_path": {
+        "via": "sym:web/ui/mantine-ui/src/promql/utils.ts#maybeQuoteLabelName",
+        "legs": [
+          {
+            "found": true,
+            "length": 1,
+            "bounded": false,
+            "steps": [
+              {
+                "handle": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries"
+              },
+              {
+                "handle": "sym:web/ui/mantine-ui/src/promql/utils.ts#maybeQuoteLabelName",
+                "call_line": 16
+              }
+            ]
+          },
+          {
+            "found": true,
+            "length": 1,
+            "bounded": false,
+            "steps": [
+              {
+                "handle": "sym:web/ui/mantine-ui/src/promql/utils.ts#maybeQuoteLabelName"
+              },
+              {
+                "handle": "sym:web/ui/mantine-ui/src/promql/utils.ts#escapeString",
+                "call_line": 288
+              }
+            ]
+          }
+        ]
+      },
       "oracle": "false",
-      "raw_calls": 3,
+      "oracle_scope": "direct call at labeled source lines",
       "target": "sym:web/ui/mantine-ui/src/promql/utils.ts#escapeString",
       "to": false,
-      "trace": true
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries"
+            },
+            {
+              "handle": "sym:web/ui/mantine-ui/src/promql/utils.ts#escapeString",
+              "call_line": 14
+            }
+          ]
+        },
+        "direct_impact_reasons": [
+          {
+            "kind": "call",
+            "line": 14,
+            "via_symbol": "escapeString"
+          },
+          {
+            "kind": "call",
+            "line": 16,
+            "via_symbol": "escapeString"
+          },
+          {
+            "kind": "call",
+            "line": 22,
+            "via_symbol": "escapeString"
+          }
+        ]
+      }
     },
     {
       "caller": "web/ui/mantine-ui/src/lib/formatSeries.ts",
-      "impact": true,
+      "calls": [
+        {
+          "from": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries",
+          "from_file": "web/ui/mantine-ui/src/lib/formatSeries.ts",
+          "from_symbol": "formatSeries",
+          "kind": "call",
+          "line": 13,
+          "to": "sym:web/ui/mantine-ui/src/promql/utils.ts#metricContainsExtendedCharset",
+          "to_name": "metricContainsExtendedCharset"
+        }
+      ],
+      "direct_impact_reasons": [
+        {
+          "kind": "call",
+          "line": 13,
+          "via_symbol": "metricContainsExtendedCharset"
+        }
+      ],
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries"
+          },
+          {
+            "handle": "sym:web/ui/mantine-ui/src/promql/utils.ts#metricContainsExtendedCharset",
+            "call_line": 13
+          }
+        ]
+      },
+      "legitimate_indirect_path": null,
       "oracle": "true",
-      "raw_calls": 1,
+      "oracle_scope": "direct call at labeled source lines",
       "target": "sym:web/ui/mantine-ui/src/promql/utils.ts#metricContainsExtendedCharset",
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:web/ui/mantine-ui/src/lib/formatSeries.ts#formatSeries"
+            },
+            {
+              "handle": "sym:web/ui/mantine-ui/src/promql/utils.ts#metricContainsExtendedCharset",
+              "call_line": 13
+            }
+          ]
+        },
+        "direct_impact_reasons": [
+          {
+            "kind": "call",
+            "line": 13,
+            "via_symbol": "metricContainsExtendedCharset"
+          }
+        ]
+      }
     }
   ],
   "panel": [
     {
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": false,
+        "steps": []
+      },
       "id": "python_parameter_shadow",
       "impact": false,
       "oracle": "unknown",
       "raw_calls": 1,
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": false,
+          "length": 0,
+          "bounded": false,
+          "steps": []
+        },
+        "impact": false,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": false,
+        "steps": []
+      },
       "id": "python_import_shadow",
       "impact": false,
       "oracle": "false",
       "raw_calls": 1,
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": false,
+          "length": 0,
+          "bounded": false,
+          "steps": []
+        },
+        "impact": false,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": true,
+        "steps": []
+      },
       "id": "python_local_shadow",
       "impact": false,
       "oracle": "false",
       "raw_calls": 1,
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": false,
+          "length": 0,
+          "bounded": true,
+          "steps": []
+        },
+        "impact": false,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": false,
+        "steps": []
+      },
       "id": "python_dict_builtin",
       "impact": false,
       "oracle": "false",
       "raw_calls": 1,
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": false,
+          "length": 0,
+          "bounded": false,
+          "steps": []
+        },
+        "impact": false,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": false,
+        "steps": []
+      },
       "id": "python_bare_method_decoy",
       "impact": false,
       "oracle": "false",
       "raw_calls": 1,
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": false,
+          "length": 0,
+          "bounded": false,
+          "steps": []
+        },
+        "impact": false,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": false,
+        "steps": []
+      },
       "id": "python_chained_receiver",
       "impact": false,
       "oracle": "unknown",
       "raw_calls": 1,
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": false,
+          "length": 0,
+          "bounded": false,
+          "steps": []
+        },
+        "impact": false,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.py#Service.entry"
+          },
+          {
+            "handle": "sym:caller.py#Service.work",
+            "call_line": 5
+          }
+        ]
+      },
       "id": "python_self",
       "impact": null,
       "oracle": "true",
       "raw_calls": 1,
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.py#Service.entry"
+            },
+            {
+              "handle": "sym:caller.py#Service.work",
+              "call_line": 5
+            }
+          ]
+        },
+        "impact": null,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.py#entry"
+          },
+          {
+            "handle": "sym:caller.py#Service.work",
+            "call_line": 6
+          }
+        ]
+      },
       "id": "python_class",
       "impact": null,
       "oracle": "true",
       "raw_calls": 1,
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.py#entry"
+            },
+            {
+              "handle": "sym:caller.py#Service.work",
+              "call_line": 6
+            }
+          ]
+        },
+        "impact": null,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.py#entry"
+          },
+          {
+            "handle": "sym:actual.py#work",
+            "call_line": 3
+          }
+        ]
+      },
       "id": "python_bare_import",
       "impact": true,
       "oracle": "true",
       "raw_calls": 1,
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.py#entry"
+            },
+            {
+              "handle": "sym:actual.py#work",
+              "call_line": 3
+            }
+          ]
+        },
+        "impact": true,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.py#entry"
+          },
+          {
+            "handle": "sym:caller.py#work",
+            "call_line": 4
+          }
+        ]
+      },
       "id": "python_recursion",
       "impact": null,
       "oracle": "true",
       "raw_calls": 2,
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.py#entry"
+            },
+            {
+              "handle": "sym:caller.py#work",
+              "call_line": 4
+            }
+          ]
+        },
+        "impact": null,
+        "raw_calls": 2
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.py#entry"
+          },
+          {
+            "handle": "sym:actual.py#work",
+            "call_line": 4
+          }
+        ]
+      },
       "id": "python_scoped_rebinding",
       "impact": true,
       "oracle": "true",
       "raw_calls": 1,
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.py#entry"
+            },
+            {
+              "handle": "sym:actual.py#work",
+              "call_line": 4
+            }
+          ]
+        },
+        "impact": true,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.js#entry"
+          },
+          {
+            "handle": "sym:actual.js#work",
+            "call_line": 2
+          }
+        ]
+      },
       "id": "javascript_parameter_shadow",
       "impact": true,
       "oracle": "unknown",
       "raw_calls": 1,
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.js#entry"
+            },
+            {
+              "handle": "sym:actual.js#work",
+              "call_line": 2
+            }
+          ]
+        },
+        "impact": true,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.js#entry"
+          },
+          {
+            "handle": "sym:actual.js#work",
+            "call_line": 2
+          }
+        ]
+      },
       "id": "javascript_local_shadow",
       "impact": true,
       "oracle": "false",
       "raw_calls": 1,
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.js#entry"
+            },
+            {
+              "handle": "sym:actual.js#work",
+              "call_line": 2
+            }
+          ]
+        },
+        "impact": true,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.js#entry"
+          },
+          {
+            "handle": "sym:actual.js#Cache.get",
+            "call_line": 1
+          }
+        ]
+      },
       "id": "javascript_map_builtin",
       "impact": true,
       "oracle": "false",
       "raw_calls": 1,
       "to": false,
-      "trace": true
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.js#entry"
+            },
+            {
+              "handle": "sym:actual.js#Cache.get",
+              "call_line": 1
+            }
+          ]
+        },
+        "impact": true,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.js#entry"
+          },
+          {
+            "handle": "sym:actual.js#work",
+            "call_line": 2
+          }
+        ]
+      },
       "id": "javascript_import_export",
       "impact": true,
       "oracle": "true",
       "raw_calls": 1,
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.js#entry"
+            },
+            {
+              "handle": "sym:actual.js#work",
+              "call_line": 2
+            }
+          ]
+        },
+        "impact": true,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": false,
+        "steps": []
+      },
       "id": "c_cpp_method_decoy",
       "impact": false,
       "oracle": "false",
       "raw_calls": 1,
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.c#entry"
+            },
+            {
+              "handle": "sym:actual.cpp#Printer::puts",
+              "call_line": 2
+            }
+          ]
+        },
+        "impact": true,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.cpp#entry"
+          },
+          {
+            "handle": "sym:caller.cpp#Service::work",
+            "call_line": 2
+          }
+        ]
+      },
       "id": "cpp_receiver",
       "impact": null,
       "oracle": "true",
       "raw_calls": 1,
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.cpp#entry"
+            },
+            {
+              "handle": "sym:caller.cpp#Service::work",
+              "call_line": 2
+            }
+          ]
+        },
+        "impact": null,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": false,
+        "steps": []
+      },
       "id": "rust_go_decoy",
       "impact": false,
       "oracle": "false",
       "raw_calls": 1,
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.rs#entry"
+            },
+            {
+              "handle": "sym:actual.go#is_empty",
+              "call_line": 1
+            }
+          ]
+        },
+        "impact": true,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.rs#entry"
+          },
+          {
+            "handle": "sym:actual.rs#Other::map",
+            "call_line": 1
+          }
+        ]
+      },
       "id": "rust_builtin_method",
       "impact": true,
       "oracle": "false",
       "raw_calls": 1,
       "to": false,
-      "trace": true
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.rs#entry"
+            },
+            {
+              "handle": "sym:actual.rs#Other::map",
+              "call_line": 1
+            }
+          ]
+        },
+        "impact": true,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": false,
+        "length": 0,
+        "bounded": false,
+        "steps": []
+      },
       "id": "go_receiver_decoy",
       "impact": false,
       "oracle": "unknown",
       "raw_calls": 1,
       "to": false,
-      "trace": false
+      "baseline": {
+        "to": false,
+        "direct_trace": {
+          "found": false,
+          "length": 0,
+          "bounded": false,
+          "steps": []
+        },
+        "impact": false,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.go#entry"
+          },
+          {
+            "handle": "sym:caller.go#work",
+            "call_line": 3
+          }
+        ]
+      },
       "id": "go_local_positive",
       "impact": null,
       "oracle": "true",
       "raw_calls": 1,
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.go#entry"
+            },
+            {
+              "handle": "sym:caller.go#work",
+              "call_line": 3
+            }
+          ]
+        },
+        "impact": null,
+        "raw_calls": 1
+      }
     },
     {
+      "direct_trace": {
+        "found": true,
+        "length": 1,
+        "bounded": false,
+        "steps": [
+          {
+            "handle": "sym:caller.rs#entry"
+          },
+          {
+            "handle": "sym:caller.rs#work",
+            "call_line": 2
+          }
+        ]
+      },
       "id": "rust_local_positive",
       "impact": null,
       "oracle": "true",
       "raw_calls": 1,
       "to": true,
-      "trace": true
+      "baseline": {
+        "to": true,
+        "direct_trace": {
+          "found": true,
+          "length": 1,
+          "bounded": false,
+          "steps": [
+            {
+              "handle": "sym:caller.rs#entry"
+            },
+            {
+              "handle": "sym:caller.rs#work",
+              "call_line": 2
+            }
+          ]
+        },
+        "impact": null,
+        "raw_calls": 1
+      }
     }
   ],
   "parity": {
@@ -371,11 +1446,11 @@
       "initial",
       "repeated",
       "database reopened",
-      "caller newline edit then incremental index",
+      "caller whitespace-only edit then incremental index",
       "independent full rebuild"
     ],
     "all_equal": true,
-    "additional_regression": "replace then restore Go target; raw rows, trace, impact and reachable-test answers checked after incremental index and full rebuild"
+    "scope": "same-answer stability; semantic invalidation is a separate enforced regression"
   },
   "disposition": {
     "adopt": [
@@ -391,14 +1466,92 @@
       "JavaScript callable parameter unknown but guessed to/trace/impact",
       "JavaScript Map.get false trace/impact",
       "Rust Option.map false trace/impact",
-      "Prometheus imported escapeString resolves to both imported-file homonyms for trace/impact; to is absent"
+      "Prometheus has a false direct formatSeries:14 -> utils.escapeString edge and callsite impact reasons at14/16/22; a genuine indirect route via maybeQuoteLabelName remains and dependent-file membership is legitimate"
     ],
     "limits": [
       "bounded independently labeled panel, not global soundness or corpus prevalence",
       "arbitrary FFI unresolved",
       "same-file impact not applicable",
       "find_references to handle requires stronger evidence than trace/impact",
-      "no donor tests or type inference copied"
+      "no donor tests or type inference copied",
+      "direct-edge evidence uses max_depth=1, exact endpoint handles and callsite lines; transitive or whole-file reachability is not labeled false by a direct-edge oracle"
     ]
+  },
+  "semantic_edit": {
+    "test": "semantic_caller_edit_replaces_edges_before_restoration",
+    "source_change": "caller.c:3 switches first() to second(), then restores first()",
+    "query_depth": 1,
+    "snapshots": {
+      "before": {
+        "first": {
+          "calls": [
+            {
+              "line": 3,
+              "to": "sym:first.c#first"
+            }
+          ],
+          "impact": true,
+          "reachable": [
+            "tests/caller_test.c"
+          ],
+          "trace": true
+        },
+        "second": {
+          "calls": [],
+          "impact": false,
+          "reachable": [],
+          "trace": false
+        }
+      },
+      "changed": {
+        "first": {
+          "calls": [],
+          "impact": false,
+          "reachable": [],
+          "trace": false
+        },
+        "second": {
+          "calls": [
+            {
+              "line": 3,
+              "to": "sym:second.c#second"
+            }
+          ],
+          "impact": true,
+          "reachable": [
+            "tests/caller_test.c"
+          ],
+          "trace": true
+        }
+      },
+      "restored": {
+        "first": {
+          "calls": [
+            {
+              "line": 3,
+              "to": "sym:first.c#first"
+            }
+          ],
+          "impact": true,
+          "reachable": [
+            "tests/caller_test.c"
+          ],
+          "trace": true
+        },
+        "second": {
+          "calls": [],
+          "impact": false,
+          "reachable": [],
+          "trace": false
+        }
+      }
+    },
+    "compared_after_each_change_to": [
+      "repeated query on same warmed database",
+      "independent empty full rebuild"
+    ],
+    "negative_control": "withhold incremental indexing between semantic edit and changed-state query",
+    "negative_control_result": "expected assertion failure: stale first edge still true where false required",
+    "restored_result": "all six callee_language_test regressions passed with incremental indexing restored"
   }
 }

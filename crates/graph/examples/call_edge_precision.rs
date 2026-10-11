@@ -2,8 +2,8 @@ use codesage_graph::{
     find_references, full_index, impact_analysis, incremental_index, trace_call_path,
 };
 use codesage_protocol::{
-    CallPathRequest, DEFAULT_EMBEDDING_DIM, FindReferencesRequest, ImpactRequest, ImpactTarget,
-    ReferenceKind,
+    CallPathReport, CallPathRequest, DEFAULT_EMBEDDING_DIM, FindReferencesRequest, ImpactRequest,
+    ImpactTarget, ReferenceKind,
 };
 use codesage_storage::Database;
 
@@ -48,17 +48,16 @@ fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, Database) {
     (root, db)
 }
 
-fn trace(db: &Database, from: &str, to: &str) -> bool {
+fn direct_trace(db: &Database, from: &str, to: &str) -> CallPathReport {
     trace_call_path(
         db,
         &CallPathRequest {
             from: from.into(),
             to: to.into(),
-            max_depth: 4,
+            max_depth: 1,
         },
     )
     .unwrap()
-    .found
 }
 
 fn impact(db: &Database, target: &str, caller: &str) -> bool {
@@ -144,7 +143,6 @@ fn prometheus_real_workload(root: std::path::PathBuf) {
             start.elapsed().as_micros()
         );
     }
-    assert!(failures.is_empty(), "{failures:?}");
     for edge in oracle["edges"].as_array().unwrap() {
         let caller = edge["from_file"].as_str().unwrap();
         let candidate = edge["candidate"].as_str().unwrap();
@@ -206,16 +204,59 @@ fn prometheus_real_workload(root: std::path::PathBuf) {
             .collect();
         assert!(!calls.is_empty(), "missing oracle call: {edge}");
         let to = calls.iter().any(|row| row.to.as_deref() == Some(&target));
-        let traced = trace(&db, &from, &target);
-        let impacted = (caller != definition).then(|| impact(&db, &target, caller));
+        let direct = direct_trace(&db, &from, &target);
+        if direct.found {
+            assert_eq!(direct.length, 1, "{direct:?}");
+            assert_eq!(direct.steps[0].handle, from);
+            assert_eq!(direct.steps[1].handle, target);
+            assert!(
+                calls
+                    .iter()
+                    .any(|row| Some(row.line) == direct.steps[1].call_line),
+                "direct path must use an oracle callsite: {direct:?}, {calls:?}"
+            );
+        }
+        let reasons = (caller != definition).then(|| {
+            impact_analysis(
+                &db,
+                &ImpactRequest {
+                    target: ImpactTarget::Symbol {
+                        name: target.clone(),
+                    },
+                    depth: 1,
+                    source_only: false,
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.file_path == caller)
+            .flat_map(|row| row.reasons)
+            .filter(|reason| {
+                reason.kind == ReferenceKind::Call
+                    && calls
+                        .iter()
+                        .any(|row| row.line == reason.line && row.to_name == reason.via_symbol)
+            })
+            .collect::<Vec<_>>()
+        });
+        let indirect = edge["legitimate_indirect_via"].as_str().map(|via| {
+            let first = direct_trace(&db, &from, via);
+            let second = direct_trace(&db, via, &target);
+            assert!(
+                first.found && second.found,
+                "known indirect path: {first:?}, {second:?}"
+            );
+            serde_json::json!({"via": via, "legs": [first, second]})
+        });
         println!(
             "real_edge={}",
-            serde_json::json!({"caller": caller, "target": target, "oracle": edge["label"], "raw_calls": calls.len(), "to": to, "trace": traced, "impact": impacted})
+            serde_json::json!({"caller": caller, "target": target, "oracle": edge["label"], "oracle_scope": "direct call at labeled source lines", "calls": calls, "to": to, "direct_trace": direct, "direct_impact_reasons": reasons, "legitimate_indirect_path": indirect})
         );
         if edge["label"] == "true" {
-            assert!(traced, "lost known true edge: {edge}");
+            assert!(direct.found, "lost known true direct edge: {edge}");
         }
     }
+    assert!(failures.is_empty(), "{failures:?}");
 }
 
 fn receiver_scope_evaluation() {
@@ -275,16 +316,21 @@ fn receiver_scope_evaluation() {
                     "{raw:?}"
                 );
             }
+            let direct = direct_trace(db, &entry, &target);
             serde_json::json!({"id": case["id"], "oracle": case["oracle"],
                 "to": raw.iter().any(|row| row.to.as_deref() == Some(&target)),
-                "trace": trace(db, &entry, &target),
+                "direct_trace": direct,
                 "impact": (definition != files[0].0).then(|| impact(db, &target, files[0].0)),
                 "raw_calls": raw.len()})
         };
         let cold = snapshot(&db);
         if case["oracle"] == "true" {
             assert_eq!(cold["to"], true, "lost known true target: {}", case["id"]);
-            assert_eq!(cold["trace"], true, "lost known true path: {}", case["id"]);
+            assert_eq!(
+                cold["direct_trace"]["found"], true,
+                "lost known true direct path: {}",
+                case["id"]
+            );
         }
         assert_eq!(cold, snapshot(&db), "repeated {}", case["id"]);
         drop(db);
