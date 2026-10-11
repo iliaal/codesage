@@ -320,8 +320,8 @@ fn silent_client_that_never_initializes_is_dropped() {
     };
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut socket: Option<PathBuf> = None;
-    while Instant::now() < deadline && socket.is_none() {
+    let mut stream = None;
+    while Instant::now() < deadline && stream.is_none() {
         thread::sleep(Duration::from_millis(50));
         for entry in std::fs::read_dir(&runtime_dir)
             .into_iter()
@@ -330,13 +330,22 @@ fn silent_client_that_never_initializes_is_dropped() {
         {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) == Some("sock") {
-                socket = Some(p);
+                match UnixStream::connect(&p) {
+                    Ok(connected) => {
+                        stream = Some(connected);
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) => {}
+                    Err(error) => panic!("connect to daemon socket: {error}"),
+                }
             }
         }
     }
-    let socket = socket.expect("daemon should bind a socket");
-
-    let mut stream = UnixStream::connect(&socket).expect("connect to daemon socket");
+    let mut stream = stream.expect("daemon should accept a connection within 5s");
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
