@@ -87,7 +87,23 @@ def lint(body: str) -> list[str]:
                 f"canonical order: {' -> '.join(CANONICAL)})"
             )
         last_rank = max(last_rank, RANK[name])
-        bullets = [ln.strip()[2:].strip() for ln in lines if ln.lstrip().startswith("- ")]
+        bullets: list[str] = []
+        continuing = False
+        for line in lines:
+            if not line.strip() or re.match(r"^\[[^\]]+\]:\s*\S", line):
+                continuing = False
+            elif line.lstrip().startswith("- ") or line.strip() == "-":
+                bullets.append(line.lstrip()[1:].strip())
+                continuing = True
+            elif continuing:
+                # Markdown permits both indented and lazy wrapped lines.
+                # Validate their complete text, not only the first line.
+                bullets[-1] = (bullets[-1] + " " + line.strip()).strip()
+            else:
+                problems.append(
+                    f"`### {name}`: entry outside a bullet — "
+                    f"{_excerpt(line.strip())}"
+                )
         if not bullets:
             problems.append(f"section `### {name}` has no `- ` bullets (remove it or fill it)")
         for bullet in bullets:
@@ -98,6 +114,8 @@ def lint(body: str) -> list[str]:
 def _lint_bullet(bullet: str) -> list[str]:
     """Terse-style problems for a single bullet body (leading `- ` stripped)."""
     problems: list[str] = []
+    if not bullet:
+        problems.append("empty bullet — add a change or remove it")
     if bullet.startswith("**"):
         problems.append(f"bold lead-in — drop the `**...**` prefix — {_excerpt(bullet)}")
     low = bullet.lower()

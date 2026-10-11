@@ -108,5 +108,68 @@ class PreSectionContentTests(unittest.TestCase):
         self.assertEqual(status, 0, err)
 
 
+class SectionEntryTests(unittest.TestCase):
+    def test_non_bullet_content_inside_section_fails(self):
+        for entry in ("Unattached prose.", "  An explanatory continuation.",
+                      "1. Numbered entry.", "* Alternate bullet.", "#### Nested heading"):
+            with self.subTest(entry=entry):
+                status, err = run_main(load_checker(),
+                    "## [Unreleased]\n\n### Fixed\n\n- Real fix.\n\n" + entry + "\n")
+                self.assertEqual(status, 1)
+                self.assertIn("entry outside a bullet", err)
+
+    def test_wrapped_bullet_passes(self):
+        for indent in ("", "  "):
+            with self.subTest(indent=indent):
+                status, err = run_main(load_checker(),
+                    "## [Unreleased]\n\n### Fixed\n\n- Search returns\n"
+                    + indent + "matching files.\n")
+                self.assertEqual(status, 0, err)
+
+    def test_wrapped_explanation_fails(self):
+        status, err = run_main(load_checker(),
+            "## [Unreleased]\n\n### Fixed\n\n- Search returns files,\n"
+            "  so users can continue.\n")
+        self.assertEqual(status, 1)
+        self.assertIn("explanation", err)
+
+    def test_wrapped_bullet_length_boundary(self):
+        checker = load_checker()
+        for length in (checker.BULLET_MAX_LEN - 1,
+                       checker.BULLET_MAX_LEN, checker.BULLET_MAX_LEN + 1):
+            with self.subTest(length=length):
+                status, err = run_main(checker,
+                    "## [Unreleased]\n\n### Fixed\n\n- " + "x" * 200
+                    + "\n  " + "x" * (length - 201) + "\n")
+                self.assertEqual(status, int(length > checker.BULLET_MAX_LEN), err)
+
+    def test_empty_bullet_fails(self):
+        for entry in ("-", "- ", "-   ", "  - "):
+            with self.subTest(entry=entry):
+                status, err = run_main(load_checker(),
+                    "## [Unreleased]\n\n### Fixed\n\n" + entry + "\n")
+                self.assertEqual(status, 1)
+                self.assertIn("empty bullet", err)
+
+    def test_link_references_after_last_section_pass(self):
+        status, err = run_main(load_checker(),
+            "## [Unreleased]\n\n### Fixed\n\n- Real fix.\n\n"
+            "[Unreleased]: https://example.com/compare\n")
+        self.assertEqual(status, 0, err)
+
+    def test_link_reference_does_not_fill_empty_section(self):
+        status, err = run_main(load_checker(),
+            "## [Unreleased]\n\n### Fixed\n\n"
+            "[Unreleased]: https://example.com/compare\n")
+        self.assertEqual(status, 1)
+        self.assertIn("has no `- ` bullets", err)
+
+    def test_released_prose_is_not_linted(self):
+        status, err = run_main(load_checker(),
+            "## [Unreleased]\n\n### Fixed\n\n- Real fix.\n\n"
+            "## [1.0.0]\n\n### Added\n\nHistorical prose.\n")
+        self.assertEqual(status, 0, err)
+
+
 if __name__ == "__main__":
     unittest.main()
