@@ -148,7 +148,8 @@ def query_rejection_reason(query: str, rel_path: str, content: str) -> str | Non
         path.stem.lower(),
     }
     for term in forbidden_path_terms:
-        if term and term in q_lower:
+        # Short stems such as `io` must not reject ordinary words like `session`.
+        if term and re.search(rf"(?<!\w){re.escape(term)}(?!\w)", q_lower):
             return f"query includes path term {term!r}"
 
     for pattern in (DECLARED_SYMBOL, ASSIGNED_CONSTANT):

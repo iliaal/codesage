@@ -118,6 +118,48 @@ check(
 
 gen = _load("generate-llm-corpus.py", "gen")
 
+# A short filename stem inside a longer word is not a verbatim path reference.
+for rel_path, query in (
+    ("src/io.py", "configure session authentication middleware"),
+    ("src/os.py", "find host platform environment settings"),
+    ("src/net.py", "handle ethernet device connection errors"),
+    ("src/io.py", "find bio input buffering behavior"),
+    ("src/io.py", "find io_helpers input buffering behavior"),
+    ("src/io.py", "find io2 input buffering behavior"),
+    ("src/io.py", "find stream buffering behavior"),
+    ("src/io.py", "find stream buffering behavior\n"),
+    ("src/io.py", "find ordinary stream buffering behavior"),
+):
+    check(gen.validate_query_text(query, rel_path, "") == query,
+          f"gen: keeps ordinary query words for {rel_path}: {query}")
+
+for query in (
+    "find io stream buffering behavior",
+    "find IO stream buffering behavior",
+    "find (io) stream buffering behavior",
+    "find io.py stream buffering behavior",
+    "find src/io.py stream buffering behavior",
+    "io handles stream buffering behavior",
+    "find stream buffering behavior io",
+    "find\tio\tstream buffering behavior",
+    "find\nio\nstream buffering behavior",
+    "find\n\nio stream buffering behavior",
+    "\n\nfind io stream buffering behavior\n\n",
+):
+    check(gen.query_rejection_reason(query, "src/io.py", "") is not None,
+          f"gen: still rejects exact path terms or multiline queries: {query!r}")
+
+for query, content, symbol in (
+    ("find ProcessIO stream buffering behavior", "class ProcessIO:\n    pass\n", "ProcessIO"),
+    ("find LIMIT stream buffering behavior", "LIMIT = 30\n", "LIMIT"),
+):
+    check(gen.query_rejection_reason(query, "src/io.py", content)
+          == f"query includes symbol {symbol!r}",
+          "gen: complete symbol names remain rejected even when their path stem is embedded")
+check(gen.query_rejection_reason("find a+b stream buffering behavior",
+                                "src/a+b.py", "") is not None,
+      "gen: path terms containing regex punctuation remain literal")
+
 raised = False
 try:
     gen.positive_int("-5")
