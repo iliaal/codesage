@@ -309,6 +309,63 @@ with tempfile.TemporaryDirectory() as td:
         f"extract: root-level allowed files are retained in cases (got {cases!r})",
     )
 
+# Session mining must retain every source extension CodeSage can index.
+# Keep legacy non-indexed/config inputs too: corpora measure coverage gaps.
+source_extensions = (
+    "php", "py", "pyi", "c", "h", "cu", "cuh", "cpp", "cc", "cxx", "c++",
+    "cppm", "ixx", "hpp", "hh", "hxx", "h++", "tpp", "ipp", "java", "rs",
+    "js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts", "go",
+    "vue", "rb", "kt", "swift", "yml", "yaml", "json", "toml", "env", "conf",
+)
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "project"
+    sessions = Path(td) / "sessions"
+    root.mkdir()
+    sessions.mkdir()
+    messages = []
+    for ext in source_extensions:
+        for result_shape in ("toolUseResult", "tool_result"):
+            path = root / f"source-{result_shape}.{ext}"
+            path.write_text("synthetic source\n")
+            messages.append({"type": "user", "message": {
+                "content": f"where is the implementation for {path.name}?"}})
+            if result_shape == "toolUseResult":
+                messages.append({"type": "user", "toolUseResult": {
+                    "file": {"filePath": str(path)}}})
+            else:
+                messages.append({"type": "assistant", "message": {"content": [
+                    {"type": "tool_result", "content": {"file_path": str(path)}}]}})
+    # An unsupported artifact must not create a candidate.
+    messages.extend([
+        {"type": "user", "message": {"content": "where is the generated binary artifact?"}},
+        {"type": "user", "toolUseResult": {"file_path": str(root / "artifact.png")}},
+    ])
+    (sessions / "extensions.jsonl").write_text(
+        "\n".join(json.dumps(m) for m in messages) + "\n")
+    cases = extract.extract_cases(sessions, str(root), min_files=1, max_cases=100)
+    expected = {f"source-{shape}.{ext}" for ext in source_extensions
+                for shape in ("toolUseResult", "tool_result")}
+    actual = {f for case in cases for f in case["files"]}
+    check(actual == expected,
+          f"extract: supported extension cases survive both result paths (missing {expected - actual}, extra {actual - expected})")
+    # The threshold applies to the complete expected-file set, not only old extensions.
+    mixed = [
+        {"type": "user", "message": {"content": "where is the mixed language implementation?"},
+         "padding": "x" * 3500},
+        {"type": "user", "toolUseResult": {"files": [
+            {"filePath": str(root / f"mixed.{ext}")} for ext in ("h", "cpp", "mts")]}}
+    ]
+    (sessions / "extensions.jsonl").write_text(
+        "\n".join(json.dumps(m) for m in mixed) + "\n")
+    cases = extract.extract_cases(sessions, str(root), min_files=3, max_cases=1)
+    check(len(cases) == 1 and cases[0]["files"] == ["mixed.cpp", "mixed.h", "mixed.mts"],
+          f"extract: mixed-language case meets min-files without dropping expectations ({cases!r})")
+    if cases:
+        output = root / "corpus.yaml"
+        extract.write_yaml(cases, str(root), "mixed", output)
+        check(all(f'      - "mixed.{ext}"' in output.read_text() for ext in ("h", "cpp", "mts")),
+              "extract: YAML preserves the complete mixed-language expected-file set")
+
 # Exclude CodeSage-derived cases so the benchmark does not grade its own retrieval.
 # Naming the root `codesage` tests that cd/git prefixes do not count as CodeSage calls.
 with tempfile.TemporaryDirectory() as td:

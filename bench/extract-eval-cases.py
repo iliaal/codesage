@@ -279,7 +279,12 @@ def extract_cases(
                         rel = normalize_path(f, project_root)
                         if rel:
                             ext = rel.rsplit(".", 1)[-1] if "." in rel else ""
-                            if ext in ("php", "py", "js", "jsx", "ts", "tsx", "c", "h", "rs",
+                            # Include all parser/detect.rs source extensions, plus
+                            # existing non-indexed/config inputs used to measure gaps.
+                            if ext in ("php", "py", "pyi", "js", "mjs", "cjs", "jsx",
+                                       "ts", "tsx", "mts", "cts", "c", "h", "cu", "cuh",
+                                       "cpp", "cc", "cxx", "c++", "cppm", "ixx", "hpp",
+                                       "hh", "hxx", "h++", "tpp", "ipp", "rs",
                                        "vue", "rb", "go", "java", "kt", "swift", "yml", "yaml",
                                        "json", "toml", "env", "conf"):
                                 rel_files.add(rel)
