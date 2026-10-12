@@ -178,7 +178,10 @@ def rule_group_by_directory(text: str) -> int:
     if data is None:
         return _utf8_size(text)
     if isinstance(data, list):
-        return _utf8_size(json.dumps(_compress_file_array(data)))
+        compressed = _compress_file_array(data)
+        if compressed is data:
+            return _utf8_size(text)
+        return _utf8_size(json.dumps(compressed))
     if isinstance(data, dict):
         out: dict[str, Any] = {}
         touched = False
@@ -284,6 +287,7 @@ def rule_collapse_adjacent_refs(text: str) -> int:
 
     items = sorted(data, key=key)
     compressed: list[Any] = []
+    touched = False
     i = 0
     while i < len(items):
         j = i
@@ -295,6 +299,7 @@ def rule_collapse_adjacent_refs(text: str) -> int:
             else:
                 break
         if j > i + 1:  # at least 3 adjacent hits
+            touched = True
             compressed.append({
                 "file": f,
                 "lines": f"{start_line}-{key(items[j])[1]}",
@@ -303,6 +308,8 @@ def rule_collapse_adjacent_refs(text: str) -> int:
         else:
             compressed.extend(items[i: j + 1])
         i = j + 1
+    if not touched:
+        return _utf8_size(text)
     return _utf8_size(json.dumps(compressed))
 
 

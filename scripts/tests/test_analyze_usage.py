@@ -78,6 +78,38 @@ class UsageBytesTests(unittest.TestCase):
         self.assertEqual(usage.rule_dedupe_repeated_strings(json.dumps(rows, ensure_ascii=False)),
                          len(json.dumps(expected).encode("utf-8")))
 
+    def test_noop_array_rules_preserve_original_bytes(self):
+        arrays = [
+            ([], True), (["検索"], True), ([{"file": "検索.rs"}], True),
+            ([{"file": f"d{n}/検索.rs", "line": n * 10} for n in range(3)], True),
+            ([{"file": "検索.rs", "line": n * 10} for n in range(3)], False),
+        ]
+        for rows, directory_noop in arrays:
+            for indent in (None, 8):
+                text = json.dumps(rows, ensure_ascii=False, indent=indent)
+                with self.subTest(rows=rows, indent=indent):
+                    if directory_noop:
+                        self.assertEqual(usage.rule_group_by_directory(text),
+                                         len(text.encode("utf-8")))
+                    self.assertEqual(usage.rule_collapse_adjacent_refs(text),
+                                     len(text.encode("utf-8")))
+
+    def test_noop_rules_do_not_promote_compression_in_cli_scorecard(self):
+        rows = [{"file": f"d{n}/f.rs", "line": n * 10} for n in range(3)]
+        text = json.dumps(rows, indent=8)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            for n in range(20):
+                self.write_transcript(project / f"session-{n}.jsonl", text)
+            result = subprocess.run([sys.executable, str(SCRIPT), "--projects-root", str(root)],
+                                    text=True, capture_output=True, check=True)
+            for rule in ("group_by_directory", "collapse_adjacent_refs", "structured_best"):
+                self.assertIn(f"| `{rule}` |  | 0 | 0.0% |", result.stdout)
+            self.assertIn("**Shelf item 1.5.**", result.stdout)
+            self.assertNotIn("**Promote", result.stdout)
+
     def test_invalid_surrogate_does_not_abort_analysis(self):
         text = "bad: " + chr(0xD800)
         self.assertEqual(usage.rule_middle_truncate(text), 6)
