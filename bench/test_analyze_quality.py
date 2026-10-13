@@ -778,7 +778,7 @@ shape = aq.aggregate([events])["question_shape_counts"]["identifier"]
 check(shape["first_grep"] == 1 and shape["first_other_or_none"] == 0, f"shape walk: shell grep is first=Grep {shape}")
 check("**Transcripts scanned**: 3 (1 session, 2 subagent)" in report, "render: subagent count in header")
 empty_report = aq.render(aq.aggregate([]), window_days=7, transcripts=0, now="now")
-check("_No codesage tool calls in the window._" in empty_report, "render: empty placeholder")
+check("_No codesage tool calls in the selected transcripts._" in empty_report, "render: empty placeholder")
 
 # Claude Code puts tool results on role=user envelopes, alongside actual user turns.
 rows = [
