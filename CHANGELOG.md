@@ -2,6 +2,7 @@
 
 ### Fixed
 
+- The CodeSage edit-context hook displays its name in Codex.
 - The MCP usage scorecard reports zero directory or reference compression savings when no rows are grouped.
 
 ### Security
