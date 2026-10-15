@@ -7,10 +7,14 @@ from pathlib import Path
 import re
 
 
-COMMANDS = (
-    "bench", "eval", "onboard", "prompt-override", "reindex", "report",
+GLOBAL_COMMANDS = (
+    "onboard", "prompt-override", "reindex", "report",
     "reset", "revalidate", "review", "triage",
 )
+# Benchmarks and evals measure CodeSage itself, so they load only inside this checkout. A global
+# skill is offered to every Codex run, including isolated review passes it can hijack.
+REPO_COMMANDS = ("bench", "eval")
+COMMANDS = GLOBAL_COMMANDS + REPO_COMMANDS
 
 
 def render(source: Path, plugin: Path) -> str:
@@ -71,26 +75,43 @@ additional authority for edits, external actions, or configuration changes.
 """
 
 
-def install(source_root: Path, skills_dir: Path) -> int:
-    plugin = source_root.resolve(strict=True) / "plugins" / "codesage-tools"
+def install(source_root: Path, skills_dir: Path, repo_skills_dir: Path | None = None) -> int:
+    root = source_root.resolve(strict=True)
+    plugin = root / "plugins" / "codesage-tools"
     if any(c in str(plugin) for c in "\n\r<>`"):
         raise ValueError("source path cannot be represented safely in an adapter")
-    sources = [plugin / "commands" / f"codesage-{name}.md" for name in COMMANDS]
-    sources.append(plugin / "agents" / "codesage-feature-reviewer.md")
+    if repo_skills_dir is None:
+        repo_skills_dir = root / ".agents" / "skills"
+    sources = [(skills_dir, plugin / "commands" / f"codesage-{name}.md") for name in GLOBAL_COMMANDS]
+    sources.append((skills_dir, plugin / "agents" / "codesage-feature-reviewer.md"))
+    sources += [(repo_skills_dir, plugin / "commands" / f"codesage-{name}.md") for name in REPO_COMMANDS]
     planned = []
-    for source in sources:
-        target = skills_dir / source.stem / "SKILL.md"
+    for directory, source in sources:
+        target = directory / source.stem / "SKILL.md"
         for path in (target, *target.parents):
             if path.is_symlink():
                 raise ValueError(f"refusing symlink destination: {path}")
         if target.exists() and not target.is_file():
-            raise ValueError(f"not a regular skill file: {target}")
+            raise ValueError(f"not a skill file: {target}")
         if target.parent.exists() and not target.parent.is_dir():
             raise ValueError(f"not a skill directory: {target.parent}")
         planned.append((target, render(source, plugin)))
+    retired = []
+    for name in REPO_COMMANDS:
+        legacy = skills_dir / f"codesage-{name}" / "SKILL.md"
+        canonical = plugin / "commands" / f"codesage-{name}.md"
+        if (legacy.is_file() and not legacy.is_symlink()
+                and f"(<{canonical}>)" in legacy.read_text(encoding="utf-8", errors="replace")):
+            retired.append(legacy)
     for target, content in planned:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+    for legacy in retired:
+        legacy.unlink()
+        try:
+            legacy.parent.rmdir()
+        except OSError:
+            pass
     return len(planned)
 
 
@@ -100,13 +121,18 @@ def main() -> None:
                         help="CodeSage checkout to reference (keep it available after installation)")
     parser.add_argument("--skills-dir", type=Path,
                         default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "skills",
-                        help="Codex skill directory; replaces only the 11 CodeSage SKILL.md adapters")
+                        help="Codex skill directory; replaces only the 9 global CodeSage SKILL.md adapters")
+    parser.add_argument("--repo-skills-dir", type=Path, default=None,
+                        help="repository-scoped skill directory for bench and eval "
+                             "(default: <source-root>/.agents/skills)")
     args = parser.parse_args()
     try:
-        count = install(args.source_root, args.skills_dir.absolute())
+        repo = args.repo_skills_dir.absolute() if args.repo_skills_dir else None
+        count = install(args.source_root, args.skills_dir.absolute(), repo)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"error: {exc}\n")
-    print(f"Installed {count} CodeSage adapters in {args.skills_dir}")
+    print(f"Installed {count} CodeSage adapters: {len(GLOBAL_COMMANDS) + 1} in {args.skills_dir}, "
+          f"{len(REPO_COMMANDS)} repository-scoped (bench, eval)")
 
 
 if __name__ == "__main__":
