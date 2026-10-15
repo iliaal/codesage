@@ -183,7 +183,8 @@ def main() -> int:
         sys.exit(f"invalid annotations JSON in {annotations_path}: {e}")
 
     baseline = score_corpus(
-        args.codesage_bin, project_root, annotations, args.limit, env_extra={}
+        args.codesage_bin, project_root, annotations, args.limit,
+        env_extra={"CODESAGE_QUALIFIED_NAME_BOOST": "0"},
     )
     cfg2 = score_corpus(
         args.codesage_bin, project_root, annotations, args.limit,
