@@ -4,6 +4,10 @@
 
 - The MCP usage scorecard reports zero directory or reference compression savings when no rows are grouped.
 
+### Security
+
+- Bumped `rustls` to 0.23.46 for model downloads, fixing RUSTSEC-2026-0346, -0347, -0348, and -0349.
+
 ## [0.42.0] - 2026-10-11
 
 ### Added
