@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score `codesage search` on semble's published annotation corpus, NDCG@10.
+"""Score `codesage search` on semble's published annotation corpus, NDCG@k (default k=10).
 
 This uses semble's annotations and binary-relevance NDCG formula, but deduplicates
 results by file and weights language means by query count. Upstream rankings can
@@ -20,6 +20,9 @@ Usage:
       --repos ~/ai/codesage_ref/semble/benchmarks/repos.json \
       --codesage-bin /abs/path/to/target/release/codesage \
       [--limit 10] [--json out.json]
+
+Metric keys and progress labels use the selected cutoff (for example,
+`--limit 5` reports `ndcg@5`); the default remains `ndcg@10`.
 
 `--codesage-bin` must be ABSOLUTE: each search runs with cwd set to the corpus
 repo, so a relative path resolves against that repo and dies with FileNotFound.
@@ -192,6 +195,7 @@ def main():
     ap.add_argument("--json", type=Path)
     ap.add_argument("--only", nargs="*", help="restrict to these repo names")
     args = ap.parse_args()
+    metric = f"ndcg@{args.limit}"
 
     # Resolve before subprocesses change cwd to each corpus repository.
     bin_path = Path(args.codesage_bin)
@@ -248,12 +252,12 @@ def main():
             scores.append(score)
             query_results.append({
                 "query_index": query_index, "query": t["query"], "status": status,
-                "paths": got, "ndcg@10": score, **evidence,
+                "paths": got, metric: score, **evidence,
             })
         mean = sum(scores) / len(scores) if scores else 0.0
         degraded = {k: v for k, v in statuses.items() if k != "ok"}
         per_repo[name] = {
-            "language": lang, "queries": len(scores), "ndcg@10": round(mean, 4),
+            "language": lang, "queries": len(scores), metric: round(mean, 4),
             "query_results": query_results,
         }
         if degraded:
@@ -262,7 +266,7 @@ def main():
                 run_warnings.append(f"{name}: {v} query(s) {k}")
         by_lang[lang].append((mean, len(scores), dict(degraded)))
         flag = f"  [{', '.join(f'{v} {k}' for k, v in degraded.items())}]" if degraded else ""
-        print(f"  {name:<22} {lang:<11} n={len(scores):<4} ndcg@10={mean:.3f}{flag}",
+        print(f"  {name:<22} {lang:<11} n={len(scores):<4} {metric}={mean:.3f}{flag}",
               file=sys.stderr)
 
     lang_tbl = {}
@@ -271,7 +275,7 @@ def main():
         entry = {
             "repos": len(rows),
             "queries": n,
-            "ndcg@10": round(sum(m * c for m, c, _ in rows) / n, 4) if n else 0.0,
+            metric: round(sum(m * c for m, c, _ in rows) / n, 4) if n else 0.0,
         }
         # Published per-language rows must retain query failure disclosures.
         lang_degraded = Counter()
