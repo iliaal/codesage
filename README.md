@@ -629,7 +629,7 @@ Corpora aren't bundled. Bring your own, or point the plugin at `$CODESAGE_BENCH_
 
 ## ⚠️ Known limitations
 
-Measured on canary corpora and 30 days of Claude Code session logs; `bench/analyze-codesage-quality.py` reproduces the numbers locally.
+The session-log measurements below are historical. `bench/analyze-codesage-quality.py` analyzes your local transcripts selected by file modification time within `--window-days` (default 7). It includes their full history, without filtering event timestamps; a resumed session can include older calls. Running it on different local logs does not reproduce the historical figures. The usage scorecard (`bench/analyze-codesage-usage.py`) uses the same selection rule.
 
 **Language surface is narrower than competitors'.** Nine languages today (Java added after C++ in 0.4.5). Graphify ships 25, SocratiCode 18+, and code-review-graph more than CodeSage (its README no longer states an exact count). The gap matters most if your stack is Ruby, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 47% of queries target a language codesage does not parse (588 of 1,251), with zero recall on those. To extend coverage, contribute tree-sitter query files under `crates/parser/src/queries/`.
 
@@ -637,7 +637,7 @@ Measured on canary corpora and 30 days of Claude Code session logs; `bench/analy
 
 **`impact_analysis` reports a lower bound on dependencies.** The tool walks resolved reference and import edges up to a configurable depth. Name ambiguity can add false positives, while dynamic calls, unsupported syntax, unresolved imports, and traversal limits can omit real dependencies even in a fresh index. Read `counts_floor` and boundedness disclosures before interpreting an empty result. Reducing `--depth` to 1 and adding `--source-only` narrows the report further.
 
-**MCP tool-selection rate is low today.** When CodeSage MCP tools are available in a Claude Code session alongside `Grep`, the agent picks `Grep` on code-identifier queries: 1.1% CodeSage-pick rate over 30 days of sessions, 0/10 on a controlled active harness (measured 2026-04-24, not re-measured since). Tool descriptions and per-project CLAUDE.md guidance have since been sharpened; that change has not been measured. For a hook-level workaround, see the LSP enforcement kit in the [Complementary tools](#complementary-tools) section.
+**Historical MCP tool-selection rate was low.** When CodeSage MCP tools are available in a Claude Code session alongside `Grep`, the agent picks `Grep` on code-identifier queries: 1.1% CodeSage-pick rate in the historical session-log sample described as 30 days, 0/10 on a controlled active harness (measured 2026-04-24, not re-measured since). Tool descriptions and per-project CLAUDE.md guidance have since been sharpened; that change has not been measured. For a hook-level workaround, see the LSP enforcement kit in the [Complementary tools](#complementary-tools) section.
 
 **`find_coupling` returns empty on young files.** Each empty result now carries a `note` field (`"no commits tracked"`, `"below min-count=3 threshold"`, `"path shape mismatch"`) so the agent can tell the cause. Recently added files have no co-change history to report.
 

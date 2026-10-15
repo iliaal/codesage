@@ -1549,7 +1549,8 @@ def render(
 
     out.append("# CodeSage MCP quality + utility analysis")
     out.append("")
-    out.append(f"**Window**: last {window_days} days  ")
+    out.append(f"**Transcript selection**: files modified within the last {window_days} days  ")
+    out.append("**Event scope**: entire selected transcripts; event timestamps are not filtered.  ")
     out.append(
         f"**Transcripts scanned**: {transcripts} "
         f"({transcripts - subagent_transcripts} session, {subagent_transcripts} subagent)  "
@@ -1569,7 +1570,7 @@ def render(
     out.append("## Quality: empty / error / ok by tool")
     out.append("")
     if not q:
-        out.append("_No codesage tool_results in the window._")
+        out.append("_No codesage tool_results in the selected transcripts._")
     else:
         out.append("| tool | calls | ok | empty | error | ok rate |")
         out.append("|---|---:|---:|---:|---:|---:|")
@@ -1602,7 +1603,7 @@ def render(
     tool_gated = agg.get("grep_tool_calls", gc)
     tool_all = agg.get("grep_tool_calls_all", tool_gated)
     out.append(
-        f"- **Grep calls in window**: {gc} (Grep tool {tool_gated}, "
+        f"- **Grep calls in selected transcripts**: {gc} (Grep tool {tool_gated}, "
         f"shell `grep`/`rg`/`git grep` at a pipeline head or `find -exec grep` {shell_gated}; "
         f"both under an onboarded root). "
         f"Excluded from the denominator below: {tool_all - tool_gated} Grep tool calls and "
@@ -1646,7 +1647,7 @@ def render(
         parts = ", ".join(f"`{k}`={v}" for k, v in sorted(retr.items(), key=lambda kv: -kv[1]))
         out.append(f"  - breakdown: {parts}")
     else:
-        out.append("  - breakdown: none (zero retrieval-class codesage calls in window)")
+        out.append("  - breakdown: none (zero retrieval-class codesage calls in selected transcripts)")
     out.append(
         f"- **Identifier-shaped Grep tool + shell grep calls in same sessions**: {id_grep_in_avail}"
     )
@@ -1660,7 +1661,7 @@ def render(
             f"retrieval-shape decisions)"
         )
     else:
-        out.append("- **Tool-selection rate**: n/a (no retrieval-shape decisions in window)")
+        out.append("- **Tool-selection rate**: n/a (no retrieval-shape decisions in selected transcripts)")
     id_grep_all = agg.get("identifier_grep_in_codesage_sessions_all", id_grep_in_avail)
     all_decisions = retr_in_avail + id_grep_all
     out.append(
@@ -1768,7 +1769,7 @@ def render(
     out.append("")
     term_tools: dict[str, dict[str, Any]] = term.get("tools") or {}
     if not term_tools:
-        out.append("_No codesage tool calls in the window._")
+        out.append("_No codesage tool calls in the selected transcripts._")
     else:
         out.append(
             "| tool | calls | terminal | non-terminal | chained | rate | strict rate | "
@@ -1816,7 +1817,7 @@ def render(
     if total_codesage < 20:
         notes.append(
             f"**Inconclusive on quality** — only {total_codesage} codesage result(s) in "
-            "the window. Widen `--window-days` or check back after more usage."
+            "the selected transcripts. Widen `--window-days` or check back after more usage."
         )
     else:
         ok_rate = pct(
@@ -1935,8 +1936,8 @@ def render(
         else:
             verdict = (
                 f"**Sample too small ({sem_decisions} semantic-shape retrieval decisions "
-                f"in window, {sem_q} total semantic-shape questions).** "
-                "Either widen the window with `--window-days`, or wait for more sessions "
+                f"in selected transcripts, {sem_q} total semantic-shape questions).** "
+                "Either widen transcript selection with `--window-days`, or wait for more sessions "
                 "before drawing a conclusion. Note that the harness corpora "
                 "(`bench/corpora/{ripgrep,nest}-eval.yaml`) are also a source of "
                 "retrieval decisions — those don't count here because they're driven "
@@ -1952,7 +1953,11 @@ def render(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--window-days", type=int, default=7)
+    ap.add_argument(
+        "--window-days", type=int, default=7,
+        help="Select transcripts by file modification time within the last N days "
+             "(default 7); analyze their full history, without filtering event timestamps.",
+    )
     ap.add_argument(
         "--projects-root",
         type=Path,

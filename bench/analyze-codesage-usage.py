@@ -395,7 +395,8 @@ def render(summary: dict[str, Any], *, window_days: int, transcripts: int, now: 
 
     out.append("# CodeSage MCP usage analysis")
     out.append("")
-    out.append(f"**Window**: last {window_days} days  ")
+    out.append(f"**Transcript selection**: files modified within the last {window_days} days  ")
+    out.append("**Event scope**: entire selected transcripts; event timestamps are not filtered.  ")
     out.append(f"**Transcripts scanned**: {transcripts}  ")
     out.append(f"**Run at**: {now}  ")
     out.append(f"**Calls observed**: {totals['calls']} (error responses: {totals['errors']})  ")
@@ -447,7 +448,7 @@ def render(summary: dict[str, Any], *, window_days: int, transcripts: int, now: 
     out.append("## Verdict")
     out.append("")
     if totals["calls"] < 20:
-        out.append(f"**Inconclusive.** Only {totals['calls']} codesage calls in the window. "
+        out.append(f"**Inconclusive.** Only {totals['calls']} codesage calls in the selected transcripts. "
                    "Widen `--window-days`, or shelf item 1.5 until the user pattern produces "
                    "more data.")
     elif combined_pct < 10.0:
@@ -485,7 +486,8 @@ def render(summary: dict[str, Any], *, window_days: int, transcripts: int, now: 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--window-days", type=int, default=7,
-                    help="Only scan transcripts modified within the last N days (default 7).")
+                    help="Select transcripts by file modification time within the last N days "
+                         "(default 7); analyze their full history, without filtering event timestamps.")
     ap.add_argument(
         "--projects-root",
         type=Path,
