@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.43.0] - 2026-10-15
+
 ### Changed
 
 - PHP parsing uses tree-sitter-php 0.25.1, which parses asymmetric-visibility constructor promotion, `clone()` with arguments, partial-application placeholders, and leading-backslash group `use`, and no longer degrades files with sequential heredocs; the next `codesage index` reparses every file and recomputes PHP `find_similar` fingerprints.
@@ -1285,5 +1287,7 @@ Initial public release.
 
 [0.41.0]: https://github.com/iliaal/codesage/releases/tag/v0.41.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.42.0...HEAD
 [0.42.0]: https://github.com/iliaal/codesage/releases/tag/v0.42.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.43.0...HEAD
+[0.43.0]: https://github.com/iliaal/codesage/releases/tag/v0.43.0
