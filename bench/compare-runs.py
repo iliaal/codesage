@@ -64,6 +64,9 @@ same statistic on the un-resampled data, which equals the plain case mean.
 Under `source-prefix` / `repo` with unequal cluster sizes the interval is
 therefore for the pooled estimator resampled by cluster, not for the mean of
 per-cluster means. The 2.5th/97.5th nearest-rank percentiles are reported.
+Count/rank ratios, paired deltas, and gate comparisons use exact rational
+arithmetic, including bootstrap quantiles. Decimal rounding is presentation
+only; equality meets inclusive thresholds, but a zero lower bound still fails.
 Fewer than 5 clusters makes the interval a resample of a handful of means, so
 the comparison is refused (exit 2) instead of printing a verdict; pick a finer
 `--cluster-key`, or add cases when already on `case`.
@@ -109,6 +112,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from fractions import Fraction
 import json
 import math
 import random
@@ -129,10 +133,10 @@ from _retrieval_controls import (
 RECALL_K = (5, 10)
 GATE_K = 10
 
-MIN_R10_DELTA = 0.02
-MIN_MRR_DELTA = -0.005
-MAX_MISS_DELTA = 0.005
-MIN_CLUSTER_R10_DELTA = -0.02
+MIN_R10_DELTA = Fraction(2, 100)
+MIN_MRR_DELTA = Fraction(-5, 1000)
+MAX_MISS_DELTA = Fraction(5, 1000)
+MIN_CLUSTER_R10_DELTA = Fraction(-2, 100)
 MIN_CLUSTERS_FOR_INTERVAL = 5
 MIN_CLUSTER_SIZE_FOR_VETO = 5
 PROVENANCE_KEYS = ("corpus", "corpus_sha256", "split", "salt", "limit", "head",
@@ -643,23 +647,23 @@ def first_hit_rank(rec: dict) -> int | None:
     return None
 
 
-def recall_at(rec: dict, k: int) -> float:
+def recall_at(rec: dict, k: int) -> Fraction:
     expected = set(rec.get("expected_files", []))
     if not expected:
-        return 0.0
-    return len(set(rec.get("hits", [])[:k]) & expected) / len(expected)
+        return Fraction(0)
+    return Fraction(len(set(rec.get("hits", [])[:k]) & expected), len(expected))
 
 
-def mrr_of(rec: dict) -> float:
+def mrr_of(rec: dict) -> Fraction:
     rank = first_hit_rank(rec)
-    return 1.0 / rank if rank else 0.0
+    return Fraction(1, rank) if rank else Fraction(0)
 
 
 def score(rec: dict) -> dict:
     rank = first_hit_rank(rec)
     return {
         "first_hit_rank": rank,
-        "miss": 0.0 if rank else 1.0,
+        "miss": Fraction(0 if rank else 1),
         "mrr": mrr_of(rec),
         **{f"recall@{k}": recall_at(rec, k) for k in RECALL_K},
     }
@@ -674,7 +678,7 @@ def cluster_of(rec: dict, key: str) -> str:
     return source.split(":", 1)[0]
 
 
-def mean(xs: list[float]) -> float:
+def mean(xs: list[float | Fraction]) -> float | Fraction:
     return sum(xs) / len(xs) if xs else 0.0
 
 
@@ -692,23 +696,23 @@ def arm_summary(scores: list[dict]) -> dict:
     }
 
 
-def percentile(sorted_xs: list[float], q: float) -> float:
+def percentile(sorted_xs: list[float | Fraction], q: float) -> float | Fraction:
     """Nearest-rank percentile: the ceil(q*n)-th smallest value (1-based)."""
     n = len(sorted_xs)
     if n == 0:
         return 0.0
-    idx = max(0, math.ceil(q * n) - 1)
+    idx = max(0, math.ceil(Fraction(str(q)) * n) - 1)
     return sorted_xs[min(idx, n - 1)]
 
 
-def pooled(clusters: dict[str, list[float]]) -> float:
+def pooled(clusters: dict[str, list[float | Fraction]]) -> float | Fraction:
     """Ratio of sums over all clusters: the statistic the bootstrap resamples."""
     count = sum(len(v) for v in clusters.values())
     return sum(sum(v) for v in clusters.values()) / count if count else 0.0
 
 
 def clustered_bootstrap(
-    clusters: dict[str, list[float]], draws: int, seed: int
+    clusters: dict[str, list[float | Fraction]], draws: int, seed: int
 ) -> dict:
     """Resample clusters with replacement; return mean and 2.5/97.5 percentiles.
 
@@ -716,22 +720,27 @@ def clustered_bootstrap(
     so the point estimate reported alongside must be `pooled(clusters)`.
     """
     names = sorted(clusters)
-    sums = [sum(clusters[n]) for n in names]
+    # Scale exact cluster sums once. The inner sampling loop adds integers,
+    # retaining the pooled estimator without repeated Fraction arithmetic.
+    totals = [Fraction(sum(clusters[n])) for n in names]
+    denominator = math.lcm(*(value.denominator for value in totals))
+    sums = [value.numerator * (denominator // value.denominator) for value in totals]
     sizes = [len(clusters[n]) for n in names]
     rng = random.Random(seed)
     k = len(names)
-    means: list[float] = []
+    means: list[Fraction] = []
     for _ in range(draws):
-        total = 0.0
+        total = 0
         count = 0
         for _ in range(k):
             j = rng.randrange(k)
             total += sums[j]
             count += sizes[j]
-        means.append(total / count if count else 0.0)
+        means.append(Fraction(total, denominator * count) if count else Fraction(0))
     means.sort()
     return {
-        "mean": mean(means),
+        # The bootstrap mean is presentation-only; quantiles remain exact.
+        "mean": math.fsum(float(value) for value in means) / len(means) if means else 0.0,
         "lb": percentile(means, 0.025),
         "ub": percentile(means, 0.975),
         "clusters": k,
@@ -740,35 +749,35 @@ def clustered_bootstrap(
 
 
 def verdict(
-    r10_delta: float,
-    r10_lb: float,
-    mrr_delta: float,
-    miss_delta: float,
-    cluster_r10: dict[str, float],
+    r10_delta: Fraction,
+    r10_lb: Fraction,
+    mrr_delta: Fraction,
+    miss_delta: Fraction,
+    cluster_r10: dict[str, Fraction],
     cluster_sizes: dict[str, int],
 ) -> tuple[bool, list[str]]:
     failing: list[str] = []
     if not r10_delta >= MIN_R10_DELTA:
         failing.append(
-            f"mean recall@{GATE_K} delta {r10_delta:+.4f} < {MIN_R10_DELTA:+.4f}"
+            f"mean recall@{GATE_K} delta {float(r10_delta):+.4f} < {float(MIN_R10_DELTA):+.4f}"
         )
     if not r10_lb > 0:
         failing.append(
-            f"bootstrap lower bound of recall@{GATE_K} delta {r10_lb:+.4f} <= 0"
+            f"bootstrap lower bound of recall@{GATE_K} delta {float(r10_lb):+.4f} <= 0"
         )
     if not mrr_delta >= MIN_MRR_DELTA:
-        failing.append(f"mean MRR delta {mrr_delta:+.4f} < {MIN_MRR_DELTA:+.4f}")
+        failing.append(f"mean MRR delta {float(mrr_delta):+.4f} < {float(MIN_MRR_DELTA):+.4f}")
     if not miss_delta <= MAX_MISS_DELTA:
-        failing.append(f"miss-rate delta {miss_delta:+.4f} > {MAX_MISS_DELTA:+.4f}")
+        failing.append(f"miss-rate delta {float(miss_delta):+.4f} > {float(MAX_MISS_DELTA):+.4f}")
     regressed = sorted(
         (name, d)
         for name, d in cluster_r10.items()
         if cluster_sizes[name] >= MIN_CLUSTER_SIZE_FOR_VETO and d < MIN_CLUSTER_R10_DELTA
     )
     if regressed:
-        detail = ", ".join(f"{name} {d:+.4f}" for name, d in regressed)
+        detail = ", ".join(f"{name} {float(d):+.4f}" for name, d in regressed)
         failing.append(
-            f"per-cluster recall@{GATE_K} delta < {MIN_CLUSTER_R10_DELTA:+.4f} "
+            f"per-cluster recall@{GATE_K} delta < {float(MIN_CLUSTER_R10_DELTA):+.4f} "
             f"(clusters with n >= {MIN_CLUSTER_SIZE_FOR_VETO}): {detail}"
         )
     return (not failing), failing
@@ -848,8 +857,8 @@ def compare(
     mrr_deltas = [c["mrr"] - b["mrr"] for b, c in zip(base_scores, cand_scores)]
     miss_delta = cand["miss_rate"] - base["miss_rate"]
 
-    r10_clusters: dict[str, list[float]] = {}
-    mrr_clusters: dict[str, list[float]] = {}
+    r10_clusters: dict[str, list[Fraction]] = {}
+    mrr_clusters: dict[str, list[Fraction]] = {}
     for cid, d10, dmrr in zip(ids, r10_deltas, mrr_deltas):
         name = cluster_of(baseline[cid], cluster_key)
         r10_clusters.setdefault(name, []).append(d10)
@@ -888,7 +897,7 @@ def compare(
         ("MRR", "mrr"),
     ):
         lines.append(
-            f"| {label} | {base[key]:.4f} | {cand[key]:.4f} | {cand[key] - base[key]:+.4f} |"
+            f"| {label} | {float(base[key]):.4f} | {float(cand[key]):.4f} | {float(cand[key] - base[key]):+.4f} |"
         )
     lines.append(
         f"| median first-hit | {fmt_median(base['median_first_hit'])} "
@@ -910,12 +919,12 @@ def compare(
     lines.append("| metric | mean | boot mean | 2.5% | 97.5% |")
     lines.append("|---|---:|---:|---:|---:|")
     lines.append(
-        f"| recall@{GATE_K} | {r10_delta:+.4f} | {r10_boot['mean']:+.4f} "
-        f"| {r10_boot['lb']:+.4f} | {r10_boot['ub']:+.4f} |"
+        f"| recall@{GATE_K} | {float(r10_delta):+.4f} | {float(r10_boot['mean']):+.4f} "
+        f"| {float(r10_boot['lb']):+.4f} | {float(r10_boot['ub']):+.4f} |"
     )
     lines.append(
-        f"| MRR | {mrr_delta:+.4f} | {mrr_boot['mean']:+.4f} "
-        f"| {mrr_boot['lb']:+.4f} | {mrr_boot['ub']:+.4f} |"
+        f"| MRR | {float(mrr_delta):+.4f} | {float(mrr_boot['mean']):+.4f} "
+        f"| {float(mrr_boot['lb']):+.4f} | {float(mrr_boot['ub']):+.4f} |"
     )
     lines.append("")
     lines.append(f"## Per-cluster recall@{GATE_K} delta")
@@ -936,7 +945,7 @@ def compare(
             veto = "yes" if size >= MIN_CLUSTER_SIZE_FOR_VETO else (
                 f"no (n < {MIN_CLUSTER_SIZE_FOR_VETO}, informational)"
             )
-            lines.append(f"| {name} | {size} | {cluster_r10[name]:+.4f} | {veto} |")
+            lines.append(f"| {name} | {size} | {float(cluster_r10[name]):+.4f} | {veto} |")
     lines.append("")
 
     accept, failing = verdict(
@@ -949,12 +958,12 @@ def compare(
     else:
         cluster_clause = (
             f" AND no cluster with n >= {MIN_CLUSTER_SIZE_FOR_VETO} has "
-            f"recall@{GATE_K} delta < {MIN_CLUSTER_R10_DELTA:+.2f}"
+            f"recall@{GATE_K} delta < {float(MIN_CLUSTER_R10_DELTA):+.2f}"
         )
     lines.append(
-        f"Predicate: mean recall@{GATE_K} delta >= {MIN_R10_DELTA:+.2f} AND bootstrap "
-        f"lower bound > 0 AND mean MRR delta >= {MIN_MRR_DELTA:+.3f} AND miss-rate "
-        f"delta <= {MAX_MISS_DELTA:+.3f}{cluster_clause}"
+        f"Predicate: mean recall@{GATE_K} delta >= {float(MIN_R10_DELTA):+.2f} AND bootstrap "
+        f"lower bound > 0 AND mean MRR delta >= {float(MIN_MRR_DELTA):+.3f} AND miss-rate "
+        f"delta <= {float(MAX_MISS_DELTA):+.3f}{cluster_clause}"
     )
     lines.append("")
     if accept:

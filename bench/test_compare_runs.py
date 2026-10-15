@@ -11,8 +11,11 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import math
+import random
 import sys
 import tempfile
+from fractions import Fraction
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -405,6 +408,214 @@ clauses = rejected_clauses(out)
 check(rc == 1, f"miss: --gate exits 1 (rc={rc})")
 check("miss-rate delta +0.0833 > +0.0050" in clauses, f"miss: miss-rate clause named (got {clauses})")
 check(len(clauses) == 1, f"miss: miss-rate is the only failing clause (got {clauses})")
+
+
+# Gate inputs originate as counts and ranks, so inclusive decimal thresholds
+# must be exact. In particular, rounding the report or adding an epsilon would
+# hide the bug at equality while changing decisions just across the boundary.
+for attr, exact in (("MIN_R10_DELTA", Fraction(1, 50)),
+                    ("MIN_MRR_DELTA", Fraction(-1, 200)),
+                    ("MAX_MISS_DELTA", Fraction(1, 200)),
+                    ("MIN_CLUSTER_R10_DELTA", Fraction(-1, 50))):
+    check(getattr(cmp, attr) == exact, f"exact: {attr} is the exact published threshold")
+
+third = record("third", "thirds", ["a", "b", "c", "a"], ["noise", "noise", "a", "a"])
+third_score = cmp.score(third)
+for metric in ("recall@5", "recall@10", "mrr"):
+    check(isinstance(third_score[metric], Fraction) and third_score[metric] == Fraction(1, 3),
+          f"exact: {metric} retains one third; duplicate gold/hits do not inflate recall")
+derived_rank = {key: value for key, value in third.items() if key != "first_hit_rank"}
+check(cmp.score(derived_rank) == third_score and cmp.score({**third, "first_hit_rank": None}) == third_score,
+      "exact: omitted/null rank is still derived from the first matching hit")
+missing_gold = cmp.score({"id": "missing-gold", "hits": ["noise"]})
+check(missing_gold == cmp.score(record("empty", "empty", [], [])),
+      "exact: omitted gold and rank retain empty-record scoring semantics")
+late_hit = cmp.score(record("late", "late", ["a"], [f"noise/{i}" for i in range(10)] + ["a"]))
+check(late_hit["recall@5"] == late_hit["recall@10"] == 0
+      and late_hit["mrr"] == Fraction(1, 11) and late_hit["miss"] == 0,
+      "exact: recall is top-k but reciprocal rank and misses retain all-hit semantics")
+for rec, expected_miss in ((third, 0), (record("empty", "empty", [], []), 1)):
+    scores = cmp.score(rec)
+    check(isinstance(scores["miss"], Fraction) and scores["miss"] == expected_miss,
+          f"exact: miss indicator {expected_miss} stays exact")
+    if expected_miss:
+        check(all(isinstance(scores[k], Fraction) and scores[k] == 0
+                  for k in ("recall@5", "recall@10", "mrr")),
+              "exact: empty gold and missing rank give exact zero metrics")
+summary = cmp.arm_summary([third_score] * 7)
+check(all(summary[k] == Fraction(1, 3) for k in ("recall@5", "recall@10", "mrr")),
+      "exact: arm means preserve thirds through repeated summation")
+
+
+def exact_gate_fixture(name: str, baseline: list[dict], candidate: list[dict],
+                       failing_clause: str | None, cluster_key: str = "case") -> str:
+    """Exercise JSON scoring, report and CLI exits without patching gate inputs."""
+    meta = {"corpus": name + ".yaml", "split": None, "salt": None,
+            "limit": 10, "head": "fixture", "search_failures": 0}
+    base_path = write(name + "-a.json", baseline, meta=meta)
+    cand_path = write(name + "-b.json", candidate, meta=meta)
+    outputs = []
+    for gate in (False, True):
+        flags = ["--baseline", str(base_path), "--candidate", str(cand_path),
+                 "--bootstrap", "241", "--seed", "17", "--cluster-key", cluster_key]
+        rc, output, err = run(flags + (["--gate"] if gate else []))
+        wanted_rc = int(gate and failing_clause is not None)
+        check(rc == wanted_rc, f"exact/{name}: gate={gate} exits {wanted_rc} (got {rc}; {err.strip()})")
+        clauses = rejected_clauses(output)
+        if failing_clause is None:
+            check("\nACCEPT\n" in output and not clauses,
+                  f"exact/{name}: equality/allowed neighbor ACCEPTs (got {clauses})")
+        else:
+            check("\nREJECT\n" in output and len(clauses) == 1
+                  and clauses[0].startswith(failing_clause),
+                  f"exact/{name}: only {failing_clause!r} rejects (got {clauses})")
+        check("Fraction(" not in output, f"exact/{name}: report remains decimal text")
+        outputs.append(output)
+    check(outputs[0] == outputs[1], f"exact/{name}: --gate changes only the exit status")
+    return outputs[-1]
+
+
+def exact_threshold_fixtures() -> list[tuple[str, list[dict], list[dict], str | None, str]]:
+    """Reusable runner-shaped boundary fixtures for CLI tests and differential checks."""
+    fixtures = []
+    # Previously 10/100 paired improvements of 1/5 summed below +0.02.
+    for improved in (9, 10, 11):
+        exact_a, exact_b = [], []
+        for i in range(100):
+            cid = f"recall-{i:03d}"
+            exact_a.append(record(cid, "recall", list("abcde"), ["a", "b"]))
+            exact_b.append(record(cid, "recall", list("abcde"), ["a", "b", "c"] if i < improved else ["a", "b"]))
+        fixtures.append((f"recall-{improved}", exact_a, exact_b,
+                         "mean recall@10 delta" if improved < 10 else None, "case"))
+
+    # A difference of 5/200 - 4/200 is exactly +0.005, despite float cancellation.
+    for misses in (4, 5, 6):
+        exact_a, exact_b = [], []
+        for i in range(200):
+            cid = f"miss-{i:03d}"
+            exact_a.append(record(cid, "miss", ["a", "b"], [] if i < 4 else ["noise", "a"]))
+            exact_b.append(record(cid, "miss", ["a", "b"], [] if i < misses else ["a", "b"]))
+        fixtures.append((f"miss-{misses}", exact_a, exact_b,
+                         "miss-rate delta" if misses > 5 else None, "case"))
+
+    # Six rank-5 -> rank-6 changes among 40 cases are exactly -0.005 MRR.
+    # Every case gains 1/2 recall, so a rejection must name MRR alone.
+    for degraded in (5, 6, 7):
+        exact_a, exact_b = [], []
+        for i in range(40):
+            cid = f"mrr-{i:03d}"
+            noise = [f"noise/{j}" for j in range(5)]
+            exact_a.append(record(cid, "mrr", ["a", "b"], noise[:4] + ["a"]))
+            exact_b.append(record(cid, "mrr", ["a", "b"], noise[:5 if i < degraded else 4] + ["a", "b"]))
+        fixtures.append((f"mrr-{degraded}", exact_a, exact_b,
+                         "mean MRR delta" if degraded > 6 else None, "case"))
+
+    # One lost gold result among 5 ten-gold cases gives an exact -0.02 cluster
+    # mean. The n=4 control is ineligible; n=5 and n=6 can both veto.
+    for size, lost in ((5, 0), (5, 1), (5, 2), (4, 2), (6, 1), (6, 2)):
+        exact_a, exact_b = [], []
+        gold = [f"gold/{i}" for i in range(10)]
+        for cluster in range(6):
+            for i in range(size if cluster == 0 else 20):
+                cid = f"cluster-{cluster}-{i:03d}"
+                keep = 8 - lost if cluster == 0 and i == 0 else (8 if cluster == 0 else 9)
+                exact_a.append(record(cid, f"group{cluster}", gold, gold[:8]))
+                exact_b.append(record(cid, f"group{cluster}", gold, gold[:keep]))
+        fixtures.append((f"cluster-{size}-{lost}", exact_a, exact_b,
+                         "per-cluster recall@10 delta" if size >= 5 and lost > 1 else None,
+                         "source-prefix"))
+    return fixtures
+
+
+for fixture in exact_threshold_fixtures():
+    output = exact_gate_fixture(*fixture)
+    if fixture[0] == "cluster-5-1":
+        check("| group0 | 5 | -0.0200 | yes |" in output,
+              "exact/cluster: equality is eligible but does not veto")
+    if fixture[0] == "cluster-4-2":
+        check("| group0 | 4 | -0.0500 | no (n < 5, informational) |" in output,
+              "exact/cluster: n=4 regression remains informational")
+
+
+def exact_bootstrap_oracle(clusters: dict[str, list[Fraction]], draws: int, seed: int) -> dict:
+    """Exact ratios/quantiles with a presentation-only float bootstrap mean."""
+    names = sorted(clusters)
+    rng = random.Random(seed)
+    samples = []
+    for _ in range(draws):
+        selected = [names[rng.randrange(len(names))] for _ in names]
+        values = [value for name in selected for value in clusters[name]]
+        samples.append(sum(values, Fraction()) / len(values))
+    samples.sort()
+    return {"mean": math.fsum(float(value) for value in samples) / draws,
+            "lb": samples[math.ceil(Fraction(1, 40) * draws) - 1],
+            "ub": samples[math.ceil(Fraction(39, 40) * draws) - 1],
+            "clusters": len(names), "draws": draws}
+
+
+# Unsorted names, unequal sizes and mutually different denominators exercise
+# integer scaling, ratio sorting (not numerator sorting), and sample weights.
+exact_clusters = {
+    "zeta": [Fraction(1, 3), Fraction(-1, 7), Fraction(2, 11)],
+    "alpha": [Fraction(1, 5)],
+    "kappa": [Fraction(-2, 13)] * 7,
+    "beta": [Fraction(4, 17)] * 2,
+    "omega": [Fraction(1, 19), Fraction(2, 23), Fraction(-3, 29), Fraction(5, 31)],
+}
+exact_values = [v for values in exact_clusters.values() for v in values]
+check(cmp.pooled(exact_clusters) == sum(exact_values, Fraction()) / len(exact_values),
+      "exact/pooled: unequal-cluster point estimate is the exact case-weighted mean")
+for draws, seed in ((200, 0), (241, 17), (401, 812)):
+    oracle = exact_bootstrap_oracle(exact_clusters, draws, seed)
+    actual = cmp.clustered_bootstrap(exact_clusters, draws, seed)
+    check(actual == oracle, f"exact/bootstrap: Fraction oracle matches all fields ({draws=}, {seed=})")
+    reversed_clusters = dict(reversed(list(exact_clusters.items())))
+    check(cmp.clustered_bootstrap(reversed_clusters, draws, seed) == actual,
+          f"exact/bootstrap: input insertion order does not change seeded draws ({draws=}, {seed=})")
+
+
+def check_exact_verdict(label: str, expected_clause: str | None, **overrides) -> None:
+    args = {"r10_delta": Fraction(1, 10), "r10_lb": Fraction(1, 20),
+            "mrr_delta": Fraction(), "miss_delta": Fraction(),
+            "cluster_r10": {"eligible": Fraction()}, "cluster_sizes": {"eligible": 5}}
+    args.update(overrides)
+    try:
+        accepted, clauses = cmp.verdict(**args)
+    except (TypeError, ValueError) as error:
+        check(False, f"exact/{label}: exact gate inputs must format safely ({error})")
+        return
+    check(accepted == (expected_clause is None), f"exact/{label}: strict decision (got {accepted})")
+    check((not clauses) if expected_clause is None else
+          (len(clauses) == 1 and clauses[0].startswith(expected_clause)),
+          f"exact/{label}: only the expected clause fails (got {clauses})")
+
+
+# Arbitrarily small rational gaps must not be swallowed by an epsilon or by
+# converting the decision inputs to presentation floats before comparison.
+tiny = Fraction(1, 10 ** 40)
+for delta in (-tiny, Fraction(), tiny):
+    check_exact_verdict(f"tiny-recall-{delta}", "mean recall@10 delta" if delta < 0 else None,
+                        r10_delta=Fraction(1, 50) + delta)
+    check_exact_verdict(f"tiny-mrr-{delta}", "mean MRR delta" if delta < 0 else None,
+                        mrr_delta=Fraction(-1, 200) + delta)
+    check_exact_verdict(f"tiny-miss-{delta}", "miss-rate delta" if delta > 0 else None,
+                        miss_delta=Fraction(1, 200) + delta)
+    check_exact_verdict(f"tiny-cluster-{delta}", "per-cluster recall@10 delta" if delta < 0 else None,
+                        cluster_r10={"eligible": Fraction(-1, 50) + delta})
+
+# Translating every observation translates every resampled mean by the same
+# amount. This produces genuine bootstrap lower bounds of -tiny, zero, +tiny.
+unshifted = exact_bootstrap_oracle(exact_clusters, 241, 17)
+for lower_bound in (-tiny, Fraction(), tiny):
+    shifted = {name: [v - unshifted["lb"] + lower_bound for v in values]
+               for name, values in exact_clusters.items()}
+    actual = cmp.clustered_bootstrap(shifted, 241, 17)
+    check(actual["lb"] == lower_bound, f"exact/bootstrap: preserves signed near-zero lower bound {lower_bound}")
+    check(actual == exact_bootstrap_oracle(shifted, 241, 17),
+          f"exact/bootstrap: translated distribution agrees with full oracle ({lower_bound=})")
+    check_exact_verdict(f"bootstrap-zero-{lower_bound}",
+                        "bootstrap lower bound" if lower_bound <= 0 else None,
+                        r10_lb=actual["lb"])
 
 
 
