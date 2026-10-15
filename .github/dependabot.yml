@@ -9,6 +9,11 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: deps
+    ignore:
+      # hf-hub 1.0 replaced the api::sync/Repo/Cache API that crates/embed/src/model.rs uses; it needs a manual port.
+      - dependency-name: hf-hub
+        update-types:
+          - version-update:semver-major
     groups:
       minor-and-patch:
         update-types:
