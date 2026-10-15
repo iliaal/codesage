@@ -18,6 +18,7 @@ class AdapterInstallTests(unittest.TestCase):
         self.source = self.root / "source with spaces"
         self.plugin = self.source / "plugins" / "codesage-tools"
         self.skills = self.root / "skills"
+        self.repo_skills = self.source / ".agents" / "skills"
         for group, names in (
             ("commands", [f"codesage-{name}" for name in INSTALLER.COMMANDS]),
             ("agents", ["codesage-feature-reviewer"]),
@@ -35,7 +36,11 @@ class AdapterInstallTests(unittest.TestCase):
         (skill / "notes.txt").write_text("preserve")
         self.assertEqual(INSTALLER.install(self.source, self.skills), 11)
         first = {p: p.read_bytes() for p in self.skills.glob("*/SKILL.md")}
+        first.update({p: p.read_bytes() for p in self.repo_skills.glob("*/SKILL.md")})
         self.assertEqual(len(first), 11)
+        self.assertEqual(sorted(p.parent.name for p in self.repo_skills.glob("*/SKILL.md")),
+                         ["codesage-bench", "codesage-eval"])
+        self.assertFalse((self.skills / "codesage-bench").exists())
         for path, data in first.items():
             group = "agents" if path.parent.name == "codesage-feature-reviewer" else "commands"
             canonical = self.plugin / group / f"{path.parent.name}.md"
@@ -44,14 +49,30 @@ class AdapterInstallTests(unittest.TestCase):
         canonical = self.plugin / "commands" / "codesage-revalidate.md"
         canonical.write_text(canonical.read_text() + "New policy is immediately available.\n")
         self.assertEqual(INSTALLER.install(self.source, self.skills), 11)
-        self.assertEqual(first, {p: p.read_bytes() for p in self.skills.glob("*/SKILL.md")})
+        again = {p: p.read_bytes() for p in self.skills.glob("*/SKILL.md")}
+        again.update({p: p.read_bytes() for p in self.repo_skills.glob("*/SKILL.md")})
+        self.assertEqual(first, again)
         self.assertEqual((skill / "notes.txt").read_text(), "preserve")
+
+    def test_retires_only_its_own_global_bench_and_eval_adapters(self):
+        INSTALLER.install(self.source, self.skills, self.root / "unused")
+        ours = self.skills / "codesage-bench" / "SKILL.md"
+        ours.parent.mkdir(parents=True)
+        ours.write_text(INSTALLER.render(self.plugin / "commands" / "codesage-bench.md", self.plugin))
+        foreign = self.skills / "codesage-eval" / "SKILL.md"
+        foreign.parent.mkdir(parents=True)
+        foreign.write_text("personal eval skill\n")
+        INSTALLER.install(self.source, self.skills)
+        self.assertFalse(ours.parent.exists())
+        self.assertEqual(foreign.read_text(), "personal eval skill\n")
+        self.assertTrue((self.repo_skills / "codesage-bench" / "SKILL.md").is_file())
 
     def test_missing_source_preflights_before_any_write(self):
         (self.plugin / "agents" / "codesage-feature-reviewer.md").unlink()
         with self.assertRaises(FileNotFoundError):
             INSTALLER.install(self.source, self.skills)
         self.assertFalse(self.skills.exists())
+        self.assertFalse(self.repo_skills.exists())
 
     def test_symlink_skill_cannot_redirect_writes(self):
         outside = self.root / "outside"

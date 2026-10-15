@@ -349,7 +349,7 @@ codex plugin marketplace add /path/to/codesage
 codex plugin add codesage-tools@codesage
 ```
 
-To use the task workflows as Codex skills, run `python3 scripts/install-codex-skills.py` from this checkout. It installs 11 thin adapters in `${CODEX_HOME:-$HOME/.codex}/skills`, replacing the CodeSage task skills and feature reviewer there. Keep the checkout available: each adapter reads the maintained command or agent file when invoked. Start a new Codex thread after installation. The eval workflow still reads Claude Code transcripts; it does not convert Codex sessions.
+To use the task workflows as Codex skills, run `python3 scripts/install-codex-skills.py` from this checkout. It installs 9 thin adapters in `${CODEX_HOME:-$HOME/.codex}/skills`, replacing the CodeSage task skills and feature reviewer there, and writes the `codesage-bench` and `codesage-eval` adapters to this checkout's `.agents/skills/`, so Codex offers them only inside this repository. It removes earlier global bench and eval adapters that point at this checkout and leaves any other skill with those names in place. Keep the checkout available: each adapter reads the maintained command or agent file when invoked. Start a new Codex thread after installation. The eval workflow still reads Claude Code transcripts; it does not convert Codex sessions.
 
 When a release is approved for push, `scripts/release.sh` bumps the plugin to the CodeSage release version and reinstalls it before pushing when `codex` is on `PATH`. During local plugin development between releases, update its manifest cachebuster and reinstall it from the same marketplace:
 
