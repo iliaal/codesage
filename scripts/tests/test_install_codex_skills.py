@@ -67,6 +67,24 @@ class AdapterInstallTests(unittest.TestCase):
         self.assertEqual(foreign.read_text(), "personal eval skill\n")
         self.assertTrue((self.repo_skills / "codesage-bench" / "SKILL.md").is_file())
 
+    def test_repository_local_install_is_idempotent(self):
+        self.assertEqual(INSTALLER.install(self.source, self.repo_skills), 11)
+        first = {p.parent.name: p.read_bytes() for p in self.repo_skills.glob("*/SKILL.md")}
+        self.assertEqual(len(first), 11)
+        self.assertEqual(INSTALLER.install(self.source, self.repo_skills), 11)
+        again = {p.parent.name: p.read_bytes() for p in self.repo_skills.glob("*/SKILL.md")}
+        self.assertEqual(first, again)
+
+    def test_custom_destination_aliases_are_idempotent(self):
+        for alias in (self.skills, self.skills / ".." / self.skills.name):
+            with self.subTest(alias=alias):
+                self.assertEqual(INSTALLER.install(self.source, self.skills, alias), 11)
+                first = {p.parent.name: p.read_bytes() for p in self.skills.glob("*/SKILL.md")}
+                self.assertEqual(len(first), 11)
+                self.assertEqual(INSTALLER.install(self.source, self.skills, alias), 11)
+                again = {p.parent.name: p.read_bytes() for p in self.skills.glob("*/SKILL.md")}
+                self.assertEqual(first, again)
+
     def test_missing_source_preflights_before_any_write(self):
         (self.plugin / "agents" / "codesage-feature-reviewer.md").unlink()
         with self.assertRaises(FileNotFoundError):
