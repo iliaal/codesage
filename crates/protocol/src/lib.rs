@@ -1161,12 +1161,12 @@ pub struct CoChangeEntry {
     /// which read true.
     #[serde(default = "default_span_known")]
     pub span_known: bool,
-    /// DEPRECATED, removed in the next minor: read `p_cochange`. The name
+    /// DEPRECATED, still emitted: read `p_cochange`. The name
     /// collides with `search`'s `confidence`, which reports ranking flatness,
     /// not a probability.
     #[serde(default)]
     pub confidence: f32,
-    /// DEPRECATED, removed in the next minor: read `p_reverse`.
+    /// DEPRECATED, still emitted: read `p_reverse`.
     #[serde(default)]
     pub reverse_confidence: f32,
     /// P(`file` changes | the queried file changes): `count` divided by the

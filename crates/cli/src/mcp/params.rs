@@ -50,9 +50,9 @@ const FILE_TARGETS_DESC: &str = "Preferred spelling of the file set: each entry 
 
 /// One target from a legacy argument and its `target` alias.
 ///
-/// Both spellings are accepted for one minor release. Equal values proceed;
-/// different ones are a parameter error naming both, because picking one
-/// would answer a question the caller did not ask.
+/// Both spellings are accepted while the legacy one is deprecated. Equal
+/// values proceed; different ones are a parameter error naming both, because
+/// picking one would answer a question the caller did not ask.
 pub(crate) fn one_target(
     tool: &str,
     legacy_field: &str,
@@ -222,7 +222,7 @@ pub struct FindSymbolParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: pass `target`. Symbol name or qualified name to search for."
+        description = "DEPRECATED, still accepted: pass `target`. Symbol name or qualified name to search for."
     )]
     pub name: Option<String>,
     #[schemars(description = SYMBOL_TARGET_DESC)]
@@ -278,7 +278,7 @@ pub struct FindSimilarParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: pass `target`. Function/method name to find near-clones of."
+        description = "DEPRECATED, still accepted: pass `target`. Function/method name to find near-clones of."
     )]
     pub name: Option<String>,
     #[schemars(description = SYMBOL_TARGET_DESC)]
@@ -312,7 +312,7 @@ pub struct ListDependenciesParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: pass `target`. Relative file path from project root."
+        description = "DEPRECATED, still accepted: pass `target`. Relative file path from project root."
     )]
     pub file_path: Option<String>,
     #[schemars(description = FILE_TARGET_DESC)]
@@ -336,7 +336,7 @@ pub struct CouplingParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: pass `target`. Repo-relative file path to look up co-change history for."
+        description = "DEPRECATED, still accepted: pass `target`. Repo-relative file path to look up co-change history for."
     )]
     pub file_path: Option<String>,
     #[schemars(description = FILE_TARGET_DESC)]
@@ -367,7 +367,7 @@ pub struct RiskParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: pass `target`. Repo-relative file path to assess."
+        description = "DEPRECATED, still accepted: pass `target`. Repo-relative file path to assess."
     )]
     pub file_path: Option<String>,
     #[schemars(description = FILE_TARGET_DESC)]
@@ -393,7 +393,7 @@ pub struct RiskDiffParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: pass `targets`. Repo-relative file paths in the patch (typically the output of `git diff --name-only`). Must provide at least one path: an empty list is rejected."
+        description = "DEPRECATED, still accepted: pass `targets`. Repo-relative file paths in the patch (typically the output of `git diff --name-only`). Must provide at least one path: an empty list is rejected."
     )]
     pub file_paths: Option<Vec<String>>,
     #[schemars(description = FILE_TARGETS_DESC)]
@@ -423,7 +423,7 @@ pub struct RiskBatchParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: pass `targets`. Repo-relative file paths to score individually. Must provide at least one path: an empty list is rejected. Returns one RiskAssessment per path, in input order. Use when you have a list of files (e.g. from impact analysis or coupling) and want each one's individual score — saves the per-file MCP round-trip overhead vs N separate `assess_risk` calls. For patch-level aggregation (max/mean, summary_notes, cycles), use `assess_risk_diff` instead."
+        description = "DEPRECATED, still accepted: pass `targets`. Repo-relative file paths to score individually. Must provide at least one path: an empty list is rejected. Returns one RiskAssessment per path, in input order. Use when you have a list of files (e.g. from impact analysis or coupling) and want each one's individual score — saves the per-file MCP round-trip overhead vs N separate `assess_risk` calls. For patch-level aggregation (max/mean, summary_notes, cycles), use `assess_risk_diff` instead."
     )]
     pub file_paths: Option<Vec<String>>,
     #[schemars(description = FILE_TARGETS_DESC)]
@@ -453,7 +453,7 @@ pub struct TestsForParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: pass `targets`. Repo-relative file paths whose tests should be recommended. Must provide at least one path: an empty list is rejected."
+        description = "DEPRECATED, still accepted: pass `targets`. Repo-relative file paths whose tests should be recommended. Must provide at least one path: an empty list is rejected."
     )]
     pub file_paths: Option<Vec<String>>,
     #[schemars(description = FILE_TARGETS_DESC)]
@@ -530,7 +530,7 @@ pub struct ImpactParams {
     )]
     pub target: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: the grammar disambiguates. Treat target as file path (auto-detected if path-like); pass false to force symbol interpretation. Ignored when `target` is a handle, which names its own kind."
+        description = "DEPRECATED, still accepted: the grammar disambiguates. Treat target as file path (auto-detected if path-like); pass false to force symbol interpretation. Ignored when `target` is a handle, which names its own kind."
     )]
     pub is_file: Option<bool>,
     #[schemars(
@@ -569,7 +569,7 @@ pub struct ExportContextParams {
     )]
     pub target: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: the grammar disambiguates. For unresolved text, force symbol lookup instead of semantic search; a missing forced symbol returns found:false. Resolved entities always name their own kind."
+        description = "DEPRECATED, still accepted: the grammar disambiguates. For unresolved text, force symbol lookup instead of semantic search; a missing forced symbol returns found:false. Resolved entities always name their own kind."
     )]
     pub is_symbol: Option<bool>,
     #[schemars(
@@ -652,7 +652,7 @@ pub struct FindFeatureParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: pass `target`. Repo-relative file path to look up."
+        description = "DEPRECATED, still accepted: pass `target`. Repo-relative file path to look up."
     )]
     pub file_path: Option<String>,
     #[schemars(description = FILE_TARGET_DESC)]
@@ -676,7 +676,7 @@ pub struct FeatureBundleParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: pass `target`. Feature id (e.g. feat_abc123) from `list_features` / `find_feature`."
+        description = "DEPRECATED, still accepted: pass `target`. Feature id (e.g. feat_abc123) from `list_features` / `find_feature`."
     )]
     pub feature_id: Option<String>,
     #[schemars(
@@ -777,7 +777,7 @@ pub struct ReviewRehearsalParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "DEPRECATED, removed in the next minor: pass `targets`. Repo-relative file paths in the patch / working-tree change set (typically `git diff --name-only`). Must provide at least one path: an empty list is rejected (the CLI's stdin/working-tree fallback does not exist over MCP)."
+        description = "DEPRECATED, still accepted: pass `targets`. Repo-relative file paths in the patch / working-tree change set (typically `git diff --name-only`). Must provide at least one path: an empty list is rejected (the CLI's stdin/working-tree fallback does not exist over MCP)."
     )]
     pub file_paths: Option<Vec<String>>,
     #[schemars(description = FILE_TARGETS_DESC)]

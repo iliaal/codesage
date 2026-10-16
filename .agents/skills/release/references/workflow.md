@@ -22,6 +22,11 @@ Steps:
    - Extract the `## [Unreleased]` block from `CHANGELOG.md` (everything
      between that header and the next `## [` header). Run the writing
      skill against that block.
+   - Check the same block against the CHANGELOG content rules in
+     `AGENTS.md`, not only for AI-writing tells: drop performance-only
+     internals and robustness bullets framed as mechanism, lead each bullet
+     with the observable effect, and consolidate bullets that share one
+     surface. `scripts/check-changelog.py` checks section structure, not content.
    - Resolve the most recent tag with `git describe --tags --abbrev=0`, then
      inspect `git diff <tag> -- README.md`, including the working contents
      that will enter the release. If no tag exists, audit the current README.

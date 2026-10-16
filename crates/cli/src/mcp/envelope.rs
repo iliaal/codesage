@@ -9,7 +9,7 @@
 //!
 //! `completeness` is derived here from the legacy incompleteness fields the
 //! tools already emit, so one vocabulary covers all of them. The legacy fields
-//! keep being emitted this release; the next minor removes them.
+//! are deprecated and still emitted.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -935,7 +935,7 @@ pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
             "completeness",
             json!({
                 "type": "object",
-                "description": "Absent when the answer is exact. One vocabulary replacing `counts_floor`, `bounded`, `truncated`, `_meta.truncated`, `callers_truncated`, `reachable_capped`, `reach_walk_capped`, `unmodelled`, `unscored`, `_meta.clamps`, `_meta.coverage`, and the per-input reason lists, all of which are deprecated and removed in the next minor. `kind` is the most severe of `kinds` in the order truncated > bounded > partial > clamped > unscored > floor.",
+                "description": "Absent when the answer is exact. One vocabulary replacing `counts_floor`, `bounded`, `truncated`, `_meta.truncated`, `callers_truncated`, `reachable_capped`, `reach_walk_capped`, `unmodelled`, `unscored`, `_meta.clamps`, `_meta.coverage`, and the per-input reason lists, all of which are deprecated and still emitted. `kind` is the most severe of `kinds` in the order truncated > bounded > partial > clamped > unscored > floor.",
                 "properties": {
                     "kind": {"enum": ["truncated", "bounded", "partial", "clamped", "unscored", "floor"]},
                     "kinds": {"type": "array", "items": {"enum": ["truncated", "bounded", "partial", "clamped", "unscored", "floor"]}},

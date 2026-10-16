@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- MCP tool schemas and `help` no longer promise removal of the arguments and response fields deprecated in 0.35.0 in the next minor; they stay deprecated and accepted (request arguments) or emitted (response fields).
+
 ## [0.43.0] - 2026-10-15
 
 ### Changed

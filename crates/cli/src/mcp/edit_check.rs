@@ -9,7 +9,7 @@ pub(super) struct EditCheckParams {
     pub project: String,
     /// Repository-relative source path at HEAD.
     pub file_path: String,
-    /// DEPRECATED, removed in the next minor: pass `target`. Exact
+    /// DEPRECATED, still accepted: pass `target`. Exact
     /// unqualified declaration name, or a `sym:` handle naming `file_path`.
     pub symbol_name: Option<String>,
     /// Preferred spelling of the declaration: the exact unqualified name, or

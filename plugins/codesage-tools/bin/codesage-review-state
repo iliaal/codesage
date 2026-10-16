@@ -116,7 +116,7 @@ def response_truncated(payload):
     """True when a CodeSage response dropped rows for budget.
 
     Reads the response envelope's `completeness` first and falls back to the
-    deprecated `_meta.truncated`, which the next minor removes.
+    deprecated, still-emitted `_meta.truncated`.
     """
     if not isinstance(payload, dict):
         return False

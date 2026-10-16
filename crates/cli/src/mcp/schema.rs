@@ -66,7 +66,7 @@ const NON_READONLY_TOOLS: &[&str] = &["session_start", "session_end"];
 pub(super) fn meta_property_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "DEPRECATED, removed in the next minor: read the top-level \
+        "description": "DEPRECATED, still emitted: read the top-level \
             `completeness` and `index` keys instead. \
             Response envelope annotations, present only when the server \
             trimmed, capped, or flagged this response. `_meta.truncated` means the response \
