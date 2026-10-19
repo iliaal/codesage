@@ -11,7 +11,7 @@ cargo test --workspace                         # all tests
 cargo clippy --workspace                       # lint
 ```
 
-> Always build with `--features cuda` when targeting GPU. Without it, CUDA silently falls back to CPU. The binary will error out if GPU is requested in config but the cuda feature is missing.
+> Always build with `--features cuda` when targeting GPU. The binary errors if GPU is requested in config but the `cuda` feature is missing; it does not silently fall back to CPU.
 
 ## Sanity check before pushing
 
@@ -83,7 +83,7 @@ ONNX Runtime loads dynamically. CUDA libraries come from pip-installed `nvidia-*
 
 `codesage doctor` reports how many nvidia lib dirs were discovered and warns if none.
 
-If CUDA is requested (`device = "gpu"`) but fails to register, the process errors out instead of falling back to CPU. This is intentional: silent CPU fallback produces different embeddings and slower performance. The check inspects `/proc/self/maps` after session creation and hard-fails when libcuda/libcudart aren't mapped. To bypass it deliberately (tests, mixed CPU/GPU setups), set `CODESAGE_ALLOW_CPU_FALLBACK=1`; embeddings are then silently CPU-computed, so never leave it set on a GPU-configured project.
+If CUDA is requested (`device = "gpu"`) but fails to register, the process errors out instead of falling back to CPU. This is intentional: silent CPU fallback produces different embeddings and slower performance. The check inspects `/proc/self/maps` after session creation and hard-fails when libcuda/libcudart aren't mapped. To bypass the Linux post-session library check deliberately (tests, mixed CPU/GPU setups), set `CODESAGE_ALLOW_CPU_FALLBACK=1`. If that check fails with the override enabled, the session logs a warning and fingerprints its execution provider as CPU; do not leave the override set on a GPU-configured project.
 
 Required pip packages: `onnxruntime-gpu`, `nvidia-cudnn-cu12`, `nvidia-cublas-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-cufft-cu12`, `nvidia-curand-cu12`, `nvidia-cuda-nvrtc-cu12`.
 
