@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.44.0] - 2026-10-19
+
 ### Added
 
 - `codesage edit-check` compares a proposed replacement declaration from a file or stdin against pinned Git HEAD, with the same analysis as MCP `edit_check` and optional JSON output.
@@ -1317,5 +1319,7 @@ Initial public release.
 
 [0.42.0]: https://github.com/iliaal/codesage/releases/tag/v0.42.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.43.0...HEAD
 [0.43.0]: https://github.com/iliaal/codesage/releases/tag/v0.43.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.44.0...HEAD
+[0.44.0]: https://github.com/iliaal/codesage/releases/tag/v0.44.0
