@@ -129,9 +129,9 @@ impl TextEmbedder for LazyEmbedder {
 use codesage_storage::{Database, SemanticAttestation};
 use rayon::prelude::*;
 
+use codesage_parser::discover::DiscoveryReport;
 #[cfg(test)]
-use codesage_parser::discover::discover_files_with_excludes;
-use codesage_parser::discover::{DiscoveryReport, discover_files_report_with_cache};
+use codesage_parser::discover::{discover_files_report_with_cache, discover_files_with_excludes};
 use codesage_parser::source::read_indexable_file;
 
 #[derive(Debug)]
@@ -654,7 +654,13 @@ fn semantic_index(
     } else {
         HashMap::new()
     };
-    let discovery = discover_files_report_with_cache(root, exclude_patterns, &cache)?;
+    let previous = crate::index::header_routing_context(db)?;
+    let discovery = codesage_parser::discover::discover_files_report_with_context(
+        root,
+        exclude_patterns,
+        &cache,
+        &previous,
+    )?;
     db.replace_file_hash_cache(&discovery.hash_cache)?;
     semantic_index_discovery_report(
         root,

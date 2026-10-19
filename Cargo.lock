@@ -314,6 +314,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "toml",
  "tracing",
  "tree-sitter",
  "tree-sitter-c",

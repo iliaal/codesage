@@ -2,6 +2,7 @@ pub mod branch_overlap;
 mod brief;
 mod bundle;
 mod call_path;
+mod dependencies;
 mod describe;
 pub mod drift;
 pub mod edit_check;

@@ -16,9 +16,10 @@ Corpus directory resolution (first match wins):
 
 ## Step 1: Run the benchmark
 
-```
-${CLAUDE_PLUGIN_ROOT}/bin/codesage-bench $ARGUMENTS
-```
+Read and follow [the argument transport procedure](<${CLAUDE_PLUGIN_ROOT}/references/command-arguments.md>).
+Use the `bench` command identifier with the parsed `$ARGUMENTS` values. The
+dispatcher runs `${CLAUDE_PLUGIN_ROOT}/bin/codesage-bench` from the currently
+installed plugin.
 
 No re-indexing happens; this only runs `codesage search` against existing indexes. Each corpus takes 10-60 seconds depending on case count. Background and poll if total runtime exceeds ~2 minutes.
 

@@ -1,18 +1,22 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use codesage_parser::{parse::parse_file_tolerant, source::read_indexable_file};
-use codesage_protocol::{Language, Symbol, Visibility};
+use codesage_protocol::{Language, Reference, Symbol, Visibility};
 use codesage_storage::Database;
 use tree_sitter::Node;
 
+use super::RustImportEvidence;
+
 const RESOLUTION_BUDGET: Duration = Duration::from_secs(2);
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct Surface {
     locals: HashSet<String>,
+    public_locals: HashSet<String>,
     definitions: HashMap<String, Vec<Symbol>>,
     modules: HashMap<String, bool>,
     uses: Vec<Use>,
@@ -21,6 +25,9 @@ struct Surface {
     uncertain_glob: bool,
     uncertain_ranges: Vec<(tree_sitter::Point, tree_sitter::Point)>,
     uncertain_names: HashSet<String>,
+    proven_import_sites: HashSet<(u32, u32)>,
+    import_bindings: HashMap<(u32, u32), String>,
+    module_items: HashSet<(u32, u32)>,
 }
 
 #[derive(Clone)]
@@ -34,9 +41,9 @@ pub(super) struct ExternalCrates {
     root: Option<PathBuf>,
     library_callers: HashSet<String>,
     caller_roots: HashMap<String, Vec<String>>,
-    manifests: HashMap<String, Option<toml::Value>>,
+    manifests: HashMap<String, Option<Arc<toml::Value>>>,
     missing: HashSet<String>,
-    sources: HashMap<(String, bool), Option<Surface>>,
+    sources: HashMap<(String, bool), Option<Arc<Surface>>>,
     resolved: HashMap<(String, String), Option<Vec<Symbol>>>,
     reads: usize,
     bytes: usize,
@@ -46,6 +53,214 @@ pub(super) struct ExternalCrates {
 }
 
 impl ExternalCrates {
+    pub(super) fn import_evidence(
+        &mut self,
+        db: &Database,
+        caller: &str,
+    ) -> Result<RustImportEvidence> {
+        if self.capped {
+            return Ok(RustImportEvidence::default());
+        }
+        Ok(self
+            .source(db, caller, true)?
+            .map(|source| RustImportEvidence {
+                bindings: source.import_bindings.clone(),
+                module_items: Some(source.module_items.clone()),
+            })
+            .unwrap_or_default())
+    }
+
+    pub(super) fn package_import(
+        &mut self,
+        db: &Database,
+        caller: &str,
+        spelling: &str,
+        is_test: bool,
+        sites: &[&Reference],
+    ) -> Result<Option<(String, bool)>> {
+        if self.capped {
+            return Ok(None);
+        }
+        let name = spelling.split("::").next().unwrap_or_default();
+        if matches!(name, "crate" | "self" | "super") {
+            return Ok(None);
+        }
+        let Some(source) = self.source(db, caller, true)? else {
+            return Ok(None);
+        };
+        if !sites
+            .iter()
+            .any(|row| source.proven_import_sites.contains(&(row.line, row.col)))
+        {
+            return Ok(None);
+        }
+        let partial = sites
+            .iter()
+            .any(|row| !source.proven_import_sites.contains(&(row.line, row.col)));
+        if matches!(name, "std" | "core" | "alloc") {
+            return Ok(Some((name.to_string(), partial)));
+        }
+        let Some((package, manifest)) = self.package(caller) else {
+            return Ok(None);
+        };
+        if !self.supported_caller(caller, &package, &manifest)
+            || !self.modern_edition(&package, &manifest)
+        {
+            return Ok(None);
+        }
+        let mut ancestor = Path::new(&package);
+        loop {
+            for suffix in ["Cargo.toml", ".cargo/config.toml", ".cargo/config"] {
+                let path = ancestor.join(suffix);
+                let Some(path) = path.to_str() else {
+                    return Ok(None);
+                };
+                let config = self.manifest(path);
+                if config.as_ref().is_some_and(|config| {
+                    config.get("patch").is_some()
+                        || config.get("replace").is_some()
+                        || config.get("paths").is_some()
+                }) || config.is_none() && !self.missing.contains(path)
+                {
+                    return Ok(None);
+                }
+            }
+            let Some(parent) = ancestor.parent() else {
+                break;
+            };
+            ancestor = parent;
+        }
+        let mut matches = Vec::new();
+        for table in ["dependencies", "dev-dependencies"] {
+            if table == "dev-dependencies" && !is_test {
+                continue;
+            }
+            for (key, value) in manifest
+                .get(table)
+                .and_then(toml::Value::as_table)
+                .into_iter()
+                .flatten()
+            {
+                if key.replace('-', "_") != name {
+                    continue;
+                }
+                let mut dependency = value.clone();
+                if dependency.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                    let mut ancestor = Path::new(&package);
+                    loop {
+                        let Some(path) = ancestor.join("Cargo.toml").to_str().map(str::to_string)
+                        else {
+                            return Ok(None);
+                        };
+                        if let Some(manifest) = self.manifest(&path)
+                            && let Some(workspace) = manifest.get("workspace")
+                        {
+                            let Some(inherited) =
+                                workspace.get("dependencies").and_then(|deps| deps.get(key))
+                            else {
+                                return Ok(None);
+                            };
+                            dependency = inherited.clone();
+                            break;
+                        }
+                        if self.manifests.get(&path).is_some_and(Option::is_none)
+                            && !self.missing.contains(&path)
+                        {
+                            return Ok(None);
+                        }
+                        let Some(parent) = ancestor.parent() else {
+                            return Ok(None);
+                        };
+                        ancestor = parent;
+                    }
+                }
+                if dependency.get("path").is_some()
+                    || dependency.get("optional").and_then(toml::Value::as_bool) == Some(true)
+                    || value.get("optional").and_then(toml::Value::as_bool) == Some(true)
+                    || !(dependency.is_str()
+                        || dependency.get("version").is_some()
+                        || dependency.get("git").is_some())
+                {
+                    return Ok(None);
+                }
+                matches.push(
+                    dependency
+                        .get("package")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or(key)
+                        .to_string(),
+                );
+            }
+        }
+        matches.sort();
+        matches.dedup();
+        Ok(match matches.as_slice() {
+            [package] => Some((package.clone(), partial)),
+            _ => None,
+        })
+    }
+
+    pub(super) fn import_file(&mut self, db: &Database, row: &Reference) -> Result<Option<String>> {
+        if self.capped {
+            return Ok(None);
+        }
+        let (name, tail) = row.to_name.split_once("::").unwrap_or((&row.to_name, ""));
+        if matches!(name, "crate" | "self" | "super") {
+            return Ok(None);
+        }
+        let Some(source) = self.source(db, &row.from_file, true)? else {
+            return Ok(None);
+        };
+        if !source.proven_import_sites.contains(&(row.line, row.col)) {
+            return Ok(None);
+        }
+        let Some((package, manifest)) = self.package(&row.from_file) else {
+            return Ok(None);
+        };
+        if !self.supported_caller(&row.from_file, &package, &manifest)
+            || !self.modern_edition(&package, &manifest)
+        {
+            return Ok(None);
+        }
+        let Some(mut file) = self.library(&row.from_file, &package, &manifest, name) else {
+            return Ok(None);
+        };
+        if db.file_id_for_path(&file)?.is_none() {
+            return Ok(None);
+        }
+        // A dependency on a crate's export surface exists even when attributes
+        // prevent resolving the imported item to a particular definition.
+        for segment in tail.split("::") {
+            let Some(surface) = self.source(db, &file, false)? else {
+                return Ok(None);
+            };
+            if surface.modules.get(segment) != Some(&true) || surface.blocked.contains(segment) {
+                return Ok((segment.is_empty()
+                    || surface.public_locals.contains(segment)
+                    || surface
+                        .uses
+                        .iter()
+                        .any(|binding| binding.public && binding.name == segment))
+                .then_some(file));
+            }
+            let directory = module_directory(&file);
+            let mut children = Vec::new();
+            for candidate in [
+                format!("{directory}{segment}.rs"),
+                format!("{directory}{segment}/mod.rs"),
+            ] {
+                if db.file_id_for_path(&candidate)?.is_some() {
+                    children.push(candidate);
+                }
+            }
+            let [child] = children.as_slice() else {
+                return Ok(None);
+            };
+            file = child.clone();
+        }
+        Ok(Some(file))
+    }
+
     pub(super) fn new(db: &Database, modules: &HashMap<String, Vec<super::Module>>) -> Self {
         let root = db.path().and_then(|path| {
             let dir = path.parent()?;
@@ -239,18 +454,19 @@ impl ExternalCrates {
         Some(source)
     }
 
-    fn manifest(&mut self, path: &str) -> Option<toml::Value> {
+    fn manifest(&mut self, path: &str) -> Option<Arc<toml::Value>> {
         if let Some(manifest) = self.manifests.get(path) {
             return manifest.clone();
         }
         let manifest = self
             .read(path)
-            .and_then(|source| toml::from_str(std::str::from_utf8(&source.bytes).ok()?).ok());
+            .and_then(|source| toml::from_str(std::str::from_utf8(&source.bytes).ok()?).ok())
+            .map(Arc::new);
         self.manifests.insert(path.into(), manifest.clone());
         manifest
     }
 
-    fn package(&mut self, file: &str) -> Option<(String, toml::Value)> {
+    fn package(&mut self, file: &str) -> Option<(String, Arc<toml::Value>)> {
         let mut parent = Path::new(file).parent()?;
         loop {
             let path = parent.join("Cargo.toml").to_str()?.to_string();
@@ -340,9 +556,8 @@ impl ExternalCrates {
             let Some(path) = path.to_str() else {
                 return false;
             };
-            if let Some(workspace) = self
-                .manifest(path)
-                .and_then(|value| value.get("workspace").cloned())
+            if let Some(manifest) = self.manifest(path)
+                && let Some(workspace) = manifest.get("workspace")
             {
                 return workspace
                     .get("package")
@@ -376,9 +591,8 @@ impl ExternalCrates {
             let mut ancestor = Path::new(package);
             loop {
                 let path = ancestor.join("Cargo.toml").to_str()?.to_string();
-                if let Some(workspace) = self
-                    .manifest(&path)
-                    .and_then(|value| value.get("workspace").cloned())
+                if let Some(manifest) = self.manifest(&path)
+                    && let Some(workspace) = manifest.get("workspace")
                 {
                     dependency = workspace.get("dependencies")?.get(key)?.clone();
                     base = ancestor.to_str()?.to_string();
@@ -422,7 +636,7 @@ impl ExternalCrates {
         Some((extern_name, conventional_library(&directory, &target)?))
     }
 
-    fn source(&mut self, db: &Database, file: &str, caller: bool) -> Result<Option<Surface>> {
+    fn source(&mut self, db: &Database, file: &str, caller: bool) -> Result<Option<Arc<Surface>>> {
         let key = (file.to_string(), caller);
         if let Some(surface) = self.sources.get(&key) {
             return Ok(surface.clone());
@@ -434,12 +648,45 @@ impl ExternalCrates {
             let parsed = parse_file_tolerant(&source.bytes, Language::Rust)?;
             (!parsed.degraded)
                 .then(|| {
-                    surface(
+                    let mut result = surface(
                         parsed.tree.root_node(),
                         &source.bytes,
                         db.symbols_for_file(file),
                         caller,
-                    )
+                    )?;
+                    result.module_items = module_item_positions(parsed.tree.root_node());
+                    if caller {
+                        for row in db.references_in_file_range(file, 1, u32::MAX)? {
+                            codesage_protocol::work::checkpoint()?;
+                            let position = tree_sitter::Point {
+                                row: row.line.saturating_sub(1) as usize,
+                                column: row.col as usize,
+                            };
+                            if row.kind == codesage_protocol::ReferenceKind::Import
+                                && !result
+                                    .uncertain_ranges
+                                    .iter()
+                                    .any(|(start, end)| *start <= position && position < *end)
+                            {
+                                if let Some(binding) = module_import_binding(
+                                    parsed.tree.root_node(),
+                                    &source.bytes,
+                                    &row,
+                                    &result.module_items,
+                                ) {
+                                    result.import_bindings.insert((row.line, row.col), binding);
+                                }
+                                if import_namespace_proven(
+                                    parsed.tree.root_node(),
+                                    &source.bytes,
+                                    &row,
+                                )? {
+                                    result.proven_import_sites.insert((row.line, row.col));
+                                }
+                            }
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(result)
                 })
                 .transpose()?
         } else {
@@ -463,6 +710,7 @@ impl ExternalCrates {
             }
             surface.uncertain_ranges.clear();
         }
+        let surface = surface.map(Arc::new);
         self.sources.insert(key, surface.clone());
         Ok(surface)
     }
@@ -635,6 +883,9 @@ fn surface(
         } else if let Some(name) = declared_binding(item) {
             let name = text(name, bytes).to_string();
             surface.locals.insert(name.clone());
+            if public {
+                surface.public_locals.insert(name.clone());
+            }
             if attributed || item.kind() == "mod_item" && item.child_by_field_name("body").is_some()
             {
                 surface.blocked.insert(name);
@@ -842,6 +1093,125 @@ fn module_scope(mut node: Node<'_>) -> Option<Node<'_>> {
         }
         node = node.parent()?;
     }
+}
+
+fn import_declaration<'a>(root: Node<'a>, row: &Reference) -> Option<Node<'a>> {
+    let position = tree_sitter::Point {
+        row: row.line.saturating_sub(1) as usize,
+        column: row.col as usize,
+    };
+    let mut node = root.descendant_for_point_range(position, position)?;
+    while node.kind() != "use_declaration" {
+        node = node.parent()?;
+    }
+    Some(node)
+}
+
+fn module_item_positions(root: Node<'_>) -> HashSet<(u32, u32)> {
+    let mut positions = HashSet::new();
+    let mut modules = vec![root];
+    while let Some(module) = modules.pop() {
+        for item in module.named_children(&mut module.walk()) {
+            let start = item.start_position();
+            positions.insert((start.row as u32 + 1, start.column as u32));
+            if item.kind() == "mod_item"
+                && let Some(body) = item.child_by_field_name("body")
+            {
+                modules.push(body);
+            }
+        }
+    }
+    positions
+}
+
+fn module_import_binding(
+    root: Node<'_>,
+    bytes: &[u8],
+    row: &Reference,
+    module_items: &HashSet<(u32, u32)>,
+) -> Option<String> {
+    let declaration = import_declaration(root, row)?;
+    let start = declaration.start_position();
+    if !module_items.contains(&(start.row as u32 + 1, start.column as u32)) {
+        return None;
+    }
+    let mut bindings = Vec::new();
+    use_bindings(
+        declaration.child_by_field_name("argument")?,
+        bytes,
+        false,
+        &mut bindings,
+    );
+    let mut matches = bindings
+        .into_iter()
+        .filter(|binding| binding.path == row.to_name);
+    let binding = matches.next()?;
+    matches.next().is_none().then_some(binding.name)
+}
+
+fn import_namespace_proven(root: Node<'_>, bytes: &[u8], row: &Reference) -> Result<bool> {
+    let head = row.to_name.split("::").next().unwrap_or_default();
+    let Some(mut node) = import_declaration(root, row) else {
+        return Ok(false);
+    };
+    let declaration = node.id();
+    while let Some(scope) = node.parent() {
+        if matches!(scope.kind(), "block" | "declaration_list" | "source_file") {
+            for item in scope.named_children(&mut scope.walk()) {
+                codesage_protocol::work::checkpoint()?;
+                if matches!(
+                    item.kind(),
+                    "mod_item"
+                        | "struct_item"
+                        | "enum_item"
+                        | "trait_item"
+                        | "type_item"
+                        | "union_item"
+                        | "extern_crate_declaration"
+                ) && declared_binding(item).is_some_and(|name| text(name, bytes) == head)
+                {
+                    return Ok(false);
+                }
+                if item.kind() == "use_declaration"
+                    && let Some(argument) = item.child_by_field_name("argument")
+                {
+                    let mut bindings = Vec::new();
+                    use_bindings(argument, bytes, false, &mut bindings);
+                    if bindings.iter().any(|binding| {
+                        binding.name == head && (item.id() != declaration || binding.path != head)
+                    }) {
+                        return Ok(false);
+                    }
+                    let mut pending = vec![argument];
+                    while let Some(part) = pending.pop() {
+                        codesage_protocol::work::checkpoint()?;
+                        let start = part.start_position();
+                        if part.kind() == "use_wildcard"
+                            && (item.id() != declaration
+                                || (start.row as u32 + 1, start.column as u32)
+                                    != (row.line, row.col))
+                            && relative_glob_bindings(part, root, bytes)
+                                .is_none_or(|bindings| bindings.contains(head))
+                        {
+                            return Ok(false);
+                        }
+                        pending.extend(part.named_children(&mut part.walk()));
+                    }
+                }
+            }
+        }
+        if let Some(parameters) = scope.child_by_field_name("type_parameters")
+            && parameters
+                .named_children(&mut parameters.walk())
+                .any(|parameter| {
+                    declared_binding(parameter).is_some_and(|name| text(name, bytes) == head)
+                })
+        {
+            return Ok(false);
+        }
+        node = scope;
+    }
+    Ok(true)
 }
 
 fn pattern_bindings(pattern: Node<'_>, bytes: &[u8], bindings: &mut HashSet<String>) {

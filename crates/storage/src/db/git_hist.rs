@@ -181,6 +181,26 @@ impl Database {
         Ok(rows)
     }
 
+    /// Highest-churn indexed paths from one candidate population.
+    pub fn top_churn_files_for_paths(&self, paths: &[String], limit: usize) -> Result<Vec<String>> {
+        let mut ranked: Vec<(String, f64)> = Vec::new();
+        for batch in paths.chunks(500) {
+            codesage_protocol::work::checkpoint()?;
+            let placeholders = vec!["?"; batch.len()].join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT path, churn_score FROM git_files WHERE path IN ({placeholders}) ORDER BY churn_score DESC, path LIMIT {limit}"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?;
+            ranked.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            ranked.dedup_by(|a, b| a.0 == b.0);
+            ranked.truncate(limit);
+        }
+        Ok(ranked.into_iter().map(|(path, _)| path).collect())
+    }
+
     /// Record the commit SHA we just indexed up to. indexed_at stamped with unixepoch().
     pub fn set_git_index_state(&self, sha: &str) -> Result<()> {
         self.set_git_index_state_with_anchor(sha, None)
@@ -836,6 +856,28 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::{CoChangeWrite, Database, RECURRING_SPAN_SECS};
+
+    #[test]
+    fn selected_churn_candidates_merge_batches_and_ignore_hotter_other_paths() {
+        let db = Database::open_in_memory().unwrap();
+        let paths: Vec<_> = (0..503)
+            .map(|index| format!("tests/file{index}.rs"))
+            .collect();
+        db.execute_batch(|db| {
+            for (index, path) in paths.iter().enumerate() {
+                db.upsert_git_file(path, index as f64, 1, 2, None)?;
+            }
+            db.upsert_git_file("src/hottest.rs", 9000.0, 1, 2, None)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            db.top_churn_files_for_paths(&paths, 3).unwrap(),
+            ["tests/file502.rs", "tests/file501.rs", "tests/file500.rs"]
+        );
+        assert!(db.top_churn_files_for_paths(&paths, 0).unwrap().is_empty());
+        assert!(db.top_churn_files_for_paths(&[], 3).unwrap().is_empty());
+    }
 
     #[test]
     fn rejected_anchor_write_rolls_back_the_state_update_and_invalidation() {

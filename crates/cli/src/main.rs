@@ -52,6 +52,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Compare a replacement declaration against pinned Git HEAD without writing files
+    #[command(
+        after_help = "No index or model is required. FILE is relative to the Git worktree root; REPLACEMENT is relative to the current directory.\nExit 0 means analysis completed, including findings or unknowns; exit 1 means the check failed; exit 2 means invalid CLI usage. This is not a compilation or safety verdict."
+    )]
+    EditCheck {
+        /// Source file at HEAD, relative to the Git worktree root
+        file: String,
+        /// Exact declaration name or sym: handle naming FILE
+        target: String,
+        /// UTF-8 file containing the complete replacement declaration; `-` or omitted reads stdin (1 MiB maximum)
+        replacement: Option<PathBuf>,
+        /// One-based declaration start line at HEAD, for ambiguous names
+        #[arg(long, value_parser = parse_positive_usize)]
+        line: Option<NonZeroUsize>,
+        /// Output the full engine report as JSON; errors remain on stderr
+        #[arg(long)]
+        json: bool,
+    },
     /// Describe an indexed file, symbol, feature, or directory
     Describe {
         target: String,
@@ -121,6 +139,9 @@ enum Commands {
     Dependencies {
         /// File path (relative to project root)
         file: String,
+        /// Full detail includes original indexed import spellings
+        #[arg(long, default_value = "compact", value_parser = ["compact", "standard", "full"])]
+        detail: String,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -223,8 +244,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// One-call project orientation: languages, freshness, features, risk,
-    /// trust boundaries, test conventions, and suggested next calls
+    /// Project orientation: module map, entrypoints, freshness, risk, and recovery
     Overview {
         /// Output as JSON
         #[arg(long)]
@@ -1030,6 +1050,19 @@ fn run(cli: Cli) -> Result<()> {
     use commands::{features, hooks, index, query, risk, runtime, session};
 
     match cli.command {
+        Commands::EditCheck {
+            file,
+            target,
+            replacement,
+            line,
+            json,
+        } => commands::edit_check::run(
+            &file,
+            &target,
+            replacement.as_deref(),
+            line.map(NonZeroUsize::get),
+            json,
+        ),
         Commands::Init { force } => runtime::cmd_init(force),
         Commands::Index {
             full,
@@ -1055,7 +1088,9 @@ fn run(cli: Cli) -> Result<()> {
         Commands::FindReferences { name, kind, json } => {
             query::cmd_find_references(&name, kind.as_deref(), json)
         }
-        Commands::Dependencies { file, json } => query::cmd_dependencies(&file, json),
+        Commands::Dependencies { file, detail, json } => {
+            query::cmd_dependencies(&file, &detail, json)
+        }
         Commands::Search {
             query,
             limit,
@@ -1872,6 +1907,8 @@ mod tests {
             "find-symbol",
             "find-references",
             "dependencies",
+            "edit-check",
+            "describe",
             "impact",
             "from-trace",
             "trust-boundaries",

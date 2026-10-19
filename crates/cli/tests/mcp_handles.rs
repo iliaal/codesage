@@ -444,3 +444,64 @@ fn semantic_search_rows_carry_handles() {
         );
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn semantic_search_detail_preserves_rows_and_full_source_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fixture(&root);
+    {
+        let db = Database::open_for_model(
+            &root.join(".codesage/index.db"),
+            "jinaai/jina-embeddings-v2-base-code",
+            4,
+        )
+        .unwrap();
+        for path in ["cluster/a.rs", "cluster/b.rs", "cluster/c.rs"] {
+            let body = std::fs::read_to_string(root.join(path)).unwrap();
+            db.insert_chunks(path, "rust", &[(&body, 1, 1, &[10.0; 4])])
+                .unwrap();
+        }
+    }
+    let mut server = Server::start(Some("0.1,0.2,0.3,0.4"));
+    let args = json!({"query": "behavior locator", "limit": 5});
+    let standard = server.call(&root, "search", args.clone());
+    let full = server.call(
+        &root,
+        "search",
+        json!({"query": "behavior locator", "limit": 5, "detail": "full"}),
+    );
+    assert_eq!(standard["confidence"], "high");
+    assert_eq!(standard["cliff_at"], 2);
+    let standard_rows = rows(&standard, "results", "standard search");
+    let full_rows = rows(&full, "results", "full search");
+    assert_eq!(standard_rows.len(), 5);
+    assert_eq!(full_rows.len(), 5);
+    for (i, (standard_row, full_row)) in standard_rows.iter().zip(full_rows).enumerate() {
+        assert!(full_row["content"].is_string(), "{full_row}");
+        let mut expected = full_row.clone();
+        if i >= 2 {
+            expected.as_object_mut().unwrap().remove("content");
+        }
+        assert_eq!(*standard_row, expected);
+        assert_handle(standard_row, "handle", "chunk:", "projected search");
+    }
+    let cut = server.call(
+        &root,
+        "search",
+        json!({"query": "behavior locator", "limit": 5, "adaptive_limit": true}),
+    );
+    assert_eq!(
+        rows(&cut, "results", "adaptive search"),
+        &standard_rows[..2]
+    );
+    let compact = server.call(
+        &root,
+        "search",
+        json!({"query": "behavior locator", "limit": 5, "detail": "compact"}),
+    );
+    let compact_rows = rows(&compact, "results", "compact search");
+    assert_eq!(compact_rows.len(), 5);
+    assert!(compact_rows.iter().all(|row| row.get("content").is_none()));
+}

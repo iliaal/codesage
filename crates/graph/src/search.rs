@@ -1895,8 +1895,49 @@ fn test_query_aware_enabled() -> bool {
     *TEST_QUERY_AWARE_ENABLED.get_or_init(|| env_default_on(tuning::TEST_QUERY_AWARE))
 }
 
+fn auxiliary_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized
+        .rsplit_once('/')
+        .is_some_and(|(parent, _)| has_dir_segment(parent, &["bench", "scripts"]))
+}
+
+fn query_names_path_or_platform(query: &str) -> bool {
+    let normalized = query.replace('\\', "/");
+    extract_query_mentions(&normalized)
+        .iter()
+        .any(|mention| matches!(mention, QueryMention::Path(_)))
+        || normalized.split_whitespace().any(|token| {
+            let token = token.trim_matches(|c| matches!(c, '`' | '\'' | '"' | ',' | ';'));
+            token.ends_with('/')
+                || token.starts_with("./")
+                || token.starts_with("../")
+                || token.starts_with('/')
+                || (token
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphabetic)
+                    && token.as_bytes().get(1..3) == Some(b":/"))
+                || token.contains("/*")
+                || token.contains("/?")
+                || (token.contains('/') && has_dir_segment(token, &["bench", "scripts"]))
+        })
+        || query_names_foreign_platform(query, false)
+        || query_names_foreign_platform(query, true)
+}
+
 fn apply_path_penalties(results: &mut [SearchResult], query: &str, test_files: &TestFileFlags) {
     let is_test_query = query_is_test_shaped(query);
+    let auxiliary_files: HashSet<String> = if query_names_path_or_platform(query) {
+        HashSet::new()
+    } else {
+        results
+            .iter()
+            .map(|result| &result.file_path)
+            .filter(|path| auxiliary_path(path))
+            .cloned()
+            .collect()
+    };
     let demote_php_declaration = php_declaration_demote_enabled();
     // Require a competing .c implementation; otherwise exempt inline headers get
     // a free relative boost in header-only projects detected as C.
@@ -1904,11 +1945,11 @@ fn apply_path_penalties(results: &mut [SearchResult], query: &str, test_files: &
         .iter()
         .any(|r| r.language == Language::C && r.file_path.ends_with(".c"));
     for result in results.iter_mut() {
-        let mut penalty = path_penalty(
-            &result.file_path,
-            test_files.is_test(&result.file_path),
-            is_test_query,
-        );
+        let is_test_file = test_files.is_test(&result.file_path);
+        let mut penalty = path_penalty(&result.file_path, is_test_file, is_test_query);
+        if auxiliary_files.contains(&result.file_path) && (!is_test_file || is_test_query) {
+            penalty *= SOFT_PENALTY_STRONG * EXTRA_TEST_DEMOTE_NON_TEST_QUERY;
+        }
         if has_c_implementation {
             penalty *= declaration_header_penalty(&result.file_path, result.language);
         }
@@ -3497,6 +3538,93 @@ mod test_query_aware_penalty_tests {
         assert!(query_is_test_shaped("login fixtures"));
         assert!(query_is_test_shaped("phpt for string"));
         assert!(query_is_test_shaped("UPPERCASE TEST query")); // case-insensitive
+    }
+
+    #[test]
+    fn ordinary_queries_demote_bench_and_script_files_once() {
+        let mut rows: Vec<_> = [
+            "src/runtime.js",
+            "bench/runtime.js",
+            "scripts/runtime.js",
+            "tools/scripts/runtime.js",
+            "scripts/test_runtime.js",
+            "src/benchmarks.js",
+            "src/scripts_parser.js",
+            "tools\\scripts\\runtime.js",
+        ]
+        .into_iter()
+        .map(|path| mk(path, 1.0))
+        .collect();
+        let flags = TestFileFlags::heuristic(&rows);
+        apply_path_penalties(&mut rows, "runtime initialization", &flags);
+        for row in rows {
+            let expected = if [
+                "src/runtime.js",
+                "src/benchmarks.js",
+                "src/scripts_parser.js",
+            ]
+            .contains(&row.file_path.as_str())
+            {
+                1.0
+            } else {
+                0.15
+            };
+            assert!(
+                (row.score - expected).abs() < 1e-6,
+                "{}: {}",
+                row.file_path,
+                row.score
+            );
+        }
+    }
+
+    #[test]
+    fn path_and_platform_queries_lift_only_the_auxiliary_penalty() {
+        for query in [
+            "bench/runtime.js initialization",
+            "bench\\runtime.js initialization",
+            "find scripts/",
+            "find scripts\\",
+            "search under ./scripts/tools",
+            "search under ../scripts/tools",
+            "search under /project/scripts/tools",
+            "search under C:\\project\\scripts\\tools",
+            "search under scripts/tools",
+            "scripts/**/*.js",
+            "Linux runtime initialization",
+            "Windows runtime initialization",
+            "portable runtime initialization",
+        ] {
+            let mut rows: Vec<_> = ["bench/runtime.js", "scripts/runtime.js", "tests/runtime.js"]
+                .into_iter()
+                .map(|path| mk(path, 1.0))
+                .collect();
+            let flags = TestFileFlags::heuristic(&rows);
+            apply_path_penalties(&mut rows, query, &flags);
+            for row in rows {
+                let expected = if row.file_path.starts_with("tests/") {
+                    0.15
+                } else {
+                    1.0
+                };
+                assert!(
+                    (row.score - expected).abs() < 1e-6,
+                    "{query}: {}: {}",
+                    row.file_path,
+                    row.score
+                );
+            }
+        }
+        for query in [
+            "runtime windowsize",
+            "testimony",
+            "request/response processing",
+        ] {
+            let mut rows = vec![mk("scripts/runtime.js", 1.0)];
+            let flags = TestFileFlags::heuristic(&rows);
+            apply_path_penalties(&mut rows, query, &flags);
+            assert!((rows[0].score - 0.15).abs() < 1e-6, "{query}");
+        }
     }
 
     #[test]

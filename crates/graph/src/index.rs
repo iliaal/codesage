@@ -11,7 +11,7 @@ use codesage_storage::db::FingerprintInput;
 use codesage_storage::{Database, is_unique_violation};
 use rayon::prelude::*;
 
-use codesage_parser::discover::{DiscoveryReport, discover_files_report_with_cache};
+use codesage_parser::discover::{DiscoveryReport, discover_files_report_with_context};
 use codesage_parser::extract::{extract_symbols, file_is_test_by_syntax};
 use codesage_parser::fingerprint::{FunctionFingerprint, file_fingerprints_cancellable};
 use codesage_parser::parse::{ParsedTree, parse_file_tolerant};
@@ -39,6 +39,11 @@ fn parse_one(
     let snapshot = read_indexable_file(root, Path::new(&file_info.path))
         .with_context(|| format!("reading {}", file_info.path))?
         .with_context(|| format!("{} exceeds the indexable file size cap", file_info.path))?;
+    ensure!(
+        !is_header_context_path(&file_info.path) || snapshot.content_hash == file_info.content_hash,
+        "{} changed after header routing; retry indexing",
+        file_info.path
+    );
     let mut info = file_info.clone();
     info.content_hash = snapshot.content_hash;
     parse_source(&info, &snapshot.bytes, java_context)
@@ -224,6 +229,10 @@ fn count_written(stats: &mut IndexStats, p: &ParsedFile) {
     stats.files_indexed += 1;
     if p.degraded {
         stats.files_degraded += 1;
+        *stats
+            .files_degraded_by_language
+            .entry(p.info.language.to_string())
+            .or_default() += 1;
     }
 }
 
@@ -292,9 +301,29 @@ fn index(
     } else {
         HashMap::new()
     };
-    let discovery = discover_files_report_with_cache(root, exclude_patterns, &cache)?;
+    let previous = header_routing_context(db)?;
+    let discovery = discover_files_report_with_context(root, exclude_patterns, &cache, &previous)?;
     db.replace_file_hash_cache(&discovery.hash_cache)?;
     index_discovery_report(root, db, &discovery, strategy, verbose)
+}
+
+pub(crate) fn header_routing_context(db: &Database) -> Result<Vec<FileInfo>> {
+    let interpretations = db.all_file_interpretations()?;
+    let files = db.overlay_file_infos()?;
+    if files
+        .iter()
+        .filter(|file| {
+            file.path.ends_with(".h")
+                || codesage_parser::header::is_cpp_evidence(Path::new(&file.path))
+        })
+        .any(|file| {
+            interpretations.get(&file.path).and_then(Option::as_deref)
+                != Some(STRUCTURAL_INTERPRETATION)
+        })
+    {
+        return Ok(Vec::new());
+    }
+    Ok(files)
 }
 
 /// Index an already-discovered file set. `files` is the complete set for
@@ -331,6 +360,55 @@ fn index_discovery_report(
 ) -> Result<IndexStats> {
     let files = &discovery.files;
     let mut stats = IndexStats::default();
+    let cpp_context = |files: &[FileInfo]| {
+        files
+            .iter()
+            .filter(|file| codesage_parser::header::is_cpp_evidence(Path::new(&file.path)))
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    (file.content_hash.clone(), file.language),
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    let headers = |files: &[FileInfo]| {
+        files
+            .iter()
+            .filter(|file| file.path.ends_with(".h"))
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    (file.content_hash.clone(), file.language),
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    let previous = db.overlay_file_infos()?;
+    let previous_cpp = cpp_context(&previous);
+    let current_cpp = cpp_context(files);
+    let previous_headers = headers(&previous);
+    let current_headers = headers(files);
+    let header_membership_changed = previous_headers.len() != current_headers.len()
+        || previous_headers
+            .keys()
+            .any(|path| !current_headers.contains_key(path));
+    // Orphan removal is atomic. C++ edits can leave a mixed context after a
+    // partial write, even when the complete old and new header decisions match.
+    let only_cpp_removals = current_cpp.len() < previous_cpp.len()
+        && current_cpp
+            .iter()
+            .all(|(path, state)| previous_cpp.get(path) == Some(state));
+    let retained_headers = only_cpp_removals && previous_headers == current_headers;
+    if (previous_cpp != current_cpp && !retained_headers)
+        || header_membership_changed
+        || discovery
+            .failed_paths
+            .iter()
+            .any(|path| is_header_context_path(path))
+    {
+        mark_header_context_stale(db)?;
+    }
 
     if verbose {
         tracing::info!(total = files.len(), "discovered files for structural index");
@@ -365,6 +443,10 @@ fn index_discovery_report(
     let unavailable_java_source = discovery.failed_paths.iter().any(|path| {
         path.ends_with(".java") || existing_languages.get(path) == Some(&Language::Java)
     });
+    let unavailable_header_source = discovery
+        .failed_paths
+        .iter()
+        .any(|path| is_header_context_path(path));
     let mut to_parse: Vec<&FileInfo> = match strategy {
         IndexStrategy::Full => files.iter().collect(),
         IndexStrategy::Incremental => {
@@ -407,6 +489,16 @@ fn index_discovery_report(
         .map(|file| file.path.clone())
         .collect();
     let mut context_failed_paths = Vec::new();
+    if unavailable_header_source {
+        to_parse.retain(|file| {
+            if file.path.ends_with(".h") {
+                context_failed_paths.push(file.path.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
     let java_context = if to_parse.iter().any(|file| file.language == Language::Java)
         || unavailable_java_source
     {
@@ -467,6 +559,13 @@ fn index_discovery_report(
         .extend(discovery.failed_paths.iter().cloned());
     stats.files_failed += context_failed_paths.len();
     stats.failed_paths.extend(context_failed_paths);
+    if stats
+        .failed_paths
+        .iter()
+        .any(|path| is_header_context_path(path))
+    {
+        mark_header_context_stale(db)?;
+    }
     Ok(stats)
 }
 
@@ -506,6 +605,13 @@ pub fn index_files(
 
     if files.is_empty() {
         return Ok(stats);
+    }
+    let known_paths: HashSet<_> = db.all_file_paths()?.into_iter().collect();
+    if files.iter().any(|file| {
+        codesage_parser::header::is_cpp_evidence(Path::new(&file.path))
+            || (file.path.ends_with(".h") && !known_paths.contains(&file.path))
+    }) {
+        mark_header_context_stale(db)?;
     }
 
     if verbose {
@@ -581,6 +687,22 @@ fn mark_java_context_stale(db: &Database) -> Result<()> {
     })
 }
 
+fn is_header_context_path(path: &str) -> bool {
+    path.ends_with(".h") || codesage_parser::header::is_cpp_evidence(Path::new(path))
+}
+
+fn mark_header_context_stale(db: &Database) -> Result<()> {
+    let files = db.all_files_with_id_and_language()?;
+    db.execute_batch(|db| {
+        for (id, path, _) in &files {
+            if path.ends_with(".h") {
+                db.record_file_interpretation(*id, "codesage/structural/header-context-stale")?;
+            }
+        }
+        Ok(())
+    })
+}
+
 pub fn remove_files_with_source(root: &Path, db: &Database, paths: &[String]) -> Result<usize> {
     let java_changed = paths.iter().any(|path| path.ends_with(".java"))
         || db
@@ -595,6 +717,9 @@ pub fn remove_files_with_source(root: &Path, db: &Database, paths: &[String]) ->
 }
 
 pub fn remove_files(db: &Database, paths: &[String]) -> Result<usize> {
+    if paths.iter().any(|path| is_header_context_path(path)) {
+        mark_header_context_stale(db)?;
+    }
     let mut removed = 0;
     db.execute_batch(|db| {
         for path in paths {
@@ -636,6 +761,27 @@ mod tests {
         assert_eq!(parsed.info.content_hash, content_hash(source));
         assert_eq!(parsed.symbols.len(), 1);
         assert_eq!(parsed.symbols[0].name, "after");
+    }
+
+    #[test]
+    fn structural_reader_rejects_header_context_snapshot_drift() {
+        let root = tempfile::tempdir().unwrap();
+        for (path, language) in [("api.h", Language::C), ("api.cpp", Language::Cpp)] {
+            let info = file(
+                root.path(),
+                path,
+                language,
+                b"struct Before { int value; };\n",
+            );
+            std::fs::write(root.path().join(path), b"struct After { int value; };\n").unwrap();
+            let Err(error) = parse_one(root.path(), &info, &JavaTypeContext::default()) else {
+                panic!("snapshot drift must fail");
+            };
+            assert!(
+                error.to_string().contains("changed after header routing"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]
@@ -829,6 +975,195 @@ mod tests {
             info.content_hash
         );
         assert_eq!(db.symbols_for_file("a.py").unwrap()[0].name, "obsolete");
+    }
+
+    #[test]
+    fn interrupted_cpp_removal_cannot_reuse_a_rolled_back_header() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["cpp", "include"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        let original_header =
+            b"struct Api { int value; };\nint read_api(void) { return called(); }\n";
+        let old_header = file(root.path(), "include/api.h", Language::Cpp, original_header);
+        file(
+            root.path(),
+            "cpp/main.cpp",
+            Language::Cpp,
+            b"#include <api.h>\nvoid marker() {}\n",
+        );
+        let retained_cpp = file(
+            root.path(),
+            "cpp/keep.cpp",
+            Language::Cpp,
+            b"void marker() {}\n",
+        );
+        let db = Database::open_in_memory().unwrap();
+        full_index(root.path(), &db, &[], false).unwrap();
+        let header_language = |db: &Database| {
+            db.overlay_file_infos()
+                .unwrap()
+                .into_iter()
+                .find(|file| file.path == "include/api.h")
+                .unwrap()
+                .language
+        };
+        assert_eq!(header_language(&db), Language::Cpp);
+
+        std::fs::remove_file(root.path().join("cpp/main.cpp")).unwrap();
+        file(
+            root.path(),
+            "include/api.h",
+            Language::Cpp,
+            b"int broken( {\n",
+        );
+        let discovered =
+            codesage_parser::discover::discover_files_with_excludes(root.path(), &[]).unwrap();
+        assert_eq!(discovered.len(), 2);
+        assert_eq!(discovered.last().unwrap().language, Language::Cpp);
+        db.execute_raw_for_tests(
+            "CREATE TRIGGER fail_header BEFORE UPDATE OF boundaries_derived_at ON files
+             WHEN NEW.path = 'include/api.h' AND NEW.boundaries_derived_at > 0
+             BEGIN SELECT RAISE(ABORT, 'header write rejected'); END;",
+        )
+        .unwrap();
+
+        let error = index_discovered(
+            root.path(),
+            &db,
+            &discovered,
+            IndexStrategy::Incremental,
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("header write rejected"));
+        let hashes = db.all_file_hashes().unwrap();
+        assert!(!hashes.contains_key("cpp/main.cpp"));
+        assert_eq!(hashes["cpp/keep.cpp"], retained_cpp.content_hash);
+        assert_eq!(hashes["include/api.h"], old_header.content_hash);
+        db.execute_raw_for_tests("DROP TRIGGER fail_header;")
+            .unwrap();
+        std::fs::write(root.path().join("include/api.h"), original_header).unwrap();
+
+        incremental_index(root.path(), &db, &[], false).unwrap();
+        let rebuilt = Database::open_in_memory().unwrap();
+        full_index(root.path(), &rebuilt, &[], false).unwrap();
+        assert_eq!(header_language(&db), Language::C);
+        assert_eq!(header_language(&db), header_language(&rebuilt));
+        assert_eq!(
+            db.symbols_for_file("include/api.h").unwrap(),
+            rebuilt.symbols_for_file("include/api.h").unwrap()
+        );
+        let references = db
+            .references_in_file_range("include/api.h", 1, u32::MAX)
+            .unwrap();
+        assert!(references.iter().any(|reference| {
+            reference.to_name == "called" && reference.from_symbol.as_deref() == Some("read_api")
+        }));
+        assert_eq!(
+            references,
+            rebuilt
+                .references_in_file_range("include/api.h", 1, u32::MAX)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn interrupted_cpp_include_transfer_cannot_attest_an_unchanged_header() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["cpp", "include"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        file(
+            root.path(),
+            "include/api.h",
+            Language::Cpp,
+            b"struct Api { int value; };\nint read_api(void) { return called(); }\n",
+        );
+        file(
+            root.path(),
+            "cpp/first.cpp",
+            Language::Cpp,
+            b"#include <api.h>\nvoid first() {}\n",
+        );
+        let old_second = file(
+            root.path(),
+            "cpp/second.cpp",
+            Language::Cpp,
+            b"void second() {}\n",
+        );
+        let db = Database::open_in_memory().unwrap();
+        full_index(root.path(), &db, &[], false).unwrap();
+        let old_headers: Vec<_> = db
+            .overlay_file_infos()
+            .unwrap()
+            .into_iter()
+            .filter(|file| file.path.ends_with(".h"))
+            .collect();
+        assert_eq!(old_headers[0].language, Language::Cpp);
+
+        let changed_first = file(
+            root.path(),
+            "cpp/first.cpp",
+            Language::Cpp,
+            b"void first() {}\n",
+        );
+        file(
+            root.path(),
+            "cpp/second.cpp",
+            Language::Cpp,
+            b"#include <api.h>\nvoid second() {}\n",
+        );
+        let discovered =
+            codesage_parser::discover::discover_files_with_excludes(root.path(), &[]).unwrap();
+        assert_eq!(
+            discovered
+                .iter()
+                .filter(|file| file.path.ends_with(".h"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            old_headers
+        );
+        db.execute_raw_for_tests(
+            "CREATE TRIGGER fail_second BEFORE UPDATE OF boundaries_derived_at ON files
+             WHEN NEW.path = 'cpp/second.cpp' AND NEW.boundaries_derived_at > 0
+             BEGIN SELECT RAISE(ABORT, 'second source write rejected'); END;",
+        )
+        .unwrap();
+        let error = index_discovered(
+            root.path(),
+            &db,
+            &discovered,
+            IndexStrategy::Incremental,
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("second source write rejected"));
+        let hashes = db.all_file_hashes().unwrap();
+        assert_eq!(hashes["cpp/first.cpp"], changed_first.content_hash);
+        assert_eq!(hashes["cpp/second.cpp"], old_second.content_hash);
+        db.execute_raw_for_tests("DROP TRIGGER fail_second;")
+            .unwrap();
+        std::fs::write(root.path().join("cpp/second.cpp"), b"void second() {}\n").unwrap();
+
+        incremental_index(root.path(), &db, &[], false).unwrap();
+        let rebuilt = Database::open_in_memory().unwrap();
+        full_index(root.path(), &rebuilt, &[], false).unwrap();
+        assert_eq!(
+            db.overlay_file_infos().unwrap(),
+            rebuilt.overlay_file_infos().unwrap()
+        );
+        assert_eq!(
+            db.symbols_for_file("include/api.h").unwrap(),
+            rebuilt.symbols_for_file("include/api.h").unwrap()
+        );
+        assert_eq!(
+            db.references_in_file_range("include/api.h", 1, u32::MAX)
+                .unwrap(),
+            rebuilt
+                .references_in_file_range("include/api.h", 1, u32::MAX)
+                .unwrap()
+        );
     }
 
     /// Simulate a file disappearing after discovery.

@@ -173,6 +173,74 @@ fn fixture() -> tempfile::TempDir {
 }
 
 #[test]
+fn dependencies_stdio_and_cli_keep_internal_handles_and_full_raw_recovery() {
+    let root = fixture();
+    let mut server = Server::start();
+    for detail in ["compact", "standard", "full"] {
+        let command: Value = serde_json::from_slice(&cli(
+            root.path(),
+            &["dependencies", "src/lib.rs", "--detail", detail, "--json"],
+        ))
+        .unwrap();
+        assert_eq!(command["imports"], json!(["file:src/helper.rs"]));
+        assert_eq!(command.get("raw_imports").is_some(), detail == "full");
+        let response = server.call(
+            "list_dependencies",
+            json!({"project":root.path(), "target":"src/lib.rs", "detail":detail}),
+        );
+        assert_ne!(response["isError"], true, "{response}");
+        let mcp = &response["structuredContent"];
+        for field in [
+            "imports",
+            "test_imports",
+            "externals",
+            "unresolved_imports",
+            "intra_file_imports",
+            "raw_imports",
+            "imported_by",
+        ] {
+            assert_eq!(
+                mcp.get(field),
+                command.get(field),
+                "{detail}: {field}: {response}"
+            );
+        }
+        if detail == "full" {
+            assert!(
+                command["raw_imports"]["imports"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("crate::helper::leaf"))
+            );
+        }
+    }
+    let full: Value = serde_json::from_slice(&cli(
+        root.path(),
+        &[
+            "dependencies",
+            "src/helper.rs",
+            "--detail",
+            "full",
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(full["intra_file_imports"], 1);
+    assert!(
+        full["raw_imports"]["test_imports"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("super::leaf"))
+    );
+    let human = String::from_utf8(cli(root.path(), &["dependencies", "src/helper.rs"])).unwrap();
+    assert!(
+        human.contains("Omitted 1 same-file import spellings"),
+        "{human}"
+    );
+    assert!(!human.contains("super::leaf"), "{human}");
+}
+
+#[test]
 fn describe_stdio_and_cli_surface_plugin_saved_findings() {
     let root = fixture();
     let generator = Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use anyhow::Result;
-use codesage_protocol::{Symbol, SymbolKind};
+use codesage_protocol::{Reference, Symbol, SymbolKind};
 use codesage_storage::Database;
 
 use crate::bundle::rust_crate_layout;
@@ -22,15 +22,77 @@ struct Module {
 }
 
 #[derive(Default)]
+struct CandidateCache {
+    rows: HashMap<String, HashMap<String, Vec<String>>>,
+    entries: usize,
+    bytes: usize,
+}
+
+const CANDIDATE_CACHE_ENTRIES: usize = 16_384;
+const CANDIDATE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
 pub(crate) struct RustModules {
     modules: HashMap<String, Vec<Module>>,
     declared: HashSet<String>,
     capped: bool,
     scopes: Mutex<HashMap<String, Vec<Symbol>>>,
     external: Mutex<Option<external::ExternalCrates>>,
+    candidates: Mutex<CandidateCache>,
+}
+
+#[derive(Default)]
+pub(crate) struct RustImportEvidence {
+    pub bindings: HashMap<(u32, u32), String>,
+    pub module_items: Option<HashSet<(u32, u32)>>,
 }
 
 impl RustModules {
+    pub(crate) fn import_evidence(
+        &self,
+        db: &Database,
+        caller: &str,
+    ) -> Result<RustImportEvidence> {
+        let mut external = self
+            .external
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        external
+            .get_or_insert_with(|| external::ExternalCrates::new(db, &self.modules))
+            .import_evidence(db, caller)
+    }
+
+    pub(crate) fn external_package(
+        &self,
+        db: &Database,
+        caller: &str,
+        spelling: &str,
+        is_test: bool,
+        sites: &[&Reference],
+    ) -> Result<Option<(String, bool)>> {
+        let mut external = self
+            .external
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        external
+            .get_or_insert_with(|| external::ExternalCrates::new(db, &self.modules))
+            .package_import(db, caller, spelling, is_test, sites)
+    }
+
+    pub(crate) fn external_import_file(
+        &self,
+        db: &Database,
+        row: &Reference,
+    ) -> Result<Option<String>> {
+        let mut external = self
+            .external
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        external
+            .get_or_insert_with(|| external::ExternalCrates::new(db, &self.modules))
+            .import_file(db, row)
+    }
+
     pub(crate) fn capped(&self) -> bool {
         self.capped
             || self
@@ -236,6 +298,61 @@ impl RustModules {
     }
 
     pub(crate) fn candidates(&self, file: &str, module: &str) -> Option<Vec<String>> {
+        if let Some(candidates) = self
+            .candidates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rows
+            .get(file)
+            .and_then(|rows| rows.get(module))
+        {
+            return Some(candidates.clone());
+        }
+        let result = self.uncached_candidates(file, module);
+        if let Some(candidates) = &result {
+            let mut cache = self
+                .candidates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache
+                .rows
+                .get(file)
+                .is_some_and(|rows| rows.contains_key(module))
+            {
+                return result;
+            }
+            let file_bytes = if cache.rows.contains_key(file) {
+                0
+            } else {
+                file.len()
+            };
+            let bytes = candidates
+                .iter()
+                .fold(
+                    candidates
+                        .len()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                    |bytes, candidate| bytes.saturating_add(candidate.len()),
+                )
+                .saturating_add(module.len())
+                .saturating_add(file_bytes);
+            // Retention limits affect reuse only; resolution always returns its full result.
+            if cache.entries < CANDIDATE_CACHE_ENTRIES
+                && bytes <= CANDIDATE_CACHE_BYTES.saturating_sub(cache.bytes)
+            {
+                cache
+                    .rows
+                    .entry(file.to_string())
+                    .or_default()
+                    .insert(module.to_string(), candidates.clone());
+                cache.entries += 1;
+                cache.bytes += bytes;
+            }
+        }
+        result
+    }
+
+    fn uncached_candidates(&self, file: &str, module: &str) -> Option<Vec<String>> {
         if self.capped {
             return Some(Vec::new());
         }
@@ -244,7 +361,7 @@ impl RustModules {
         };
         let mut common: Option<Vec<String>> = None;
         for context in contexts {
-            let mut parts = context.path.clone();
+            let mut parts: Vec<_> = context.path.iter().map(String::as_str).collect();
             let mut segments = module.split("::").peekable();
             match segments.peek().copied() {
                 Some("crate") => {
@@ -264,7 +381,7 @@ impl RustModules {
                 }
                 _ => parts.clear(),
             }
-            parts.extend(segments.map(str::to_string));
+            parts.extend(segments);
             let candidates = if parts.is_empty() {
                 vec![context.root_file.clone()]
             } else {
@@ -312,9 +429,9 @@ impl RustModules {
     }
 
     pub(crate) fn note(&self, file: &str, imported_by: &[String]) -> Option<&'static str> {
-        if self.capped {
+        if self.capped() {
             return Some(
-                "Rust module-context limit reached; context-dependent dependencies are omitted.",
+                "Rust module-context or external-resolution limit reached; unresolved dependencies remain unverified.",
             );
         }
         if self.modules.get(file).is_some_and(Vec::is_empty) {
@@ -345,6 +462,96 @@ mod tests {
     use codesage_protocol::{
         CallPathRequest, ExportRequest, ImpactOptions, ImpactRequest, ImpactTarget,
     };
+
+    fn candidate_context() -> RustModules {
+        RustModules {
+            modules: HashMap::from([(
+                "src/nested/child.rs".to_string(),
+                vec![Module {
+                    root_file: "src/lib.rs".to_string(),
+                    root_dir: "src/".to_string(),
+                    path: vec!["nested".to_string(), "child".to_string()],
+                }],
+            )]),
+            ..RustModules::default()
+        }
+    }
+
+    #[test]
+    fn candidate_memo_preserves_paths_order_and_unknown_states() {
+        let modules = candidate_context();
+        let file = "src/nested/child.rs";
+        for (module, expected) in [
+            ("crate", vec!["src/lib.rs"]),
+            ("crate::api", vec!["src/api.rs", "src/api/mod.rs"]),
+            (
+                "self",
+                vec!["src/nested/child.rs", "src/nested/child/mod.rs"],
+            ),
+            ("super", vec!["src/nested.rs", "src/nested/mod.rs"]),
+            ("super::super", vec!["src/lib.rs"]),
+            ("super::super::super", vec![]),
+            ("other", vec!["src/other.rs", "src/other/mod.rs"]),
+        ] {
+            let expected = Some(expected.into_iter().map(str::to_string).collect());
+            assert_eq!(modules.candidates(file, module), expected);
+            assert_eq!(modules.candidates(file, module), expected);
+        }
+        assert_eq!(modules.candidates("unknown.rs", "crate"), None);
+        assert_eq!(modules.candidates("unknown.rs", "crate"), None);
+        assert_eq!(modules.candidates.lock().unwrap().entries, 7);
+
+        let mut ambiguous = candidate_context();
+        ambiguous.modules.get_mut(file).unwrap().push(Module {
+            root_file: "alternate/lib.rs".to_string(),
+            root_dir: "alternate/".to_string(),
+            path: vec![],
+        });
+        assert_eq!(ambiguous.candidates(file, "crate::api"), Some(vec![]));
+        assert_eq!(ambiguous.candidates(file, "crate::api"), Some(vec![]));
+        let capped = RustModules {
+            capped: true,
+            ..RustModules::default()
+        };
+        assert_eq!(capped.candidates(file, "crate"), Some(vec![]));
+        assert_eq!(capped.candidates(file, "crate"), Some(vec![]));
+    }
+
+    #[test]
+    fn candidate_memo_limits_only_retention_not_resolution() {
+        let file = "src/nested/child.rs";
+        for prefix in [String::new(), "x".repeat(512)] {
+            let modules = candidate_context();
+            let mut retained = 0;
+            let mut rejected = None;
+            for index in 0..=CANDIDATE_CACHE_ENTRIES {
+                let module = format!("{prefix}entry{index}");
+                let expected = Some(vec![
+                    format!("src/{module}.rs"),
+                    format!("src/{module}/mod.rs"),
+                ]);
+                assert_eq!(modules.candidates(file, &module), expected);
+                let cache = modules.candidates.lock().unwrap();
+                assert!(cache.entries <= CANDIDATE_CACHE_ENTRIES);
+                assert!(cache.bytes <= CANDIDATE_CACHE_BYTES);
+                if cache.entries == retained {
+                    if prefix.is_empty() {
+                        assert_eq!(cache.entries, CANDIDATE_CACHE_ENTRIES);
+                    } else {
+                        assert!(cache.entries < CANDIDATE_CACHE_ENTRIES);
+                    }
+                    rejected = Some((module, expected));
+                    break;
+                }
+                retained = cache.entries;
+            }
+            let (module, expected) = rejected.expect("one retention limit must be reached");
+            assert_eq!(modules.candidates(file, &module), expected);
+            assert_eq!(modules.candidates(file, &module), expected);
+            assert_eq!(modules.candidates.lock().unwrap().entries, retained);
+            assert!(!modules.capped());
+        }
+    }
 
     #[test]
     fn public_rust_resolution_requests_build_context_once() {

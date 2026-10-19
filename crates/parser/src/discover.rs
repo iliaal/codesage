@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use anyhow::Result;
@@ -10,7 +9,7 @@ use codesage_protocol::{CoverageSurvey, FileInfo, Language};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 
-use crate::detect::{detect_language_with_dialect, is_unambiguous_cpp_extension};
+use crate::detect::detect_language_with_dialect;
 use crate::source::IndexableFile;
 
 /// Bound per-file allocation even when generated files evade exclusion patterns.
@@ -56,13 +55,21 @@ pub fn discover_files_report_with_cache(
     exclude_patterns: &[String],
     cache: &HashMap<String, CachedFileHash>,
 ) -> Result<DiscoveryReport> {
+    discover_files_report_with_context(root, exclude_patterns, cache, &[])
+}
+
+pub fn discover_files_report_with_context(
+    root: &Path,
+    exclude_patterns: &[String],
+    cache: &HashMap<String, CachedFileHash>,
+    previous: &[FileInfo],
+) -> Result<DiscoveryReport> {
     let excludes = if exclude_patterns.is_empty() {
         None
     } else {
         Some(build_exclude_set(exclude_patterns)?)
     };
 
-    // Resolve header dialect after all workers have observed the project's C++ files.
     let mut builder = ignore::WalkBuilder::new(root);
     builder.hidden(true).git_ignore(true);
     if let Some(excludes_for_filter) = excludes.clone() {
@@ -82,7 +89,6 @@ pub fn discover_files_report_with_cache(
     }
     let walker = builder.build_parallel();
 
-    let saw_cpp = AtomicBool::new(false);
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let (tx, rx) = mpsc::channel::<FileInfo>();
     let (failed_tx, failed_rx) = mpsc::channel::<String>();
@@ -94,7 +100,6 @@ pub fn discover_files_report_with_cache(
         let failed_tx = failed_tx.clone();
         let cache_tx = cache_tx.clone();
         let excludes = excludes.clone();
-        let saw_cpp = &saw_cpp;
         let first_err = &first_err;
         let root = root.clone();
         Box::new(move |entry| {
@@ -128,10 +133,6 @@ pub fn discover_files_report_with_cache(
                 && exclude_matches_path(exc, &rel_path, false)
             {
                 return WalkState::Continue;
-            }
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if is_unambiguous_cpp_extension(ext) {
-                saw_cpp.store(true, Ordering::Relaxed);
             }
             if let Ok(meta) = entry.metadata()
                 && meta.len() > MAX_INDEXABLE_FILE_BYTES
@@ -190,11 +191,13 @@ pub fn discover_files_report_with_cache(
     }
 
     let mut files: Vec<FileInfo> = rx.iter().collect();
-    if saw_cpp.load(Ordering::Relaxed) {
-        for f in &mut files {
-            if f.path.ends_with(".h") {
-                f.language = Language::Cpp;
-            }
+    let cpp_headers = match crate::header::unchanged_context(&files, previous) {
+        Some(headers) => headers,
+        None => crate::header::cpp_headers_with_context(&root, &files, previous)?,
+    };
+    for file in &mut files {
+        if cpp_headers.contains(&file.path) {
+            file.language = Language::Cpp;
         }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -294,7 +297,7 @@ fn project_relative_path(root: &Path, path: &Path) -> Option<String> {
         .map(|rel| rel.to_string_lossy().into_owned())
 }
 
-fn exclude_matches_path(excludes: &GlobSet, rel_path: &str, is_dir: bool) -> bool {
+pub(crate) fn exclude_matches_path(excludes: &GlobSet, rel_path: &str, is_dir: bool) -> bool {
     if excludes.is_match(rel_path) {
         return true;
     }
@@ -655,7 +658,8 @@ fn path_or_ancestor_excluded(excludes: &GlobSet, rel_path: &str) -> bool {
     false
 }
 
-/// Walk `root` and report coverage without reading or hashing file contents.
+/// Walk `root` and report coverage without hashing file contents.
+/// C++ include evidence is read when ambiguous headers are present.
 ///
 /// Keep diagnostic-only counting off the incremental indexing path.
 pub fn survey_coverage(root: &Path, exclude_patterns: &[String]) -> Result<CoverageSurvey> {
@@ -679,7 +683,7 @@ pub fn survey_coverage(root: &Path, exclude_patterns: &[String]) -> Result<Cover
     // Every path the indexing-equivalent pass accounted for, in any bucket.
     // The gitignore pass reports only what is missing from this set.
     let mut accounted: HashSet<String> = HashSet::new();
-    let mut c_headers = 0usize;
+    let mut covered_files = Vec::new();
 
     for entry in make_walker(true) {
         let entry = match entry {
@@ -729,9 +733,12 @@ pub fn survey_coverage(root: &Path, exclude_patterns: &[String]) -> Result<Cover
             continue;
         }
 
-        if rel_path.ends_with(".h") {
-            c_headers += 1;
-        }
+        covered_files.push(FileInfo {
+            path: rel_path,
+            language,
+            content_hash: String::new(),
+            is_test: false,
+        });
         *survey
             .covered_by_language
             .entry(language.to_string())
@@ -763,10 +770,10 @@ pub fn survey_coverage(root: &Path, exclude_patterns: &[String]) -> Result<Cover
         }
     }
 
-    // Apply discovery's project-wide header dialect to the coverage counts.
+    let c_headers = crate::header::cpp_headers(root, &covered_files)?.len();
     let cpp_key = Language::Cpp.to_string();
     let c_key = Language::C.to_string();
-    if c_headers > 0 && survey.covered_by_language.contains_key(&cpp_key) {
+    if c_headers > 0 {
         if let Some(c_total) = survey.covered_by_language.get_mut(&c_key) {
             *c_total = c_total.saturating_sub(c_headers);
             if *c_total == 0 {
@@ -890,11 +897,12 @@ mod coverage_survey_tests {
     }
 
     #[test]
-    fn headers_follow_the_project_wide_cpp_flip() {
+    fn headers_follow_local_cpp_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let r = dir.path();
         write(r, "src/app.cc", "int main() {}");
         write(r, "src/app.h", "#pragma once");
+        write(r, "c/api.h", "#pragma once\nstruct Api { int value; };\n");
 
         let s = survey_coverage(r, &[]).unwrap();
         assert_eq!(
@@ -903,7 +911,7 @@ mod coverage_survey_tests {
             "{:?}",
             s.covered_by_language
         );
-        assert_eq!(s.covered_by_language.get("c"), None);
+        assert_eq!(s.covered_by_language.get("c"), Some(&1));
     }
 
     #[test]

@@ -581,6 +581,117 @@ fn tokenize(src: &[u8]) -> Vec<Token> {
     tokens
 }
 
+/// Retain literal directives at their original byte offsets without parsing
+/// C++ expressions merely to establish header include evidence.
+pub(crate) fn directives_only(src: &[u8]) -> Vec<u8> {
+    let mut output: Vec<_> = src
+        .iter()
+        .map(|byte| {
+            if matches!(byte, b'\n' | b'\r') {
+                *byte
+            } else {
+                b' '
+            }
+        })
+        .collect();
+    let mut i = if src.starts_with(b"\xef\xbb\xbf") {
+        3
+    } else {
+        0
+    };
+    let mut line_start = true;
+    while i < src.len() {
+        if let Some(length) = splice_len(src, i) {
+            i += length;
+            continue;
+        }
+        if src[i] == b'\n' {
+            line_start = true;
+            i += 1;
+            continue;
+        }
+        if src[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if src.get(i..i + 2) == Some(b"//") {
+            i = skip_spliced_comment(src, i);
+            continue;
+        }
+        if src.get(i..i + 2) == Some(b"/*") {
+            let end = skip_block_comment(src, i);
+            let mut at = i;
+            while at < end {
+                if let Some(length) = splice_len(src, at) {
+                    at += length;
+                } else {
+                    line_start |= src[at] == b'\n';
+                    at += 1;
+                }
+            }
+            i = end;
+            continue;
+        }
+        if src[i] == b'#' && line_start {
+            let start = i;
+            i += 1;
+            while i < src.len() && src[i] != b'\n' {
+                if let Some(length) = splice_len(src, i) {
+                    i += length;
+                    continue;
+                }
+                if src.get(i..i + 2) == Some(b"//") {
+                    i = skip_spliced_comment(src, i);
+                } else if src.get(i..i + 2) == Some(b"/*") {
+                    i = skip_block_comment(src, i);
+                } else if matches!(src[i], b'\'' | b'"') {
+                    i = skip_quoted(src, i, src[i]);
+                } else {
+                    i += 1;
+                }
+            }
+            output[start..i].copy_from_slice(&src[start..i]);
+            continue;
+        }
+        line_start = false;
+        if matches!(src[i], b'\'' | b'"') {
+            i = skip_quoted(src, i, src[i]);
+        } else if src[i].is_ascii_alphabetic() || src[i] == b'_' {
+            let start = i;
+            while i < src.len() && (src[i].is_ascii_alphanumeric() || src[i] == b'_') {
+                i += 1;
+            }
+            if src.get(i) == Some(&b'"')
+                && matches!(&src[start..i], b"R" | b"LR" | b"uR" | b"UR" | b"u8R")
+            {
+                i = skip_raw_string(src, i);
+            }
+        } else if src[i].is_ascii_digit() {
+            i = skip_number(src, i);
+        } else {
+            i += 1;
+        }
+    }
+    output
+}
+
+fn splice_len(src: &[u8], i: usize) -> Option<usize> {
+    if src.get(i..i + 2) == Some(b"\\\n") {
+        Some(2)
+    } else if src.get(i..i + 3) == Some(b"\\\r\n") {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn skip_spliced_comment(src: &[u8], mut i: usize) -> usize {
+    while i < src.len() && src[i] != b'\n' {
+        i += splice_len(src, i).unwrap_or(1);
+    }
+    i
+}
+
 fn skip_line(src: &[u8], mut i: usize) -> usize {
     while i < src.len() && src[i] != b'\n' {
         i += 1;

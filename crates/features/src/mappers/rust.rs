@@ -15,6 +15,9 @@ use crate::mappers::shared::{
 };
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
 
+#[path = "rust_services.rs"]
+mod services;
+
 pub struct RustMapper;
 
 impl FeatureMapper for RustMapper {
@@ -152,6 +155,7 @@ fn seed_for_package(
             }
         }
     }
+    services::seed_mcp_servers(ctx, pkg_dir, &pkg_name, seeds);
     let tests_dir = pkg_dir.join("tests");
     if is_safe_dir(root, &tests_dir) {
         for p in sorted_read_dir(&tests_dir) {

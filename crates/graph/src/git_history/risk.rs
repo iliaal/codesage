@@ -1783,6 +1783,21 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
 /// without patch-level aggregation. See [`RiskBatchAssessment`] for the
 /// design distinction vs [`assess_risk_diff`].
 pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBatchAssessment> {
+    assess_risk_batch_with_detail(db, file_paths, true)
+}
+
+pub(crate) fn assess_risk_batch_for_ranking(
+    db: &Database,
+    file_paths: &[String],
+) -> Result<RiskBatchAssessment> {
+    assess_risk_batch_with_detail(db, file_paths, false)
+}
+
+fn assess_risk_batch_with_detail(
+    db: &Database,
+    file_paths: &[String],
+    resolve_top_symbols: bool,
+) -> Result<RiskBatchAssessment> {
     codesage_protocol::work::checkpoint()?;
     if file_paths.is_empty() {
         return Ok(RiskBatchAssessment::default());
@@ -1808,7 +1823,11 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
         .context("bulk churn percentiles for risk batch")?;
     let window = IndexWindow::probe(db)?;
     let mut cache = WalkCache::default();
-    let mut scope = RiskRequestScope::multi_file(&mut cache);
+    let mut scope = if resolve_top_symbols {
+        RiskRequestScope::multi_file(&mut cache)
+    } else {
+        RiskRequestScope::score_only(&mut cache)
+    };
     let mut files: Vec<RiskAssessment> = file_paths
         .iter()
         .map(|p| {
@@ -2164,6 +2183,103 @@ mod tests {
         assert_eq!(lean.score, full.score);
         assert_eq!(lean.notes, full.notes);
         assert_eq!(lean.unscored, full.unscored);
+    }
+
+    #[test]
+    fn ranking_batch_preserves_full_assessments_without_symbol_detail() {
+        let (_dir, db) = setup_project();
+        db.upsert_git_file("Repository.php", 5.0, 2, 10, Some(1_700_000_000))
+            .unwrap();
+        let paths = db.all_file_paths().unwrap();
+        let mut full = assess_risk_batch(&db, &paths).unwrap();
+        assert!(full.files.iter().any(|file| !file.top_symbols.is_empty()));
+
+        TOP_SYMBOLS_PASSES.with(|passes| passes.set(0));
+        let lean = assess_risk_batch_for_ranking(&db, &paths).unwrap();
+        assert_eq!(TOP_SYMBOLS_PASSES.with(std::cell::Cell::get), 0);
+        assert!(lean.files.iter().all(|file| file.top_symbols.is_empty()));
+        for file in &mut full.files {
+            file.top_symbols.clear();
+        }
+        assert_eq!(
+            serde_json::to_value(lean).unwrap(),
+            serde_json::to_value(full).unwrap()
+        );
+    }
+
+    #[test]
+    fn overview_ranking_preserves_both_populations_and_skips_symbol_detail() {
+        let (dir, db) = setup_project();
+        std::fs::create_dir(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("tests/check_repository.php"),
+            b"<?php\nnamespace App;\nuse App\\Repository;\nfunction test_find(Repository $r) { return $r->find(1); }\n",
+        )
+        .unwrap();
+        crate::full_index(dir.path(), &db, &[], false).unwrap();
+        db.upsert_git_file("Repository.php", 5.0, 2, 10, Some(1_700_000_000))
+            .unwrap();
+        db.upsert_git_file(
+            "tests/check_repository.php",
+            100.0,
+            8,
+            10,
+            Some(1_700_000_000),
+        )
+        .unwrap();
+        let _policy = CompletePolicy::enter(false);
+        let paths = db.all_file_paths().unwrap();
+        let full = assess_risk_batch(&db, &paths).unwrap();
+        let mut expected: Vec<_> = full.files.iter().collect();
+        expected.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let expected_rows = |include_tests: bool, only_tests: bool| {
+            expected
+                .iter()
+                .filter(|row| {
+                    let is_test = row.file.starts_with("tests/");
+                    (include_tests || !is_test) && (!only_tests || is_test)
+                })
+                .map(|row| (row.file.as_str(), row.score))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(expected_rows(true, true).len(), 1);
+
+        for include_tests in [false, true] {
+            TOP_SYMBOLS_PASSES.with(|passes| passes.set(0));
+            let ranking =
+                crate::session::top_risk_ranking_with_options(&db, false, include_tests).unwrap();
+            assert_eq!(TOP_SYMBOLS_PASSES.with(std::cell::Cell::get), 0);
+            assert_eq!(
+                ranking
+                    .rows()
+                    .iter()
+                    .map(|row| (row.file.as_str(), row.score))
+                    .collect::<Vec<_>>(),
+                expected_rows(include_tests, false),
+            );
+            assert_eq!(
+                ranking
+                    .test_rows()
+                    .iter()
+                    .map(|row| (row.file.as_str(), row.score))
+                    .collect::<Vec<_>>(),
+                expected_rows(true, true),
+            );
+            for row in ranking.assessments() {
+                let source = full
+                    .files
+                    .iter()
+                    .find(|file| file.file == row.file)
+                    .unwrap();
+                let notes: Vec<_> = source
+                    .notes
+                    .iter()
+                    .map(|note| full.legend.get(note).unwrap_or(note).clone())
+                    .collect();
+                assert_eq!(row.notes, notes);
+                assert_eq!(row.unscored, source.unscored);
+            }
+        }
     }
 
     #[test]

@@ -173,6 +173,7 @@ fn file_fingerprints_with_control(
 
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    let mut definition_names = crate::extract::DefinitionNames::new(root, source, language);
 
     while let Some(m) = matches.next() {
         if control.is_some_and(|control| control.check().is_err()) {
@@ -191,13 +192,15 @@ fn file_fingerprints_with_control(
             continue;
         };
         let def = def_cap.node;
-        let kind = crate::extract::refine_definition_kind(kind, &def, language);
         // Keep the fingerprinted set equal to the indexed symbol set: a
         // definition in a dead `#if 0` arm is not a symbol either.
         if dead.covers(&def) {
             continue;
         }
-        let captured = crate::parse::node_text_lossy(&name_cap.node, source);
+        let Some((captured, kind)) = definition_names.name(name_cap.node, kind) else {
+            continue;
+        };
+        let kind = crate::extract::refine_definition_kind(kind, &def, language);
         let name = if language == Language::Cpp {
             crate::extract::cpp_bare_name(&captured)
         } else {

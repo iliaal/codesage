@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -297,4 +297,317 @@ fn failure(result: &Value) -> Value {
     }
     assert_eq!(block["error"]["message"], text, "{block}");
     block
+}
+
+fn cli_fixture(source: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), source).unwrap();
+    run(dir.path(), "git", &["init", "-q"]);
+    run(dir.path(), "git", &["add", "lib.rs"]);
+    run(
+        dir.path(),
+        "git",
+        &[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-qm",
+            "baseline",
+        ],
+    );
+    dir
+}
+
+fn cli(root: &Path, args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .current_dir(root)
+        .args(args)
+        .env("CODESAGE_WATCH", "1")
+        .env("ORT_DYLIB_PATH", root.join("missing-ort-library"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn cli_report(output: Output) -> Value {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn cli_error(output: Output, code: i32, message: &str) {
+    assert_eq!(output.status.code(), Some(code));
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(message), "{stderr}");
+}
+
+#[test]
+fn cli_reads_file_and_stdin_with_full_mcp_payload_parity() {
+    let dir = cli_fixture("mod api { pub fn f(a: i32) {} }\nfn caller() { self::api::f(1); }\n");
+    let root = dir.path();
+    let cwd = root.join("nested");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::create_dir(cwd.join(".codesage")).unwrap();
+    let replacement = "fn f() {}";
+    std::fs::write(cwd.join("replacement.rs"), replacement).unwrap();
+    let source_before = std::fs::read(root.join("lib.rs")).unwrap();
+    let git_index_before = std::fs::read(root.join(".git/index")).unwrap();
+    let head = String::from_utf8(run(root, "git", &["rev-parse", "HEAD"])).unwrap();
+    let from_file = cli_report(cli(
+        &cwd,
+        &["edit-check", "lib.rs", "f", "replacement.rs", "--json"],
+        b"",
+    ));
+    assert_eq!(from_file["head"], head.trim());
+    assert_eq!(from_file["arity_changed"], true);
+    assert_eq!(from_file["visibility_changed"], true);
+    assert_eq!(
+        from_file["incompatible_callers"][0]["expression"],
+        "self::api::f"
+    );
+    assert_eq!(from_file["worktree_matches_head"], true);
+    for args in [
+        vec!["edit-check", "lib.rs", "f", "-", "--json"],
+        vec!["edit-check", "lib.rs", "sym:lib.rs#api::f@1", "--json"],
+    ] {
+        assert_eq!(
+            cli_report(cli(&cwd, &args, replacement.as_bytes())),
+            from_file
+        );
+    }
+    let mut session = Session::start();
+    let result = session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"lib.rs", "target":"f", "replacement":replacement}}));
+    assert_ne!(result["isError"], true, "{result}");
+    let mut mcp_payload = result["structuredContent"].clone();
+    for key in ["tool", "cost", "completeness", "next"] {
+        mcp_payload.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(from_file, mcp_payload);
+    assert_eq!(std::fs::read(root.join("lib.rs")).unwrap(), source_before);
+    assert_eq!(
+        std::fs::read(root.join(".git/index")).unwrap(),
+        git_index_before
+    );
+    assert!(!root.join(".codesage").exists());
+}
+
+#[test]
+fn cli_uses_head_despite_divergent_worktree_and_unusable_index() {
+    let dir = cli_fixture("pub fn f(a: i32) {}\n");
+    let root = dir.path();
+    std::fs::write(root.join("lib.rs"), "fn uncommitted() {}\n").unwrap();
+    std::fs::create_dir(root.join(".codesage")).unwrap();
+    let sentinel = format!("unreadable-index-sentinel:{}", root.display());
+    std::fs::write(root.join(".codesage/index.db"), &sentinel).unwrap();
+    std::fs::write(root.join(".codesage/config.toml"), "invalid = [").unwrap();
+    let report = cli_report(cli(
+        root,
+        &["edit-check", "lib.rs", "f", "--json"],
+        b"fn f() {}",
+    ));
+    assert_eq!(report["before"]["arity"]["minimum"], 1);
+    assert_eq!(report["worktree_matches_head"], false);
+    assert!(report["unknown"].as_array().unwrap().iter().any(|reason| {
+        reason
+            .as_str()
+            .unwrap()
+            .contains("working file differs from HEAD")
+    }));
+    assert_eq!(
+        std::fs::read_to_string(root.join("lib.rs")).unwrap(),
+        "fn uncommitted() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codesage/index.db")).unwrap(),
+        sentinel
+    );
+    assert!(!root.join(".codesage/watch.status").exists());
+}
+
+#[test]
+fn cli_replacement_byte_boundary_applies_to_files_and_stdin() {
+    let dir = cli_fixture("fn f() {}");
+    let root = dir.path();
+    let mut replacement = b"fn f() {}".to_vec();
+    replacement.resize(1_048_576, b' ');
+    let at_limit = cli_report(cli(
+        root,
+        &["edit-check", "lib.rs", "f", "--json"],
+        &replacement,
+    ));
+    assert_eq!(at_limit["symbol"], "f");
+    std::fs::write(root.join("replacement.rs"), &replacement).unwrap();
+    assert_eq!(
+        cli_report(cli(
+            root,
+            &["edit-check", "lib.rs", "f", "replacement.rs", "--json"],
+            b"",
+        )),
+        at_limit
+    );
+    replacement.push(b' ');
+    std::fs::write(root.join("replacement.rs"), &replacement).unwrap();
+    for (args, input) in [
+        (
+            vec!["edit-check", "lib.rs", "f", "--json"],
+            replacement.as_slice(),
+        ),
+        (
+            vec!["edit-check", "lib.rs", "f", "replacement.rs", "--json"],
+            b"".as_slice(),
+        ),
+    ] {
+        cli_error(cli(root, &args, input), 1, "replacement exceeds 1 MiB");
+    }
+}
+
+#[test]
+fn cli_refuses_bad_replacements_and_paths() {
+    let dir = cli_fixture("fn f() {}\n");
+    let root = dir.path();
+    for (input, message) in [
+        (b"".as_slice(), "replacement is empty"),
+        (b" \n\t".as_slice(), "replacement is empty"),
+        (b"\xff".as_slice(), "replacement must be UTF-8"),
+        (b"fn f( {".as_slice(), "replacement produces syntax errors"),
+        (b"fn g() {}".as_slice(), "retain the selected symbol name"),
+    ] {
+        cli_error(
+            cli(root, &["edit-check", "lib.rs", "f", "--json"], input),
+            1,
+            message,
+        );
+    }
+    std::fs::write(root.join("replacement.rs"), b"\xff").unwrap();
+    cli_error(
+        cli(
+            root,
+            &["edit-check", "lib.rs", "f", "replacement.rs", "--json"],
+            b"",
+        ),
+        1,
+        "replacement must be UTF-8",
+    );
+    cli_error(
+        cli(
+            root,
+            &["edit-check", "lib.rs", "f", "absent.rs", "--json"],
+            b"",
+        ),
+        1,
+        "opening replacement from absent.rs",
+    );
+    cli_error(
+        cli(
+            root,
+            &["edit-check", "../lib.rs", "f", "--json"],
+            b"fn f() {}",
+        ),
+        1,
+        "without traversal",
+    );
+    cli_error(
+        cli(
+            root,
+            &["edit-check", "missing.rs", "f", "--json"],
+            b"fn f() {}",
+        ),
+        1,
+        "not at Git HEAD",
+    );
+    cli_error(
+        cli(
+            root,
+            &["edit-check", "lib.rs", "sym:other.rs#f", "--json"],
+            b"fn f() {}",
+        ),
+        1,
+        "handle names `other.rs`",
+    );
+    let outside = tempfile::tempdir().unwrap();
+    cli_error(
+        cli(
+            outside.path(),
+            &["edit-check", "lib.rs", "f", "--json"],
+            b"",
+        ),
+        1,
+        "no Git worktree found",
+    );
+}
+
+#[test]
+fn cli_disambiguates_by_head_line_or_handle() {
+    let dir = cli_fixture("fn f() {}\nmod inner { fn f() {} }\n");
+    let root = dir.path();
+    cli_error(
+        cli(root, &["edit-check", "lib.rs", "f", "--json"], b"fn f() {}"),
+        1,
+        "starting at lines 1, 2",
+    );
+    cli_error(
+        cli(
+            root,
+            &["edit-check", "lib.rs", "f", "--line", "3", "--json"],
+            b"fn f() {}",
+        ),
+        1,
+        "starting at line 3",
+    );
+    for args in [
+        vec!["edit-check", "lib.rs", "f", "--line", "2", "--json"],
+        vec!["edit-check", "lib.rs", "sym:lib.rs#inner::f@2", "--json"],
+    ] {
+        assert_eq!(cli_report(cli(root, &args, b"fn f() {}"))["line"], 2);
+    }
+    cli_error(
+        cli(
+            root,
+            &["edit-check", "lib.rs", "f", "--line", "0", "--json"],
+            b"",
+        ),
+        2,
+        "positive integer",
+    );
+}
+
+#[test]
+fn cli_text_mode_exposes_limits_and_discovery_help() {
+    let dir = cli_fixture("pub fn f(a: i32) {}\n");
+    let output = cli(dir.path(), &["edit-check", "lib.rs", "f"], b"fn f() {}");
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("changed: arity=true, visibility=true"),
+        "{text}"
+    );
+    assert!(text.contains("unknown:"), "{text}");
+    assert!(
+        text.contains("not a compilation or safety verdict"),
+        "{text}"
+    );
+    let help = cli(dir.path(), &["edit-check", "--help"], b"");
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8(help.stdout).unwrap();
+    for required in [
+        "Git worktree root",
+        "relative to the current directory",
+        "Exit 0",
+        "exit 1",
+        "exit 2",
+        "--json",
+    ] {
+        assert!(text.contains(required), "missing {required}: {text}");
+    }
 }

@@ -20,9 +20,10 @@ Default device is `gpu`. The binary errors out if CUDA is requested but unavaila
 
 Resolve `${CLAUDE_PLUGIN_ROOT}/bin/codesage-onboard` from the currently installed
 plugin, including when refreshing a hint written by an older version. Invoke the
-executable through Bash with its path as one argument. Pass the project path and
-each parsed option as separate arguments; `$ARGUMENTS` supplies argument data,
-not shell source. The plugin does not install `codesage-onboard` on `PATH`.
+executable through [the argument transport procedure](<${CLAUDE_PLUGIN_ROOT}/references/command-arguments.md>)
+with command identifier `onboard`. Pass the project path and each parsed option
+as separate JSON strings; `$ARGUMENTS` supplies argument data, not shell source.
+The plugin does not install `codesage-onboard` on `PATH`.
 
 The script runs seven steps: global MCP registration (idempotent), `codesage init`, set device in `config.toml`, `codesage index`, install git hooks (if repo), `codesage git-index` for V2b history (if repo), and write the agent hint. The hint lands in `.claude/CLAUDE.md` by default, or in a marked block inside a gitignored `AGENTS.md` if the repo keeps one. `--refresh-hint` overwrites an existing hint; `--hint-only` rewrites just the hint and skips MCP registration, init, indexing, and hooks.
 

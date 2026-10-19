@@ -165,10 +165,40 @@ pub(crate) fn cmd_overview(json: bool) -> Result<()> {
         }
     }
 
-    if !overview.suggested_next_calls.is_empty() {
-        println!("Suggested next calls:");
-        for c in &overview.suggested_next_calls {
-            println!("  {} → {}  ({})", c.intent, c.tool, c.why);
+    if !overview.module_map.is_empty() {
+        println!("Modules:");
+        for module in &overview.module_map {
+            println!(
+                "  {}: {} files, {} lines, {} symbols, {:.0}% test files{}",
+                module.path,
+                module.files,
+                module.lines,
+                module.symbols,
+                module.test_share * 100.0,
+                if module.unmeasured_files > 0 {
+                    format!(" ({} files with unmeasured lines)", module.unmeasured_files)
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+    if !overview.top_risk_tests.is_empty() {
+        println!("Top test risk:");
+        for row in &overview.top_risk_tests {
+            println!("  {:.3}  {}", row.score, row.file);
+        }
+    }
+    if !overview.hot_symbols.is_empty() {
+        println!("Hot product symbols (name-based reference sites):");
+        for row in &overview.hot_symbols {
+            println!("  {}  {}", row.fan_in, row.handle);
+        }
+    }
+    if !overview.recovery.is_empty() {
+        println!("Recovery:");
+        for c in &overview.recovery {
+            println!("  {}  ({})", c.command, c.why);
         }
     }
 

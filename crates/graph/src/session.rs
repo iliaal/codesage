@@ -10,7 +10,7 @@ use codesage_protocol::{
 };
 use codesage_storage::Database;
 
-use crate::git_history::{RiskRequestScope, assess_risk_batch, assess_risk_with_scope};
+use crate::git_history::{RiskRequestScope, assess_risk_batch_for_ranking, assess_risk_with_scope};
 use crate::impact::WalkCache;
 
 const SESSIONS_DIR: &str = "sessions";
@@ -22,6 +22,7 @@ const TOP_RISK_BASELINE: usize = 50;
 pub struct CompleteRiskRanking {
     rows: Vec<SessionRiskEntry>,
     assessments: Vec<CachedRiskAssessment>,
+    test_rows: Vec<SessionRiskEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +47,17 @@ impl From<RiskAssessment> for CachedRiskAssessment {
 impl CompleteRiskRanking {
     pub fn allocated_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            .saturating_add(
+                self.test_rows
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SessionRiskEntry>()),
+            )
+            .saturating_add(
+                self.test_rows
+                    .iter()
+                    .map(|row| row.file.capacity())
+                    .fold(0usize, usize::saturating_add),
+            )
             .saturating_add(
                 self.rows
                     .capacity()
@@ -89,6 +101,10 @@ impl CompleteRiskRanking {
 
     pub fn rows(&self) -> &[SessionRiskEntry] {
         &self.rows
+    }
+
+    pub fn test_rows(&self) -> &[SessionRiskEntry] {
+        &self.test_rows
     }
 
     pub fn into_rows(self) -> Vec<SessionRiskEntry> {
@@ -145,7 +161,44 @@ pub fn top_risk_ranking_with_options(
     include_tests: bool,
 ) -> Result<CompleteRiskRanking> {
     let _policy = crate::git_history::CompletePolicy::enter(recurrence);
-    let assessments = top_risk_assessments(db, TOP_RISK_BASELINE, include_tests)?;
+    checkpoint()?;
+    let mut files = Vec::new();
+    let mut tests = Vec::new();
+    for (path, stored, interpretation) in db.all_file_test_flags()? {
+        let is_test = crate::index::file_is_test(&path, stored, interpretation.as_deref());
+        if include_tests || !is_test {
+            files.push(path.clone());
+        }
+        if is_test {
+            tests.push(path);
+        }
+    }
+    let candidates = risk_candidates(db, &files)?;
+    let test_candidates = risk_candidates(db, &tests)?;
+    let mut combined = candidates.clone();
+    let included: HashSet<_> = candidates.iter().collect();
+    combined.extend(
+        test_candidates
+            .iter()
+            .filter(|path| !included.contains(path))
+            .cloned(),
+    );
+    let (scored, failure) = risk_scores(db, &combined)?;
+    if let Some(cause) = failure {
+        return Err(IncompleteRiskRanking::new(cause).into());
+    }
+    let by_file: HashMap<_, _> = scored
+        .into_iter()
+        .map(|assessment| (assessment.file.clone(), assessment))
+        .collect();
+    let assessments = rank_population(&by_file, &candidates, TOP_RISK_BASELINE)?;
+    let test_rows = rank_population(&by_file, &test_candidates, 10)?
+        .into_iter()
+        .map(|assessment| SessionRiskEntry {
+            file: assessment.file,
+            score: assessment.score,
+        })
+        .collect();
     Ok(CompleteRiskRanking {
         rows: assessments
             .iter()
@@ -155,6 +208,7 @@ pub fn top_risk_ranking_with_options(
             })
             .collect(),
         assessments,
+        test_rows,
     })
 }
 
@@ -448,33 +502,53 @@ fn compute_top_risk(
     files: &[String],
     limit: usize,
 ) -> Result<Vec<CachedRiskAssessment>> {
-    // Bound per-file dependency walks by selecting high-churn candidates.
-    const CANDIDATE_BUDGET: usize = 400;
-    let candidates: Vec<String> = if files.len() > CANDIDATE_BUDGET {
-        let ranked = db.top_churn_files(CANDIDATE_BUDGET)?;
-        if ranked.is_empty() {
-            return Ok(Vec::new());
-        }
-        let allowed: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
-        ranked
-            .into_iter()
-            .filter(|p| allowed.contains(p.as_str()))
-            .collect()
-    } else {
-        files.to_vec()
-    };
+    let candidates = risk_candidates(db, files)?;
     checkpoint()?;
-    let (mut scored, failure) = risk_scores(db, &candidates)?;
+    let (scored, failure) = risk_scores(db, &candidates)?;
     if let Some(cause) = failure {
         return Err(IncompleteRiskRanking::new(cause).into());
     }
+    Ok(rank_assessments(scored, limit))
+}
+
+fn risk_candidates(db: &Database, files: &[String]) -> Result<Vec<String>> {
+    // Bound per-file dependency walks by selecting high-churn candidates.
+    const CANDIDATE_BUDGET: usize = 400;
+    if files.len() > CANDIDATE_BUDGET {
+        db.top_churn_files_for_paths(files, CANDIDATE_BUDGET)
+    } else {
+        Ok(files.to_vec())
+    }
+}
+
+fn rank_population(
+    by_file: &HashMap<String, CachedRiskAssessment>,
+    candidates: &[String],
+    limit: usize,
+) -> Result<Vec<CachedRiskAssessment>> {
+    let scored = candidates
+        .iter()
+        .map(|path| {
+            by_file
+                .get(path)
+                .cloned()
+                .with_context(|| format!("risk batch omitted candidate {path}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rank_assessments(scored, limit))
+}
+
+fn rank_assessments(
+    mut scored: Vec<CachedRiskAssessment>,
+    limit: usize,
+) -> Vec<CachedRiskAssessment> {
     scored.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     scored.truncate(limit);
-    Ok(scored)
+    scored
 }
 
 /// Batch shared graph work; fall back to per-file scoring on batch failure.
@@ -486,7 +560,7 @@ fn risk_scores(db: &Database, files: &[String]) -> Result<RiskScores> {
     if files.is_empty() {
         return Ok((Vec::new(), None));
     }
-    match assess_risk_batch(db, files) {
+    match assess_risk_batch_for_ranking(db, files) {
         Ok(batch) => {
             let assessments = batch
                 .files
@@ -691,6 +765,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn separate_risk_populations_select_their_own_churn_candidates() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute_batch(|db| {
+            for index in 0..401 {
+                for (prefix, is_test, churn) in [("src", false, 1000.0), ("tests", true, 1.0)] {
+                    let path = format!("{prefix}/file{index}.rs");
+                    db.upsert_file(&codesage_protocol::FileInfo {
+                        path: path.clone(),
+                        language: codesage_protocol::Language::Rust,
+                        content_hash: "fixture".into(),
+                        is_test,
+                    })?;
+                    db.upsert_git_file(&path, churn, 1, 2, Some(1_700_000_000))?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        let ranking = top_risk_ranking_with_policy(&db, false).unwrap();
+        assert_eq!(ranking.rows().len(), 50);
+        assert!(
+            ranking
+                .rows()
+                .iter()
+                .all(|row| row.file.starts_with("src/"))
+        );
+        assert_eq!(ranking.test_rows().len(), 10);
+        assert!(
+            ranking
+                .test_rows()
+                .iter()
+                .all(|row| row.file.starts_with("tests/"))
+        );
+        let test_paths: Vec<_> = (0..401)
+            .map(|index| format!("tests/file{index}.rs"))
+            .collect();
+        let expected = compute_top_risk(&db, &test_paths[..400], 10).unwrap();
+        assert_eq!(ranking.test_rows()[0].score, expected[0].score);
+    }
+
+    #[test]
     fn ranking_payload_accounts_for_truncated_vector_and_string_capacity() {
         let mut rows = Vec::with_capacity(400);
         let mut file = String::with_capacity(1024);
@@ -714,7 +829,11 @@ mod tests {
             + assessments[0].file.capacity()
             + assessments[0].notes.capacity() * std::mem::size_of::<String>()
             + assessments[0].notes[0].capacity();
-        let ranking = CompleteRiskRanking { rows, assessments };
+        let ranking = CompleteRiskRanking {
+            rows,
+            assessments,
+            test_rows: Vec::new(),
+        };
         assert_eq!(ranking.allocated_bytes(), expected);
         assert!(ranking.allocated_bytes() >= 400 * std::mem::size_of::<SessionRiskEntry>() + 1024);
     }

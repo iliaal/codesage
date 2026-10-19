@@ -188,14 +188,17 @@ pub(super) fn advertise(tool: &str, schema: &mut Value) {
 }
 
 pub(super) fn project(value: &mut Value, detail: Detail) {
-    if detail != Detail::Compact {
+    if detail == Detail::Full {
         return;
     }
     match value {
         Value::Object(map) => {
             // Navigation, uncertainty, counts, and executable remedies remain evidence.
-            for key in COMPACT_OMISSIONS {
-                map.remove(*key);
+            map.remove("raw_imports");
+            if detail == Detail::Compact {
+                for key in COMPACT_OMISSIONS {
+                    map.remove(*key);
+                }
             }
             for (key, child) in map {
                 if !matches!(
@@ -208,6 +211,26 @@ pub(super) fn project(value: &mut Value, detail: Detail) {
         }
         Value::Array(items) => items.iter_mut().for_each(|item| project(item, detail)),
         _ => {}
+    }
+}
+
+pub(super) fn project_search(value: &mut Value, detail: Detail) {
+    if detail != Detail::Standard || value["confidence"] != "high" {
+        return;
+    }
+    let Some(cliff) = value["cliff_at"]
+        .as_u64()
+        .and_then(|cliff| usize::try_from(cliff).ok())
+        .filter(|cliff| *cliff > 0)
+    else {
+        return;
+    };
+    if let Some(rows) = value["results"].as_array_mut() {
+        for row in rows.iter_mut().skip(cliff) {
+            if let Some(row) = row.as_object_mut() {
+                row.remove("content");
+            }
+        }
     }
 }
 
@@ -714,6 +737,84 @@ fn largest_rows(value: &Value, path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_standard_omits_only_source_below_a_high_confidence_cliff() {
+        let original = json!({
+            "confidence": "high", "cliff_at": 2, "margin_pct": 60,
+            "results": (0..5).map(|i| json!({
+                "handle": format!("chunk:src/{i}.rs#1-3"),
+                "file_path": format!("src/{i}.rs"),
+                "language": "rust", "start_line": 1, "end_line": 3,
+                "symbols": [{"name": format!("function_{i}")}],
+                "score": 1.0 - i as f64 / 10.0,
+                "content": format!("fn function_{i}() {{}}"),
+                "trace": [{"stage": "final", "after": 1.0 - i as f64 / 10.0}]
+            })).collect::<Vec<_>>()
+        });
+        let mut standard = original.clone();
+        project_search(&mut standard, Detail::Standard);
+        for i in 0..5 {
+            let mut expected = original["results"][i].clone();
+            if i >= 2 {
+                expected.as_object_mut().unwrap().remove("content");
+            }
+            assert_eq!(standard["results"][i], expected);
+        }
+        assert_eq!(standard["results"].as_array().unwrap().len(), 5);
+        for key in ["confidence", "cliff_at", "margin_pct"] {
+            assert_eq!(standard[key], original[key]);
+        }
+        let mut full = original.clone();
+        project_search(&mut full, Detail::Full);
+        assert_eq!(full, original);
+
+        let mut compact = original.clone();
+        project_search(&mut compact, Detail::Compact);
+        project(&mut compact, Detail::Compact);
+        assert!(
+            compact["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row.get("content").is_none())
+        );
+    }
+
+    #[test]
+    fn search_projection_preserves_flat_missing_and_already_cut_pages() {
+        for (confidence, cliff) in [
+            (json!("low"), json!(1)),
+            (json!("high"), Value::Null),
+            (json!("high"), json!(0)),
+            (json!("high"), json!(-1)),
+            (json!("high"), json!(2)),
+            (json!("high"), json!(20)),
+            (Value::Null, json!(1)),
+        ] {
+            let original = json!({"confidence": confidence, "cliff_at": cliff,
+                "results": [{"content": "first"}, {"content": "second"}]});
+            let mut projected = original.clone();
+            project_search(&mut projected, Detail::Standard);
+            assert_eq!(projected, original);
+        }
+    }
+
+    #[test]
+    fn dependencies_preserve_raw_spellings_only_at_full_detail() {
+        let source = json!({"imports":["file:src/util.rs"], "test_imports":["file:tests/helper.rs"],
+            "externals":{"imports":4}, "unresolved_imports":[{"target":"unknown::item","candidates":[]}],
+            "raw_imports":{"imports":["crate::util::item"],"test_imports":["super::*"]}});
+        for detail in [Detail::Compact, Detail::Standard, Detail::Full] {
+            let mut result = source.clone();
+            project(&mut result, detail);
+            assert_eq!(result["imports"], source["imports"]);
+            assert_eq!(result["test_imports"], source["test_imports"]);
+            assert_eq!(result["externals"], source["externals"]);
+            assert_eq!(result["unresolved_imports"], source["unresolved_imports"]);
+            assert_eq!(result.get("raw_imports").is_some(), detail == Detail::Full);
+        }
+    }
 
     #[test]
     fn aliases_have_deterministic_matching_and_conflicts() {

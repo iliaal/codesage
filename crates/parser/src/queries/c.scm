@@ -14,11 +14,15 @@
   declarator: (parenthesized_declarator
     (identifier) @name)) @def
 
-; Pattern 3: Struct → Struct
-(struct_specifier name: (type_identifier) @name) @def
+; Pattern 3: Struct definition → Struct
+(struct_specifier
+  name: (type_identifier) @name
+  body: (field_declaration_list)) @def
 
-; Pattern 4: Enum → Enum
-(enum_specifier name: (type_identifier) @name) @def
+; Pattern 4: Enum definition → Enum
+(enum_specifier
+  name: (type_identifier) @name
+  body: (enumerator_list)) @def
 
 ; Pattern 5: Typedef → Constant (used as a proxy for typedef)
 (type_definition
@@ -45,3 +49,13 @@
     declarator: (init_declarator
       declarator: (identifier) @name)
     (#any-of? @_qual "const" "constexpr")) @def)
+
+; Pattern 9: Function name wrapped by a locally proven identity macro.
+(function_definition
+  declarator: (function_declarator
+    declarator: (function_declarator) @name)) @def
+
+; Pattern 10: Named union body -> Struct, matching C++ union extraction.
+(union_specifier
+  name: (type_identifier) @name
+  body: (field_declaration_list)) @def

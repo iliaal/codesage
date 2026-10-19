@@ -13,7 +13,7 @@ use codesage_graph::{
 use codesage_parser::detect::{
     detect_language, detect_language_with_dialect, is_unambiguous_cpp_extension,
 };
-use codesage_parser::discover::{WatchFilter, is_test_like_path};
+use codesage_parser::discover::{WatchFilter, discover_files_with_excludes, is_test_like_path};
 use codesage_parser::source::read_indexable_file;
 use codesage_protocol::FileInfo;
 use codesage_storage::Database;
@@ -376,6 +376,11 @@ fn run_statewatcher_with_admission(
                         if !removed_prefixes.contains(&rel_str) {
                             removed_prefixes.push(rel_str);
                         }
+                        bulk_retry_at = Some(
+                            bulk_cooldown_until.map_or(Instant::now() + debounce, |until| {
+                                until.max(Instant::now() + debounce)
+                            }),
+                        );
                     }
 
                     if !is_source_file(&rel) {
@@ -387,6 +392,17 @@ fn run_statewatcher_with_admission(
                     }
 
                     let rel_str = rel.to_string_lossy().to_string();
+                    if matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                    ) && header_context_changed(&rel)
+                    {
+                        bulk_retry_at = Some(
+                            bulk_cooldown_until.map_or(Instant::now() + debounce, |until| {
+                                until.max(Instant::now() + debounce)
+                            }),
+                        );
+                    }
                     match event.kind {
                         EventKind::Create(_) | EventKind::Modify(_) => {
                             if !header_is_cpp
@@ -1099,6 +1115,19 @@ fn reindex_one_with(
     }
 
     let hash = source.content_hash;
+    let header_is_cpp = if header_is_cpp && rel.extension().is_some_and(|ext| ext == "h") {
+        match discover_files_with_excludes(&config.project_root, &config.exclude_patterns) {
+            Ok(files) => files.iter().any(|file| {
+                file.path == rel_str && file.language == codesage_protocol::Language::Cpp
+            }),
+            Err(error) => {
+                tracing::warn!(error = %error, "cannot establish header dialect");
+                return WorkOutcome::Failed;
+            }
+        }
+    } else {
+        false
+    };
     let Some(lang) = detect_language_with_dialect(rel, header_is_cpp) else {
         return WorkOutcome::Done;
     };
@@ -1114,7 +1143,16 @@ fn reindex_one_with(
         *stale_semantic = Some(file_info.clone());
     }
 
-    if structural_hash_is_fresh(config, &rel_str, &hash) {
+    if structural_hash_is_fresh(config, &rel_str, &hash)
+        && (!rel_str.ends_with(".h")
+            || Database::open_existing(&config.db_path)
+                .and_then(|db| db.all_files_with_id_and_language())
+                .is_ok_and(|files| {
+                    files
+                        .iter()
+                        .any(|(_, path, language)| path == &rel_str && *language == lang)
+                }))
+    {
         return WorkOutcome::Done;
     }
 
@@ -1349,8 +1387,13 @@ fn purge_one_locked(config: &StateWatcherConfig, rel_str: &str) -> WorkOutcome {
     purge_index_rows(config, &[rel_str.to_string()])
 }
 
-/// Match discovery's header rule using indexed paths, not stored language:
-/// CUDA files have C++ language but do not flip `.h` parsing. Never create a reset index.
+fn header_context_changed(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "h")
+        || codesage_parser::header::is_cpp_evidence(path)
+}
+
+/// Whether indexed paths contain any C++ evidence. This only avoids unnecessary
+/// discovery for C-only projects; each header's dialect uses the shared router.
 fn header_dialect_is_cpp(db_path: &Path) -> bool {
     let Ok(db) = Database::open_existing(db_path) else {
         return false;
@@ -2960,6 +3003,7 @@ mod tests {
         }
     }
 
+    #[track_caller]
     fn await_watcher_condition(mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !condition() {
@@ -2995,6 +3039,62 @@ mod tests {
             await_watcher_condition(|| watcher.thread.as_ref().unwrap().is_finished());
             drop(watcher);
             std::fs::write(root.join("main.rs"), "fn idle_gap() {}\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn watcher_reconciles_header_context_after_cpp_add_include_edit_and_remove() {
+        use codesage_protocol::Language;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for directory in [".codesage", "cpp", "include", "c"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        std::fs::write(root.join("cpp/local.h"), "class Local {};\n").unwrap();
+        std::fs::write(root.join("include/api.h"), "struct Api { int value; };\n").unwrap();
+        std::fs::write(root.join("c/core.h"), "struct Core { int value; };\n").unwrap();
+        let config = test_config(root);
+        let db = Database::open(&config.db_path).unwrap();
+        codesage_graph::full_index(root, &db, &[], false).unwrap();
+        let languages = |db: &Database| {
+            db.all_files_with_id_and_language()
+                .unwrap()
+                .into_iter()
+                .map(|(_, path, language)| (path, language))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let _watcher = RunningWatcher::start(config);
+        await_watcher_condition(|| {
+            read_status(root).is_some_and(|status| status.startup_reconciled)
+        });
+        for source in [
+            Some("#include <api.h>\nvoid marker() {}\n"),
+            Some("void marker() {}\n"),
+            None,
+        ] {
+            let cpp = root.join("cpp/main.cpp");
+            if let Some(source) = source {
+                std::fs::write(cpp, source).unwrap();
+            } else {
+                std::fs::remove_file(cpp).unwrap();
+            }
+            let fresh = Database::open_in_memory().unwrap();
+            codesage_graph::full_index(root, &fresh, &[], false).unwrap();
+            let expected = languages(&fresh);
+            await_watcher_condition(|| languages(&db) == expected);
+            assert_eq!(languages(&db)["c/core.h"], Language::C);
+            for path in expected.keys() {
+                assert_eq!(
+                    db.symbols_for_file(path).unwrap(),
+                    fresh.symbols_for_file(path).unwrap(),
+                    "{path}"
+                );
+                assert_eq!(
+                    db.references_in_file_range(path, 1, u32::MAX).unwrap(),
+                    fresh.references_in_file_range(path, 1, u32::MAX).unwrap(),
+                    "{path}"
+                );
+            }
         }
     }
 
@@ -4842,6 +4942,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         std::fs::write(root.join("api.h"), "struct foo { int x; };\n").unwrap();
+        std::fs::write(root.join("api.cpp"), "int api() { return 1; }\n").unwrap();
         let config = test_config(root);
 
         assert_eq!(

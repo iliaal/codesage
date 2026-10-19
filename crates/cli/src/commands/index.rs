@@ -416,6 +416,7 @@ fn run_index_passes(
             files_failed = stats.files_failed,
             failed_paths = %codesage_graph::summarize_paths(&stats.failed_paths, 10),
             files_degraded = stats.files_degraded,
+            files_degraded_by_language = ?stats.files_degraded_by_language,
             files_removed = stats.files_removed,
             symbols = stats.symbols_found,
             refs = stats.references_found,
@@ -436,6 +437,17 @@ fn run_index_passes(
                 ", {} parsed with syntax errors",
                 stats.files_degraded
             ));
+            if !stats.files_degraded_by_language.is_empty() {
+                line.push_str(&format!(
+                    " ({})",
+                    stats
+                        .files_degraded_by_language
+                        .iter()
+                        .map(|(language, count)| format!("{language}: {count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
         println!("{line}");
         if !stats.failed_paths.is_empty() {

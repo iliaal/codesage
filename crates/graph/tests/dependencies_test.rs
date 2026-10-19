@@ -17,6 +17,13 @@ fn indexed(files: &[(&str, &str)]) -> (tempfile::TempDir, Database) {
     (dir, db)
 }
 
+fn disk_index(root: &std::path::Path) -> Database {
+    std::fs::create_dir(root.join(".codesage")).unwrap();
+    let db = Database::open(&root.join(".codesage/index.db")).unwrap();
+    full_index(root, &db, &[], false).unwrap();
+    db
+}
+
 #[test]
 fn rust_use_crate_import_appears_in_imported_by() {
     let (_dir, db) = indexed(&[
@@ -497,4 +504,607 @@ fn batch_matches_single_file_results_in_order() {
         assert_eq!(entry.imports, single.imports);
         assert_eq!(entry.imported_by, single.imported_by);
     }
+}
+
+#[test]
+fn outgoing_paths_keep_unknown_and_ambiguous_evidence_without_homonym_edges() {
+    let (_dir, db) = indexed(&[
+        (
+            "src/main.ts",
+            "import { value } from './util';\nimport missing from './missing';\nimport other from 'unproven-package';\n",
+        ),
+        ("src/util.ts", "export const value = 1;"),
+        ("src/util.js", "export const value = 2;"),
+        ("missing.ts", "export const missing = 3;"),
+        ("unrelated.ts", "export const other = 4;"),
+    ]);
+    let deps = list_dependencies(&db, "src/main.ts").unwrap();
+    assert!(deps.imports.is_empty(), "{deps:?}");
+    assert_eq!(deps.externals.imports, 0);
+    assert_eq!(deps.unresolved_imports.len(), 3);
+    let ambiguous = deps
+        .unresolved_imports
+        .iter()
+        .find(|row| row.target == "./util")
+        .unwrap();
+    assert_eq!(
+        ambiguous.candidates,
+        vec!["file:src/util.js", "file:src/util.ts"]
+    );
+    assert!(ambiguous.reason.contains("multiple"));
+    for target in ["./missing", "unproven-package"] {
+        assert!(
+            deps.unresolved_imports
+                .iter()
+                .find(|row| row.target == target)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+    }
+    assert_eq!(deps.raw_imports.unwrap().imports.len(), 3);
+}
+
+#[test]
+fn outgoing_paths_resolve_c_includes_and_python_modules() {
+    let (_dir, db) = indexed(&[
+        ("app/main.c", "#include \"util.h\"\n#include <stdio.h>\n"),
+        ("app/util.h", "int helper(void);"),
+        ("main.py", "from helpers import assist\n"),
+        ("helpers.py", "def assist():\n    return 1\n"),
+    ]);
+    let c = list_dependencies(&db, "app/main.c").unwrap();
+    assert_eq!(c.imports, vec!["file:app/util.h"]);
+    assert_eq!(c.unresolved_imports.len(), 1);
+    assert_eq!(c.unresolved_imports[0].target, "<stdio.h>");
+    let python = list_dependencies(&db, "main.py").unwrap();
+    assert_eq!(python.imports, vec!["file:helpers.py"]);
+    assert!(python.unresolved_imports.is_empty(), "{python:?}");
+}
+
+#[test]
+fn inline_rust_reimports_are_removed_but_external_self_and_super_edges_survive() {
+    let (_dir, db) = indexed(&[
+        ("src/lib.rs", "pub mod feature; pub fn parent() {}"),
+        (
+            "src/feature.rs",
+            "mod child;\nuse self::child::helper;\nuse super::parent;\nfn local() {}\n#[cfg(test)] mod tests {\nuse super::*;\nuse super::local;\nuse super::child::helper;\n}\n",
+        ),
+        ("src/feature/child.rs", "pub fn helper() {}"),
+        ("src/decoy.rs", "pub fn local() {} pub fn parent() {}"),
+    ]);
+    let deps = list_dependencies(&db, "src/feature.rs").unwrap();
+    assert_eq!(
+        deps.imports,
+        vec!["file:src/feature/child.rs", "file:src/lib.rs"]
+    );
+    assert_eq!(deps.intra_file_imports, 2, "{deps:?}");
+    assert!(deps.unresolved_imports.is_empty(), "{deps:?}");
+    assert_eq!(
+        deps.raw_imports.unwrap().test_imports,
+        vec!["super::*", "super::local", "super::child::helper"]
+    );
+}
+
+#[test]
+fn test_only_internal_files_remain_separate() {
+    let (_dir, db) = indexed(&[
+        ("main.js", "import './product.js';\nfunction unused() {}\n"),
+        ("product.js", "export function product() {}"),
+        ("tests/check.js", "import '../product.js';\n"),
+    ]);
+    let deps = list_dependencies(&db, "tests/check.js").unwrap();
+    assert!(deps.imports.is_empty());
+    assert_eq!(deps.test_imports, vec!["file:product.js"]);
+}
+
+#[test]
+fn rust_manifest_evidence_separates_internal_external_and_unknown_imports() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"app\", \"dependency\"]\nresolver = \"2\"\n[workspace.dependencies]\nanyhow = \"1\"\n",
+        ),
+        (
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ninternal = { package = \"dependency\", path = \"../dependency\" }\nanyhow.workspace = true\n",
+        ),
+        (
+            "dependency/Cargo.toml",
+            "[package]\nname = \"dependency\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        ),
+        (
+            "app/src/lib.rs",
+            "use internal::helper;\nuse anyhow::Result;\nuse std::collections::HashMap;\nuse unknown::helper;\n",
+        ),
+        ("dependency/src/lib.rs", "pub fn helper() {}"),
+        ("app/src/unrelated.rs", "pub fn helper() {}"),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "app/src/lib.rs").unwrap();
+    assert_eq!(deps.imports, vec!["file:dependency/src/lib.rs"]);
+    assert_eq!(deps.externals.imports, 2, "{deps:?}");
+    assert_eq!(deps.externals.packages_total, 2);
+    assert_eq!(
+        deps.externals
+            .top_packages
+            .iter()
+            .map(|row| row.package.as_str())
+            .collect::<Vec<_>>(),
+        vec!["anyhow", "std"]
+    );
+    assert_eq!(deps.unresolved_imports.len(), 1, "{deps:?}");
+    assert_eq!(deps.unresolved_imports[0].target, "unknown::helper");
+}
+
+#[test]
+fn rust_unknown_and_shadowed_packages_do_not_become_external() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nanyhow = \"1\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod anyhow { pub struct Result; }\nuse anyhow::Result;\nuse absent::Result;\n",
+        ),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.externals.imports, 0);
+    assert!(deps.imports.is_empty());
+    assert!(
+        deps.unresolved_imports
+            .iter()
+            .any(|row| row.target == "absent::Result")
+    );
+}
+
+#[test]
+fn rust_undeclared_files_and_nested_homonyms_are_not_outgoing_edges() {
+    let (_dir, db) = indexed(&[
+        (
+            "src/lib.rs",
+            "use crate::undeclared::helper;\nuse crate::nested_only;\nmod inner { pub fn nested_only() {} }\n",
+        ),
+        ("src/undeclared.rs", "pub fn helper() {}"),
+    ]);
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert!(deps.imports.is_empty(), "{deps:?}");
+    assert_eq!(deps.unresolved_imports.len(), 2);
+    assert!(
+        deps.unresolved_imports
+            .iter()
+            .all(|row| row.candidates.is_empty())
+    );
+}
+
+#[test]
+fn rust_external_summary_counts_distinct_spellings_and_bounds_top_packages() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\na=\"1\"\nb=\"1\"\nc=\"1\"\nd=\"1\"\ne=\"1\"\nf=\"1\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "use a::One;\nuse a::Two;\nuse b::Three;\nuse c::Four;\nuse d::Five;\nuse e::Six;\n#[cfg(test)] mod tests { use f::Seven; use f::Seven; }\n",
+        ),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.externals.imports, 6, "{deps:?}");
+    assert_eq!(deps.externals.test_imports, 1);
+    assert_eq!(deps.externals.packages_total, 6);
+    assert_eq!(
+        deps.externals
+            .top_packages
+            .iter()
+            .map(|row| row.package.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "c", "d", "e"]
+    );
+    assert_eq!(deps.externals.top_packages[0].imports, 2);
+    assert!(deps.unresolved_imports.is_empty());
+}
+
+#[test]
+fn rust_registry_overrides_keep_external_classification_unknown() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nanyhow=\"1\"\n[patch.crates-io]\nanyhow={path=\"vendor/anyhow\"}\n",
+        ),
+        ("src/lib.rs", "use anyhow::Result;\n"),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.externals.imports, 0);
+    assert_eq!(deps.unresolved_imports.len(), 1);
+    assert_eq!(deps.unresolved_imports[0].target, "anyhow::Result");
+}
+
+#[test]
+fn rust_attribute_decorated_imports_resolve_files_without_inventing_item_definitions() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nmodels={path=\"models\"}\n",
+        ),
+        (
+            "models/Cargo.toml",
+            "[package]\nname=\"models\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "use models::Record;\nuse models::Missing;\nuse models::Private;\n#[cfg(test)] mod tests { use models::testing::TestRecord; }\n",
+        ),
+        (
+            "models/src/lib.rs",
+            "#[derive(Clone)]\npub struct Record;\nstruct Private;\npub mod testing;\n",
+        ),
+        (
+            "models/src/testing.rs",
+            "#[derive(Clone)]\npub struct TestRecord;\n",
+        ),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.imports, vec!["file:models/src/lib.rs"]);
+    assert_eq!(deps.test_imports, vec!["file:models/src/testing.rs"]);
+    assert_eq!(
+        deps.unresolved_imports
+            .iter()
+            .map(|row| row.target.as_str())
+            .collect::<Vec<_>>(),
+        vec!["models::Missing", "models::Private"]
+    );
+}
+
+#[test]
+fn rust_external_imports_ignore_unrelated_value_bindings_but_keep_namespace_shadows_unknown() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nglobset=\"0.4\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "use globset::GlobSet;\nfn unrelated() { let globset = 1; }\nmod scoped { pub struct globset; use globset::GlobBuilder; }\nmod module_shadow { mod globset {} use globset::GlobSetBuilder; }\nmod alias_shadow { use crate::scoped as globset; use globset::Unknown; }\n",
+        ),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.externals.imports, 1, "{deps:?}");
+    assert_eq!(deps.externals.top_packages[0].package, "globset");
+    for target in [
+        "globset::GlobBuilder",
+        "globset::GlobSetBuilder",
+        "globset::Unknown",
+    ] {
+        assert!(
+            deps.unresolved_imports
+                .iter()
+                .any(|row| row.target == target),
+            "{deps:?}"
+        );
+    }
+}
+
+#[test]
+fn proven_internal_import_survives_an_unresolved_occurrence_of_the_same_spelling() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nmodels={path=\"models\"}\n",
+        ),
+        (
+            "models/Cargo.toml",
+            "[package]\nname=\"models\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "use models::Record;\nfn dynamic() { unknown_macro!(); use models::Record; }\n",
+        ),
+        ("models/src/lib.rs", "#[derive(Clone)] pub struct Record;\n"),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.imports, vec!["file:models/src/lib.rs"]);
+    assert_eq!(deps.unresolved_imports.len(), 1);
+    assert_eq!(deps.unresolved_imports[0].target, "models::Record");
+    assert_eq!(
+        deps.unresolved_imports[0].candidates,
+        vec!["file:models/src/lib.rs"]
+    );
+    assert!(
+        deps.unresolved_imports[0]
+            .reason
+            .contains("some import sites")
+    );
+}
+
+#[test]
+fn proven_external_package_preserves_unknown_sites_of_the_same_import() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nanyhow=\"1\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "use anyhow::Result;\nfn dynamic() { unknown_macro!(); use anyhow::Result; }\n",
+        ),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.externals.imports, 1);
+    assert_eq!(deps.externals.top_packages[0].package, "anyhow");
+    assert_eq!(deps.unresolved_imports.len(), 1);
+    assert_eq!(deps.unresolved_imports[0].target, "anyhow::Result");
+    assert!(
+        deps.unresolved_imports[0]
+            .reason
+            .contains("proven external package is retained")
+    );
+}
+
+#[test]
+fn review_bare_import_uses_its_inline_module_namespace() {
+    let (dir, _memory) = indexed(&[
+        ("src/lib.rs", "mod target; mod consumer;\n"),
+        (
+            "src/consumer.rs",
+            "mod nested { mod target { pub struct Item; } use target::Item; }\n",
+        ),
+        ("src/target.rs", "pub struct Item;\n"),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/consumer.rs").unwrap();
+    assert!(deps.imports.is_empty(), "{deps:?}");
+    assert_eq!(deps.intra_file_imports, 1, "{deps:?}");
+    assert_eq!(deps.raw_imports.unwrap().imports, vec!["target::Item"]);
+}
+
+#[test]
+fn review_identical_import_spellings_keep_each_sites_test_scope() {
+    let (_dir, db) = indexed(&[
+        (
+            "src/lib.rs",
+            "mod product { pub mod child; use self::child::helper; }\n#[cfg(test)] mod tests { mod child; use self::child::helper; }\n",
+        ),
+        ("src/product/child.rs", "pub fn helper() {}\n"),
+        ("src/tests/child.rs", "pub fn helper() {}\n"),
+    ]);
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.imports, vec!["file:src/product/child.rs"]);
+    assert_eq!(deps.test_imports, vec!["file:src/tests/child.rs"]);
+    let raw = deps.raw_imports.unwrap();
+    assert_eq!(raw.imports, vec!["./product/child", "self::child::helper"]);
+    assert_eq!(raw.test_imports, vec!["./tests/child"]);
+}
+
+#[test]
+fn review_renamed_import_does_not_bind_its_original_tail() {
+    let (dir, _memory) = indexed(&[
+        (
+            "src/lib.rs",
+            "mod other; use crate::other::item as renamed; #[cfg(test)] mod tests { use super::item; use super::renamed; }\n",
+        ),
+        ("src/other.rs", "pub fn item() {}\n"),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.imports, vec!["file:src/other.rs"]);
+    assert_eq!(deps.intra_file_imports, 1, "{deps:?}");
+    assert_eq!(deps.unresolved_imports.len(), 1, "{deps:?}");
+    assert_eq!(deps.unresolved_imports[0].target, "super::item");
+    assert!(deps.unresolved_imports[0].is_test);
+}
+
+#[test]
+fn review_package_alias_in_same_use_tree_is_not_external_evidence() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nanyhow=\"1\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod local { pub struct Result; } use {crate::local as anyhow, anyhow::Result};\n",
+        ),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.externals.imports, 0, "{deps:?}");
+    assert!(
+        deps.unresolved_imports
+            .iter()
+            .any(|row| row.target == "anyhow::Result")
+    );
+}
+
+#[test]
+fn review_function_local_items_do_not_prove_module_imports() {
+    let (dir, _memory) = indexed(&[
+        (
+            "src/lib.rs",
+            "mod target; fn unrelated() { struct Item; use target::Item as Local; } #[cfg(test)] mod tests { use super::Item; }\n",
+        ),
+        ("src/target.rs", "pub struct Item;\n"),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.intra_file_imports, 0, "{deps:?}");
+    assert!(
+        deps.unresolved_imports
+            .iter()
+            .any(|row| row.target == "super::Item")
+    );
+}
+
+#[test]
+fn review_mixed_local_and_external_sites_keep_the_proven_package() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nanyhow=\"1\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "use anyhow::Result; mod local { mod anyhow { pub struct Result; } use anyhow::Result; }\n",
+        ),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.externals.imports, 1, "{deps:?}");
+    assert_eq!(deps.intra_file_imports, 0);
+    assert!(deps.imports.is_empty());
+    assert!(deps.unresolved_imports.is_empty(), "{deps:?}");
+}
+
+#[test]
+fn review_external_test_scope_follows_the_proven_import_site() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nanyhow=\"1\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod local { mod anyhow { pub struct Result; } use anyhow::Result; } #[cfg(test)] mod tests { use anyhow::Result; }\n",
+        ),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.externals.imports, 0, "{deps:?}");
+    assert_eq!(deps.externals.test_imports, 1, "{deps:?}");
+    assert_eq!(deps.externals.top_packages[0].package, "anyhow");
+    assert_eq!(deps.raw_imports.unwrap().imports, vec!["anyhow::Result"]);
+}
+
+#[test]
+fn review_associated_items_do_not_prove_module_imports() {
+    let (dir, _memory) = indexed(&[
+        (
+            "src/lib.rs",
+            "mod other; use crate::other::VALUE as Remote; struct Owner; impl Owner { fn associated() {} const VALUE: u8 = 1; } const MODULE: u8 = 2; #[cfg(test)] mod tests { use super::{associated, VALUE, MODULE}; }\n",
+        ),
+        (
+            "src/other.rs",
+            "pub struct Owner; impl Owner { pub const VALUE: u8 = 1; }\n",
+        ),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.intra_file_imports, 1, "{deps:?}");
+    for target in ["crate::other::VALUE", "super::associated", "super::VALUE"] {
+        assert!(
+            deps.unresolved_imports
+                .iter()
+                .any(|row| row.target == target),
+            "{deps:?}"
+        );
+    }
+}
+
+#[test]
+fn review_same_use_tree_globs_preserve_namespace_uncertainty() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nanyhow=\"1\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod local { pub mod anyhow { pub struct Result; } } use {crate::local::*, anyhow::Result};\n",
+        ),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.externals.imports, 0, "{deps:?}");
+    assert!(
+        deps.unresolved_imports
+            .iter()
+            .any(|row| row.target == "anyhow::Result")
+    );
+}
+
+#[test]
+fn review_unrelated_parent_glob_keeps_external_package() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nanyhow=\"1\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod parent { pub struct Other; mod consumer { use {super::*, anyhow::Result}; } }\n",
+        ),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.externals.imports, 1, "{deps:?}");
+    assert_eq!(deps.externals.top_packages[0].package, "anyhow");
+    assert!(
+        !deps
+            .unresolved_imports
+            .iter()
+            .any(|row| row.target == "anyhow::Result")
+    );
+}
+
+#[test]
+fn review_current_glob_import_keeps_external_package() {
+    let (dir, _memory) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nanyhow=\"1\"\n",
+        ),
+        ("src/lib.rs", "use anyhow::*;\n"),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.externals.imports, 1, "{deps:?}");
+    assert_eq!(deps.externals.top_packages[0].package, "anyhow");
+    assert!(deps.unresolved_imports.is_empty(), "{deps:?}");
+}
+
+#[test]
+fn review_function_local_modules_do_not_publish_import_bindings() {
+    let (dir, _memory) = indexed(&[
+        (
+            "src/lib.rs",
+            "mod other; fn owner() { mod inner { use crate::other::Item; } } #[cfg(test)] mod tests { use super::inner::Item; }\n",
+        ),
+        ("src/other.rs", "pub struct Item;\n"),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.intra_file_imports, 0, "{deps:?}");
+    assert!(
+        deps.unresolved_imports
+            .iter()
+            .any(|row| row.target == "super::inner::Item")
+    );
+}
+
+#[test]
+fn review_nested_module_imports_remain_same_file_bindings() {
+    let (dir, _memory) = indexed(&[
+        (
+            "src/lib.rs",
+            "mod other; mod inner { pub use crate::other::Item; } #[cfg(test)] mod tests { use super::inner::Item; }\n",
+        ),
+        ("src/other.rs", "pub struct Item;\n"),
+    ]);
+    let db = disk_index(dir.path());
+    let deps = list_dependencies(&db, "src/lib.rs").unwrap();
+    assert_eq!(deps.imports, vec!["file:src/other.rs"]);
+    assert_eq!(deps.intra_file_imports, 1, "{deps:?}");
+    assert!(deps.unresolved_imports.is_empty(), "{deps:?}");
+    assert_eq!(
+        deps.raw_imports.unwrap().test_imports,
+        vec!["super::inner::Item"]
+    );
 }

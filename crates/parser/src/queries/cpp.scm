@@ -154,3 +154,8 @@
   declarator: (field_identifier) @name
   default_value: (_)
   (#any-of? @_qual "const" "constexpr" "constinit")) @def
+
+; Pattern 26: Function name wrapped by a locally proven identity macro.
+(function_definition
+  declarator: (function_declarator
+    declarator: (function_declarator) @name)) @def

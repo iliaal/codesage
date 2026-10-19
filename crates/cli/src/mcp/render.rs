@@ -348,6 +348,12 @@ fn render_with_budget<T: serde::Serialize>(
             let options = request
                 .as_ref()
                 .and_then(|request| super::detail::Options::parse(kind, &request.arguments).ok());
+            if kind == "search" {
+                super::detail::project_search(
+                    &mut value,
+                    options.map_or_else(|| super::detail::default_detail(kind), |o| o.detail),
+                );
+            }
             if let Some(options) = options {
                 super::detail::project(&mut value, options.detail);
                 if options.detail == codesage_protocol::DescribeDetail::Full

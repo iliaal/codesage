@@ -88,8 +88,15 @@ def pipeline_results(root, baseline, candidate, cases, projects, deps, experimen
         directory = Path(temporary)
         (directory / "qualified-baseline.rs").write_text(baseline)
         (directory / "qualified-candidate.rs").write_text(candidate)
+        index_source = (root / "crates/graph/src/index.rs").read_text()
+        helper_start = index_source.index("pub const STRUCTURAL_INTERPRETATION:")
+        helper_end = index_source.index("/// Skip and record unreadable", helper_start)
+        (directory / "index-support.rs").write_text(index_source[helper_start:helper_end])
         runner = directory / "pipeline.rs"
-        runner.write_text((root / "bench/qualified_name_pipeline.rs").read_text())
+        runner.write_text(
+            '#[path = "index-support.rs"]\nmod index;\n'
+            + (root / "bench/qualified_name_pipeline.rs").read_text()
+        )
         binary = directory / "pipeline"
         command = ["rustc", "--edition=2024", "-C", "opt-level=2", "-L", f"dependency={deps}", str(runner), "-o", str(binary)]
         dependencies = ["codesage_embed", "codesage_storage", "codesage_protocol", "codesage_parser", "serde_json", "anyhow", "regex", "globset", "tracing"]

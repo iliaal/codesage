@@ -43,7 +43,7 @@ pub fn is_c_header_extension(ext: &str) -> bool {
     )
 }
 
-/// Extensions that switch project-wide `.h` parsing to C++.
+/// Extensions that provide local C++ header-routing evidence.
 pub fn is_unambiguous_cpp_extension(ext: &str) -> bool {
     matches!(
         ext,

@@ -648,14 +648,54 @@ pub struct DependencyEntry {
     pub found: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// Import / include targets written from product code in this file.
+    /// Resolved internal file handles imported from product code.
     pub imports: Vec<String>,
-    /// Import / include targets written from test code: inside a test symbol
-    /// (a `#[cfg(test)]` module's `use`, a `Test*` class's import) or anywhere
-    /// in a test file. Same row shape as `imports`; omitted when empty.
+    /// Resolved internal file handles imported only from test code.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub test_imports: Vec<String>,
+    #[serde(default)]
+    pub externals: ExternalDependencies,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_imports: Vec<UnresolvedImport>,
+    /// Number of import spellings proven to refer only to this file.
+    #[serde(default)]
+    pub intra_file_imports: usize,
+    /// Original indexed spellings, available at full detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_imports: Option<RawDependencyImports>,
     pub imported_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RawDependencyImports {
+    pub imports: Vec<String>,
+    pub test_imports: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExternalDependencies {
+    /// Counts are distinct indexed import spellings, not installed packages.
+    pub imports: usize,
+    pub test_imports: usize,
+    pub packages_total: usize,
+    /// At most five packages, ordered by total import count then package name.
+    pub top_packages: Vec<ExternalDependencyPackage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExternalDependencyPackage {
+    pub package: String,
+    pub imports: usize,
+    pub test_imports: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UnresolvedImport {
+    pub target: String,
+    pub is_test: bool,
+    /// Multiple candidates are evidence, not resolved dependency edges.
+    pub candidates: Vec<String>,
+    pub reason: String,
 }
 
 /// What a repository contains that indexing will not see.
@@ -717,6 +757,10 @@ pub struct IndexStats {
     /// outside the damaged regions were extracted and stored.
     #[serde(default)]
     pub files_degraded: usize,
+    /// Degraded files written by this pass, keyed by parser language. An empty
+    /// map on an older producer does not establish zero degraded files.
+    #[serde(default)]
+    pub files_degraded_by_language: std::collections::BTreeMap<String, usize>,
     pub files_removed: usize,
     pub symbols_found: usize,
     pub references_found: usize,
@@ -2702,9 +2746,17 @@ pub struct ProjectOverview {
     pub feature_summary: Vec<FeatureKindCount>,
     /// Total mapped features.
     pub feature_count: usize,
-    /// Highest-risk files (capped), descending by score. Empty when git
-    /// history is not yet indexed.
+    /// Package roots or top-level directories, ranked by product symbols.
+    pub module_map: Vec<OverviewModule>,
+    /// Highest-risk files (capped), descending by score. Missing Git history
+    /// leaves structural scores only; `recovery` carries the history command.
     pub top_risk_files: Vec<SessionRiskEntry>,
+    /// Highest-risk test files, kept separate even when `include_tests` merges them.
+    pub top_risk_tests: Vec<SessionRiskEntry>,
+    /// Product definitions ranked by name-based reference sites, not resolved calls.
+    pub hot_symbols: Vec<OverviewHotSymbol>,
+    /// CLI recovery derived from missing or stale evidence; never static routing.
+    pub recovery: Vec<OverviewRecovery>,
     /// Trust-boundary file counts across the project, descending. Surfaces the
     /// security-sensitive clusters (network, secrets, process-exec, …).
     pub trust_boundary_clusters: Vec<TrustBoundaryCount>,
@@ -2714,15 +2766,43 @@ pub struct ProjectOverview {
     /// A sample of mapped entrypoints (routes, CLI commands, services,
     /// libraries): the agent-facing surface area. Capped.
     pub entrypoints: Vec<EntrypointSummary>,
-    /// Recommended next CodeSage calls for common intents, given this project's
-    /// current state.
-    pub suggested_next_calls: Vec<SuggestedCall>,
     /// Git-hook indexing health: installed codesage hooks, the last logged
     /// run, and the single-flight lock state. Read-only here; `codesage
     /// doctor` reaps a dead-pid lock. Absent when the project is not a Git
     /// repository.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub hook_health: Option<HookHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OverviewModule {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub handle: Option<String>,
+    pub path: String,
+    pub files: usize,
+    /// Lines in measured working-tree source. Consult `unmeasured_files`.
+    pub lines: usize,
+    /// Files unreadable or outside the 10 MiB/file and 32 MiB/project read budget.
+    pub unmeasured_files: usize,
+    pub symbols: usize,
+    pub product_symbols: usize,
+    pub languages: Vec<LanguageStat>,
+    /// Fraction of indexed files marked as tests, in [0, 1].
+    pub test_share: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OverviewHotSymbol {
+    pub handle: String,
+    pub fan_in: u32,
+    /// Name-based reference sites can conflate definitions and omit dynamic uses.
+    pub counts_floor: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OverviewRecovery {
+    pub command: String,
+    pub why: String,
 }
 
 /// Health of the `codesage install-hooks` indexing hooks, derived from the
@@ -2835,18 +2915,6 @@ pub struct EntrypointSummary {
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub route: Option<String>,
-}
-
-/// A suggested next tool call keyed by the agent's likely intent.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct SuggestedCall {
-    /// The intent this call serves (e.g. "find code by behavior",
-    /// "before editing a file", "before committing a patch").
-    pub intent: String,
-    /// The CodeSage tool to call.
-    pub tool: String,
-    /// Why this call, in one line.
-    pub why: String,
 }
 
 /// Severity of a predicted review objection. Declaration order is the sort

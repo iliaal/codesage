@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run a CodeSage plugin command with JSON argv data")
+    parser.add_argument("command", choices=("onboard", "eval", "bench"))
+    parser.add_argument("argument_file", type=Path, help="UTF-8 JSON array of argument strings")
+    args = parser.parse_args()
+    try:
+        arguments = json.loads(args.argument_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        parser.error(f"cannot read argument file: {exc}")
+    if not isinstance(arguments, list) or any(
+        not isinstance(value, str) or "\0" in value for value in arguments
+    ):
+        parser.error("arguments must be a JSON array of UTF-8 strings without NUL")
+    try:
+        for value in arguments:
+            value.encode("utf-8")
+    except UnicodeError:
+        parser.error("arguments must be a JSON array of UTF-8 strings without NUL")
+    script = Path(__file__).resolve().with_name(f"codesage-{args.command}")
+    try:
+        os.execv("/bin/bash", ["bash", str(script), *arguments])
+    except OSError as exc:
+        parser.exit(1, f"cannot start plugin command: {exc}\n")
+
+
+if __name__ == "__main__":
+    main()

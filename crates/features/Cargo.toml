@@ -14,6 +14,7 @@ ignore.workspace = true
 regex.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+toml = "1.1"
 tree-sitter.workspace = true
 tree-sitter-c.workspace = true
 tree-sitter-cpp.workspace = true

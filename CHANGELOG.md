@@ -1,8 +1,32 @@
 ## [Unreleased]
 
+### Added
+
+- `codesage edit-check` compares a proposed replacement declaration from a file or stdin against pinned Git HEAD, with the same analysis as MCP `edit_check` and optional JSON output.
+- `project_overview` includes a module map, product symbol handles ranked by fan-in, separate test risk, and evidence-derived CLI recovery commands.
+- `codesage index` reports syntax-degraded files by parser language.
+
 ### Changed
 
 - MCP tool schemas and `help` no longer promise removal of the arguments and response fields deprecated in 0.35.0 in the next minor; they stay deprecated and accepted (request arguments) or emitted (response fields).
+- `project_overview` ranks product entrypoints first and diversifies their kinds; Rust MCP server implementations appear as service entrypoints.
+- `list_dependencies` and `codesage dependencies` resolve internal imports to file handles, summarize proven external packages, retain unresolved evidence, and recover raw import spellings at full detail.
+- MCP `search` omits source content below a high-confidence relevance cliff at standard detail, preserving every result and restoring content with `detail: full`.
+- Search demotes `bench/` and `scripts/` results unless the query matches the path or platform-intent heuristic.
+
+### Removed
+
+- `project_overview.suggested_next_calls`; use evidence-derived MCP `next[]` and CLI `recovery[]` instead.
+
+### Fixed
+
+- C/C++ definitions with locally proven identity macros around their names retain lexical names, source ranges, and body-call ownership.
+- C parsing retains named union definitions and excludes bodyless struct and enum references from definition results.
+- Header routing uses local C++ evidence and unambiguous clean C parses, retaining the project dialect for degraded or ambiguous headers; indexing, watcher updates, and overlays use the same policy.
+
+### Security
+
+- Plugin onboard, eval, and bench commands pass argument values through a JSON argv dispatcher instead of embedding them in shell commands.
 
 ## [0.43.0] - 2026-10-15
 

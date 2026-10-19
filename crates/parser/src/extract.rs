@@ -132,6 +132,8 @@ fn c_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         6 => Some(SymbolKind::Macro),
         7 => Some(SymbolKind::Function), // double-pointer return
         8 => Some(SymbolKind::Constant), // file-scope const object
+        9 => Some(SymbolKind::Function), // identity-macro wrapped name
+        10 => Some(SymbolKind::Struct),  // named union body
         _ => None,
     }
 }
@@ -156,6 +158,7 @@ fn cpp_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         19..=22 => Some(SymbolKind::Function), // in-class definitions (refined to Method)
         // 23 file scope, 24 namespace scope, 25 in-class static member.
         23..=25 => Some(SymbolKind::Constant),
+        26 => Some(SymbolKind::Function), // identity-macro wrapped name
         _ => None,
     }
 }
@@ -291,6 +294,7 @@ pub fn extract_symbols(
     // Error recovery can emit distinct name nodes with the same storage key,
     // e.g. parameter types in `typedef R (CALLCONV *fn)(T, T, T)`.
     let mut seen_rows = std::collections::HashSet::new();
+    let mut definition_names = DefinitionNames::new(root, source, language);
 
     while let Some(m) = matches.next() {
         codesage_protocol::work::checkpoint()?;
@@ -323,7 +327,9 @@ pub fn extract_symbols(
         if !seen_defs.insert(def_id) {
             continue;
         }
-        let captured_name = crate::parse::node_text_lossy(&name_node, source);
+        let Some((captured_name, kind)) = definition_names.name(name_node, kind) else {
+            continue;
+        };
         if captured_name.is_empty() {
             continue;
         }
@@ -403,6 +409,148 @@ pub fn extract_symbols(
 
     codesage_protocol::work::checkpoint()?;
     Ok(symbols)
+}
+
+pub(crate) struct DefinitionNames<'tree, 'source> {
+    root: Node<'tree>,
+    source: &'source [u8],
+    language: Language,
+    wrappers: Option<std::collections::HashMap<String, Vec<(usize, bool)>>>,
+    barriers: Vec<usize>,
+}
+
+impl<'tree, 'source> DefinitionNames<'tree, 'source> {
+    pub(crate) fn new(root: Node<'tree>, source: &'source [u8], language: Language) -> Self {
+        Self {
+            root,
+            source,
+            language,
+            wrappers: None,
+            barriers: Vec::new(),
+        }
+    }
+
+    pub(crate) fn name(&mut self, node: Node, kind: SymbolKind) -> Option<(String, SymbolKind)> {
+        if !matches!(self.language, Language::C | Language::Cpp)
+            || node.kind() != "function_declarator"
+        {
+            return Some((crate::parse::node_text_lossy(&node, self.source), kind));
+        }
+        if node.has_error() {
+            return None;
+        }
+        let wrapper = node.child_by_field_name("declarator")?;
+        if !matches!(
+            wrapper.kind(),
+            "identifier" | "field_identifier" | "qualified_identifier"
+        ) {
+            return None;
+        }
+        let parameters = node.child_by_field_name("parameters")?;
+        if parameters.named_child_count() != 1 {
+            return None;
+        }
+        let parameter = parameters.named_child(0)?;
+        if parameter.kind() != "parameter_declaration" || parameter.named_child_count() != 1 {
+            return None;
+        }
+        let name = parameter.child_by_field_name("type")?;
+        if name.kind() != "type_identifier" {
+            return None;
+        }
+        let mut scopes = Vec::new();
+        let mut wrapper_name = wrapper;
+        while wrapper_name.kind() == "qualified_identifier" {
+            scopes.push(match wrapper_name.child_by_field_name("scope") {
+                Some(scope) => scope.utf8_text(self.source).ok()?,
+                None => "",
+            });
+            wrapper_name = wrapper_name.child_by_field_name("name")?;
+        }
+        if !matches!(wrapper_name.kind(), "identifier" | "field_identifier") {
+            return None;
+        }
+        let wrapper_name = wrapper_name.utf8_text(self.source).ok()?;
+        if self.wrappers.is_none() {
+            self.scan_wrappers();
+        }
+        let states = self.wrappers.as_ref()?.get(wrapper_name)?;
+        let state_index = states.partition_point(|(byte, _)| *byte < node.start_byte());
+        let &(defined_at, identity) = states.get(state_index.checked_sub(1)?)?;
+        let barrier_index = self
+            .barriers
+            .partition_point(|byte| *byte < node.start_byte());
+        if !identity || barrier_index > 0 && self.barriers[barrier_index - 1] > defined_at {
+            return None;
+        }
+        let name = name.utf8_text(self.source).ok()?;
+        if scopes.is_empty() {
+            Some((name.to_string(), kind))
+        } else {
+            scopes.push(name);
+            Some((scopes.join("::"), SymbolKind::Method))
+        }
+    }
+
+    fn scan_wrappers(&mut self) {
+        let mut wrappers: std::collections::HashMap<String, Vec<(usize, bool)>> =
+            std::collections::HashMap::new();
+        let mut cursor = self.root.walk();
+        loop {
+            let node = cursor.node();
+            match node.kind() {
+                "preproc_function_def" | "preproc_def" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        let identity = node.kind() == "preproc_function_def"
+                            && node
+                                .parent()
+                                .is_some_and(|parent| parent.kind() == "translation_unit")
+                            && identity_macro(node, self.source);
+                        wrappers
+                            .entry(crate::parse::node_text_lossy(&name, self.source))
+                            .or_default()
+                            .push((node.start_byte(), identity));
+                    }
+                }
+                // Included files and unknown directives can change macro state.
+                "preproc_include" | "preproc_call" => self.barriers.push(node.start_byte()),
+                _ => {}
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    self.wrappers = Some(wrappers);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn identity_macro(node: Node, source: &[u8]) -> bool {
+    let (Some(parameters), Some(value)) = (
+        node.child_by_field_name("parameters"),
+        node.child_by_field_name("value"),
+    ) else {
+        return false;
+    };
+    if node.has_error() || parameters.child_count() != 3 || parameters.named_child_count() != 1 {
+        return false;
+    }
+    let Some(parameter) = parameters.named_child(0) else {
+        return false;
+    };
+    parameter.kind() == "identifier"
+        && parameter
+            .utf8_text(source)
+            .ok()
+            .zip(value.utf8_text(source).ok())
+            .is_some_and(|(parameter, value)| parameter == value.trim())
 }
 
 /// The columns of the `symbols` UNIQUE index, minus `file_id` (one file per

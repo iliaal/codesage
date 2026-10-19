@@ -92,7 +92,7 @@ fn lazy_edge_remains_visible_to_dependencies_and_impact() {
     let deps = list_dependencies(&db, "a.py").unwrap();
     assert!(deps.found);
     assert!(
-        deps.imports.iter().any(|i| i == "b.other" || i == "b"),
+        deps.imports.iter().any(|i| i == "file:b.py"),
         "a.py imports should keep the lazy edge: {:?}",
         deps.imports
     );

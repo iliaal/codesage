@@ -220,11 +220,14 @@ pub(crate) fn cmd_search(req: SearchRequest, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_dependencies(file: &str, json: bool) -> Result<()> {
+pub(crate) fn cmd_dependencies(file: &str, detail: &str, json: bool) -> Result<()> {
     let root = find_project_root()?;
     let db = open_db(&root)?;
 
-    let deps = list_dependencies(&db, file)?;
+    let mut deps = list_dependencies(&db, file)?;
+    if detail != "full" {
+        deps.raw_imports = None;
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&deps)?);
@@ -245,6 +248,44 @@ pub(crate) fn cmd_dependencies(file: &str, json: bool) -> Result<()> {
             println!("\nTest imports (from test code only):");
             for imp in &deps.test_imports {
                 println!("  {imp}");
+            }
+        }
+        if deps.externals.imports + deps.externals.test_imports > 0 {
+            println!(
+                "\nExternal imports: {} product, {} test-only, {} packages",
+                deps.externals.imports, deps.externals.test_imports, deps.externals.packages_total
+            );
+            for package in &deps.externals.top_packages {
+                println!(
+                    "  {}: {} product, {} test-only",
+                    package.package, package.imports, package.test_imports
+                );
+            }
+        }
+        if !deps.unresolved_imports.is_empty() {
+            println!("\nUnresolved imports:");
+            for import in &deps.unresolved_imports {
+                let scope = if import.is_test { " (test-only)" } else { "" };
+                println!("  {}{scope}: {}", import.target, import.reason);
+                for candidate in &import.candidates {
+                    println!("    candidate: {candidate}");
+                }
+            }
+        }
+        if deps.intra_file_imports > 0 {
+            println!(
+                "\nOmitted {} same-file import spellings (recover with --detail full)",
+                deps.intra_file_imports
+            );
+        }
+        if let Some(raw) = &deps.raw_imports {
+            println!("\nRaw imports:");
+            for import in &raw.imports {
+                println!("  {import}");
+            }
+            println!("\nRaw test imports:");
+            for import in &raw.test_imports {
+                println!("  {import}");
             }
         }
         if deps.imported_by.is_empty() {

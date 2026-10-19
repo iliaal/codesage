@@ -169,23 +169,25 @@ fn cfg_test_use_directives_move_to_test_imports() {
     let (_dir, db) = indexed_project();
     let deps = list_dependencies(&db, "src/lib.rs").unwrap();
     assert!(deps.found);
+    let raw = deps.raw_imports.as_ref().unwrap();
     assert!(
-        deps.test_imports.iter().any(|i| i == "super::*"),
+        raw.test_imports.iter().any(|i| i == "super::*"),
         "`use super::*;` inside mod tests: {deps:?}"
     );
     assert!(
-        deps.test_imports.iter().any(|i| i == "crate::util::twice"),
+        raw.test_imports.iter().any(|i| i == "crate::util::twice"),
         "`use crate::util::twice;` inside mod tests: {deps:?}"
     );
     assert!(
-        !deps
-            .imports
+        !raw.imports
             .iter()
             .any(|i| i.starts_with("super") || i == "crate::util::twice"),
         "test-only directives leave imports[]: {deps:?}"
     );
     let json = serde_json::to_value(&deps).unwrap();
-    assert!(json["test_imports"].is_array());
+    assert!(json["raw_imports"]["test_imports"].is_array());
+    assert!(deps.intra_file_imports > 0);
+    assert!(deps.imports.contains(&"file:src/util.rs".into()));
 
     // A file with no test code keeps the old shape: no `test_imports` key.
     let util = list_dependencies(&db, "src/util.rs").unwrap();
@@ -196,7 +198,10 @@ fn cfg_test_use_directives_move_to_test_imports() {
     // Every directive in a test file is test code.
     let it = list_dependencies(&db, "tests/it.rs").unwrap();
     assert!(it.imports.is_empty(), "{it:?}");
-    assert_eq!(it.test_imports, vec!["fixture::product".to_string()]);
+    assert_eq!(
+        it.raw_imports.unwrap().test_imports,
+        vec!["fixture::product".to_string()]
+    );
 }
 
 #[test]

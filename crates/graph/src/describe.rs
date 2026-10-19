@@ -409,6 +409,7 @@ impl Builder<'_> {
 
     fn dependencies(&mut self, path: &str) -> Result<Value> {
         let dependency = crate::list_dependencies(self.db, path)?;
+        let raw = dependency.raw_imports.as_ref().cloned().unwrap_or_default();
         let indexed: HashSet<String> = self.db.all_file_paths()?.into_iter().collect();
         let modules = crate::rust_modules::RustModules::load(self.db)?;
         let packages = if path.ends_with(".rs") {
@@ -423,7 +424,7 @@ impl Builder<'_> {
         } else {
             None
         };
-        for name in &dependency.imports {
+        for name in &raw.imports {
             codesage_protocol::work::checkpoint()?;
             let mut targets = BTreeSet::new();
             if let Some(rows) = &python_refs {
@@ -477,7 +478,7 @@ impl Builder<'_> {
             );
         }
         Ok(
-            json!({"imports": {"internal": internal, "external": dependency.imports.len().saturating_sub(internal), "test_only": dependency.test_imports.len(), "top_internal": top.into_iter().take(row_limit(self.options.detail)).collect::<Vec<_>>()},
+            json!({"imports": {"internal": internal, "external": raw.imports.len().saturating_sub(internal), "test_only": raw.test_imports.len(), "top_internal": top.into_iter().take(row_limit(self.options.detail)).collect::<Vec<_>>()},
             "imported_by": {"total": dependency.imported_by.len(), "top": file_handles(&dependency.imported_by, row_limit(self.options.detail))}, "counts_floor": true}),
         )
     }
@@ -1053,7 +1054,7 @@ fn brief(text: &str, detail: DescribeDetail) -> String {
     format!("{}…", &text[..end])
 }
 
-fn read_regular(root: &Path, relative: &str, limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_regular(root: &Path, relative: &str, limit: u64) -> Result<Vec<u8>> {
     ensure!(
         !Path::new(relative).is_absolute()
             && Path::new(relative)

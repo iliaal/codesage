@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use codesage_features::trust_boundary::JavaTypeContext;
-use codesage_parser::detect::{detect_language_with_dialect, is_unambiguous_cpp_extension};
+use codesage_parser::detect::detect_language_with_dialect;
 use codesage_parser::discover::{hash_indexable_file, is_test_like_path};
 use codesage_parser::source::read_indexable_file;
 use codesage_protocol::Language;
@@ -55,18 +55,38 @@ pub struct WorkingTreeOverlayCache {
 impl WorkingTreeOverlayCache {
     /// Install request-local structural rows for edits to already indexed files.
     /// Unknown generations deliberately disable reuse between requests.
-    /// Removing the last indexed C++ dialect activator falls back when a bounded
-    /// walk finds another candidate, including ignored or oversized sources.
     pub fn apply(&mut self, root: &Path, db: &Database, generation: Option<u64>) -> OverlayReport {
-        self.apply_with_budget(root, db, generation, PREPARATION_BUDGET)
+        self.apply_with_excludes(root, db, generation, &[])
     }
 
+    pub fn apply_with_excludes(
+        &mut self,
+        root: &Path,
+        db: &Database,
+        generation: Option<u64>,
+        excludes: &[String],
+    ) -> OverlayReport {
+        self.apply_with_options(root, db, generation, PREPARATION_BUDGET, excludes)
+    }
+
+    #[cfg(test)]
     fn apply_with_budget(
         &mut self,
         root: &Path,
         db: &Database,
         generation: Option<u64>,
         budget: Duration,
+    ) -> OverlayReport {
+        self.apply_with_options(root, db, generation, budget, &[])
+    }
+
+    fn apply_with_options(
+        &mut self,
+        root: &Path,
+        db: &Database,
+        generation: Option<u64>,
+        budget: Duration,
+        excludes: &[String],
     ) -> OverlayReport {
         let started = Instant::now();
         let parent = codesage_protocol::work::current();
@@ -96,7 +116,7 @@ impl WorkingTreeOverlayCache {
         };
         let result = {
             let _scope = control.enter();
-            self.prepare(root, db, &mut report)
+            self.prepare(root, db, &mut report, excludes)
         };
         if let Err(error) = result {
             report.reason = Some(format!("{error:#}"));
@@ -105,7 +125,13 @@ impl WorkingTreeOverlayCache {
         report
     }
 
-    fn prepare(&mut self, root: &Path, db: &Database, report: &mut OverlayReport) -> Result<()> {
+    fn prepare(
+        &mut self,
+        root: &Path,
+        db: &Database,
+        report: &mut OverlayReport,
+        excludes: &[String],
+    ) -> Result<()> {
         codesage_protocol::work::checkpoint()?;
         let files = db.overlay_file_infos()?;
         let interpretations = db.all_file_interpretations()?;
@@ -125,13 +151,6 @@ impl WorkingTreeOverlayCache {
         let mut observations = HashMap::new();
         let mut unavailable = None;
         let mut java_changed = false;
-        let mut saw_cpp = false;
-        let indexed_saw_cpp = files.iter().any(|file| {
-            Path::new(&file.path)
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(is_unambiguous_cpp_extension)
-        });
         let mut deleted = HashSet::new();
         for file in &files {
             codesage_protocol::work::checkpoint()?;
@@ -142,10 +161,6 @@ impl WorkingTreeOverlayCache {
                 .or_else(|| indexed_cache.get(&file.path));
             match hash_indexable_file(root, Path::new(&file.path), cached) {
                 Ok(Some((hash, observation, _, _))) => {
-                    saw_cpp |= Path::new(&file.path)
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(is_unambiguous_cpp_extension);
                     if hash == file.content_hash {
                         continue;
                     }
@@ -181,14 +196,38 @@ impl WorkingTreeOverlayCache {
             bail!(reason);
         }
         let mut affected_paths = report.dirty_paths.clone();
-        if indexed_saw_cpp && !saw_cpp && files.iter().any(|file| file.path.ends_with(".h")) {
-            verify_no_cpp_dialect_candidates(root)?;
-        }
-        for file in files.iter().filter(|file| {
-            indexed_saw_cpp != saw_cpp && file.path.ends_with(".h") && !deleted.contains(&file.path)
-        }) {
-            let Some(language) = detect_language_with_dialect(Path::new(&file.path), saw_cpp)
-            else {
+        let surviving: Vec<_> = files
+            .iter()
+            .filter(|file| !deleted.contains(&file.path))
+            .map(|file| {
+                changed
+                    .iter()
+                    .find(|current| current.path == file.path)
+                    .unwrap_or(file)
+            })
+            .cloned()
+            .collect();
+        let cpp_headers = if surviving.iter().any(|file| file.path.ends_with(".h")) {
+            codesage_parser::header::verify_membership(root, &files, excludes)?;
+            if report.dirty_paths.iter().any(|path| {
+                path.ends_with(".h") || codesage_parser::header::is_cpp_evidence(Path::new(path))
+            }) {
+                codesage_parser::header::cpp_headers_with_context(root, &surviving, &files)?
+            } else {
+                surviving
+                    .iter()
+                    .filter(|file| file.path.ends_with(".h") && file.language == Language::Cpp)
+                    .map(|file| file.path.clone())
+                    .collect()
+            }
+        } else {
+            HashSet::new()
+        };
+        for file in surviving.iter().filter(|file| file.path.ends_with(".h")) {
+            let Some(language) = detect_language_with_dialect(
+                Path::new(&file.path),
+                cpp_headers.contains(&file.path),
+            ) else {
                 continue;
             };
             if file.language == language {
@@ -318,42 +357,6 @@ impl WorkingTreeOverlayCache {
         report.state = OverlayState::Overlay;
         Ok(())
     }
-}
-
-fn verify_no_cpp_dialect_candidates(root: &Path) -> Result<()> {
-    let mut pending = vec![root.to_path_buf()];
-    let mut visited = 0;
-    while let Some(directory) = pending.pop() {
-        codesage_protocol::work::checkpoint()?;
-        for entry in std::fs::read_dir(&directory)? {
-            codesage_protocol::work::checkpoint()?;
-            visited += 1;
-            ensure!(
-                visited <= 16_384,
-                "header dialect context exceeds 16384 directory entries; run codesage index"
-            );
-            let entry = entry?;
-            if entry.file_name().as_encoded_bytes().starts_with(b".") {
-                continue;
-            }
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                pending.push(entry.path());
-            } else if kind.is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(is_unambiguous_cpp_extension)
-            {
-                bail!(
-                    "header dialect requires codesage index: remaining C++ candidate {}",
-                    entry.path().strip_prefix(root)?.display()
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -669,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_cpp_activator_does_not_change_stored_header_dialect() {
+    fn oversized_cpp_sources_do_not_supply_header_evidence() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("subject.h"), "class original {};").unwrap();
         std::fs::File::create(root.path().join("oversized.cpp"))
@@ -689,13 +692,13 @@ mod tests {
         assert_eq!(report.state, OverlayState::Clean, "{report:?}");
         assert_eq!(
             db.all_files_with_id_and_language().unwrap()[0].2,
-            Language::Cpp
+            Language::C
         );
         assert_eq!(
             db.find_symbols("original", Some(codesage_protocol::SymbolKind::Class))
                 .unwrap()
                 .len(),
-            1
+            0
         );
 
         std::fs::write(root.path().join("subject.h"), "class current {};").unwrap();
@@ -706,16 +709,16 @@ mod tests {
             db.find_symbols("current", Some(codesage_protocol::SymbolKind::Class))
                 .unwrap()
                 .len(),
-            1
+            0
         );
         assert_eq!(
             db.all_files_with_id_and_language().unwrap()[0].2,
-            Language::Cpp
+            Language::C
         );
     }
 
     #[test]
-    fn remaining_oversized_cpp_candidate_prevents_false_header_downgrade() {
+    fn deleting_cpp_evidence_ignores_oversized_candidates_and_matches_rebuild() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("subject.h"), "class Widget {};").unwrap();
         std::fs::write(root.path().join("marker.cpp"), "void marker() {}").unwrap();
@@ -733,21 +736,16 @@ mod tests {
 
         let db = Database::open_read_only(&path).unwrap();
         let report = WorkingTreeOverlayCache::default().apply(root.path(), &db, Some(1));
-        assert_eq!(report.state, OverlayState::Dirty, "{report:?}");
+        assert_eq!(report.state, OverlayState::Overlay, "{report:?}");
         assert_eq!(report.dirty_paths, ["marker.cpp"]);
         assert!(report.checked_all);
-        assert!(
-            report
-                .reason
-                .unwrap()
-                .contains("remaining C++ candidate oversized.cpp")
-        );
-        assert!(!db.has_structural_overlay().unwrap());
+        assert!(report.reason.is_none());
+        assert!(db.has_structural_overlay().unwrap());
         assert_eq!(
             db.find_symbols("Widget", Some(codesage_protocol::SymbolKind::Class))
                 .unwrap()
                 .len(),
-            1
+            0
         );
 
         let writer = Database::open(&path).unwrap();
@@ -757,8 +755,101 @@ mod tests {
                 .find_symbols("Widget", Some(codesage_protocol::SymbolKind::Class))
                 .unwrap()
                 .len(),
-            1
+            0
         );
+    }
+
+    #[test]
+    fn include_edits_change_only_resolved_headers_and_match_rebuild() {
+        let (root, path) = indexed(&[
+            ("cpp/main.cpp", "void marker() {}\n"),
+            (
+                "include/api.h",
+                "struct Api { int value; };\nvoid api_call(void) { helper(); }\n",
+            ),
+            ("c/unrelated.h", "struct Core { int value; };\n"),
+        ]);
+        std::fs::write(
+            root.path().join("cpp/main.cpp"),
+            "#include <api.h>\nvoid marker() {}\n",
+        )
+        .unwrap();
+        let db = Database::open_read_only(&path).unwrap();
+        let report = WorkingTreeOverlayCache::default().apply(root.path(), &db, Some(1));
+        assert_eq!(report.state, OverlayState::Overlay, "{report:?}");
+        assert_eq!(
+            db.all_files_with_id_and_language()
+                .unwrap()
+                .into_iter()
+                .find(|(_, file, _)| file == "include/api.h")
+                .unwrap()
+                .2,
+            Language::Cpp
+        );
+        let fresh = Database::open_in_memory().unwrap();
+        crate::full_index(root.path(), &fresh, &[], false).unwrap();
+        for file in ["include/api.h", "c/unrelated.h", "cpp/main.cpp"] {
+            assert_eq!(
+                db.symbols_for_file(file).unwrap(),
+                fresh.symbols_for_file(file).unwrap()
+            );
+            assert_eq!(
+                db.references_in_file_range(file, 1, u32::MAX).unwrap(),
+                fresh.references_in_file_range(file, 1, u32::MAX).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn new_header_evidence_requires_index_but_excluded_evidence_does_not() {
+        let (root, path) = indexed(&[("api.h", "class Api {};\n")]);
+        std::fs::write(root.path().join("main.cpp"), "void marker() {}\n").unwrap();
+        let db = Database::open_read_only(&path).unwrap();
+        let mut cache = WorkingTreeOverlayCache::default();
+        let report = cache.apply(root.path(), &db, Some(1));
+        assert_eq!(report.state, OverlayState::Dirty, "{report:?}");
+        assert!(report.reason.unwrap().contains("new candidate main.cpp"));
+        assert!(!db.has_structural_overlay().unwrap());
+        let report = cache.apply_with_excludes(root.path(), &db, Some(1), &["main.cpp".into()]);
+        assert_eq!(report.state, OverlayState::Clean, "{report:?}");
+    }
+
+    #[test]
+    fn excluding_indexed_cpp_evidence_requires_index() {
+        let (root, path) = indexed(&[
+            ("api.h", "class Api {};\n"),
+            ("main.cpp", "void marker() {}\n"),
+        ]);
+        let db = Database::open_read_only(&path).unwrap();
+        let report = WorkingTreeOverlayCache::default().apply_with_excludes(
+            root.path(),
+            &db,
+            Some(1),
+            &["main.cpp".into()],
+        );
+        assert_eq!(report.state, OverlayState::Dirty, "{report:?}");
+        assert!(
+            report
+                .reason
+                .unwrap()
+                .contains("main.cpp is no longer admitted")
+        );
+        assert!(!db.has_structural_overlay().unwrap());
+    }
+
+    #[test]
+    fn unsupported_files_do_not_exhaust_header_evidence_membership() {
+        let (root, path) = indexed(&[("api.h", "struct Api { int value; };\n")]);
+        let data = root.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        for number in 0..17_000 {
+            std::fs::write(data.join(format!("case{number}.txt")), "").unwrap();
+        }
+        let db = Database::open_read_only(&path).unwrap();
+        let report = WorkingTreeOverlayCache::default().apply(root.path(), &db, Some(1));
+        assert_eq!(report.state, OverlayState::Clean, "{report:?}");
+        assert!(report.checked_all);
+        assert!(report.reason.is_none());
     }
 
     #[test]

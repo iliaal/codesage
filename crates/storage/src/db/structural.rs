@@ -1333,6 +1333,10 @@ impl Database {
                 ),
                 imports: Vec::new(),
                 test_imports: Vec::new(),
+                externals: Default::default(),
+                unresolved_imports: Vec::new(),
+                intra_file_imports: 0,
+                raw_imports: None,
                 imported_by: Vec::new(),
             });
         }
@@ -1413,6 +1417,10 @@ impl Database {
             note: None,
             imports,
             test_imports,
+            externals: Default::default(),
+            unresolved_imports: Vec::new(),
+            intra_file_imports: 0,
+            raw_imports: None,
             imported_by,
         })
     }
