@@ -82,6 +82,7 @@ impl Shim {
             .env("CODESAGE_DAEMON_IDLE_TIMEOUT_SECS", idle_seconds)
             .env("CODESAGE_CLIENT_IDLE_MAX_SECS", "0")
             .env("RUST_LOG", "codesage=info")
+            .env("NO_COLOR", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
