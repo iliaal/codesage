@@ -30,13 +30,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Bound each batch so a wedged daemon cannot indefinitely hold the index lock.
 const EMBED_TIMEOUT: Duration = Duration::from_secs(120);
 /// Retries of one indexing batch after the daemon timed out, was saturated,
-/// or cancelled it, before the batch falls back to a private embedder.
+/// cancelled it, or lost its session before private embedding.
 const DAEMON_RETRIES: u32 = 2;
 /// Wall time one batch may spend across the daemon attempts, so retries
 /// cannot hold the index lock much past a single timeout.
 const DAEMON_RETRY_BUDGET: Duration = Duration::from_secs(240);
 /// Backoff before retry `n` is `n` times this.
 const DAEMON_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+/// Give a replacement daemon time to bind the same-build socket.
+const DAEMON_RECONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DAEMON_RECONNECT_POLL: Duration = Duration::from_millis(100);
 /// A retry with less time than this left would only time out again.
 const MIN_RETRY_ATTEMPT: Duration = Duration::from_secs(10);
 /// Consecutive batches that may exhaust their retries on a saturated daemon
@@ -48,6 +51,7 @@ fn transient_code(code: &str) -> Option<TransientKind> {
     match code {
         "E_TIMEOUT" | "E_CANCELLED" => Some(TransientKind::Timeout),
         "E_SATURATED" => Some(TransientKind::Busy),
+        "E_SHUTDOWN" => Some(TransientKind::Unavailable),
         _ => None,
     }
 }
@@ -59,6 +63,8 @@ enum TransientKind {
     Timeout,
     /// The daemon refused new work as saturated.
     Busy,
+    /// The daemon is shutting down or its transport has closed.
+    Unavailable,
 }
 
 /// A daemon attempt that failed for want of time or capacity; the same batch
@@ -85,6 +91,26 @@ fn transient_failure(error: &anyhow::Error) -> Option<&TransientFailure> {
         .find_map(|cause| cause.downcast_ref::<TransientFailure>())
 }
 
+fn daemon_service_error(error: rmcp::ServiceError) -> anyhow::Error {
+    let (kind, reason) = match &error {
+        rmcp::ServiceError::Timeout { .. } => (
+            TransientKind::Timeout,
+            "daemon embed_texts request timed out",
+        ),
+        rmcp::ServiceError::TransportSend(_) | rmcp::ServiceError::TransportClosed => (
+            TransientKind::Unavailable,
+            "daemon embed_texts connection was lost",
+        ),
+        _ => return anyhow::Error::new(error),
+    };
+    anyhow::Error::new(TransientFailure {
+        reason,
+        kind,
+        reopen_session: true,
+    })
+    .context(error.to_string())
+}
+
 /// The `error.code` of a failed tool result's contract block, if any.
 fn daemon_error_code(result: &rmcp::model::CallToolResult) -> Option<String> {
     result.content.iter().find_map(|block| {
@@ -102,6 +128,7 @@ struct RetryPolicy {
     budget: Duration,
     backoff: Duration,
     min_attempt: Duration,
+    reconnect_timeout: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -112,6 +139,7 @@ impl Default for RetryPolicy {
             budget: DAEMON_RETRY_BUDGET,
             backoff: DAEMON_RETRY_BACKOFF,
             min_attempt: MIN_RETRY_ATTEMPT,
+            reconnect_timeout: DAEMON_RECONNECT_TIMEOUT,
         }
     }
 }
@@ -131,8 +159,7 @@ pub(crate) struct DaemonEmbedder {
     /// Lazily constructed fallback for oversized texts and daemon failures.
     private_init: Option<PrivateEmbedderInit>,
     private: Option<Box<dyn TextEmbedder>>,
-    /// The client session was torn down within the current batch's
-    /// attempts; reopen it before the next retry.
+    /// Reopen before the next retry or batch, including after private fallback.
     session_lost: bool,
     /// Consecutive batches that exhausted their retries on a saturated daemon.
     busy_batches: u32,
@@ -310,7 +337,13 @@ impl DaemonEmbedder {
         let mut last_error: Option<anyhow::Error> = None;
         loop {
             if self.session_lost {
-                let reopened = open_session(&self.rt, &self.socket, CONNECT_TIMEOUT.min(left()));
+                let reopened = reopen_session(
+                    &self.rt,
+                    &self.socket,
+                    policy
+                        .reconnect_timeout
+                        .min(left().saturating_sub(policy.min_attempt)),
+                );
                 match reopened {
                     Ok(client) => {
                         self.client = client;
@@ -319,7 +352,10 @@ impl DaemonEmbedder {
                     Err(reconnect) => {
                         let error = anyhow::Error::new(TransientFailure {
                             reason: "daemon session could not be reopened",
-                            kind: TransientKind::Timeout,
+                            kind: last_error
+                                .as_ref()
+                                .and_then(transient_failure)
+                                .map_or(TransientKind::Unavailable, |t| t.kind),
                             reopen_session: true,
                         })
                         .context(format!("reconnecting to the daemon failed: {reconnect:#}"));
@@ -384,24 +420,13 @@ impl DaemonEmbedder {
                         PeerRequestOptions::with_timeout(timeout.saturating_sub(delivery_grace)),
                     )
                     .await
+                    .map_err(daemon_service_error)
                     .context("sending daemon embed_texts")?;
-                match request.await_response().await {
-                    Ok(response) => Ok(response),
-                    // rmcp discards a failed cancellation send, so a broken
-                    // socket also ends here; retry on a fresh session, which
-                    // costs one handshake.
-                    Err(error @ rmcp::ServiceError::Timeout { .. }) => {
-                        Err(anyhow::Error::new(TransientFailure {
-                            reason: "daemon embed_texts request timed out",
-                            kind: TransientKind::Timeout,
-                            reopen_session: true,
-                        })
-                        .context(error.to_string()))
-                    }
-                    Err(error) => {
-                        Err(anyhow::Error::new(error).context("daemon embed_texts failed"))
-                    }
-                }
+                request
+                    .await_response()
+                    .await
+                    .map_err(daemon_service_error)
+                    .context("daemon embed_texts failed")
             };
             match tokio::time::timeout(timeout, operation).await {
                 Ok(result) => result,
@@ -433,7 +458,7 @@ impl DaemonEmbedder {
                 return Err(anyhow::Error::new(TransientFailure {
                     reason: "daemon could not schedule or finish embed_texts",
                     kind,
-                    reopen_session: false,
+                    reopen_session: kind == TransientKind::Unavailable,
                 })
                 .context(format!("daemon refused embed_texts ({code}): {text}")));
             }
@@ -451,6 +476,27 @@ impl DaemonEmbedder {
             texts.len()
         );
         Ok(parsed)
+    }
+}
+
+fn reopen_session(
+    rt: &tokio::runtime::Runtime,
+    socket: &Path,
+    timeout: Duration,
+) -> Result<RunningService<RoleClient, ()>> {
+    let started = Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        match open_session(rt, socket, CONNECT_TIMEOUT.min(remaining)) {
+            Ok(client) => return Ok(client),
+            Err(error) => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(DAEMON_RECONNECT_POLL.min(remaining));
+            }
+        }
     }
 }
 
@@ -605,7 +651,7 @@ impl TextEmbedder for DaemonEmbedder {
                             (self.busy_batches >= BUSY_BATCHES_BEFORE_BYPASS)
                                 .then_some("stayed saturated")
                         }
-                        None => None,
+                        Some(TransientKind::Unavailable) | None => None,
                     };
                     if let Some(why) = why {
                         self.bypass_daemon = true;
@@ -943,6 +989,98 @@ pub(crate) mod tests {
                         }
                     }
                 }
+            });
+        });
+        (dir, socket, handle)
+    }
+
+    fn spawn_restarting_fake(
+        shutdown: bool,
+        successor: Option<FakeDaemon>,
+        restart_delay: Duration,
+    ) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<()>) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("restart.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server_socket = socket.clone();
+        let handle = std::thread::spawn(move || {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    listener.set_nonblocking(true).unwrap();
+                    let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = BufReader::new(stream);
+                    let mut batch = None;
+                    while batch.is_none() {
+                        let mut line = String::new();
+                        assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let result = match request["method"].as_str() {
+                            Some("initialize") => json!({
+                                "protocolVersion": request["params"]["protocolVersion"],
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "restarting", "version": "1"}
+                            }),
+                            Some("tools/call")
+                                if request["params"]["arguments"]["texts"]
+                                    .as_array()
+                                    .is_some_and(Vec::is_empty) =>
+                            {
+                                json!({
+                                    "content": [],
+                                    "structuredContent": {"model": "m", "dim": 4,
+                                        "fingerprint": fp_a().as_str(), "embeddings": []}
+                                })
+                            }
+                            Some("tools/call") => {
+                                batch = Some(request);
+                                continue;
+                            }
+                            _ => continue,
+                        };
+                        let response = json!({
+                            "jsonrpc": "2.0", "id": request["id"], "result": result
+                        });
+                        stream
+                            .get_mut()
+                            .write_all(format!("{response}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    drop(listener);
+                    std::fs::remove_file(&server_socket).unwrap();
+                    if shutdown {
+                        let response = json!({
+                            "jsonrpc": "2.0", "id": batch.unwrap()["id"],
+                            "result": {"isError": true, "content": [{
+                                "type": "text", "text": json!({
+                                    "error": {"code": "E_SHUTDOWN", "message": "stopping"}
+                                }).to_string()
+                            }]}
+                        });
+                        stream
+                            .get_mut()
+                            .write_all(format!("{response}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    drop(stream);
+                    if let Some(daemon) = successor {
+                        tokio::time::sleep(restart_delay).await;
+                        let listener = tokio::net::UnixListener::bind(&server_socket).unwrap();
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let service = daemon.serve(stream).await.unwrap();
+                        let _ = service.waiting().await;
+                    }
+                })
+                .await
+                .expect("restart fixture must complete");
             });
         });
         (dir, socket, handle)
@@ -1379,6 +1517,7 @@ pub(crate) mod tests {
             budget: Duration::from_secs(5),
             backoff: Duration::from_millis(10),
             min_attempt: Duration::from_millis(50),
+            reconnect_timeout: Duration::from_secs(1),
         };
     }
 
@@ -1672,9 +1811,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn shutdown_and_unknown_daemon_errors_are_not_retried() {
+    fn shutdown_retries_on_a_fresh_session_before_loading_a_private_embedder() {
         let daemon = FakeDaemon::new(4, "m");
         daemon.refusals.lock().unwrap().push("E_SHUTDOWN");
+        let sessions = daemon.sessions.clone();
+        let (_dir, socket, handle) = spawn_fake(daemon);
+        {
+            let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
+                .unwrap()
+                .with_private_fallback(Box::new(|| {
+                    Ok(Box::new(FakePrivate::new(4)) as Box<dyn TextEmbedder>)
+                }));
+            quick_retries(&mut client);
+            client.bind_fingerprint(&fp_a()).unwrap();
+            let out = client.embed_batch(&["ab"]).unwrap();
+            assert!(
+                !client.private_loaded(),
+                "shutdown must retry before private loading"
+            );
+            assert_eq!(out[0][0], 2.0);
+            assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn unknown_daemon_errors_are_not_retried() {
+        let daemon = FakeDaemon::new(4, "m");
+        daemon.refusals.lock().unwrap().push("E_UNKNOWN");
         let requests = daemon.requests.clone();
         let (_dir, socket, handle) = spawn_fake(daemon);
         {
@@ -1692,6 +1856,140 @@ pub(crate) mod tests {
                 4.0,
                 "a non-timeout failure does not bypass the daemon for the pass"
             );
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_replacement_daemon_embeds_after_shutdown_or_transport_loss() {
+        for shutdown in [false, true] {
+            let daemon = FakeDaemon::new(4, "m");
+            let requests = daemon.requests.clone();
+            let (_dir, socket, handle) =
+                spawn_restarting_fake(shutdown, Some(daemon), Duration::from_millis(100));
+            {
+                let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
+                    .unwrap()
+                    .with_private_fallback(Box::new(|| {
+                        Ok(Box::new(FakePrivate::new(4)) as Box<dyn TextEmbedder>)
+                    }));
+                quick_retries(&mut client);
+                client.bind_fingerprint(&fp_a()).unwrap();
+                let out = client.embed_batch(&["ab", "abcd"]).unwrap();
+                assert!(
+                    !client.private_loaded(),
+                    "replacement must precede private loading"
+                );
+                assert_eq!(out[0][0], 2.0);
+                assert_eq!(out[1][0], 4.0);
+                assert_eq!(client.embed_batch(&["xyz"]).unwrap()[0][0], 3.0);
+                assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+            }
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_replacement_daemon_with_another_fingerprint_is_not_retried_or_used_privately() {
+        let daemon = FakeDaemon {
+            fingerprint: fp_b().as_str().to_string(),
+            ..FakeDaemon::new(4, "m")
+        };
+        let requests = daemon.requests.clone();
+        let (_dir, socket, handle) =
+            spawn_restarting_fake(false, Some(daemon), Duration::from_millis(100));
+        {
+            let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
+                .unwrap()
+                .with_private_fallback(Box::new(|| {
+                    Ok(Box::new(FakePrivate::new(4)) as Box<dyn TextEmbedder>)
+                }));
+            quick_retries(&mut client);
+            client.bind_fingerprint(&fp_a()).unwrap();
+            let error = client.embed_batch(&["ab"]).unwrap_err();
+            assert!(is_fingerprint_refusal(&error), "{error:#}");
+            assert!(!client.private_loaded());
+            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn an_absent_successor_is_bounded_and_later_batches_can_reconnect() {
+        for bounded_by_budget in [false, true] {
+            let (_dir, socket, stopped) = spawn_restarting_fake(false, None, Duration::ZERO);
+            let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
+                .unwrap()
+                .with_private_fallback(Box::new(|| {
+                    Ok(Box::new(FakePrivate::new(4)) as Box<dyn TextEmbedder>)
+                }));
+            quick_retries(&mut client);
+            if bounded_by_budget {
+                client.retry.budget = Duration::from_millis(250);
+            } else {
+                client.retry.reconnect_timeout = Duration::from_millis(200);
+            }
+            client.bind_fingerprint(&fp_a()).unwrap();
+            let started = Instant::now();
+            assert_eq!(client.embed_batch(&["ab"]).unwrap()[0][0], -1.0);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(150),
+                "wait for a successor before private loading: {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "reconnect must respect its window and batch budget: {elapsed:?}"
+            );
+            assert!(client.private_loaded());
+            stopped.join().unwrap();
+
+            let daemon = FakeDaemon::new(4, "m");
+            let requests = daemon.requests.clone();
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let replacement = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    listener.set_nonblocking(true).unwrap();
+                    let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+                    let (stream, _) =
+                        tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    let service = daemon.serve(stream).await.unwrap();
+                    let _ = service.waiting().await;
+                });
+            });
+            assert_eq!(client.embed_batch(&["abcd"]).unwrap()[0][0], 4.0);
+            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+            drop(client);
+            replacement.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_closed_session_is_replaced_before_sending_the_next_batch() {
+        let daemon = FakeDaemon::new(4, "m");
+        let sessions = daemon.sessions.clone();
+        let (_dir, socket, handle) = spawn_fake(daemon);
+        {
+            let _other_client = DaemonEmbedder::connect_to(&socket, "/p", "m").unwrap();
+            let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
+                .unwrap()
+                .with_private_fallback(Box::new(|| {
+                    Ok(Box::new(FakePrivate::new(4)) as Box<dyn TextEmbedder>)
+                }));
+            quick_retries(&mut client);
+            client.bind_fingerprint(&fp_a()).unwrap();
+            client.client.cancellation_token().cancel();
+            client.rt.block_on(async { tokio::task::yield_now().await });
+            assert_eq!(client.embed_batch(&["ab"]).unwrap()[0][0], 2.0);
+            assert!(!client.private_loaded());
+            assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 3);
         }
         handle.join().unwrap();
     }

@@ -14,7 +14,10 @@ mod unix {
         ffi::OsString,
         fs::{self, OpenOptions},
         io::{self, Write},
-        os::unix::fs::{MetadataExt, PermissionsExt},
+        os::unix::{
+            fs::{MetadataExt, PermissionsExt},
+            process::CommandExt,
+        },
         path::{Path, PathBuf},
         pin::Pin,
         process::{Child, Command, Stdio},
@@ -931,6 +934,14 @@ mod unix {
         // model-load scratch across ORT/tokio threads. Preserve operator overrides.
         if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
             cmd.env("MALLOC_ARENA_MAX", "2");
+        }
+        // The shared daemon must outlive host process-group teardown and terminal hangups.
+        // SAFETY: setsid is async-signal-safe and the closure does not allocate or lock.
+        unsafe {
+            cmd.pre_exec(|| {
+                rustix::process::setsid()?;
+                Ok(())
+            });
         }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::from(

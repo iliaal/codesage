@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+### Fixed
+
+- Shared MCP daemons survive termination of the spawning client's process group or session.
+- Indexing reconnects after daemon shutdown or a broken connection before falling back to private embedding.
+
 ## [0.44.0] - 2026-10-19
 
 ### Added
