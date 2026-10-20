@@ -1,7 +1,5 @@
 ## [Unreleased]
 
-## [0.44.1] - 2026-10-20
-
 ### Fixed
 
 - Shared MCP daemons survive termination of the spawning client's process group or session.
@@ -1328,7 +1326,5 @@ Initial public release.
 
 [0.43.0]: https://github.com/iliaal/codesage/releases/tag/v0.43.0
 
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.44.0...HEAD
 [0.44.0]: https://github.com/iliaal/codesage/releases/tag/v0.44.0
-
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.44.1...HEAD
-[0.44.1]: https://github.com/iliaal/codesage/releases/tag/v0.44.1
