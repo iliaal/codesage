@@ -633,7 +633,7 @@ def first_hit_rank(rec: dict) -> int | None:
             raise bad
         try:
             value = int(rank)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise bad
         if isinstance(rank, float) and rank != value:
             raise bad
