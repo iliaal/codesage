@@ -13,6 +13,7 @@ import io
 import json
 import math
 import random
+import subprocess
 import sys
 import tempfile
 from fractions import Fraction
@@ -770,11 +771,25 @@ bad_rank = write("bad-rank.json", [{**recs_b[0], "first_hit_rank": "one"}] + rec
 rc, _, err = run(["--baseline", str(write("bad-rank-base.json", recs_a)), "--candidate", str(bad_rank), "--bootstrap", "200"])
 check(rc == 2 and "record 'case-0-0': first_hit_rank must be a positive integer ('one')" in err,
       f"bad rank: exits 2 naming the record (rc={rc}, err={err.strip()[-100:]})")
-for bad_value in (-1, True, 2.9, 0):
+for bad_value in (-1, True, 2.9, 0, float("inf"), float("-inf"), float("nan")):
     bad_rank = write("bad-rank2.json", [{**recs_b[0], "first_hit_rank": bad_value}] + recs_b[1:])
     rc, _, err = run(["--baseline", str(write("bad-rank-base.json", recs_a)), "--candidate", str(bad_rank), "--bootstrap", "200"])
     check(rc == 2 and f"must be a positive integer ({bad_value!r})" in err,
           f"bad rank: {bad_value!r} is refused (rc={rc}, err={err.strip()[-100:]})")
+# Valid JSON exponents can overflow Python's float parser to infinity. Exercise
+# the real CLI so these inputs refuse cleanly rather than leaking a traceback.
+for raw_rank in ("1e309", "-1e309"):
+    overflow_rank = write("overflow-rank.json", [{**recs_b[0], "first_hit_rank": "RAW_RANK"}] + recs_b[1:])
+    overflow_rank.write_text(overflow_rank.read_text().replace('"RAW_RANK"', raw_rank))
+    result = subprocess.run(
+        [sys.executable, str(HERE / "compare-runs.py"), "--baseline",
+         str(write("overflow-rank-base.json", recs_a)), "--candidate", str(overflow_rank),
+         "--bootstrap", "200"], capture_output=True, text=True,
+    )
+    check(result.returncode == 2 and "REFUSED:" in result.stderr
+          and "first_hit_rank must be a positive integer" in result.stderr
+          and "Traceback" not in result.stderr and not result.stdout,
+          f"bad rank: JSON {raw_rank} exits CLI cleanly (rc={result.returncode})")
 ok_rank = write("ok-rank.json", [{**recs_b[0], "first_hit_rank": 1.0}, {**recs_b[1], "first_hit_rank": "1"}] + recs_b[2:])
 rc, out, _ = run(["--baseline", str(write("bad-rank-base.json", recs_a)), "--candidate", str(ok_rank), "--bootstrap", "200"])
 check(rc == 0 and "\nACCEPT\n" in out, f"bad rank: integral 1.0 and '1' are accepted (rc={rc})")
