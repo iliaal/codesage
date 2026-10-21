@@ -96,11 +96,13 @@ def install(source_root: Path, skills_dir: Path, repo_skills_dir: Path | None = 
         if target.parent.exists() and not target.parent.is_dir():
             raise ValueError(f"not a skill directory: {target.parent}")
         planned.append((target, render(source, plugin)))
+    destinations = {target.resolve() for target, _ in planned}
     retired = []
     for name in REPO_COMMANDS:
         legacy = skills_dir / f"codesage-{name}" / "SKILL.md"
         canonical = plugin / "commands" / f"codesage-{name}.md"
         if (legacy.is_file() and not legacy.is_symlink()
+                and legacy.resolve() not in destinations
                 and f"(<{canonical}>)" in legacy.read_text(encoding="utf-8", errors="replace")):
             retired.append(legacy)
     for target, content in planned:
