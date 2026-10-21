@@ -83,7 +83,9 @@ ONNX Runtime loads dynamically. CUDA libraries come from pip-installed `nvidia-*
 
 `codesage doctor` reports how many nvidia lib dirs were discovered and warns if none.
 
-If CUDA is requested (`device = "gpu"`) but fails to register, the process errors out instead of falling back to CPU. This is intentional: silent CPU fallback produces different embeddings and slower performance. The check inspects `/proc/self/maps` after session creation and hard-fails when libcuda/libcudart aren't mapped. To bypass the Linux post-session library check deliberately (tests, mixed CPU/GPU setups), set `CODESAGE_ALLOW_CPU_FALLBACK=1`. If that check fails with the override enabled, the session logs a warning and fingerprints its execution provider as CPU; do not leave the override set on a GPU-configured project.
+If CUDA is requested (`device = "gpu"`) but fails to register, session creation fails instead of falling back to CPU. On Linux builds with the `cuda` feature, the post-session check reads `/proc/self/maps` and fails if either `libcuda.so` or `libcudart.so` is absent, or if both `libcudnn` and `libcublas` are absent. The embedder and reranker share this check.
+
+`CODESAGE_ALLOW_CPU_FALLBACK=1` allows a failed Linux post-session library check to continue with a warning; it does not bypass missing-build-feature or CUDA registration errors. In that case, the embedder retains `cpu` as its execution provider for embedding fingerprint checks. The reranker uses the same session loader but discards the returned provider metadata, so this is not a reranker fingerprint guarantee. Do not leave the override set on a GPU-configured project.
 
 Required pip packages: `onnxruntime-gpu`, `nvidia-cudnn-cu12`, `nvidia-cublas-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-cufft-cu12`, `nvidia-curand-cu12`, `nvidia-cuda-nvrtc-cu12`.
 
