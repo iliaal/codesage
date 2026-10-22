@@ -224,6 +224,8 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=10)
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
+    if args.limit < 1:
+        ap.error("--limit must be a positive integer")
 
     corpus = yaml.safe_load(args.corpus.read_text())
     project_root = Path(corpus["project_root"]).expanduser().resolve()
