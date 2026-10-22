@@ -12,6 +12,26 @@ SCRIPT = Path(__file__).resolve().parents[2] / "bench" / "semble-ndcg-runner"
 
 
 class NdcgCutoffTests(unittest.TestCase):
+    def test_cli_rejects_nonpositive_cutoffs_before_reading_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "score.json"
+            artifact.write_text("existing report\n")
+            for cutoff in (0, -1, -10):
+                with self.subTest(cutoff=cutoff):
+                    proc = subprocess.run([
+                        sys.executable, str(SCRIPT), "--corpus", str(root / "missing"),
+                        "--annotations", str(root / "missing"),
+                        "--repos", str(root / "missing.json"),
+                        "--codesage-bin", str(root / "missing-binary"),
+                        "--json", str(artifact), "--limit", str(cutoff),
+                    ], capture_output=True, text=True, timeout=20)
+                    self.assertEqual(proc.returncode, 2)
+                    self.assertIn("--limit must be a positive integer", proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertEqual(proc.stdout, "")
+                    self.assertEqual(artifact.read_text(), "existing report\n")
+
     def test_cli_labels_all_score_sinks_with_actual_cutoff(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
