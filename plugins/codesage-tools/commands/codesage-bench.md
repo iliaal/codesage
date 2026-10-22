@@ -16,7 +16,7 @@ Corpus directory resolution (first match wins):
 
 ## Step 1: Run the benchmark
 
-Read and follow [the argument transport procedure](<${CLAUDE_PLUGIN_ROOT}/references/command-arguments.md>).
+Read and follow [the argument transport procedure](../references/command-arguments.md).
 Use the `bench` command identifier with the parsed `$ARGUMENTS` values. The
 dispatcher runs `${CLAUDE_PLUGIN_ROOT}/bin/codesage-bench` from the currently
 installed plugin.

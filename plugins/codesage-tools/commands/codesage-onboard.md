@@ -20,7 +20,7 @@ Default device is `gpu`. The binary errors out if CUDA is requested but unavaila
 
 Resolve `${CLAUDE_PLUGIN_ROOT}/bin/codesage-onboard` from the currently installed
 plugin, including when refreshing a hint written by an older version. Invoke the
-executable through [the argument transport procedure](<${CLAUDE_PLUGIN_ROOT}/references/command-arguments.md>)
+executable through [the argument transport procedure](../references/command-arguments.md)
 with command identifier `onboard`. Pass the project path and each parsed option
 as separate JSON strings; `$ARGUMENTS` supplies argument data, not shell source.
 The plugin does not install `codesage-onboard` on `PATH`.

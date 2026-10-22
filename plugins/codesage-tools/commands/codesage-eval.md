@@ -18,7 +18,7 @@ This is separate from `/codesage-bench`, which runs a regression suite across al
 
 ## Step 2: Run the eval
 
-Read and follow [the argument transport procedure](<${CLAUDE_PLUGIN_ROOT}/references/command-arguments.md>).
+Read and follow [the argument transport procedure](../references/command-arguments.md).
 Use the `eval` command identifier with the parsed `$ARGUMENTS` values. The
 dispatcher runs `${CLAUDE_PLUGIN_ROOT}/bin/codesage-eval` from the currently
 installed plugin.
