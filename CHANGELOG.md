@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Security
+
+- Model downloads use patched TLS certificate verification and root certificates, fixing RUSTSEC-2026-0381, RUSTSEC-2026-0382, and RUSTSEC-2026-0383.
+
 ## [0.44.1] - 2026-10-20
 
 ### Fixed
