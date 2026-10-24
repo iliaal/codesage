@@ -4330,30 +4330,36 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
 
-        // A process whose `comm` is `cargo`: a symlink to sleep named cargo.
+        // `comm` is the basename of the exec'd path, so a symlink named `cargo`
+        // gives a cargo-named process. The target is the shell blocked in its
+        // `read` builtin, not `sleep`: multicall coreutils (uutils, the Ubuntu
+        // 26.04 default) exit at once when invoked under an unknown name.
         let fake_cargo = elsewhere.path().join("cargo");
-        symlink("/bin/sleep", &fake_cargo).unwrap();
+        symlink("/bin/sh", &fake_cargo).unwrap();
+        let spawn_fake_cargo = |cwd: &Path| {
+            std::process::Command::new(&fake_cargo)
+                .args(["-c", "read _"])
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        // Checked after each scan: a child alive now was alive during the scan.
+        let assert_alive = |child: &mut std::process::Child| {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("fake cargo exited before the scan finished: {status}");
+            }
+        };
 
-        let mut outside = std::process::Command::new(&fake_cargo)
-            .arg("30")
-            .current_dir(elsewhere.path())
-            .spawn()
-            .unwrap();
-        // Give /proc time to reflect the exec'd comm.
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(
-            build_process_under(root),
-            None,
-            "cwd outside the root is not pressure"
-        );
+        let mut outside = spawn_fake_cargo(elsewhere.path());
+        let found = build_process_under(root);
+        assert_alive(&mut outside);
+        assert_eq!(found, None, "cwd outside the root is not pressure");
 
-        let mut inside = std::process::Command::new(&fake_cargo)
-            .arg("30")
-            .current_dir(&sub)
-            .spawn()
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(build_process_under(root).as_deref(), Some("cargo"));
+        let mut inside = spawn_fake_cargo(&sub);
+        let found = build_process_under(root);
+        assert_alive(&mut inside);
+        assert_eq!(found.as_deref(), Some("cargo"));
 
         let _ = inside.kill();
         let _ = inside.wait();
