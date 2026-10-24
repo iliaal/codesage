@@ -740,6 +740,7 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ),
     ("0026_python_bindings", migrate_0026_python_bindings),
     ("0027_symbol_signatures", migrate_0027_symbol_signatures),
+    ("0029_feature_entrypoints", migrate_0029_feature_entrypoints),
 ];
 
 fn migrate_0027_symbol_signatures(conn: &Connection) -> rusqlite::Result<()> {
@@ -752,6 +753,20 @@ fn migrate_0027_symbol_signatures(conn: &Connection) -> rusqlite::Result<()> {
         if !exists {
             conn.execute_batch(&format!("ALTER TABLE symbols ADD COLUMN {column} TEXT;"))?;
         }
+    }
+    Ok(())
+}
+
+fn migrate_0029_feature_entrypoints(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('features') WHERE name = 'entrypoints')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch(
+            "ALTER TABLE features ADD COLUMN entrypoints TEXT NOT NULL DEFAULT '[]';",
+        )?;
     }
     Ok(())
 }
@@ -1928,6 +1943,45 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(again, count, "second init_db must be a registry no-op");
+    }
+
+    #[test]
+    fn feature_entrypoint_migration_preserves_existing_features() {
+        let conn = open_initialized();
+        conn.execute_batch("ALTER TABLE features DROP COLUMN entrypoints;
+            DELETE FROM schema_migrations WHERE name = '0029_feature_entrypoints';
+            INSERT INTO features(feature_id,title,summary,kind,source,confidence,entry_path,language,tags)
+            VALUES('feat_legacy','Legacy','kept','library','php-ext','high','ext/demo/config.m4','php','[]');
+            INSERT INTO feature_files(feature_id,path,role,reason)
+            VALUES('feat_legacy','ext/demo/demo.c','owned','source');").unwrap();
+        init_db(&conn).unwrap();
+        let retained: (String, String, String) = conn
+            .query_row(
+                "SELECT title, summary, entrypoints FROM features WHERE feature_id='feat_legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, ("Legacy".into(), "kept".into(), "[]".into()));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM feature_files WHERE feature_id='feat_legacy'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        init_db(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT entrypoints FROM features WHERE feature_id='feat_legacy'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "[]"
+        );
     }
     #[test]
     fn python_binding_migration_is_additive_and_preserves_legacy_references() {

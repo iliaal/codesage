@@ -316,7 +316,11 @@ pub fn build_review_rehearsal(
         for feat in &feats {
             codesage_protocol::work::checkpoint()?;
             area_files
-                .entry(entry_area(&feat.entry_path))
+                .entry(if feat.source == "php-ext-source-group" {
+                    feat.entry_path.clone()
+                } else {
+                    entry_area(&feat.entry_path)
+                })
                 .or_default()
                 .insert(f.clone());
         }
@@ -617,6 +621,7 @@ mod tests {
             confidence: FeatureConfidence::High,
             entry_path: entry_path.to_string(),
             entry_symbol: None,
+            entrypoints: Vec::new(),
             entry_route: None,
             entry_command: None,
             test_command: None,
@@ -1117,6 +1122,40 @@ mod tests {
                 .contains(&format!("{SCOPE_SPREAD_THRESHOLD} feature areas")),
             "title should name the area count, got {:?}",
             obj.title
+        );
+    }
+
+    #[test]
+    fn source_group_directories_remain_distinct_feature_areas() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut changed = Vec::new();
+        for i in 0..SCOPE_SPREAD_THRESHOLD {
+            let directory = format!("ext/area{i}");
+            let path = format!("{directory}/api.c");
+            let mut group = feature(
+                &format!("feat_group_{i}"),
+                &directory,
+                vec![FeatureFileRef {
+                    path: path.clone(),
+                    role: FeatureFileRole::Owned,
+                    reason: None,
+                }],
+            );
+            group.source = "php-ext-source-group".into();
+            db.upsert_feature(&group).unwrap();
+            changed.push(path);
+        }
+        let report = build_review_rehearsal(dir.path(), &db, &changed).unwrap();
+        let scope = report
+            .objections
+            .iter()
+            .find(|objection| objection.category == "scope-spread")
+            .expect("sibling extension directories must not all collapse to ext/");
+        assert!(
+            scope
+                .title
+                .contains(&format!("{SCOPE_SPREAD_THRESHOLD} feature areas"))
         );
     }
 

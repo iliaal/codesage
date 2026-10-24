@@ -1421,6 +1421,7 @@ mod tests {
             confidence: FeatureConfidence::High,
             entry_path: "src/lib.rs".into(),
             entry_symbol: None,
+            entrypoints: Vec::new(),
             entry_route: route.map(str::to_string),
             entry_command: command.map(str::to_string),
             test_command: None,

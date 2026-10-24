@@ -1,6 +1,6 @@
 use codesage_protocol::{
-    FeatureConfidence, FeatureFileRef, FeatureFileRole, FeatureKind, FeatureRecord, Language,
-    TrustBoundary,
+    FeatureConfidence, FeatureEntrypoint, FeatureFileRef, FeatureFileRole, FeatureKind,
+    FeatureRecord, Language, TrustBoundary,
 };
 use codesage_storage::Database;
 
@@ -14,6 +14,7 @@ fn make_feature(id: &str, tags: &[&str]) -> FeatureRecord {
         confidence: FeatureConfidence::High,
         entry_path: format!("src/{id}.rs"),
         entry_symbol: None,
+        entrypoints: Vec::new(),
         entry_route: None,
         entry_command: None,
         test_command: None,
@@ -22,6 +23,94 @@ fn make_feature(id: &str, tags: &[&str]) -> FeatureRecord {
         files: Vec::new(),
         trust_boundaries: Vec::new(),
     }
+}
+
+#[test]
+fn readonly_legacy_features_use_empty_entrypoints_without_migrating() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    let mut feature = make_feature("feat_legacy", &["library"]);
+    feature.files.push(FeatureFileRef {
+        path: feature.entry_path.clone(),
+        role: FeatureFileRole::Entry,
+        reason: None,
+    });
+    {
+        let db = Database::open(&path).unwrap();
+        db.upsert_feature(&feature).unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE features DROP COLUMN entrypoints;
+            DELETE FROM schema_migrations WHERE name = '0029_feature_entrypoints';",
+        )
+        .unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    {
+        let db = Database::open_read_only(&path).unwrap();
+        assert_eq!(
+            db.load_feature(&feature.feature_id).unwrap(),
+            Some(feature.clone())
+        );
+        assert_eq!(
+            db.list_features(None, None, None, 0).unwrap(),
+            vec![feature.clone()]
+        );
+        assert_eq!(
+            db.features_for_file(&feature.entry_path).unwrap(),
+            vec![feature]
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn grouped_entrypoints_survive_every_read_and_are_replaced_on_remap() {
+    let db = Database::open_in_memory().unwrap();
+    let mut feature = make_feature("feat_group", &["source-group"]);
+    feature.entry_path = "ext/demo".into();
+    feature.files = vec![FeatureFileRef {
+        path: "ext/demo/api.c".into(),
+        role: FeatureFileRole::Owned,
+        reason: None,
+    }];
+    feature.entrypoints = vec![
+        FeatureEntrypoint {
+            path: "ext/demo/api.c".into(),
+            symbol: "first".into(),
+        },
+        FeatureEntrypoint {
+            path: "ext/demo/api.c".into(),
+            symbol: "Second::run".into(),
+        },
+    ];
+    db.upsert_feature(&feature).unwrap();
+    assert_eq!(
+        db.load_feature(&feature.feature_id)
+            .unwrap()
+            .unwrap()
+            .entrypoints,
+        feature.entrypoints
+    );
+    assert_eq!(
+        db.list_features(None, None, None, 0).unwrap()[0].entrypoints,
+        feature.entrypoints
+    );
+    assert_eq!(
+        db.features_for_file("ext/demo/api.c").unwrap()[0].entrypoints,
+        feature.entrypoints
+    );
+    feature.entrypoints.remove(0);
+    db.upsert_feature(&feature).unwrap();
+    assert_eq!(
+        db.load_feature(&feature.feature_id)
+            .unwrap()
+            .unwrap()
+            .entrypoints,
+        feature.entrypoints
+    );
 }
 
 #[test]

@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
+use codesage_protocol::{FeatureConfidence, FeatureEntrypoint, FeatureKind, Language};
 use globset::GlobSet;
 
 /// Project root and compiled `[index].exclude_patterns`, shared with the
@@ -94,6 +94,7 @@ pub struct FeatureSeed {
     pub confidence: FeatureConfidence,
     pub entry_path: String,
     pub entry_symbol: Option<String>,
+    pub entrypoints: Vec<FeatureEntrypoint>,
     pub entry_route: Option<String>,
     pub entry_command: Option<String>,
     /// Named build target when it has no runnable command, route, or symbol.
@@ -104,9 +105,8 @@ pub struct FeatureSeed {
     pub test_command: Option<String>,
     pub language: Language,
     pub tags: Vec<String>,
-    /// Files that *implement* this feature beyond the entry path itself.
-    /// The orchestrator always adds the entry file as `Entry`; these go
-    /// in as `Owned`.
+    /// Files that implement this feature, attached as `Owned`. File anchors
+    /// are added separately as `Entry`; source-group directory anchors are not.
     pub owned_files: Vec<SeedFile>,
     /// Files the feature reads but doesn't own (imports, configs, shared
     /// helpers). Folded in as `Context`.
@@ -136,6 +136,7 @@ impl FeatureSeed {
             confidence: FeatureConfidence::Medium,
             entry_path: entry_path.into(),
             entry_symbol: None,
+            entrypoints: Vec::new(),
             entry_route: None,
             entry_command: None,
             target_name: None,

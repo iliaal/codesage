@@ -56,12 +56,13 @@ impl Database {
         let result = (|| -> Result<()> {
             let tags_json =
                 serde_json::to_string(&feature.tags).unwrap_or_else(|_| "[]".to_string());
+            let entrypoints_json = serde_json::to_string(&feature.entrypoints)?;
             self.conn.prepare_cached(
                 "INSERT INTO features (
                     feature_id, title, summary, kind, source, confidence,
                     entry_path, entry_symbol, entry_route, entry_command,
-                    language, tags, test_command, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, unixepoch(), unixepoch())
+                    language, tags, test_command, entrypoints, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, unixepoch(), unixepoch())
                  ON CONFLICT(feature_id) DO UPDATE SET
                     title         = excluded.title,
                     summary       = excluded.summary,
@@ -75,6 +76,7 @@ impl Database {
                     language      = excluded.language,
                     tags          = excluded.tags,
                     test_command  = excluded.test_command,
+                    entrypoints   = excluded.entrypoints,
                     updated_at    = unixepoch()",
             )?
             .execute(params![
@@ -91,6 +93,7 @@ impl Database {
                     feature.language.as_str(),
                     tags_json,
                     feature.test_command,
+                    entrypoints_json,
             ])?;
             self.conn
                 .prepare_cached("DELETE FROM feature_files WHERE feature_id = ?1")?
@@ -186,11 +189,14 @@ impl Database {
     /// Load one feature with its files and boundaries. None when the id
     /// doesn't exist.
     pub fn load_feature(&self, feature_id: &str) -> Result<Option<FeatureRecord>> {
+        let entrypoints = self.feature_entrypoints_projection()?;
         let head = self.conn.query_row(
-            "SELECT feature_id, title, summary, kind, source, confidence,
+            &format!(
+                "SELECT feature_id, title, summary, kind, source, confidence,
                     entry_path, entry_symbol, entry_route, entry_command,
-                    language, tags, test_command
-             FROM features WHERE feature_id = ?1",
+                    language, tags, test_command, {entrypoints}
+             FROM features WHERE feature_id = ?1"
+            ),
             params![feature_id],
             row_to_feature_head,
         );
@@ -214,10 +220,11 @@ impl Database {
         tag: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FeatureRecord>> {
-        let mut sql = String::from(
+        let entrypoints = self.feature_entrypoints_projection()?;
+        let mut sql = format!(
             "SELECT feature_id, title, summary, kind, source, confidence,
                     entry_path, entry_symbol, entry_route, entry_command,
-                    language, tags, test_command
+                    language, tags, test_command, {entrypoints}
              FROM features WHERE 1=1",
         );
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -256,21 +263,35 @@ impl Database {
     /// or contexts this file. That is common: not every file belongs to a
     /// feature slice.
     pub fn features_for_file(&self, file_path: &str) -> Result<Vec<FeatureRecord>> {
-        let mut stmt = self.conn.prepare(
+        let entrypoints = self.feature_entrypoints_projection()?;
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT DISTINCT f.feature_id, f.title, f.summary, f.kind, f.source, f.confidence,
                     f.entry_path, f.entry_symbol, f.entry_route, f.entry_command,
-                    f.language, f.tags, f.test_command
+                    f.language, f.tags, f.test_command, {entrypoints}
              FROM features f
              JOIN feature_files ff ON ff.feature_id = f.feature_id
              WHERE ff.path = ?1
              ORDER BY f.kind, f.entry_path, f.feature_id",
-        )?;
+        ))?;
         let heads: Vec<FeatureRecord> = stmt
             .query_map(params![file_path], row_to_feature_head)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut features = heads;
         self.hydrate_feature_children(&mut features)?;
         Ok(features)
+    }
+
+    fn feature_entrypoints_projection(&self) -> Result<&'static str> {
+        let present: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('features') WHERE name = 'entrypoints')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(if present {
+            "entrypoints"
+        } else {
+            "'[]' AS entrypoints"
+        })
     }
 
     fn hydrate_feature_children(&self, features: &mut [FeatureRecord]) -> Result<()> {
@@ -425,6 +446,10 @@ fn row_to_feature_head(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeatureRecor
     let language_str: String = row.get(10)?;
     let tags_json: String = row.get(11)?;
     let test_command: Option<String> = row.get(12)?;
+    let entrypoints_json: String = row.get(13)?;
+    let entrypoints = serde_json::from_str(&entrypoints_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     Ok(FeatureRecord {
         feature_id,
@@ -435,6 +460,7 @@ fn row_to_feature_head(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeatureRecor
         confidence: parse_feature_confidence(&confidence_str)?,
         entry_path,
         entry_symbol,
+        entrypoints,
         entry_route,
         entry_command,
         test_command,

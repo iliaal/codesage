@@ -15,6 +15,8 @@ use crate::mappers::shared::{
 };
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
+mod source_groups;
+
 pub struct PhpMapper;
 
 impl FeatureMapper for PhpMapper {
@@ -29,7 +31,7 @@ impl FeatureMapper for PhpMapper {
             seeds.extend(composer_seeds(root, c));
             seeds.extend(composer_script_seeds(c));
         }
-        seeds.extend(php_src_extensions(root)?);
+        seeds.extend(php_src_extensions(ctx)?);
         seeds.extend(php_extension_at_root(root)?);
         let routes = parse_laravel_routes(root)?;
         seeds.extend(laravel_route_seeds(&routes));
@@ -145,7 +147,8 @@ fn composer_seeds(root: &Path, composer: &Value) -> Vec<FeatureSeed> {
 }
 
 /// Map `ext/<name>/config.{m4,w32}` to extension features and linked `.phpt` tests.
-fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
+fn php_src_extensions(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
     let mut out = Vec::new();
     let ext_dir = root.join("ext");
     if !is_safe_dir(root, &ext_dir) {
@@ -177,8 +180,13 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
         } else {
             Vec::new()
         };
-        // Source ownership lets file-to-feature lookup find the extension; bound bundle size.
-        let owned_files = list_c_sources(root, &p, 40);
+        let api_context = php_src_api_context(root, &ext_rel, &name, config_basename);
+        let groups = source_groups::extension_groups(
+            ctx,
+            &ext_rel,
+            api_context,
+            vec![format!("{ext_rel}/tests")],
+        )?;
         out.push(FeatureSeed {
             summary: format!("php-src internals extension at {ext_rel}/"),
             source: "php-ext",
@@ -188,7 +196,6 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
                 "php-src".to_string(),
                 "extension".to_string(),
             ],
-            owned_files,
             context_files: vec![SeedFile {
                 path: format!("{ext_rel}/{config_basename}"),
                 reason: "extension build config".to_string(),
@@ -202,28 +209,9 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
                 format!("{ext_rel}/{config_basename}"),
             )
         });
-        let api_context = php_src_api_context(root, &ext_rel, &name, config_basename);
-        out.extend(php_extension_api_seeds(
-            root,
-            &p,
-            api_context,
-            vec![format!("{ext_rel}/tests")],
-        ));
+        out.extend(groups);
     }
     Ok(out)
-}
-
-fn list_c_sources(root: &Path, dir: &Path, max: usize) -> Vec<SeedFile> {
-    list_dir_files(root, dir, None, |rel| {
-        rel.ends_with(".c") || rel.ends_with(".h") || rel.ends_with(".cpp")
-    })
-    .into_iter()
-    .take(max)
-    .map(|path| SeedFile {
-        path,
-        reason: "extension source".to_string(),
-    })
-    .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -2353,14 +2341,14 @@ class SyncUsers extends Command {
         let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         let symbols: Vec<&str> = seeds
             .iter()
-            .filter(|s| s.source == "php-ext-function")
-            .filter_map(|s| s.entry_symbol.as_deref())
+            .filter(|s| s.source == "php-ext-source-group")
+            .flat_map(|s| s.entrypoints.iter().map(|entry| entry.symbol.as_str()))
             .collect();
         assert_eq!(symbols, vec!["demo_active"]);
     }
 
     #[test]
-    fn php_src_ext_emits_api_function_seeds() {
+    fn php_src_ext_groups_and_preserves_api_entrypoints() {
         let dir = tempdir().unwrap();
         write(dir.path(), "ext/demo/config.m4", "PHP_ARG_ENABLE(demo,,)\n");
         write(
@@ -2373,18 +2361,41 @@ class SyncUsers extends Command {
         );
         let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
 
-        let symbols: Vec<&str> = seeds
+        let groups: Vec<&FeatureSeed> = seeds
             .iter()
-            .filter(|s| matches!(s.source, "php-ext-function" | "php-ext-method"))
-            .filter_map(|s| s.entry_symbol.as_deref())
+            .filter(|s| s.source == "php-ext-source-group")
             .collect();
-        assert_eq!(symbols, vec!["demo_hello", "Demo::run"]);
-        let api_seeds: Vec<&FeatureSeed> = seeds
-            .iter()
-            .filter(|s| matches!(s.source, "php-ext-function" | "php-ext-method"))
-            .collect();
-        assert!(api_seeds.iter().all(|s| s.entry_path == "ext/demo/demo.c"));
-        assert!(api_seeds.iter().all(|s| s.language == Language::Php));
+        assert_eq!(groups.len(), 1);
+        let group = groups[0];
+        assert_eq!(group.entry_path, "ext/demo");
+        assert_eq!(group.language, Language::Php);
+        assert_eq!(
+            group
+                .entrypoints
+                .iter()
+                .map(|entry| entry.symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["Demo::run", "demo_hello"]
+        );
+        assert!(
+            group
+                .entrypoints
+                .iter()
+                .all(|entry| entry.path == "ext/demo/demo.c")
+        );
+        assert_eq!(
+            group
+                .owned_files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["ext/demo/demo.c"]
+        );
+        assert!(
+            !seeds
+                .iter()
+                .any(|seed| matches!(seed.source, "php-ext-function" | "php-ext-method"))
+        );
     }
 
     #[test]

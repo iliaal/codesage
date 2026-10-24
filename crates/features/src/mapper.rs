@@ -241,14 +241,17 @@ fn build_record(
     // Deduplicate by path with Entry > Owned > Context > Test precedence;
     // mappers may also list the entry in owned_files.
     let mut files_by_path: BTreeMap<String, FeatureFileRef> = BTreeMap::new();
-    files_by_path.insert(
-        seed.entry_path.clone(),
-        FeatureFileRef {
-            path: seed.entry_path.clone(),
-            role: FeatureFileRole::Entry,
-            reason: Some("entrypoint".to_string()),
-        },
-    );
+    // A source group's directory identifies it, but is not an unbounded ownership edge.
+    if seed.source != "php-ext-source-group" {
+        files_by_path.insert(
+            seed.entry_path.clone(),
+            FeatureFileRef {
+                path: seed.entry_path.clone(),
+                role: FeatureFileRole::Entry,
+                reason: Some("entrypoint".to_string()),
+            },
+        );
+    }
     for f in &seed.owned_files {
         files_by_path
             .entry(f.path.clone())
@@ -303,6 +306,7 @@ fn build_record(
         confidence: seed.confidence,
         entry_path: seed.entry_path.clone(),
         entry_symbol: seed.entry_symbol.clone(),
+        entrypoints: seed.entrypoints.clone(),
         entry_route: seed.entry_route.clone(),
         entry_command: seed.entry_command.clone(),
         test_command: seed.test_command.clone(),
@@ -319,6 +323,7 @@ fn retain_allowed_files_and_refresh_boundaries(
     mut allowed: impl FnMut(&str) -> bool,
 ) -> Result<()> {
     record.files.retain(|f| allowed(&f.path));
+    record.entrypoints.retain(|entry| allowed(&entry.path));
     refresh_record_trust_boundaries(db, record)
 }
 

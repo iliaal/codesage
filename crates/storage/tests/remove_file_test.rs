@@ -1,8 +1,8 @@
 //! Structural-only removal must purge every per-path store, including inactive models and FTS.
 
 use codesage_protocol::{
-    FeatureConfidence, FeatureFileRef, FeatureFileRole, FeatureKind, FeatureRecord, FileInfo,
-    Language, Symbol, SymbolKind,
+    FeatureConfidence, FeatureEntrypoint, FeatureFileRef, FeatureFileRole, FeatureKind,
+    FeatureRecord, FileInfo, Language, Symbol, SymbolKind,
 };
 use codesage_storage::Database;
 use codesage_storage::schema::{fts_table_name, model_table_name, path_table_name};
@@ -44,6 +44,73 @@ fn count_for_path(conn: &rusqlite::Connection, table: &str, col: &str, path: &st
 }
 
 #[test]
+fn remove_file_prunes_group_entrypoints_and_preserves_other_paths() {
+    let db = Database::open_in_memory().unwrap();
+    let gone = "ext/demo/gone.c";
+    let kept = "ext/demo/kept.c";
+    for path in [gone, kept] {
+        db.upsert_file(&file_info(path)).unwrap();
+    }
+    let kept_entry = FeatureEntrypoint {
+        path: kept.into(),
+        symbol: "shared_name".into(),
+    };
+    db.upsert_feature(&FeatureRecord {
+        feature_id: "feat_group".into(),
+        title: "Source group".into(),
+        summary: String::new(),
+        kind: FeatureKind::Library,
+        source: "php-ext-source-group".into(),
+        confidence: FeatureConfidence::Low,
+        entry_path: "ext/demo".into(),
+        entry_symbol: None,
+        entrypoints: vec![
+            FeatureEntrypoint {
+                path: gone.into(),
+                symbol: "deleted_api".into(),
+            },
+            FeatureEntrypoint {
+                path: gone.into(),
+                symbol: "shared_name".into(),
+            },
+            kept_entry.clone(),
+        ],
+        entry_route: None,
+        entry_command: None,
+        test_command: None,
+        language: Language::Php,
+        tags: Vec::new(),
+        trust_boundaries: Vec::new(),
+        files: [gone, kept]
+            .into_iter()
+            .map(|path| FeatureFileRef {
+                path: path.into(),
+                role: FeatureFileRole::Owned,
+                reason: None,
+            })
+            .collect(),
+    })
+    .unwrap();
+
+    db.remove_file(gone).unwrap();
+    let group = db.load_feature("feat_group").unwrap().unwrap();
+    assert_eq!(group.entrypoints, vec![kept_entry]);
+    assert_eq!(group.files.len(), 1);
+    assert_eq!(group.files[0].path, kept);
+    assert!(db.features_for_file(gone).unwrap().is_empty());
+    assert_eq!(db.features_for_file(kept).unwrap(), vec![group]);
+
+    db.remove_file(kept).unwrap();
+    assert!(
+        db.load_feature("feat_group")
+            .unwrap()
+            .unwrap()
+            .entrypoints
+            .is_empty()
+    );
+}
+
+#[test]
 fn remove_file_purges_all_chunk_tables_fts_and_feature_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("idx.db");
@@ -70,6 +137,7 @@ fn remove_file_purges_all_chunk_tables_fts_and_feature_files() {
             confidence: FeatureConfidence::High,
             entry_path: "keep.rs".to_string(),
             entry_symbol: None,
+            entrypoints: Vec::new(),
             entry_route: None,
             entry_command: None,
             test_command: None,

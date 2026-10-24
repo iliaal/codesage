@@ -1683,6 +1683,19 @@ impl Database {
             self.conn
                 .prepare_cached("DELETE FROM features WHERE entry_path = ?1")?
                 .execute(params![path])?;
+            self.conn
+                .prepare_cached(
+                    "UPDATE features SET entrypoints = (
+                         SELECT json_group_array(json(value))
+                         FROM json_each(features.entrypoints)
+                         WHERE json_extract(value, '$.path') <> ?1
+                     )
+                     WHERE EXISTS (
+                         SELECT 1 FROM json_each(features.entrypoints)
+                         WHERE json_extract(value, '$.path') = ?1
+                     )",
+                )?
+                .execute(params![path])?;
             for (table, fts) in &chunk_tables {
                 self.delete_chunk_rows_for_path(table, path, *fts)?;
             }
@@ -2076,6 +2089,7 @@ mod tests {
             confidence: FeatureConfidence::High,
             entry_path: entry.into(),
             entry_symbol: None,
+            entrypoints: Vec::new(),
             entry_route: None,
             entry_command: None,
             test_command: None,

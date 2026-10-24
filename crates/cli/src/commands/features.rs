@@ -88,6 +88,12 @@ pub(crate) fn cmd_feature_show(id: &str, json: bool) -> Result<()> {
         if let Some(s) = &feature.entry_symbol {
             println!("  entry_symbol: {s}");
         }
+        if !feature.entrypoints.is_empty() {
+            println!("  entrypoints ({}):", feature.entrypoints.len());
+            for entry in &feature.entrypoints {
+                println!("    {}: {}", entry.path, entry.symbol);
+            }
+        }
         if let Some(r) = &feature.entry_route {
             println!("  entry_route: {r}");
         }

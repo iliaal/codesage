@@ -7,6 +7,7 @@
 ### Changed
 
 - Symbol visibility includes external C function definitions and PHP/Java method access modifiers, including implicit public PHP methods.
+- php-src feature mapping groups extension sources into slices of at most 40 files and retains their PHP callable entrypoints.
 
 ### Security
 

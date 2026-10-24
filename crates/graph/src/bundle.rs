@@ -483,6 +483,15 @@ fn build_feature_bundle(
     let mut primary: Vec<SearchResult> = Vec::new();
     let mut primary_keys: HashSet<(String, u32)> = HashSet::new();
     // Prefer the entry symbol's body over file-leading imports.
+    for entry in &feature.entrypoints {
+        if primary.len() >= limit {
+            break;
+        }
+        codesage_protocol::work::checkpoint()?;
+        if let Some(line) = entry_symbol_line(db, &entry.symbol, &entry.path)? {
+            add_chunk_at_line(db, &entry.path, line, &mut primary, &mut primary_keys)?;
+        }
+    }
     let entry_line = feature.entry_symbol.as_ref().and_then(|sym| {
         entry_symbol_line(db, sym, &feature.entry_path)
             .ok()
@@ -514,6 +523,24 @@ fn build_feature_bundle(
     // Prefer the entry file to avoid unrelated homonyms such as `main`.
     let mut symbol_definitions: Vec<Symbol> = Vec::new();
     let mut seen_sym: HashSet<String> = HashSet::new();
+    for entry in &feature.entrypoints {
+        if symbol_definitions.len() >= limit {
+            break;
+        }
+        codesage_protocol::work::checkpoint()?;
+        for definition in db
+            .find_symbols(&entry.symbol, None)?
+            .into_iter()
+            .filter(|definition| definition.file_path == entry.path)
+        {
+            if seen_sym.insert(definition.handle().to_string()) {
+                symbol_definitions.push(definition);
+                if symbol_definitions.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
     if let Some(entry_sym) = &feature.entry_symbol {
         let all_defs = db.find_symbols(entry_sym, None)?;
         let in_entry_file: Vec<Symbol> = all_defs
@@ -527,17 +554,19 @@ fn build_feature_bundle(
             in_entry_file
         };
         for def in preferred {
-            if seen_sym.insert(def.qualified_name.clone()) {
+            if seen_sym.insert(def.handle().to_string()) {
                 symbol_definitions.push(def);
             }
         }
     }
     for r in &primary {
         for sum in &r.symbols {
-            if !seen_sym.insert(sum.qualified_name.clone()) {
-                continue;
+            if !feature.entrypoints.is_empty() && symbol_definitions.len() >= limit {
+                break;
             }
-            if let Some(d) = find_definition_for_summary(db, sum, &r.file_path)? {
+            if let Some(d) = find_definition_for_summary(db, sum, &r.file_path)?
+                && seen_sym.insert(d.handle().to_string())
+            {
                 symbol_definitions.push(d);
             }
         }

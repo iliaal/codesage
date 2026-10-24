@@ -1142,6 +1142,7 @@ mod tests {
             confidence: FeatureConfidence::High,
             entry_path: "src/lib.rs".into(),
             entry_symbol: None,
+            entrypoints: Vec::new(),
             entry_route: None,
             entry_command: None,
             test_command: Some("cargo test -p describe_fixture".into()),

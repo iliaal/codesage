@@ -13,5 +13,5 @@ pub use mapper::{FeatureMapOutcome, map_features, map_features_detailed};
 /// Bump when mapper output (ids, routes, tags, file sets) changes for
 /// unchanged input, so `codesage index` re-runs mapping instead of skipping
 /// an unchanged tree.
-pub const MAPPER_OUTPUT_VERSION: u32 = 9;
+pub const MAPPER_OUTPUT_VERSION: u32 = 10;
 pub use trust_boundary::{derive_for_file, derive_for_files, derive_for_index, store_for_file};

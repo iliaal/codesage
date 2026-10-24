@@ -104,6 +104,7 @@ fn project() -> tempfile::TempDir {
             confidence: FeatureConfidence::High,
             entry_path: "src/anchor.rs".to_string(),
             entry_symbol: Some("unique_anchor".to_string()),
+            entrypoints: Vec::new(),
             entry_route: route.map(str::to_string),
             entry_command: command.map(str::to_string),
             test_command: None,

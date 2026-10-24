@@ -37,6 +37,43 @@ fn returns_empty_bundle_with_marker_when_feature_missing() {
 }
 
 #[test]
+fn php_group_bundle_retains_distinct_entrypoints_without_outside_homonyms() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "ext/demo/config.m4",
+        "PHP_NEW_EXTENSION(demo, api.c)\n",
+    );
+    let source = "/* introduction */\nPHP_FUNCTION(alpha) { helper(); }\nPHP_FUNCTION(beta) {}\n";
+    write(root, "ext/demo/api.c", source);
+    write(root, "outside.c", "void alpha(void) {}\n");
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+    map_features(root, &db, &[]).unwrap();
+    seed_chunk(&db, "ext/demo/api.c", "c", source);
+    let groups = db
+        .list_features(None, None, Some("source-group"), 0)
+        .unwrap();
+    assert_eq!(groups.len(), 1);
+    let bundle = feature_bundle(&db, &groups[0].feature_id, false, false, 2).unwrap();
+    assert!(bundle.found);
+    assert_eq!(bundle.primary.len(), 1);
+    assert_eq!(bundle.primary[0].file_path, "ext/demo/api.c");
+    assert_eq!(
+        bundle
+            .symbol_definitions
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.file_path.as_str()))
+            .collect::<Vec<_>>(),
+        [("alpha", "ext/demo/api.c"), ("beta", "ext/demo/api.c")]
+    );
+    let bounded = feature_bundle(&db, &groups[0].feature_id, false, false, 1).unwrap();
+    assert_eq!(bounded.symbol_definitions.len(), 1);
+    assert_eq!(bounded.symbol_definitions[0].name, "alpha");
+}
+
+#[test]
 fn returns_bundle_with_curated_files_after_map() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

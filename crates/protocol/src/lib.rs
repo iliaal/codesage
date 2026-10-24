@@ -2180,6 +2180,15 @@ pub struct FeatureFileRef {
     pub reason: Option<String>,
 }
 
+/// A callable entrypoint retained inside a grouped feature.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
+pub struct FeatureEntrypoint {
+    pub path: String,
+    pub symbol: String,
+}
+
 /// One behavior-keyed slice of the repository. Produced deterministically by
 /// per-language mappers (no LLM in the seed path). The `feature_id` is
 /// stable across re-runs as long as the entrypoint and kind don't change,
@@ -2214,6 +2223,9 @@ pub struct FeatureRecord {
     /// entry symbol (config files, route registrations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_symbol: Option<String>,
+    /// All callable anchors when a source group spans multiple APIs.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub entrypoints: Vec<FeatureEntrypoint>,
     /// HTTP route, queue topic, or URL template (Laravel `GET /users/{id}`,
     /// Express `/api/login`). `None` for non-route features.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2240,8 +2252,8 @@ pub struct FeatureRecord {
     /// shape as `RiskAssessment.trust_boundaries`; sorted dedupe.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub trust_boundaries: Vec<TrustBoundary>,
-    /// Files attached to the feature with role classification. Always
-    /// non-empty (contains at least the entry).
+    /// Files attached to the feature with role classification. Directory
+    /// anchors identify bounded source groups without owning the whole subtree.
     pub files: Vec<FeatureFileRef>,
 }
 

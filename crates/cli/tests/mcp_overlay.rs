@@ -161,6 +161,7 @@ fn fixture() -> tempfile::TempDir {
         confidence: FeatureConfidence::High,
         entry_path: "src/lib.rs".into(),
         entry_symbol: Some("caller".into()),
+        entrypoints: Vec::new(),
         entry_route: None,
         entry_command: None,
         test_command: None,

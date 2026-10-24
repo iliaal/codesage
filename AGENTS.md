@@ -105,7 +105,7 @@ If CoreML registration fails, the process errors out instead of silently falling
 - Symbol patterns in `crates/parser/src/queries/*.scm` dispatch on `pattern_index`, so each file is positionally coupled to its language's `kind_map` in `crates/parser/src/extract.rs`. Append a new pattern at the end, add its ordinal arm, and bump `EXPECTED_SYMBOL_PATTERN_COUNTS` in `crates/parser/src/validate.rs`; inserting mid-file silently changes the kind of every later pattern. Verify with `cargo test -p codesage-parser`.
 - ONNX inference paths (`crates/embed/src/model.rs`, `crates/embed/src/reranker.rs`) index a flat output by a shape-derived stride. Detect a squeezed rank-1 `[batch]` output with `shape.len() <= 1`, not `shape.last()`, and check `len == batch * stride` before indexing; a panic inside a daemon tool handler leaves the MCP client waiting with no reply.
 - Wrap any loop that writes more than a handful of rows in `Database::execute_batch` (`crates/storage/src/db/mod.rs`). SQLite otherwise autocommits each statement, and per-row fsyncs stalled php-src history indexing until v0.3.2.
-- Breadth metrics over the feature map (how many areas a patch touches) key on the feature's entry directory (`entry_area` in `crates/graph/src/rehearsal.rs`), not `feature_id`: the php-src mapper emits one feature per PHP function, so a single file can carry 60+ feature ids.
+- Breadth metrics over the feature map key on the feature's entry directory, not `feature_id` (`crates/graph/src/rehearsal.rs`). php-src source groups use their directory anchor directly; multiple bounded groups within that directory remain one area. Their callable APIs live in `entrypoints`, rather than separate features per PHP function.
 
 ## Versioning and changelog
 
