@@ -2882,6 +2882,7 @@ mod tests {
         let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
         let sym = |name: &str, qualified: &str, file: &str| Symbol {
             is_test: false,
+            signature: None,
             overloaded: false,
             name: name.to_string(),
             qualified_name: qualified.to_string(),
@@ -2978,6 +2979,7 @@ mod tests {
             rationale: Vec::new(),
             visibility: None,
             is_test: false,
+            signature: None,
             overloaded: false,
         };
         let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();

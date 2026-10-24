@@ -1466,6 +1466,7 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
         rationale: Vec::new(),
         visibility: None,
         is_test: false,
+        signature: None,
         overloaded: false,
     };
 
@@ -1572,6 +1573,7 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
             rationale: Vec::new(),
             visibility: None,
             is_test: false,
+            signature: None,
             overloaded: false,
         });
     }
@@ -1706,6 +1708,7 @@ mod resolution_fixture {
             rationale: Vec::new(),
             visibility,
             is_test,
+            signature: None,
             overloaded: false,
         }
     }

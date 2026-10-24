@@ -1,7 +1,7 @@
 use crate::ReferenceKind;
 
 pub const BINDING_INTERPRETATION: &str =
-    "codesage/structural/v1;parser-queries=8;extraction=17;trust-boundaries=8";
+    "codesage/structural/v1;parser-queries=8;extraction=18;trust-boundaries=8";
 
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,

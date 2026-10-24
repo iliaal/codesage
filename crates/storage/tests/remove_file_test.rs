@@ -29,6 +29,7 @@ fn symbol(name: &str, file_path: &str) -> Symbol {
         rationale: vec![],
         visibility: None,
         is_test: false,
+        signature: None,
         overloaded: false,
     }
 }

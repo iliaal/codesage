@@ -232,6 +232,143 @@ fn compact_hundred_reference_response_is_under_four_kib_and_recovers_all_rows() 
 }
 
 #[test]
+fn callable_signatures_reach_default_and_compact_stdio_responses() {
+    let root = tempfile::tempdir().unwrap();
+    for (path, source) in [
+        (
+            "api.c",
+            "int *c_allocate(unsigned count) { return 0; }\nstatic int c_hidden(void) { return 1; }",
+        ),
+        (
+            "api.cpp",
+            "int cpp_collect(int count = 2) { return count; }",
+        ),
+        (
+            "api.php",
+            "<?php class Api { public static function php_fetch(string $key): ?array { return null; } private function hidden() {} }",
+        ),
+        (
+            "api.py",
+            "def py_fetch(key: str) -> list[str]:\n    return []\n",
+        ),
+        (
+            "api.rs",
+            "pub fn rust_fetch(key: &str) -> Option<String> { None }",
+        ),
+        (
+            "api.go",
+            "package api\nfunc GoFetch(left, right int) (string, error) { return \"\", nil }",
+        ),
+        (
+            "Api.java",
+            "public class Api { public static String javaFetch(int limit) { return null; } private void hidden() {} }",
+        ),
+        (
+            "api.js",
+            "export function jsFetch(key, limit = 2) { return key; }",
+        ),
+        (
+            "api.ts",
+            "export function tsFetch(key: string): string { return key; }",
+        ),
+    ] {
+        std::fs::write(root.path().join(path), source).unwrap();
+    }
+    command(root.path(), env!("CARGO_BIN_EXE_codesage"), &["init"]);
+    command(
+        root.path(),
+        env!("CARGO_BIN_EXE_codesage"),
+        &["index", "--no-semantic"],
+    );
+    let mut server = Server::start();
+    for name in [
+        "c_allocate",
+        "cpp_collect",
+        "php_fetch",
+        "py_fetch",
+        "rust_fetch",
+        "GoFetch",
+        "javaFetch",
+        "jsFetch",
+        "tsFetch",
+    ] {
+        let found = server.call(root.path(), "find_symbol", json!({"target": name}));
+        let row = &found["results"][0];
+        assert!(
+            row["signature"]["declaration"]
+                .as_str()
+                .unwrap()
+                .contains(name),
+            "{found}"
+        );
+        assert!(
+            !row["signature"]["parameters"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{found}"
+        );
+        let described = server.call(
+            root.path(),
+            "describe",
+            json!({"target": row["handle"], "sections": ["identity"]}),
+        );
+        assert_eq!(described["cost"]["detail"], "compact");
+        assert_eq!(
+            described["card"]["sections"]["identity"]["data"]["signature"],
+            row["signature"]
+        );
+        let compact = server.call(
+            root.path(),
+            "find_symbol",
+            json!({"target": name, "detail": "compact"}),
+        );
+        assert_eq!(compact["results"][0]["signature"], row["signature"]);
+    }
+    for (path, name) in [
+        ("api.c", "c_allocate"),
+        ("api.php", "php_fetch"),
+        ("Api.java", "javaFetch"),
+    ] {
+        let described = server.call(
+            root.path(),
+            "describe",
+            json!({"target": format!("file:{path}"), "sections": ["public_api"]}),
+        );
+        let api = &described["card"]["sections"]["public_api"]["data"];
+        assert_eq!(api["total"], 1, "{described}");
+        assert!(
+            api["symbols"][0]["signature"]["declaration"]
+                .as_str()
+                .unwrap()
+                .contains(name),
+            "{described}"
+        );
+    }
+}
+
+#[test]
+fn describe_reads_legacy_signature_schema_without_migration() {
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path());
+    let path = root.path().join(".codesage/index.db");
+    let db = codesage_storage::Database::open(&path).unwrap();
+    db.execute_raw_for_tests("ALTER TABLE symbols DROP COLUMN signature; ALTER TABLE symbols DROP COLUMN arity; ALTER TABLE symbols DROP COLUMN parameters; ALTER TABLE symbols DROP COLUMN return_type; DELETE FROM schema_migrations WHERE name = '0027_symbol_signatures';").unwrap();
+    drop(db);
+    let before = std::fs::read(&path).unwrap();
+    let mut server = Server::start();
+    let result = server.call(
+        root.path(),
+        "describe",
+        json!({"target":"sym:src/lib.rs#leaf", "sections":["identity"]}),
+    );
+    assert!(result["card"]["sections"]["identity"]["data"]["signature"].is_null());
+    assert_eq!(result["card"]["handle"], "sym:src/lib.rs#leaf");
+    drop(server);
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
 fn detail_aliases_full_snippets_budgets_and_errors_work_over_stdio() {
     let root = tempfile::tempdir().unwrap();
     fixture(root.path());
@@ -241,7 +378,10 @@ fn detail_aliases_full_snippets_budgets_and_errors_work_over_stdio() {
         "find_symbol",
         json!({"name":"leaf","detail":"compact"}),
     );
-    assert!(compact["results"][0].get("signature").is_none());
+    assert_eq!(
+        compact["results"][0]["signature"]["declaration"],
+        "pub fn leaf()"
+    );
     let full = server.call(
         root.path(),
         "find_symbol",

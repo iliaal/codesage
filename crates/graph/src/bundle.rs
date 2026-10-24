@@ -956,7 +956,7 @@ pub(crate) fn visibility_admits(sym: &Symbol, caller_file: &str) -> bool {
         return true;
     }
     match sym.visibility {
-        None | Some(Visibility::Public) => true,
+        None | Some(Visibility::Public | Visibility::Private | Visibility::Protected) => true,
         Some(Visibility::File) => false,
         Some(Visibility::Module) => rust_module_subtree(&sym.file_path)
             .is_some_and(|prefix| caller_file.starts_with(&prefix)),
@@ -2115,6 +2115,7 @@ mod overlay_source_tests {
             rationale: Vec::new(),
             visibility: None,
             is_test: false,
+            signature: None,
             overloaded: false,
         };
         reader
@@ -2214,6 +2215,7 @@ mod context_export_tests {
             rationale: vec![],
             visibility: None,
             is_test: false,
+            signature: None,
             overloaded: false,
         }
     }

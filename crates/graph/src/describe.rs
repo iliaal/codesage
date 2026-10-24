@@ -102,6 +102,7 @@ pub fn describe_with_ranking(
             TargetKind::File => &[
                 "identity",
                 "symbols",
+                "public_api",
                 "dependencies",
                 "features",
                 "risk",
@@ -338,6 +339,12 @@ impl Builder<'_> {
         })?;
         self.section("symbols", self.own_expansion("symbols"), budget, |b| {
             b.symbols(path)
+        })?;
+        self.section("public_api", self.own_expansion("public_api"), budget, |b| {
+            let symbols = b.db.symbols_for_file(path)?;
+            let public: Vec<_> = symbols.iter().filter(|symbol| symbol.visibility == Some(codesage_protocol::Visibility::Public)).collect();
+            let limit = row_limit(b.options.detail);
+            Ok(json!({"total": public.len(), "symbols": public.iter().take(limit).map(|symbol| json!({"handle": symbol.handle().to_string(), "kind": symbol.kind, "signature": symbol.signature})).collect::<Vec<_>>(), "truncated": public.len() > limit, "unknown_visibility": symbols.iter().filter(|symbol| symbol.visibility.is_none()).count(), "missing_signatures": public.iter().filter(|symbol| symbol.signature.is_none()).count(), "counts_floor": true}))
         })?;
         self.section(
             "dependencies",
@@ -590,7 +597,7 @@ impl Builder<'_> {
         let budget = self.options.section_budget;
         let handle = symbol.handle().to_string();
         self.section("identity", self.expansion("find_symbol", json!({"target": handle})), budget, |b| {
-            Ok(json!({"kind": symbol.kind, "lines": [symbol.line_start, symbol.line_end], "is_test": symbol.is_test, "visibility": symbol.visibility, "rationale_total": symbol.rationale.len(), "rationale": symbol.rationale.iter().take(row_limit(b.options.detail)).map(|r| json!({"kind": r.kind, "text": brief(&r.text, b.options.detail), "line": r.line_start})).collect::<Vec<_>>()}))
+            Ok(json!({"kind": symbol.kind, "lines": [symbol.line_start, symbol.line_end], "is_test": symbol.is_test, "visibility": symbol.visibility, "signature": symbol.signature, "rationale_total": symbol.rationale.len(), "rationale": symbol.rationale.iter().take(row_limit(b.options.detail)).map(|r| json!({"kind": r.kind, "text": brief(&r.text, b.options.detail), "line": r.line_start})).collect::<Vec<_>>()}))
         })?;
         self.section("references", self.expansion("find_references", json!({"target": handle})), budget, |b| {
             let refs = b.cache.references(b.db, symbol)?;
@@ -1169,8 +1176,9 @@ mod tests {
     fn describe_file_and_symbol_expose_test_split_relationships_and_commands() {
         let (root, db, _) = fixture();
         let file = card(root.path(), &db, "file:src/helper.rs");
-        assert_eq!(file.sections.len(), 8);
+        assert_eq!(file.sections.len(), 9);
         assert!(!file.sections.contains_key("findings"));
+        assert_eq!(file.sections["public_api"].data["total"], 2);
         let symbols = &file.sections["symbols"].data;
         assert!(symbols["test"].as_u64().unwrap() >= 2);
         assert_eq!(

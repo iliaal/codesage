@@ -49,6 +49,103 @@ fn check(file: &str, source: &str, replacement: &str) -> EditCheckReport {
 }
 
 #[test]
+fn persisted_signatures_preserve_head_checks_across_index_and_worktree_changes() {
+    use codesage_storage::Database;
+    let source = "pub fn f(value: i32) -> i32 { value }\nfn caller() { self::f(1); }\n";
+    let replacement = "pub fn f(value: i32, extra: i32) -> i32 { value + extra }";
+    let dir = project("lib.rs", source);
+    let expected =
+        serde_json::to_value(edit_check(dir.path(), "lib.rs", "f", None, replacement).unwrap())
+            .unwrap();
+    std::fs::create_dir(dir.path().join(".codesage")).unwrap();
+    let db = Database::open(&dir.path().join(".codesage/index.db")).unwrap();
+    codesage_graph::full_index(dir.path(), &db, &[], false).unwrap();
+    let cached = db.find_symbols("f", None).unwrap();
+    assert_eq!(
+        cached[0]
+            .signature
+            .as_ref()
+            .unwrap()
+            .arity
+            .as_ref()
+            .unwrap()
+            .minimum,
+        1
+    );
+    assert_eq!(
+        serde_json::to_value(edit_check(dir.path(), "lib.rs", "f", None, replacement).unwrap())
+            .unwrap(),
+        expected
+    );
+    let file_id = db.file_id_for_path("lib.rs").unwrap().unwrap();
+    db.execute_raw_for_tests(
+        "UPDATE symbols SET arity = '{\"minimum\":99,\"maximum\":99}' WHERE name = 'f'",
+    )
+    .unwrap();
+    db.record_file_interpretation(file_id, "codesage/structural/old-extractor")
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(edit_check(dir.path(), "lib.rs", "f", None, replacement).unwrap())
+            .unwrap(),
+        expected
+    );
+    std::fs::write(dir.path().join("lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
+    codesage_graph::full_index(dir.path(), &db, &[], false).unwrap();
+    let report = edit_check(dir.path(), "lib.rs", "f", None, replacement).unwrap();
+    assert!(!report.worktree_matches_head);
+    assert_eq!(report.before.arity.unwrap().minimum, 1);
+    assert_eq!(report.incompatible_callers.len(), 1);
+    std::fs::write(dir.path().join("lib.rs"), source).unwrap();
+    assert_eq!(
+        serde_json::to_value(edit_check(dir.path(), "lib.rs", "f", None, replacement).unwrap())
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn cached_unknown_receiver_arity_preserves_edit_check_syntax_counts() {
+    for (file, source, replacement) in [
+        (
+            "api.py",
+            "class Api:\n    def f(self, key: str) -> str:\n        return key\n",
+            "def f(self, key: str, extra: int) -> str:\n        return key",
+        ),
+        (
+            "api.rs",
+            "struct Api; impl Api { pub fn f(self: Box<Self>, x: i32) -> i32 { x } }",
+            "pub fn f(self: Box<Self>, x: i32, extra: i32) -> i32 { x + extra }",
+        ),
+        (
+            "api.ts",
+            "function f(...args: [string, number]): void {}",
+            "function f(...args: string[]): void {}",
+        ),
+    ] {
+        let dir = project(file, source);
+        let expected =
+            serde_json::to_value(edit_check(dir.path(), file, "f", None, replacement).unwrap())
+                .unwrap();
+        std::fs::create_dir(dir.path().join(".codesage")).unwrap();
+        let db = codesage_storage::Database::open(&dir.path().join(".codesage/index.db")).unwrap();
+        codesage_graph::full_index(dir.path(), &db, &[], false).unwrap();
+        assert!(
+            db.find_symbols("f", None).unwrap()[0]
+                .signature
+                .as_ref()
+                .unwrap()
+                .arity
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(edit_check(dir.path(), file, "f", None, replacement).unwrap())
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn rust_arity_and_visibility_proofs_exclude_unresolved_calls() {
     let report = check(
         "lib.rs",

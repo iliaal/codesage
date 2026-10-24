@@ -216,7 +216,10 @@ fn c_static_functions_and_objects_are_file_visible() {
         Some(Visibility::File)
     );
     assert_eq!(visibility_of(&syms, "FILE_LIMIT"), Some(Visibility::File));
-    assert_eq!(visibility_of(&syms, "external_fn"), None);
+    assert_eq!(
+        visibility_of(&syms, "external_fn"),
+        Some(Visibility::Public)
+    );
     assert_eq!(visibility_of(&syms, "SHARED_LIMIT"), None);
     assert_eq!(visibility_of(&syms, "point"), None);
     assert_eq!(visibility_of(&syms, "handle_t"), None);

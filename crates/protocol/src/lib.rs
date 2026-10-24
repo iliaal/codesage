@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub mod describe;
 pub mod handle;
 pub mod python;
+pub mod signature;
 pub mod stat_cache;
 pub mod target;
 pub mod work;
@@ -14,6 +15,7 @@ pub use describe::{
     DescribeResult, DescribeSection,
 };
 pub use handle::Handle;
+pub use signature::{Arity, CallableSignature, Parameter};
 pub use target::{CONFIDENT, ResolveVia, ResolvedTarget, TargetKind, TargetResolution};
 
 pub const DEFAULT_EMBEDDING_DIM: usize = 384;
@@ -161,6 +163,8 @@ pub struct Symbol {
     /// never public; callee resolution admits unknown candidates unchanged.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub visibility: Option<Visibility>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub signature: Option<CallableSignature>,
     /// True when the definition is test code: its file is test-like, or the
     /// parser marked it (Rust `#[cfg(test)]` module contents and `#[test]`-
     /// family functions, Python `test_*` / `Test*` / `pytest` decorations,
@@ -272,6 +276,8 @@ fn declare_file_handle(schema: &mut schemars::Schema) {
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
     Public,
+    Private,
+    Protected,
     Crate,
     Module,
     File,
@@ -279,6 +285,8 @@ pub enum Visibility {
 
 str_enum!(Visibility {
     Public => "public",
+    Private => "private",
+    Protected => "protected",
     Crate => "crate",
     Module => "module",
     File => "file",
@@ -290,10 +298,12 @@ impl Serialize for Symbol {
         let emit_qualified = self.qualified_name != self.name;
         let emit_rationale = !self.rationale.is_empty();
         let emit_visibility = self.visibility.is_some();
+        let emit_signature = self.signature.is_some();
         let len = 6
             + usize::from(emit_qualified)
             + usize::from(emit_rationale)
             + usize::from(emit_visibility)
+            + usize::from(emit_signature)
             + usize::from(self.is_test);
         let mut s = serializer.serialize_struct("Symbol", len)?;
         s.serialize_field("handle", &self.handle().to_string())?;
@@ -310,6 +320,9 @@ impl Serialize for Symbol {
         }
         if emit_visibility {
             s.serialize_field("visibility", &self.visibility)?;
+        }
+        if emit_signature {
+            s.serialize_field("signature", &self.signature)?;
         }
         if self.is_test {
             s.serialize_field("is_test", &self.is_test)?;
@@ -338,6 +351,8 @@ impl<'de> Deserialize<'de> for Symbol {
             #[serde(default)]
             visibility: Option<Visibility>,
             #[serde(default)]
+            signature: Option<CallableSignature>,
+            #[serde(default)]
             is_test: bool,
             handle: Option<String>,
         }
@@ -356,6 +371,7 @@ impl<'de> Deserialize<'de> for Symbol {
             col_end: w.col_end,
             rationale: w.rationale,
             visibility: w.visibility,
+            signature: w.signature,
             is_test: w.is_test,
             overloaded,
         })
@@ -3618,6 +3634,7 @@ mod tests {
             rationale: Vec::new(),
             visibility: None,
             is_test: false,
+            signature: None,
             overloaded: false,
         }
     }

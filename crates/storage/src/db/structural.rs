@@ -6,8 +6,8 @@ use anyhow::Result;
 use codesage_protocol::handle::mark_overloads;
 use codesage_protocol::python::{PythonBindingTarget, PythonBindings};
 use codesage_protocol::{
-    DependencyEntry, FileInfo, Handle, Language, RationaleEntry, Reference, ReferenceKind, Symbol,
-    SymbolKind, TrustBoundary, Visibility,
+    CallableSignature, DependencyEntry, FileInfo, Handle, Language, RationaleEntry, Reference,
+    ReferenceKind, Symbol, SymbolKind, TrustBoundary, Visibility,
 };
 use rusqlite::{OptionalExtension, params};
 
@@ -48,7 +48,8 @@ fn deserialize_rationale(s: &str) -> Vec<RationaleEntry> {
 }
 
 /// Map a `(name, qualified_name, kind, path, line_start, line_end, col_start,
-/// col_end, rationale, visibility, is_test)` row into a `Symbol`. The column
+/// col_end, rationale, visibility, is_test, signature, arity, parameters,
+/// return_type)` row into a `Symbol`. The column
 /// order is shared by `find_symbols`, `symbols_for_files`, and
 /// `symbols_for_file`. An unrecognized visibility string reads as unknown.
 fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
@@ -56,6 +57,37 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     let rationale_json: String = row.get(8)?;
     let visibility: Option<String> = row.get(9)?;
     let is_test: i64 = row.get(10)?;
+    let signature = row
+        .get::<_, Option<String>>(11)?
+        .map(|declaration| {
+            let arity = row
+                .get::<_, Option<String>>(12)?
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            12,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?;
+            let parameters: String = row.get(13)?;
+            let parameters = serde_json::from_str(&parameters).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    13,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok::<_, rusqlite::Error>(CallableSignature {
+                declaration,
+                arity,
+                parameters,
+                returns: row.get(14)?,
+            })
+        })
+        .transpose()?;
     Ok(Symbol {
         name: row.get(0)?,
         qualified_name: row.get(1)?,
@@ -67,6 +99,7 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         col_end: row.get(7)?,
         rationale: deserialize_rationale(&rationale_json),
         visibility: visibility.as_deref().and_then(Visibility::parse),
+        signature,
         is_test: is_test != 0,
         overloaded: false,
     })
@@ -273,8 +306,8 @@ impl Database {
 
     pub fn insert_symbols(&self, file_id: i64, symbols: &[Symbol]) -> Result<()> {
         let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO symbols (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end, rationale, visibility, is_test)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end, rationale, visibility, is_test, signature, arity, parameters, return_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )?;
 
         for s in symbols {
@@ -292,6 +325,19 @@ impl Database {
                 rationale_json,
                 s.visibility.map(|v| v.as_str()),
                 i64::from(s.is_test),
+                s.signature.as_ref().map(|signature| &signature.declaration),
+                s.signature
+                    .as_ref()
+                    .and_then(|signature| signature.arity.as_ref())
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                s.signature
+                    .as_ref()
+                    .map(|signature| serde_json::to_string(&signature.parameters))
+                    .transpose()?,
+                s.signature
+                    .as_ref()
+                    .and_then(|signature| signature.returns.as_ref()),
             ])?;
         }
         Ok(())
@@ -566,17 +612,17 @@ impl Database {
     }
 
     pub fn find_symbols(&self, name: &str, kind: Option<SymbolKind>) -> Result<Vec<Symbol>> {
-        let sql = if name.contains('\\') || name.contains('.') || name.contains("::") {
-            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test
-              FROM symbols s JOIN files f ON s.file_id = f.id
-              WHERE s.qualified_name = ?1"
+        let name_column = if name.contains('\\') || name.contains('.') || name.contains("::") {
+            "s.qualified_name"
         } else {
-            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test
-              FROM symbols s JOIN files f ON s.file_id = f.id
-              WHERE s.name = ?1"
+            "s.name"
         };
+        let signature = self.symbol_signature_projection()?;
+        let sql = format!("SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test, {signature}
+              FROM symbols s JOIN files f ON s.file_id = f.id
+              WHERE {name_column} = ?1");
 
-        let mut stmt = self.conn.prepare_cached(sql)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![name], row_to_symbol)?;
 
         let mut symbols: Vec<Symbol> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -586,6 +632,19 @@ impl Database {
             symbols.retain(|s| s.kind == k);
         }
         Ok(symbols)
+    }
+
+    fn symbol_signature_projection(&self) -> Result<&'static str> {
+        let present: bool = self.conn.query_row(
+            "SELECT COUNT(*) = 4 FROM pragma_table_info('symbols') WHERE name IN ('signature', 'arity', 'parameters', 'return_type')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(if present {
+            "s.signature, s.arity, s.parameters, s.return_type"
+        } else {
+            "NULL, NULL, NULL, NULL"
+        })
     }
 
     /// Definitions sharing the short `name`, counted without hydrating rows.
@@ -1496,9 +1555,10 @@ impl Database {
             out.entry(path.clone()).or_default();
         }
         let placeholders: Vec<String> = (1..=file_paths.len()).map(|i| format!("?{i}")).collect();
+        let signature = self.symbol_signature_projection()?;
         let sql = format!(
             "SELECT s.name, s.qualified_name, s.kind, f.path,
-                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test
+                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test, {signature}
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE f.path IN ({})
              ORDER BY s.line_start",
@@ -1521,13 +1581,14 @@ impl Database {
     }
 
     pub fn symbols_for_file(&self, file_path: &str) -> Result<Vec<Symbol>> {
-        let mut stmt = self.conn.prepare(
+        let signature = self.symbol_signature_projection()?;
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT s.name, s.qualified_name, s.kind, f.path,
-                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test
+                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test, {signature}
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE f.path = ?1
              ORDER BY s.line_start",
-        )?;
+        ))?;
         let mut rows = stmt
             .query_map(params![file_path], row_to_symbol)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1751,6 +1812,14 @@ impl Database {
             .query_map([], row_to_file_lang)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn file_language_matches(&self, path: &str, language: Language) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 AND language = ?2)",
+            params![path, language.as_str()],
+            |row| row.get(0),
+        )?)
     }
 
     /// Outgoing (to_name, kind) references for derivation without reparsing.

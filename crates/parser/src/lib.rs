@@ -10,6 +10,7 @@ mod preproc;
 pub mod python_bindings;
 pub mod rationale;
 pub mod references;
+pub mod signature;
 pub mod source;
 mod test_marks;
 pub mod validate;

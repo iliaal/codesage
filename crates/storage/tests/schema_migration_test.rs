@@ -203,6 +203,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0024_is_test",
         "0025_git_exclusion_fingerprint",
         "0026_python_bindings",
+        "0027_symbol_signatures",
     ];
     for migration in expected_migrations {
         let count: i64 = conn
@@ -779,6 +780,7 @@ fn sample_symbol() -> codesage_protocol::Symbol {
         rationale: Vec::new(),
         visibility: None,
         is_test: false,
+        signature: None,
         overloaded: false,
     }
 }

@@ -406,6 +406,7 @@ mod tests {
             col_end: 0,
             rationale: Vec::new(),
             is_test: false,
+            signature: None,
             overloaded: false,
         }
     }

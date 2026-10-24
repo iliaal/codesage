@@ -793,6 +793,7 @@ mod tests {
                             rationale: Vec::new(),
                             visibility: None,
                             is_test: false,
+                            signature: None,
                             overloaded: false,
                         }],
                     )
@@ -869,6 +870,7 @@ mod tests {
                     rationale: Vec::new(),
                     visibility: None,
                     is_test: false,
+                    signature: None,
                     overloaded: false,
                 }],
             )

@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS symbols (
     col_end INTEGER NOT NULL,
     rationale TEXT NOT NULL DEFAULT '[]',
     visibility TEXT,
+    signature TEXT,
+    arity TEXT,
+    parameters TEXT,
+    return_type TEXT,
     is_test INTEGER NOT NULL DEFAULT 0
 );
 
@@ -735,7 +739,22 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         migrate_0025_git_exclusion_fingerprint,
     ),
     ("0026_python_bindings", migrate_0026_python_bindings),
+    ("0027_symbol_signatures", migrate_0027_symbol_signatures),
 ];
+
+fn migrate_0027_symbol_signatures(conn: &Connection) -> rusqlite::Result<()> {
+    for column in ["signature", "arity", "parameters", "return_type"] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('symbols') WHERE name = ?1)",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(&format!("ALTER TABLE symbols ADD COLUMN {column} TEXT;"))?;
+        }
+    }
+    Ok(())
+}
 
 fn migrate_0026_python_bindings(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -1931,6 +1950,32 @@ mod tests {
             .unwrap();
         assert_eq!(refs, 1);
         assert_eq!(evidence, 0);
+    }
+    #[test]
+    fn signature_migration_preserves_legacy_symbols_and_unknown_fields() {
+        let conn = open_initialized();
+        conn.execute_batch("ALTER TABLE symbols DROP COLUMN signature;
+            ALTER TABLE symbols DROP COLUMN arity;
+            ALTER TABLE symbols DROP COLUMN parameters;
+            ALTER TABLE symbols DROP COLUMN return_type;
+            DELETE FROM schema_migrations WHERE name = '0027_symbol_signatures';
+            INSERT INTO files(id,path,language,content_hash) VALUES(101,'legacy.c','c','legacy');
+            INSERT INTO symbols(file_id,name,qualified_name,kind,line_start,line_end,col_start,col_end,visibility)
+            VALUES(101,'run','run','function',1,2,0,1,'file');").unwrap();
+        init_db(&conn).unwrap();
+        let row: (String, String, Option<String>, Option<String>, Option<String>, Option<String>) = conn.query_row(
+            "SELECT name, visibility, signature, arity, parameters, return_type FROM symbols WHERE file_id=101",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).unwrap();
+        assert_eq!(row, ("run".into(), "file".into(), None, None, None, None));
+        init_db(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM symbols WHERE file_id=101", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
     }
     #[test]
     fn legacy_git_state_update_invalidates_exclusion_fingerprint() {

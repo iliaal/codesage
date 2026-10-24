@@ -1556,6 +1556,7 @@ mod tests {
                 rationale: vec![],
                 visibility: None,
                 is_test: false,
+                signature: None,
                 overloaded: false,
             }],
         )

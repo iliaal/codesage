@@ -211,8 +211,8 @@ impl Database {
             )?;
             let mut symbols = self.conn.prepare(
                 "INSERT INTO temp.__overlay_symbols
-                 (id, file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end, rationale, visibility, is_test)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 (id, file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end, rationale, visibility, is_test, signature, arity, parameters, return_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             )?;
             for symbol in replacement.symbols {
                 codesage_protocol::work::checkpoint()?;
@@ -232,7 +232,26 @@ impl Database {
                     symbol.col_end,
                     serde_json::to_string(&symbol.rationale)?,
                     symbol.visibility.map(|value| value.as_str()),
-                    symbol.is_test
+                    symbol.is_test,
+                    symbol
+                        .signature
+                        .as_ref()
+                        .map(|signature| &signature.declaration),
+                    symbol
+                        .signature
+                        .as_ref()
+                        .and_then(|signature| signature.arity.as_ref())
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    symbol
+                        .signature
+                        .as_ref()
+                        .map(|signature| serde_json::to_string(&signature.parameters))
+                        .transpose()?,
+                    symbol
+                        .signature
+                        .as_ref()
+                        .and_then(|signature| signature.returns.as_ref()),
                 ])?;
             }
             let mut references = self.conn.prepare(
@@ -512,6 +531,7 @@ mod tests {
             rationale: Vec::new(),
             visibility: None,
             is_test: false,
+            signature: None,
             overloaded: false,
         }
     }

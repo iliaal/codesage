@@ -383,10 +383,13 @@ pub fn extract_symbols(
         let visibility = match language {
             Language::Rust => rust_visibility(&def_node),
             Language::C | Language::Cpp => c_visibility(&def_node, source, language, file_path),
+            Language::Php => php_visibility(&def_node, source),
+            Language::Java => java_visibility(&def_node),
             _ => None,
         };
 
         let is_test = crate::test_marks::symbol_is_test(&def_node, source, language, test_ctx);
+        let signature = crate::signature::extract(def_node, source, language, &name);
 
         let symbol = Symbol {
             name,
@@ -399,6 +402,7 @@ pub fn extract_symbols(
             col_end,
             rationale,
             visibility,
+            signature,
             is_test,
             overloaded: false,
         };
@@ -728,6 +732,49 @@ fn rust_modifier_visibility(item: &Node) -> Visibility {
     }
 }
 
+fn php_visibility(node: &Node<'_>, source: &[u8]) -> Option<Visibility> {
+    if node.kind() == "function_definition" {
+        return Some(Visibility::Public);
+    }
+    if node.kind() != "method_declaration" {
+        return None;
+    }
+    let modifier = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "visibility_modifier");
+    match modifier
+        .and_then(|modifier| modifier.utf8_text(source).ok())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("private") => Some(Visibility::Private),
+        Some("protected") => Some(Visibility::Protected),
+        Some("public") | None => Some(Visibility::Public),
+        _ => None,
+    }
+}
+
+fn java_visibility(node: &Node<'_>) -> Option<Visibility> {
+    if !matches!(
+        node.kind(),
+        "method_declaration" | "constructor_declaration"
+    ) {
+        return None;
+    }
+    let modifier = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "modifiers");
+    let modifier = modifier?;
+    modifier
+        .children(&mut modifier.walk())
+        .find_map(|child| match child.kind() {
+            "public" => Some(Visibility::Public),
+            "private" => Some(Visibility::Private),
+            "protected" => Some(Visibility::Protected),
+            _ => None,
+        })
+}
+
 /// C/C++ internal linkage: a `static` function or file-scope object is
 /// nameable only from its own translation unit. A `static` in a header is
 /// meant to be textually included by several units, so it stays unknown.
@@ -751,7 +798,20 @@ fn c_visibility(
     let is_static = def_node.children(&mut cursor).any(|c| {
         c.kind() == "storage_class_specifier" && c.utf8_text(source).ok() == Some("static")
     });
-    is_static.then_some(Visibility::File)
+    if is_static {
+        Some(Visibility::File)
+    } else if language == Language::C && def_node.kind() == "function_definition" {
+        let mut parent = def_node.parent();
+        while let Some(node) = parent {
+            if node.kind() == "function_definition" {
+                return None;
+            }
+            parent = node.parent();
+        }
+        Some(Visibility::Public)
+    } else {
+        None
+    }
 }
 
 fn is_c_header_path(file_path: &str) -> bool {

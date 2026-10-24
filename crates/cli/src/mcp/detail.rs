@@ -36,7 +36,6 @@ const MIN_BUDGET_TOKENS: usize = 256;
 const COMPACT_OMISSIONS: &[&str] = &[
     "content",
     "snippet",
-    "signature",
     "doc_comment",
     "churn_score",
     "churn_percentile",

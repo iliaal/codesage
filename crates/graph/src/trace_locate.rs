@@ -1747,6 +1747,7 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
             rationale: Vec::new(),
             visibility: None,
             is_test: false,
+            signature: None,
             overloaded: false,
         }
     }

@@ -145,7 +145,10 @@ CORE_API zend_result ZEND_FASTCALL(void) { return 0; }\n";
         assert_eq!(s.visibility, Some(Visibility::File));
         assert_eq!(s.col_start, 0);
     }
-    assert_eq!(function(&syms, "external").visibility, None);
+    assert_eq!(
+        function(&syms, "external").visibility,
+        Some(Visibility::Public)
+    );
     function(&syms, "ZEND_FASTCALL");
     let tree = parse_file(source.as_bytes(), Language::C).unwrap();
     assert!(

@@ -3,8 +3,11 @@ use std::io::Read;
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result, ensure};
+use codesage_parser::signature::{declarator, parameter_arity};
 use codesage_parser::{detect::detect_language, parse::parse_file};
-use codesage_protocol::{Handle, Language};
+pub use codesage_protocol::Arity;
+use codesage_protocol::{Handle, Language, Symbol};
+use codesage_storage::Database;
 use schemars::JsonSchema;
 use serde::Serialize;
 use tree_sitter::Node;
@@ -56,12 +59,6 @@ impl std::fmt::Display for EditCheckRefusal {
 }
 
 impl std::error::Error for EditCheckRefusal {}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct Arity {
-    pub minimum: usize,
-    pub maximum: Option<usize>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Signature {
@@ -116,8 +113,8 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 ///
 /// `symbol` takes the shared target grammar's symbol spelling as well as a
 /// bare declaration name: a `sym:<file>#<qualified>[@<line>]` handle from
-/// `find_symbol` names the declaration outright. This path reads Git, never
-/// the index, so the handle is parsed rather than resolved.
+/// `find_symbol` names the declaration outright. The handle is parsed against
+/// Git HEAD rather than resolved through the optional signature cache.
 pub fn edit_check(
     project: &Path,
     file: &str,
@@ -179,13 +176,33 @@ pub fn edit_check(
         )
         .into());
     }
-    let mut report = check_source(&source, language, file, symbol, line, replacement)?;
+    let cached = stored_signatures(&root, file, &source, language).unwrap_or_default();
+    let mut report =
+        check_source_cached(&source, language, file, symbol, line, replacement, &cached)?;
     report.head = head;
     report.worktree_matches_head = worktree_matches(&root.join(file), source.as_bytes());
     if !report.worktree_matches_head {
         report.unknown.push("The working file differs from HEAD or cannot be read as a regular file without following a symlink; findings describe HEAD callers only.".into());
     }
     Ok(report)
+}
+
+fn stored_signatures(
+    root: &Path,
+    file: &str,
+    source: &str,
+    language: Language,
+) -> Result<Vec<Symbol>> {
+    let db = Database::open_read_only(&root.join(".codesage/index.db"))?;
+    let _snapshot = db.read_snapshot()?;
+    if db.get_indexed_file_hash(file)?.as_deref()
+        != Some(codesage_parser::discover::content_hash(source.as_bytes()).as_str())
+        || !db.file_interpretation_matches(file, crate::STRUCTURAL_INTERPRETATION)?
+        || !db.file_language_matches(file, language)?
+    {
+        return Ok(Vec::new());
+    }
+    db.symbols_for_file(file)
 }
 
 /// Read a `sym:` handle as `(declaration name, line)`. A bare name passes
@@ -230,7 +247,7 @@ fn declaration_name(qualified: &str) -> &str {
 }
 
 /// `sym:<file>#<name>@<line>` for one declaration at HEAD. Minted from the
-/// pinned source, since this path never opens an index.
+/// pinned source, independent of any optional signature cache.
 fn declaration_handle(file: &str, symbol: &str, line: usize) -> String {
     Handle::symbol(file, symbol, u32::try_from(line).ok()).to_string()
 }
@@ -304,21 +321,6 @@ fn function(node: Node<'_>) -> bool {
             }))
 }
 
-fn declarator(node: Node<'_>) -> Node<'_> {
-    let mut current = node;
-    while let Some(next) = current.child_by_field_name("declarator").or_else(|| {
-        (current.kind() == "reference_declarator")
-            .then(|| current.named_child(0))
-            .flatten()
-    }) {
-        current = next;
-        if current.kind() == "function_declarator" {
-            break;
-        }
-    }
-    current
-}
-
 fn name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     node.child_by_field_name("name")
         .or_else(|| declarator(node).child_by_field_name("declarator"))
@@ -336,12 +338,41 @@ fn scope(node: Node<'_>) -> Vec<usize> {
 }
 
 fn signature(node: Node<'_>, source: &str, language: Language) -> Signature {
+    signature_cached(node, source, language, &[])
+}
+
+fn signature_cached(
+    node: Node<'_>,
+    source: &str,
+    language: Language,
+    cached: &[Symbol],
+) -> Signature {
     let parameters = node
         .child_by_field_name("parameters")
         .or_else(|| declarator(node).child_by_field_name("parameters"));
-    let arity = parameters.and_then(|params| parameter_arity(params, source, language));
+    let (start_row, start_col) =
+        codesage_parser::position::node_start_utf8(&node, source.as_bytes());
+    let (end_row, end_col) = codesage_parser::position::node_end_utf8(&node, source.as_bytes());
+    let mut matches = cached.iter().filter(|symbol| {
+        symbol.line_start == start_row + 1
+            && symbol.col_start == start_col
+            && symbol.line_end == end_row + 1
+            && symbol.col_end == end_col
+            && name(node, source).is_some_and(|name| symbol.name == declaration_name(name))
+    });
+    let stored = matches
+        .next()
+        .and_then(|symbol| symbol.signature.as_ref())
+        .filter(|_| matches.next().is_none());
+    let arity = stored
+        .and_then(|signature| signature.arity.clone())
+        .or_else(|| parameters.and_then(|params| parameter_arity(params, source, language)));
     let body = node.child_by_field_name("body");
-    let declaration = source[node.start_byte()..body.map_or(node.end_byte(), |b| b.start_byte())]
+    let declaration = stored
+        .map_or_else(
+            || &source[node.start_byte()..body.map_or(node.end_byte(), |b| b.start_byte())],
+            |signature| signature.declaration.as_str(),
+        )
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -391,90 +422,6 @@ fn signature(node: Node<'_>, source: &str, language: Language) -> Signature {
     }
 }
 
-fn parameter_arity(params: Node<'_>, source: &str, language: Language) -> Option<Arity> {
-    let mut minimum = 0;
-    let mut maximum = Some(0);
-    let has_ellipsis = params
-        .children(&mut params.walk())
-        .any(|node| node.kind() == "...");
-    for parameter in children(params) {
-        let kind = parameter.kind();
-        if matches!(kind, "comment" | "line_comment" | "block_comment") {
-            continue;
-        }
-        if kind.contains("attribute") {
-            return None;
-        }
-        if kind == "self_parameter"
-            || (language == Language::TypeScript
-                && parameter
-                    .child_by_field_name("pattern")
-                    .is_some_and(|n| text(n, source) == "this"))
-        {
-            return None;
-        }
-        if matches!(
-            kind,
-            "positional_separator"
-                | "keyword_separator"
-                | "dictionary_splat_pattern"
-                | "list_splat_pattern"
-        ) {
-            return None;
-        }
-        if text(parameter, source) == "void" && matches!(language, Language::C | Language::Cpp) {
-            continue;
-        }
-        if kind.contains("variadic")
-            || matches!(kind, "rest_pattern" | "spread_parameter")
-            || children(parameter)
-                .iter()
-                .any(|n| n.kind() == "rest_pattern")
-        {
-            maximum = None;
-            continue;
-        }
-        let optional = matches!(
-            kind,
-            "default_parameter"
-                | "typed_default_parameter"
-                | "optional_parameter"
-                | "assignment_pattern"
-                | "optional_parameter_declaration"
-        ) || parameter.child_by_field_name("default_value").is_some()
-            || parameter.child_by_field_name("value").is_some();
-        let count = if language == Language::Go {
-            let mut cursor = parameter.walk();
-            parameter
-                .children(&mut cursor)
-                .enumerate()
-                .filter(|(index, _)| parameter.field_name_for_child(*index as u32) == Some("name"))
-                .count()
-                .max(1)
-        } else {
-            1
-        };
-        maximum = maximum.map(|n| n + count);
-        if !optional {
-            minimum = maximum?;
-        }
-    }
-    if language == Language::C && children(params).is_empty() {
-        return None;
-    }
-    // JavaScript permits omitted and surplus arguments independently of declared parameters.
-    if language == Language::JavaScript {
-        return None;
-    }
-    if language == Language::Php {
-        maximum = None;
-    }
-    if has_ellipsis {
-        maximum = None;
-    }
-    Some(Arity { minimum, maximum })
-}
-
 fn deduplicate_signatures(signatures: &mut Vec<Signature>) {
     let mut seen = Vec::new();
     signatures.retain(|signature| {
@@ -487,13 +434,14 @@ fn deduplicate_signatures(signatures: &mut Vec<Signature>) {
     });
 }
 
-fn check_source(
+fn check_source_cached(
     source: &str,
     language: Language,
     file: &str,
     symbol: &str,
     line: Option<usize>,
     replacement: &str,
+    cached: &[Symbol],
 ) -> Result<EditCheckReport> {
     let tree = parse_file(source.as_bytes(), language)?;
     if tree.root_node().has_error() {
@@ -590,13 +538,13 @@ fn check_source(
         )
         .into());
     }
-    let before = signature(old, source, language);
+    let before = signature_cached(old, source, language, cached);
     let after = signature(new, &proposed, language);
     let mut overloads_before: Vec<_> = nodes
         .iter()
         .copied()
         .filter(|n| function(*n) && name(*n, source) == Some(symbol) && scope(*n) == scope(old))
-        .map(|n| signature(n, source, language))
+        .map(|n| signature_cached(n, source, language, cached))
         .collect();
     let mut overloads_after: Vec<_> = new_nodes
         .iter()
