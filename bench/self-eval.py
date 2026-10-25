@@ -6,7 +6,8 @@ Two zero-label generators, both emitting the YAML shape that
 `bench/codesage-bench-runner` consumes (`project_root`, `cases: [{id, query,
 expected_files, source}]`), so the existing runner scores them unchanged.
 
-  cochange    Replay recent commits. Each kept commit contributes one case:
+  cochange    Replay a positive --commits window of recent non-merge commits
+              (default 80). Each kept commit contributes one case:
               query = commit subject, expected_files = the changed indexed
               source files minus one seed. The seed is the changed file whose
               path stem or parent-directory name occurs in the subject scope
@@ -1707,7 +1708,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--mode", choices=("cochange", "known-item", "both"), required=True)
     ap.add_argument("--project", type=Path, required=True)
     ap.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "corpora" / "self")
-    ap.add_argument("--commits", type=int, default=80)
+    ap.add_argument(
+        "--commits", type=int, default=80,
+        help="positive non-merge commit window for cochange (default 80); ignored in known-item mode",
+    )
     ap.add_argument("--min-files", type=int, default=2)
     ap.add_argument(
         "--max-files", type=int, default=DEFAULT_MAX_FILES,
@@ -1734,6 +1738,8 @@ def main(argv: list[str] | None = None) -> int:
     project = args.project.expanduser().resolve()
     if not project.is_dir():
         ap.error(f"project root does not exist: {project}")
+    if args.mode in ("cochange", "both") and args.commits < 1:
+        ap.error("--commits must be >= 1 for cochange or both mode")
     if args.min_files < 2:
         ap.error("--min-files must be >= 2 (a seed plus at least one gold file)")
     if args.max_files < args.min_files:
