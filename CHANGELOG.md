@@ -9,6 +9,10 @@
 - Symbol visibility includes external C function definitions and PHP/Java method access modifiers, including implicit public PHP methods.
 - php-src feature mapping groups extension sources into slices of at most 40 files and retains their PHP callable entrypoints.
 
+### Fixed
+
+- MCP structural queries reduce cold C++ parsing and header-discovery delays before applying working-tree edits.
+
 ### Security
 
 - Model downloads use patched TLS certificate verification and root certificates, fixing RUSTSEC-2026-0381, RUSTSEC-2026-0382, and RUSTSEC-2026-0383.

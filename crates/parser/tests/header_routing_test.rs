@@ -10,6 +10,56 @@ fn write(root: &std::path::Path, path: &str, source: &str) {
 }
 
 #[test]
+fn membership_walk_preserves_admission_and_detects_changes() {
+    let root = tempfile::tempdir().unwrap();
+    for directory in 0..64 {
+        write(
+            root.path(),
+            &format!("branch{directory}/api.h"),
+            "struct Api {};\n",
+        );
+        write(
+            root.path(),
+            &format!("branch{directory}/notes.txt"),
+            "notes\n",
+        );
+    }
+    let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+    let verify = codesage_parser::header::verify_membership;
+    verify(root.path(), &files, &[]).unwrap();
+    write(root.path(), ".hidden/new.cpp", "void hidden() {}\n");
+    verify(root.path(), &files, &[]).unwrap();
+    write(root.path(), "branch32/new.cpp", "void added() {}\n");
+    let error = verify(root.path(), &files, &[]).unwrap_err();
+    assert!(error.to_string().contains("new candidate branch32/new.cpp"));
+    verify(root.path(), &files, &["branch32/new.cpp".into()]).unwrap();
+    fs::remove_file(root.path().join("branch32/new.cpp")).unwrap();
+    let error = verify(root.path(), &files, &["branch16/api.h".into()]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("branch16/api.h is no longer admitted")
+    );
+    fs::remove_file(root.path().join("branch16/api.h")).unwrap();
+    verify(root.path(), &files, &[]).unwrap();
+}
+
+#[test]
+fn membership_walk_honors_the_callers_deadline() {
+    use codesage_protocol::work::WorkControl;
+    use std::time::Instant;
+
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "api.h", "struct Api {};\n");
+    let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+    write(root.path(), "new.cpp", "void added() {}\n");
+    let control = WorkControl::new(Some(Instant::now()));
+    let _scope = control.enter();
+    let error = codesage_parser::header::verify_membership(root.path(), &files, &[]).unwrap_err();
+    assert!(error.to_string().contains("DeadlineExceeded"));
+}
+
+#[test]
 fn cpp_evidence_is_local_and_literal_includes_resolve_unambiguously() {
     let root = tempfile::tempdir().unwrap();
     for path in [

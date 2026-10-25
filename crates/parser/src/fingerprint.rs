@@ -197,7 +197,15 @@ fn file_fingerprints_with_control(
         if dead.covers(&def) {
             continue;
         }
-        let Some((captured, kind)) = definition_names.name(name_cap.node, kind) else {
+        let Some((name_node, kind)) =
+            crate::extract::definition_capture(def, name_cap.node, kind, language, source)
+        else {
+            continue;
+        };
+        if !matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+            continue;
+        }
+        let Some((captured, kind)) = definition_names.name(name_node, kind) else {
             continue;
         };
         let kind = crate::extract::refine_definition_kind(kind, &def, language);

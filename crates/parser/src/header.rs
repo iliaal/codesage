@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, ensure};
 use codesage_protocol::{FileInfo, Language};
@@ -203,57 +205,80 @@ pub(crate) fn unchanged_context(
 /// discovery so suffix ambiguity and the admissible source set stay identical.
 pub fn verify_membership(root: &Path, files: &[FileInfo], excludes: &[String]) -> Result<()> {
     let known: HashSet<_> = files.iter().map(|file| file.path.as_str()).collect();
-    let mut observed = HashSet::new();
+    let observed = Mutex::new(HashSet::new());
     let excludes = crate::discover::build_exclude_set(excludes)?;
     let root_owned = root.to_path_buf();
     let mut walk = ignore::WalkBuilder::new(root);
-    walk.hidden(true)
-        .git_ignore(true)
-        .filter_entry(move |entry| {
-            let Ok(relative) = entry.path().strip_prefix(&root_owned) else {
-                return false;
-            };
-            relative.as_os_str().is_empty()
-                || !crate::discover::exclude_matches_path(
-                    &excludes,
-                    &relative.to_string_lossy(),
-                    entry.file_type().is_some_and(|kind| kind.is_dir()),
-                )
-        });
-    let mut context_entries = 0;
-    for entry in walk.build() {
-        codesage_protocol::work::checkpoint()?;
-        let entry = entry?;
-        if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-            context_entries += 1;
-            ensure!(
-                context_entries <= 16_384,
-                "header dialect context exceeds 16384 routing candidates and directories; run codesage index"
-            );
-            continue;
-        }
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        if !is_cpp_evidence(path) && path.extension().is_none_or(|ext| ext != "h") {
-            continue;
-        }
-        if entry.metadata()?.len() > crate::discover::MAX_INDEXABLE_FILE_BYTES {
-            continue;
-        }
-        context_entries += 1;
-        ensure!(
-            context_entries <= 16_384,
-            "header dialect context exceeds 16384 routing candidates and directories; run codesage index"
-        );
-        let relative = path.strip_prefix(root)?.to_string_lossy();
-        ensure!(
-            known.contains(relative.as_ref()),
-            "header dialect requires codesage index: new candidate {relative}"
-        );
-        observed.insert(relative.into_owned());
+    walk.threads(
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(4),
+    )
+    .hidden(true)
+    .git_ignore(true)
+    .filter_entry(move |entry| {
+        let Ok(relative) = entry.path().strip_prefix(&root_owned) else {
+            return false;
+        };
+        relative.as_os_str().is_empty()
+            || !crate::discover::exclude_matches_path(
+                &excludes,
+                &relative.to_string_lossy(),
+                entry.file_type().is_some_and(|kind| kind.is_dir()),
+            )
+    });
+    let context_entries = AtomicUsize::new(0);
+    let first_error = Mutex::new(None);
+    let control = codesage_protocol::work::current();
+    walk.build_parallel().run(|| {
+        Box::new(|entry| {
+            let result = (|| -> Result<()> {
+                // The caller's thread-local deadline is not inherited by walk workers.
+                if let Some(control) = &control {
+                    control.check()?;
+                }
+                let entry = entry?;
+                let is_directory = entry.file_type().is_some_and(|kind| kind.is_dir());
+                if !is_directory {
+                    if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                        return Ok(());
+                    }
+                    let path = entry.path();
+                    if !is_cpp_evidence(path) && path.extension().is_none_or(|ext| ext != "h") {
+                        return Ok(());
+                    }
+                    if entry.metadata()?.len() > crate::discover::MAX_INDEXABLE_FILE_BYTES {
+                        return Ok(());
+                    }
+                }
+                ensure!(
+                    context_entries.fetch_add(1, Ordering::Relaxed) < 16_384,
+                    "header dialect context exceeds 16384 routing candidates and directories; run codesage index"
+                );
+                if !is_directory {
+                    let relative = entry.path().strip_prefix(root)?.to_string_lossy();
+                    ensure!(
+                        known.contains(relative.as_ref()),
+                        "header dialect requires codesage index: new candidate {relative}"
+                    );
+                    observed.lock().unwrap().insert(relative.into_owned());
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => ignore::WalkState::Continue,
+                Err(error) => {
+                    first_error.lock().unwrap().get_or_insert(error);
+                    ignore::WalkState::Quit
+                }
+            }
+        })
+    });
+    if let Some(error) = first_error.into_inner().unwrap() {
+        return Err(error);
     }
+    codesage_protocol::work::checkpoint()?;
+    let observed = observed.into_inner().unwrap();
     for file in files
         .iter()
         .filter(|file| file.path.ends_with(".h") || is_cpp_evidence(Path::new(&file.path)))

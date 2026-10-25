@@ -140,25 +140,14 @@ fn c_kind_map(pattern_index: usize) -> Option<SymbolKind> {
 
 fn cpp_kind_map(pattern_index: usize) -> Option<SymbolKind> {
     match pattern_index {
-        // 0..=2 free/in-class function defs (refined to Method when inside a class body).
-        0..=2 => Some(SymbolKind::Function),
-        // 3 out-of-line method def (Foo::bar). Already a Method.
-        3 => Some(SymbolKind::Method),
-        // 4 destructor, 5 operator. Refined to Method when inside a class body, else stay Function.
-        4 | 5 => Some(SymbolKind::Function),
-        6 => Some(SymbolKind::Class),
-        7 => Some(SymbolKind::Struct),
-        8 => Some(SymbolKind::Struct), // union -> Struct (no Union variant)
-        9 => Some(SymbolKind::Enum),
-        10 => Some(SymbolKind::Constant), // typedef
-        11 => Some(SymbolKind::Constant), // using-alias
-        12 => Some(SymbolKind::Constant), // concept (no Concept variant)
-        13 => Some(SymbolKind::Macro),
-        14..=18 => Some(SymbolKind::Method), // in-class declarations (no body)
-        19..=22 => Some(SymbolKind::Function), // in-class definitions (refined to Method)
-        // 23 file scope, 24 namespace scope, 25 in-class static member.
-        23..=25 => Some(SymbolKind::Constant),
-        26 => Some(SymbolKind::Function), // identity-macro wrapped name
+        0 => Some(SymbolKind::Function),
+        1 => Some(SymbolKind::Class),
+        2 | 3 => Some(SymbolKind::Struct),
+        4 => Some(SymbolKind::Enum),
+        5..=7 => Some(SymbolKind::Constant), // typedef, using-alias, concept
+        8 => Some(SymbolKind::Macro),
+        9 => Some(SymbolKind::Method), // callable fields; const fields are refined
+        10 => Some(SymbolKind::Constant),
         _ => None,
     }
 }
@@ -309,8 +298,12 @@ pub fn extract_symbols(
             continue;
         };
 
-        let name_node = name_cap.node;
         let def_node = def_cap.node;
+        let Some((name_node, kind)) =
+            definition_capture(def_node, name_cap.node, kind, language, source)
+        else {
+            continue;
+        };
 
         // A definition parked in a dead `#if 0` arm exists in no build, and
         // must not claim a `seen_defs` key either; see `crate::preproc`.
@@ -413,6 +406,97 @@ pub fn extract_symbols(
 
     codesage_protocol::work::checkpoint()?;
     Ok(symbols)
+}
+
+pub(crate) fn definition_capture<'tree>(
+    definition: Node<'tree>,
+    name: Node<'tree>,
+    kind: SymbolKind,
+    language: Language,
+    source: &[u8],
+) -> Option<(Node<'tree>, SymbolKind)> {
+    if language != Language::Cpp {
+        return Some((name, kind));
+    }
+    let has_const_qualifier = || {
+        definition
+            .named_children(&mut definition.walk())
+            .any(|node| {
+                node.kind() == "type_qualifier"
+                    && node.end_byte() <= name.start_byte()
+                    && matches!(
+                        node.utf8_text(source),
+                        Ok("const" | "constexpr" | "constinit")
+                    )
+            })
+    };
+    match definition.kind() {
+        "function_definition" => cpp_callable_capture(name, true),
+        "field_declaration" if name.kind() == "field_identifier" => {
+            let has_later_initializer = definition
+                .children_by_field_name("default_value", &mut definition.walk())
+                .any(|value| value.start_byte() >= name.end_byte());
+            (has_later_initializer && has_const_qualifier()).then_some((name, SymbolKind::Constant))
+        }
+        "field_declaration" => cpp_callable_capture(name, false),
+        "class_specifier" | "struct_specifier" | "union_specifier" => definition
+            .child_by_field_name("body")
+            .filter(|body| {
+                body.kind() == "field_declaration_list" && body.start_byte() >= name.end_byte()
+            })
+            .map(|_| (name, kind)),
+        "enum_specifier" => definition
+            .child_by_field_name("body")
+            .filter(|body| body.kind() == "enumerator_list" && body.start_byte() >= name.end_byte())
+            .map(|_| (name, kind)),
+        "declaration" => (definition.parent().is_some_and(|parent| {
+            matches!(parent.kind(), "translation_unit" | "declaration_list")
+        }) && has_const_qualifier())
+        .then_some((name, kind)),
+        _ => Some((name, kind)),
+    }
+}
+
+fn cpp_callable_capture(declarator: Node<'_>, has_body: bool) -> Option<(Node<'_>, SymbolKind)> {
+    let function = match declarator.kind() {
+        "function_declarator" => declarator,
+        "pointer_declarator" => declarator.child_by_field_name("declarator")?,
+        "reference_declarator" => declarator
+            .named_children(&mut declarator.walk())
+            .find(|child| child.kind() == "function_declarator")?,
+        _ => return None,
+    };
+    if function.kind() != "function_declarator" {
+        return None;
+    }
+    let name = function.child_by_field_name("declarator")?;
+    let admitted = match (declarator.kind(), has_body) {
+        ("function_declarator", true) => matches!(
+            name.kind(),
+            "identifier"
+                | "field_identifier"
+                | "destructor_name"
+                | "operator_name"
+                | "qualified_identifier"
+                | "function_declarator"
+        ),
+        ("pointer_declarator", true) => matches!(name.kind(), "identifier" | "field_identifier"),
+        ("reference_declarator", true) => matches!(
+            name.kind(),
+            "identifier" | "field_identifier" | "operator_name"
+        ),
+        ("function_declarator" | "reference_declarator", false) => {
+            matches!(name.kind(), "field_identifier" | "operator_name")
+        }
+        ("pointer_declarator", false) => name.kind() == "field_identifier",
+        _ => false,
+    };
+    let kind = if !has_body || name.kind() == "qualified_identifier" {
+        SymbolKind::Method
+    } else {
+        SymbolKind::Function
+    };
+    admitted.then_some((name, kind))
 }
 
 pub(crate) struct DefinitionNames<'tree, 'source> {

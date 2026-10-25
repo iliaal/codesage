@@ -36,7 +36,7 @@ const EXPECTED_SYMBOL_PATTERN_COUNTS: &[(Language, usize)] = &[
     (Language::Php, 8),
     (Language::Python, 2),
     (Language::C, 11),
-    (Language::Cpp, 27),
+    (Language::Cpp, 11),
     (Language::Java, 9),
     (Language::Rust, 10),
     (Language::JavaScript, 12),
