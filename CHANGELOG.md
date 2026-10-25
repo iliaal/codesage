@@ -1,8 +1,10 @@
 ## [Unreleased]
 
+## [0.45.0] - 2026-10-24
+
 ### Added
 
-- `find-symbol`, MCP `find_symbol`, and `describe` expose persisted callable declarations, parameters, return declarations, and arity across all nine supported languages; file cards include a bounded `public_api` section.
+- `find-symbol`, MCP `find_symbol`, and `describe` expose persisted callable declarations across all nine supported languages, with parameters, return declarations, and arity where supported; file cards include a bounded `public_api` section.
 
 ### Changed
 
@@ -11,7 +13,7 @@
 
 ### Fixed
 
-- MCP structural queries reduce cold C++ parsing and header-discovery delays before applying working-tree edits.
+- MCP structural queries return current C and C++ header symbols on cold requests.
 
 ### Security
 
@@ -1347,5 +1349,7 @@ Initial public release.
 
 [0.44.0]: https://github.com/iliaal/codesage/releases/tag/v0.44.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.44.1...HEAD
 [0.44.1]: https://github.com/iliaal/codesage/releases/tag/v0.44.1
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.45.0...HEAD
+[0.45.0]: https://github.com/iliaal/codesage/releases/tag/v0.45.0
