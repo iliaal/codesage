@@ -1392,7 +1392,7 @@ fn describe_stdio_cards_cli_parity_and_every_expansion_execute() {
     );
     assert!(schema["outputSchema"]["properties"].get("card").is_some());
     for (target, section_count) in [
-        ("file:src/helper.rs", 8),
+        ("file:src/helper.rs", 9),
         ("sym:src/helper.rs#leaf", 7),
         ("feat_1111111111111111", 4),
         ("dir:src", 4),
@@ -1403,6 +1403,16 @@ fn describe_stdio_cards_cli_parity_and_every_expansion_execute() {
         let content = &result["structuredContent"];
         let sections = content["card"]["sections"].as_object().unwrap();
         assert_eq!(sections.len(), section_count);
+        if target == "file:src/helper.rs" {
+            let api = &sections["public_api"]["data"];
+            assert_eq!(api["total"], 2);
+            assert_eq!(api["missing_signatures"], 0);
+            assert_eq!(api["symbols"][0]["handle"], "sym:src/helper.rs#leaf");
+            assert_eq!(
+                api["symbols"][0]["signature"]["declaration"],
+                "pub fn leaf()"
+            );
+        }
         assert!(
             serde_json::to_vec(&content["card"]).unwrap().len() < 3000,
             "{target}: {content}"
