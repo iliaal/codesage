@@ -810,6 +810,44 @@ check(b.get("terminal") == 1 and b.get("follow_through_read") == 1, "extract_eve
 agg = aq.aggregate([evs])
 check(agg["codesage_results_total"] == 1 and agg["quality"]["find_symbol"]["ok"] == 1, "extract_events -> quality counts")
 
+# Explicit transcript failures must not depend on the rendered error wording.
+# Current MCP errors contain a plain message plus a structured error text block.
+with tempfile.TemporaryDirectory() as td:
+    path = Path(td) / "errors.jsonl"
+    error_rows = []
+    cases = [
+        (True, "database is locked", "error"),
+        (True, [{"type": "text", "text": "index missing"},
+                {"type": "text", "text": json.dumps({"error": {"code": "not_indexed"}})}], "error"),
+        (True, "", "error"),
+        (False, FS_RESULT, "ok"),
+        (False, "[]", "empty"),
+        (None, "Error: legacy failure", "error"),
+        (None, FS_RESULT, "ok"),
+        (False, "Error: legacy failure", "error"),
+        ("false", FS_RESULT, "ok"),
+    ]
+    for index, (is_error, content, expected) in enumerate(cases):
+        tool_id = f"quality_{index}"
+        block = {"type": "tool_result", "tool_use_id": tool_id, "content": content}
+        if is_error is not None:
+            block["is_error"] = is_error
+        error_rows.extend([
+            {"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": tool_id, "name": CS + "find_symbol",
+                 "input": {"project": ROOT, "name": "foo"}}]}},
+            {"message": {"role": "user", "content": [block]}},
+        ])
+    path.write_text("".join(json.dumps(row) + "\n" for row in error_rows), encoding="utf-8")
+    error_events = aq.extract_events(path)
+    for index, (_, _, expected) in enumerate(cases):
+        actual = aq.aggregate([error_events[2 * index:2 * index + 2]])["quality"]["find_symbol"]
+        check(actual.get(expected) == 1, f"explicit result error case {index}: {actual}")
+    totals = aq.aggregate([error_events])
+    check(totals["codesage_results_total"] == len(cases), "error flags preserve result denominator")
+    check(dict(totals["quality"]["find_symbol"]) == {"error": 5, "ok": 3, "empty": 1},
+          "explicit and legacy result quality totals")
+
 with tempfile.TemporaryDirectory() as td:
     proj = Path(td) / "-home-x-proj"
     sub = proj / "sess1" / "subagents"
