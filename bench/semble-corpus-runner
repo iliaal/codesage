@@ -165,6 +165,8 @@ def main() -> int:
     ap.add_argument("--codesage-bin", required=True)
     ap.add_argument("--limit", type=int, default=10)
     args = ap.parse_args()
+    if args.limit < 1:
+        ap.error("--limit must be a positive integer")
 
     project_root = Path(args.repo_root)
     if not (project_root / ".codesage" / "index.db").is_file():
