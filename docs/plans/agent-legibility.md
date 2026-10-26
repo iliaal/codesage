@@ -37,7 +37,7 @@ Observed on this repository at 0.31.0 with a fresh index. Each row is an evidenc
 
 Two facts from the investigations shape everything below:
 
-- **`outputSchema` never reaches the model.** Claude Code forwards `name`, `description`, and `inputSchema` only (`~/ai/wiki/tools/claude-code-quirks.md`). Field semantics written into output schemas are invisible to the agent. The only channels that reach the model are the description, the input schema, the skill, the hint, and the response body itself.
+- **`outputSchema` never reaches the model.** Claude Code forwards `name`, `description`, and `inputSchema` only. Field semantics written into output schemas are invisible to the agent. The only channels that reach the model are the description, the input schema, the skill, the hint, and the response body itself.
 - **Descriptions are the largest always-on guidance surface**: about 24,300 characters across 22 tools, roughly 6,200 tokens per session, versus 1,100 for the skill and 2,000 for the generated hint. They are also where most caveats live, so an agent pays for every caveat on every session whether or not it applies.
 
 ## 3. The tower
