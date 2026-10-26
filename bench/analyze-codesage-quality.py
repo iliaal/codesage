@@ -182,6 +182,7 @@ def extract_events(transcript: Path) -> list[dict[str, Any]]:
                         "kind": "tool_result",
                         "id": tid,
                         "text": text,
+                        "is_error": c.get("is_error") is True,
                         "ts": ts,
                         "pair_tool": (use or {}).get("tool"),
                         "pair_input": (use or {}).get("input", {}),
@@ -1424,7 +1425,9 @@ def aggregate(
                         recent_codesage_subjects.pop(0)
             elif e["kind"] == "tool_result" and (e.get("pair_tool") or "").startswith(TOOL_PREFIX):
                 tool = e["pair_tool"][len(TOOL_PREFIX):]
-                cat = classify_codesage_result(e.get("text") or "")
+                # Explicit tool failures need not have an Error: text prefix.
+                cat = ("error" if e.get("is_error") is True
+                       else classify_codesage_result(e.get("text") or ""))
                 quality[tool][cat] += 1
                 codesage_results_total += 1
                 subj = extract_codesage_subject(e)
