@@ -21,6 +21,8 @@ sizes) in the TOTAL row, matching the method recorded on bead cs-z82.
 Code-only stripping supports JavaScript/TypeScript-family files and PHP only.
 If the index contains any other file extension, scoring stops with an error
 before emitting results; unsupported files are never treated as stripped code.
+Unreadable indexed source files also stop scoring rather than silently shrinking
+the reference file universe (for example, a stale --no-index after file removal).
 
 Usage:
   impact-oracle.py --repo /tmp/semble-bench-repos/axios \
@@ -306,8 +308,8 @@ def main() -> None:
         p = repo / rel
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
+        except OSError as exc:
+            ap.error(f"cannot read indexed source file {rel!r}: {exc}")
         raw_text[rel] = text
         code_text[rel] = strip_for(rel, text)
 

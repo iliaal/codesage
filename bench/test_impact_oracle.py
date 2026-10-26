@@ -118,6 +118,45 @@ with tempfile.TemporaryDirectory(prefix="impact-oracle-unsupported-") as td:
     check(result.stdout == "", "language rejection emits no per-symbol or TOTAL scores")
     check(not (repo / "report.json").exists(), "language rejection writes no misleading JSON scores")
 
+# Read failures must not silently shrink the oracle's indexed file universe.
+# Exercise first and later failures; neither can emit partial scores.
+for failure_kind in ("missing", "directory", "dangling symlink"):
+    for failure_first in (False, True):
+        for existing_report in (False, True):
+            with tempfile.TemporaryDirectory(prefix="impact-oracle-unreadable-") as td:
+                repo = Path(td)
+                sources = {"valid.js": "Target();\n", "unreadable.js": "Target();\n"}
+                if failure_first:
+                    sources = dict(reversed(list(sources.items())))
+                write_index(repo, sources)
+                source = repo / "unreadable.js"
+                source.unlink()
+                if failure_kind == "directory":
+                    source.mkdir()
+                elif failure_kind == "dangling symlink":
+                    source.symlink_to("missing-target.js")
+                report = repo / "report.json"
+                if existing_report:
+                    report.write_text("previous report\n", encoding="utf-8")
+                # A valid executable would reveal any queries after incomplete reads.
+                binary = repo / "codesage-fixture"
+                binary.write_text(
+                    f"#!{sys.executable}\n"
+                    "from pathlib import Path\n"
+                    "Path('queried').touch()\n"
+                    "print('{\"results\": []}')\n", encoding="utf-8",
+                )
+                binary.chmod(0o755)
+                result = run_oracle(repo, binary)
+                label = f"{failure_kind}, first={failure_first}, existing report={existing_report}"
+                check(result.returncode == 2, f"{label}: read failure rejects scoring")
+                check("cannot read indexed source file 'unreadable.js'" in result.stderr,
+                      f"{label}: error identifies unreadable indexed file")
+                check(result.stdout == "", f"{label}: no partial or TOTAL scores")
+                check(not (repo / "queried").exists(), f"{label}: no scoring queries")
+                check(report.read_text(encoding="utf-8") == "previous report\n" if existing_report
+                      else not report.exists(), f"{label}: JSON report is not created or overwritten")
+
 with tempfile.TemporaryDirectory(prefix="impact-oracle-supported-") as td:
     repo = Path(td)
     write_index(repo, {
