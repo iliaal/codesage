@@ -20,8 +20,8 @@ prefix shell commands with `rtk`, using `rtk proxy` for raw/machine-parsed data.
 
 ## Baseline and migration
 
-1. Read the repository's beads protocol and the CLI-contract sections of
-   `~/ai/wiki/tools/beads-review-ledger.md`. Run `rtk proxy br info --json` from
+1. Read the repository's beads protocol and, if available, the CLI-contract
+   sections of the beads review-ledger protocol. Run `rtk proxy br info --json` from
    CodeSage and confirm its central store. Never create `.beads` in this repo or
    bypass the wrapper. Capture initial Git status, CodeSage HEAD, and UTC start
    time. Verify mutation flags against current `br <command> --help`.

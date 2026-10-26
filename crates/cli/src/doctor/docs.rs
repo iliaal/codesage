@@ -2198,7 +2198,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
         assert_eq!(classify_path("mcp-<version>-<key>.sock"), None);
         assert_eq!(classify_path("a/<name>.md"), None);
         assert_eq!(classify_path("/usr/lib/x.so"), None);
-        assert_eq!(classify_path("~/ai/wiki/x.md"), None);
+        assert_eq!(classify_path("~/notes/x.md"), None);
         assert_eq!(classify_path("--manifest-path"), None);
         assert_eq!(classify_path("a/b"), None);
         assert_eq!(classify_path("a/b/"), None);
