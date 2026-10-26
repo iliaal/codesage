@@ -1004,6 +1004,45 @@ for payload, label in (
         f"ndcg-runner: {label} is invalid-output, not a clean zero",
     )
 
+# Every returned row must identify a file; malformed rows cannot be clean
+# misses, partial successes, or unhashable keys in the deduplication map.
+malformed_path_rows = [
+    {}, {"file_path": None}, {"file_path": ""}, {"file_path": False},
+    {"file_path": True}, {"file_path": 0}, {"file_path": 7},
+    {"file_path": 1.5}, {"file_path": []}, {"file_path": ["a.rs"]},
+    {"file_path": {}}, {"file_path": {"path": "a.rs"}},
+]
+for row in malformed_path_rows:
+    for prefix in ([], [{"file_path": "a.rs"}]):
+        for wrapped in (False, True):
+            rows = prefix + [row]
+            payload = json.dumps({"results": rows} if wrapped else rows)
+            for code, timeout in ((0, False), (134, False), (0, True)):
+                label = f"{row!r}, prefix={bool(prefix)}, wrapped={wrapped}, code={code}, timeout={timeout}"
+                try:
+                    result = _run_search(payload, code, raise_timeout=timeout,
+                                         stderr="diagnostic", diagnostics=True)
+                except (TypeError, AttributeError) as exc:
+                    check(False, f"ndcg-runner: malformed path raises {type(exc).__name__}: {label}")
+                    continue
+                check(result[:2] == ([], "invalid-output"),
+                      f"ndcg-runner: reject complete malformed page: {label}")
+                check(result[2]["returncode"] == (None if timeout else code)
+                      and result[2]["timed_out"] == timeout
+                      and result[2]["stderr"] == "diagnostic",
+                      f"ndcg-runner: malformed page keeps process evidence: {label}")
+
+# Empty pages are legitimate misses; paths are not trimmed or normalized here.
+for rows, expected in (
+    ([], []),
+    ([{"file_path": p} for p in ("a.rs", "a.rs", " ", "a\\b.rs", "é.rs")],
+     ["a.rs", " ", "a\\b.rs", "é.rs"]),
+):
+    for wrapped in (False, True):
+        payload = json.dumps({"results": rows} if wrapped else rows)
+        check(_run_search(payload) == (expected, "ok"),
+              "ndcg-runner: valid rows preserve first-occurrence order and path bytes")
+
 paths, status = _run_search("not json", 0)
 check((paths, status) == ([], "unparseable"), "ndcg-runner: clean-exit garbage")
 paths, status = _run_search("not json", 134)
@@ -1124,6 +1163,42 @@ with tempfile.TemporaryDirectory() as td:
           and report["provenance"]["search_log_filter"] == "warn,codesage=info"
           and report["provenance"]["diagnostic_policy"]["quality_warnings"]["rerank-failed"] == RERANK_FAILURE,
           "ndcg-runner: artifact pins actual runner bytes and diagnostic/logging policy")
+
+
+    # Exercise the real CLI's artifact path, not just search(): malformed paths
+    # must remain visible in both repository and language degradation counts.
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "if '--version' in sys.argv:\n"
+        "    print('codesage 0.27.0 (fixture)'); sys.exit(0)\n"
+        "query = sys.argv[-1]\n"
+        "rows = [{'file_path': 'a.rs'}]\n"
+        "if query == 'invalid': rows.append({'file_path': ['bad.rs']})\n"
+        "print(json.dumps({'results': rows}))\n"
+    )
+    (annotations / "fixture.json").write_text(json.dumps([
+        {"query": query, "relevant": ["a.rs"]} for query in ("valid", "invalid")
+    ]))
+    artifact.unlink()
+    proc = ndcg_runner.subprocess.run([
+        sys.executable, str(HERE / "semble-ndcg-runner"),
+        "--corpus", str(root / "corpus"), "--annotations", str(annotations),
+        "--repos", str(repos), "--codesage-bin", str(binary), "--json", str(artifact),
+    ], capture_output=True, text=True, timeout=20)
+    check(proc.returncode == 0 and artifact.exists(),
+          "ndcg-runner: malformed file path does not crash artifact generation")
+    if proc.returncode == 0 and artifact.exists():
+        report = json.loads(artifact.read_text())
+        repo = report["per_repo"]["fixture"]
+        rows = repo["query_results"]
+        check([r["status"] for r in rows] == ["ok", "invalid-output"]
+              and [r["paths"] for r in rows] == [["a.rs"], []]
+              and [r["ndcg@10"] for r in rows] == [1.0, 0.0]
+              and repo["degraded"] == {"invalid-output": 1}
+              and report["by_language"]["rust"]["degraded"] == {"invalid-output": 1}
+              and report["warnings"] == ["fixture: 1 query(s) invalid-output"],
+              "ndcg-runner: artifact discloses invalid paths without partial success")
 
 
 if failures:
