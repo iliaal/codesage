@@ -1313,6 +1313,28 @@ def main() -> int:
             return subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True, timeout=120)
 
         base = ["--mode", "cochange", "--project", str(repo), "--out", str(out / "cli")]
+        for mode in ("cochange", "both"):
+            for count in ("0", "-1"):
+                invalid_out = out / f"invalid-commits-{mode}-{count}"
+                r = run_cli("--mode", mode, "--project", str(repo),
+                            "--out", str(invalid_out), "--commits", count)
+                check(r.returncode == 2 and "--commits must be >= 1" in r.stderr,
+                      f"cli: {mode} --commits {count} exits 2")
+                check(not invalid_out.exists(),
+                      f"cli: {mode} --commits {count} writes no corpus")
+        bounded_out = out / "bounded-commits"
+        r = run_cli("--mode", "cochange", "--project", str(repo),
+                    "--out", str(bounded_out), "--commits", "1")
+        check(r.returncode == 0 and "commits in scope: 1 of 1 scanned" in r.stdout
+              and len(cases_by_query(bounded_out / "fixture-cochange.yaml")) == 1,
+              "cli: --commits 1 retains a bounded one-commit corpus")
+        for count in ("0", "-1"):
+            ignored_out = out / f"ignored-commits-{count}"
+            r = run_cli("--mode", "known-item", "--project", str(repo),
+                        "--out", str(ignored_out), "--commits", count)
+            check(r.returncode == 0
+                  and (ignored_out / "fixture-known-item.yaml").is_file(),
+                  f"cli: known-item continues to ignore --commits {count}")
         r = run_cli(*base, "--min-files", "1")
         check(r.returncode == 2 and "--min-files must be >= 2" in r.stderr, f"cli: --min-files 1 exits 2 (rc={r.returncode})")
         r = run_cli(*base, "--max-files", "1")
