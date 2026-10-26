@@ -169,8 +169,9 @@ def search(binary, repo_dir, query, limit, timeout=120):
         if not isinstance(r, dict):
             return [], "invalid-output", evidence
         fp = r.get("file_path")
-        if fp:
-            seen.setdefault(fp, None)
+        if not isinstance(fp, str) or not fp:
+            return [], "invalid-output", evidence
+        seen.setdefault(fp, None)
 
     if timed_out:
         status = "timeout-with-output"
