@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("impact_oracle", HERE / "impact-oracle.py")
@@ -200,6 +201,75 @@ with tempfile.TemporaryDirectory(prefix="impact-oracle-supported-") as td:
         check(report["TOTAL"]["code_truth"] == 2 and report["TOTAL"]["code_hit"] == 2
               and report["TOTAL"]["precision"] == 2 / 3 and report["TOTAL"]["recall"] == 1,
               "TOTAL scores use supported code-only reference sets")
+
+# Both CLI readers must reject a whole malformed page, not manufacture empty
+# evidence or retain a valid prefix. An actual empty results list remains valid.
+invalid_pages = [None, False, 0, "", [], {}, {"error": "failed"}]
+invalid_pages += [{"results": value} for value in (None, False, 0, "", {}, "rows")]
+invalid_rows = [None, False, 0, "path.js", [], {}, *[
+    {"file_path": value} for value in (None, False, 0, [], {}, "")
+]]
+invalid_pages += [{"results": rows} for row in invalid_rows
+                  for rows in ([row], [{"file_path": "valid.js"}, row])]
+for command, reader in (
+    ("find-symbol", lambda: oracle.definition_files("fixture", HERE, "Target")),
+    ("impact", lambda: oracle.impact_files("fixture", HERE, "Target", 2)),
+):
+    for page in invalid_pages:
+        with patch.object(oracle, "run", return_value=json.dumps(page)):
+            try:
+                reader()
+            except SystemExit as exc:
+                check(str(exc).startswith(f"{command} returned invalid results:"),
+                      f"{command}, {page!r}: diagnostic identifies invalid page")
+            except Exception as exc:
+                check(False, f"{command}, {page!r}: uncontrolled {type(exc).__name__}")
+            else:
+                check(False, f"{command}, {page!r}: malformed page accepted")
+    with patch.object(oracle, "run", return_value="not JSON"):
+        try:
+            reader()
+        except SystemExit as exc:
+            check(str(exc).startswith(f"{command} returned invalid JSON:"),
+                  f"{command}: malformed JSON diagnostic")
+        except Exception as exc:
+            check(False, f"{command}: uncontrolled JSON {type(exc).__name__}")
+        else:
+            check(False, f"{command}: malformed JSON accepted")
+    for paths in ([], ["one.js"], ["one.js", "one.js", " ", "unicodé.js", "nested/a.ts"]):
+        with patch.object(oracle, "run", return_value=json.dumps({
+            "results": [{"file_path": path, "extra": 42} for path in paths],
+            "extra": "metadata",
+        })):
+            check(reader() == (set(paths) if command == "find-symbol" else paths),
+                  f"{command}, {paths!r}: valid paths and existing ordering/dedup preserved")
+
+# Exercise subprocess boundaries: malformed definition or impact evidence cannot
+# finish a successful report or replace an existing report, even with valid rows.
+for command in ("find-symbol", "impact"):
+    for page in ({}, {"results": [{"file_path": "use.js"}, {"file_path": ""}]}):
+        for existing_report in (False, True):
+            with tempfile.TemporaryDirectory(prefix="impact-oracle-invalid-results-") as td:
+                repo = Path(td)
+                write_index(repo, {"use.js": "Target();\n"})
+                report = repo / "report.json"
+                if existing_report:
+                    report.write_text("previous report\n", encoding="utf-8")
+                binary = repo / "codesage-fixture"
+                binary.write_text(
+                    f"#!{sys.executable}\nimport json, sys\n"
+                    f"page = {page!r} if sys.argv[1] == {command!r} else {{'results': []}}\n"
+                    "print(json.dumps(page))\n", encoding="utf-8",
+                )
+                binary.chmod(0o755)
+                result = run_oracle(repo, binary)
+                label = f"{command}, {page!r}, existing={existing_report}"
+                check(result.returncode != 0, f"{label}: malformed page fails scoring")
+                check(f"{command} returned invalid results:" in result.stderr,
+                      f"{label}: actionable diagnostic")
+                check("TOTAL" not in result.stdout, f"{label}: no completed score summary")
+                check(report.read_text(encoding="utf-8") == "previous report\n" if existing_report
+                      else not report.exists(), f"{label}: no JSON creation or overwrite")
 
 if failures:
     print("FAILED:\n" + "\n".join(f"  {failure}" for failure in failures))
