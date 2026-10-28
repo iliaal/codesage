@@ -217,42 +217,6 @@ def run_codesage_search(
     return stdout, None, runtime
 
 
-def parse_results(output: str) -> list[tuple[str, str]]:
-    """Extract ordered (file_path, chunk_content) pairs, first chunk per file.
-
-    Deduplicates by file_path in rank order so token-budget calculations see
-    the chunks an agent would actually consume rank-by-rank.
-    """
-    lines: list[str] = []
-    for line in output.splitlines():
-        line = line.strip()
-        if line.startswith("[") or line.startswith("{"):
-            lines.append(line)
-        elif lines:
-            lines.append(line)
-
-    json_str = "\n".join(lines)
-    if not json_str:
-        return []
-
-    try:
-        results = json.loads(json_str)
-    except json.JSONDecodeError:
-        return []
-    if isinstance(results, dict):
-        results = results.get("results", [])
-
-    seen: set[str] = set()
-    ordered: list[tuple[str, str]] = []
-    for r in results:
-        path = r.get("file_path", "")
-        if not path or path in seen:
-            continue
-        seen.add(path)
-        ordered.append((path, r.get("content", "")))
-    return ordered
-
-
 def split_of(case_id: str, salt: str) -> str:
     """Salted held-out assignment; must stay identical to compare-runs.py."""
     digest = hashlib.sha256((salt + "\0" + case_id).encode("utf-8")).digest()

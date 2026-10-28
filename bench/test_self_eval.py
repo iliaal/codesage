@@ -691,6 +691,10 @@ def check_provenance(header: str, label: str) -> None:
     for key in ("generated: ", "project_head: ", "codesage: ", "script_revision: ", "index_digest: "):
         check(f"# {key}" in header, f"{label}: header carries {key.strip()}")
     check("(files=" in header and "symbols=" in header and "refs=" in header, f"{label}: index digest lists row counts")
+    prose = " ".join(line.removeprefix("# ") for line in header.splitlines())
+    check("`codesage search --json` returns chunk rows in engine order; "
+          "the runner deduplicates emitted rows by file_path before scoring." in prose,
+          f"{label}: header describes the live runner's deduplication before scoring")
 
 
 def cochange_path_checks() -> None:
