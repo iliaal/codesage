@@ -95,23 +95,39 @@ class CrgMcpSession:
                 "arguments": {"query": query, "limit": limit},
             },
         })
-        resp = self._recv()
-        if not resp or "result" not in resp:
-            return []
-        content = resp["result"].get("content") or []
-        if not content:
-            return []
-        text = content[0].get("text", "")
         try:
+            resp = self._recv()
+            if not isinstance(resp, dict) or "error" in resp:
+                raise ValueError("expected a successful response object")
+            result = resp.get("result")
+            if not isinstance(result, dict) or result.get("isError", False) is not False:
+                raise ValueError("expected a successful tool result")
+            content = result.get("content")
+            if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+                raise ValueError("expected a text content block")
+            text = content[0].get("text")
+            if not isinstance(text, str):
+                raise ValueError("expected text content")
             data = json.loads(text)
-        except json.JSONDecodeError:
+            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                raise ValueError("expected a results list")
+            results = data["results"]
+            # Validate the whole page before deduplication: a malformed suffix
+            # must not leave a valid prefix that can be scored as a hit.
+            for row in results:
+                if (not isinstance(row, dict)
+                        or not isinstance(row.get("file_path"), str)
+                        or not row["file_path"]):
+                    raise ValueError("expected nonempty string file_path values")
+        except ValueError as exc:
+            # Keep this adapter's failure-as-miss policy, but make it visible.
+            print(f"warning: CRG search result discarded: {exc}", file=sys.stderr)
             return []
-        results = data.get("results") or []
         ordered: list[str] = []
         seen: set[str] = set()
         for r in results:
-            fp = r.get("file_path") or ""
-            if not fp or fp in seen:
+            fp = r["file_path"]
+            if fp in seen:
                 continue
             seen.add(fp)
             ordered.append(fp)
