@@ -16,6 +16,9 @@ Usage:
 For each query in the annotations file, runs `codesage search --json --limit
 N <query>` twice — once with the gate off (baseline), once with the gate on
 (config 2) — and emits a per-corpus aggregate plus per-query rank deltas.
+Search failures count as misses; JSON result pages with an invalid shape or
+path are discarded in full with a warning,
+rather than retaining partial hits.
 """
 
 import argparse
@@ -53,12 +56,19 @@ def run_search(codesage_bin: str, project_root: Path, query: str, limit: int,
     except json.JSONDecodeError:
         return []
     if isinstance(results, dict):
-        results = results.get("results", [])
+        results = results.get("results")
+    if (not isinstance(results, list)
+            or any(not isinstance(row, dict)
+                   or not isinstance(row.get("file_path"), str)
+                   or not row["file_path"] for row in results)):
+        print(f"[warn] codesage search returned malformed results: {query!r}",
+              file=sys.stderr)
+        return []
     seen = set()
     out = []
     for row in results:
-        p = row.get("file_path")
-        if p and p not in seen:
+        p = row["file_path"]
+        if p not in seen:
             seen.add(p)
             out.append(p)
     return out
