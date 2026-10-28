@@ -61,7 +61,8 @@ def run_search(codesage_bin: str, project_root: Path, query: str, limit: int,
             or any(not isinstance(row, dict)
                    or not isinstance(row.get("file_path"), str)
                    or not row["file_path"] for row in results)):
-        print(f"[warn] codesage search returned malformed results: {query!r}",
+        print(f"[warn] codesage search returned malformed results: query={query!r}; "
+              "reason=expected results list with nonempty string file_path values",
               file=sys.stderr)
         return []
     seen = set()
