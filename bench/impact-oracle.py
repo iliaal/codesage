@@ -23,6 +23,8 @@ If the index contains any other file extension, scoring stops with an error
 before emitting results; unsupported files are never treated as stripped code.
 Unreadable indexed source files also stop scoring rather than silently shrinking
 the reference file universe (for example, a stale --no-index after file removal).
+Malformed find-symbol or impact result pages stop scoring with an error rather
+than becoming empty evidence; no completed TOTAL or JSON report is produced.
 
 Usage:
   impact-oracle.py --repo /tmp/semble-bench-repos/axios \
@@ -257,14 +259,30 @@ def indexed_files(repo: Path) -> list[str]:
         con.close()
 
 
+def result_paths(binary: str, repo: Path, *args: str) -> list[str]:
+    """Require a complete CLI result page before using it as scoring evidence."""
+    raw = run(binary, repo, *args)
+    try:
+        out = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        sys.exit(f"{args[0]} returned invalid JSON: {exc}")
+    if not isinstance(out, dict) or not isinstance(out.get("results"), list):
+        sys.exit(f"{args[0]} returned invalid results: expected an object with a results list")
+    paths: list[str] = []
+    for index, row in enumerate(out["results"]):
+        if (not isinstance(row, dict) or not isinstance(row.get("file_path"), str)
+                or not row["file_path"]):
+            sys.exit(f"{args[0]} returned invalid results: row {index} needs a nonempty string file_path")
+        paths.append(row["file_path"])
+    return paths
+
+
 def definition_files(binary: str, repo: Path, symbol: str) -> set[str]:
-    out = json.loads(run(binary, repo, "find-symbol", symbol, "--json"))
-    return {r["file_path"] for r in out.get("results", [])}
+    return set(result_paths(binary, repo, "find-symbol", symbol, "--json"))
 
 
 def impact_files(binary: str, repo: Path, symbol: str, depth: int) -> list[str]:
-    out = json.loads(run(binary, repo, "impact", symbol, "--symbol", "--depth", str(depth), "--json"))
-    return [r["file_path"] for r in out.get("results", [])]
+    return result_paths(binary, repo, "impact", symbol, "--symbol", "--depth", str(depth), "--json")
 
 
 def prf(hit: int, returned: int, truth: int) -> tuple[float, float, float]:
