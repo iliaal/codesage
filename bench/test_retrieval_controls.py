@@ -341,6 +341,35 @@ class RetrievalControlsTest(unittest.TestCase):
         self.assertFalse(saved["complete"])
         self.assertEqual(len(saved["records"]), 1)
 
+    def test_main_case_failures_identify_query_and_reason(self):
+        binary = self.fixture_index()
+        corpus = self.root / "corpus.yaml"
+        output = self.root / "results.json"
+        query = "quote'\nnext\t文"
+        corpus.write_text(f"project_root: {self.root}\ncases:\n- id: q\n"
+                          f"  query: {json.dumps(query)}\n  expected_files: [a.py]\n")
+        cases = (("[broken", None, "malformed JSON output"),
+                 ('[{"file_path":"a.py","content":"alpha"}]',
+                  controls.InvalidRun("rg failed\nprocess"), "rg failed\nprocess"))
+        for raw, rg_error, reason in cases:
+            with self.subTest(reason=reason):
+                stderr = io.StringIO()
+                with patch.object(runner, "run_codesage_search", return_value=(
+                    raw, None, fixture_runtime()
+                )), patch.object(runner, "run_rg", side_effect=rg_error), patch.object(
+                    sys, "argv", ["runner", str(corpus), "--codesage-bin", str(binary),
+                                  "--results-json", str(output)]
+                ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                    self.assertEqual(runner.main(), 3)
+                self.assertEqual(stderr.getvalue().splitlines()[0],
+                                 f"[warn] q: query={query!r}; reason={reason!r}")
+                self.assertEqual(stderr.getvalue().count("[warn]"), 1)
+                record = json.loads(output.read_text())["records"][0]
+                self.assertEqual(record["query"], query)
+                self.assertEqual(record["hits"], [])
+                self.assertIsNone(record["first_hit_rank"])
+                self.assertEqual(record["error"], f"invalid-control: {reason}")
+
     def test_main_failed_rg_arm_cannot_publish_success(self):
         binary = self.fixture_index()
         corpus = self.root / "corpus.yaml"

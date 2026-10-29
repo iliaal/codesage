@@ -193,26 +193,26 @@ def run_codesage_search(
                 child.kill()
                 stdout, stderr = child.communicate()
                 runtime.update(stderr=stderr, stderr_sha256=hashlib.sha256(stderr.encode()).hexdigest())
-                print(f"[warn] codesage search timed out after 120s: {query!r}", file=sys.stderr)
+                print(f"[warn] codesage search failed: query={query!r}; reason=timed out after 120s", file=sys.stderr)
                 return stdout, "timeout", runtime
         except (OSError, subprocess.SubprocessError) as exc:
-            print(f"[warn] codesage search errored: {exc}", file=sys.stderr)
+            print(f"[warn] codesage search errored: query={query!r}; reason={str(exc)!r}", file=sys.stderr)
             return "", "error", runtime
         runtime.update(entries_after=sorted(p.name for p in runtime_path.iterdir()),
                        stderr=stderr, stderr_sha256=hashlib.sha256(stderr.encode()).hexdigest(),
                        returncode=child.returncode)
         if child.returncode != 0:
-            print(f"[warn] codesage search failed rc={child.returncode}: {stderr}", file=sys.stderr)
+            print(f"[warn] codesage search failed rc={child.returncode}: query={query!r}; reason={stderr!r}", file=sys.stderr)
             return stdout, f"rc={child.returncode}", runtime
         try:
             validate_runtime(runtime)
         except InvalidRun as exc:
-            print(f"[warn] query runtime: {exc}", file=sys.stderr)
+            print(f"[warn] query runtime: query={query!r}; reason={str(exc)!r}", file=sys.stderr)
             return stdout, "invalid-runtime", runtime
     if any(message in stderr for message in (
         "cross-encoder rerank failed", "daemon reranking failed", "CODESAGE_ALLOW_CPU_FALLBACK",
     )):
-        print(f"[warn] degraded search: {stderr}", file=sys.stderr)
+        print(f"[warn] degraded search: query={query!r}; reason={stderr!r}", file=sys.stderr)
         return stdout, "degraded", runtime
     return stdout, None, runtime
 
@@ -582,7 +582,7 @@ def main() -> int:
         except InvalidRun as exc:
             error = error or f"invalid-control: {exc}"
             returned = []
-            print(f"[warn] {cid}: {exc}", file=sys.stderr)
+            print(f"[warn] {cid}: query={query!r}; reason={str(exc)!r}", file=sys.stderr)
         scored = score_case(expected, returned, k_values)
         scored["id"] = cid
         scored["query"] = query
