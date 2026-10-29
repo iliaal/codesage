@@ -391,6 +391,10 @@ def main() -> int:
         })
         print(f"  q: {query}", file=sys.stderr)
 
+    if not cases:
+        print("no usable queries generated; corpus not written", file=sys.stderr)
+        return 1
+
     serialized = format_corpus_yaml(str(project_root), cases)
 
     if args.out:
