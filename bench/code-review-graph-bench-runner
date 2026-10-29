@@ -121,7 +121,8 @@ class CrgMcpSession:
                     raise ValueError("expected nonempty string file_path values")
         except ValueError as exc:
             # Keep this adapter's failure-as-miss policy, but make it visible.
-            print(f"warning: CRG search result discarded: {exc}", file=sys.stderr)
+            print(f"[warn] CRG search returned malformed results: query={query!r}; reason={exc}",
+                  file=sys.stderr)
             return []
         ordered: list[str] = []
         seen: set[str] = set()

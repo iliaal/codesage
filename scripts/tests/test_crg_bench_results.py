@@ -69,7 +69,7 @@ class CrgBenchResultsTests(unittest.TestCase):
                 with self.subTest(rows=rows):
                     paths, warning = self.search(response({"results": rows}))
                     self.assertEqual(paths, [])
-                    self.assertIn("CRG search result discarded", warning)
+                    self.assertIn("CRG search returned malformed results", warning)
 
     def test_rejects_malformed_payloads_envelopes_and_explicit_errors(self):
         pages = [None, False, 0, [], "bad", {}, {"result": None}, {"result": []}]
@@ -89,14 +89,27 @@ class CrgBenchResultsTests(unittest.TestCase):
             with self.subTest(page=page):
                 paths, warning = self.search(page)
                 self.assertEqual(paths, [])
-                self.assertIn("CRG search result discarded", warning)
+                self.assertIn("CRG search returned malformed results", warning)
 
     def test_malformed_outer_json_is_discarded(self):
         self.session._recv.side_effect = json.JSONDecodeError("bad", "{", 1)
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             self.assertEqual(self.session.search("query", 10), [])
-        self.assertIn("CRG search result discarded", stderr.getvalue())
+        self.assertIn("CRG search returned malformed results", stderr.getvalue())
+
+    def test_warning_identifies_query_and_reason_on_one_line(self):
+        for query in ("first", "second", "quote'\nnext\t文"):
+            with self.subTest(query=query):
+                self.session._recv.return_value = response({"results": [{}]})
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.session.search(query, 10)
+                self.assertEqual(
+                    stderr.getvalue(),
+                    f"[warn] CRG search returned malformed results: query={query!r}; "
+                    "reason=expected nonempty string file_path values\n",
+                )
 
     def test_cli_continues_after_malformed_page_without_partial_hit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -133,7 +146,7 @@ for line in sys.stdin:
             self.assertIn("| bad | ? | MISS | 0 | 0.00 | 0.00 |", proc.stdout)
             self.assertIn("| good | ? | 1 | 0 | 1.00 | 1.00 |", proc.stdout)
             self.assertIn("miss_rate=0.5000 median_first=1 r5=0.5000 r10=0.5000 cases=2", proc.stdout)
-            self.assertEqual(proc.stderr.count("CRG search result discarded"), 1)
+            self.assertEqual(proc.stderr.count("CRG search returned malformed results"), 1)
             self.assertNotIn("Traceback", proc.stderr)
 
 

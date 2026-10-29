@@ -37,7 +37,22 @@ class SembleCorpusRunnerTests(unittest.TestCase):
                     paths = runner["run_search"]("codesage", ROOT, "query", 10, {})
                 self.assertEqual(paths, [])
                 self.assertEqual(stderr.getvalue(),
-                                 "[warn] codesage search returned malformed results: 'query'\n")
+                                 "[warn] codesage search returned malformed results: query='query'; "
+                                 "reason=expected results list with nonempty string file_path values\n")
+
+    def test_warning_identifies_query_and_reason_on_one_line(self):
+        runner = runpy.run_path(str(ROOT / "bench/semble-corpus-runner"))
+        response = subprocess.CompletedProcess([], 0, json.dumps([{}]), "")
+        for query in ("first", "second", "quote'\nnext\t文"):
+            with self.subTest(query=query):
+                stderr = io.StringIO()
+                with mock.patch("subprocess.run", return_value=response), contextlib.redirect_stderr(stderr):
+                    runner["run_search"]("codesage", ROOT, query, 10, {})
+                self.assertEqual(
+                    stderr.getvalue(),
+                    f"[warn] codesage search returned malformed results: query={query!r}; "
+                    "reason=expected results list with nonempty string file_path values\n",
+                )
 
     def test_valid_result_pages_preserve_path_order(self):
         runner = runpy.run_path(str(ROOT / "bench/semble-corpus-runner"))
@@ -76,7 +91,7 @@ class SembleCorpusRunnerTests(unittest.TestCase):
                 text=True, capture_output=True, timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stderr.count("returned malformed results: 'bad'"), 2)
+            self.assertEqual(result.stderr.count("returned malformed results: query='bad'"), 2)
             metrics = json.loads(next(line.removeprefix("METRICS_JSON ")
                                      for line in result.stdout.splitlines()
                                      if line.startswith("METRICS_JSON ")))
