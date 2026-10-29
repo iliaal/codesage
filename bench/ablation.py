@@ -42,7 +42,7 @@ comparison, listed under "Invalid runs", and makes the sweep exit 1.
 Usage:
   ./ablation.py corpus1.yaml [corpus2.yaml ...] \
       [--codesage-bin codesage] [--limit 10] \
-      [--runner ~/ai/codesage/bench/codesage-bench-runner] \
+      [--runner /path/to/codesage-bench-runner] \
       [--arms baseline,bm25_weight_1.0,...] \
       [--out ablation-scorecard.md]
 """
@@ -220,7 +220,7 @@ def main() -> int:
     ap.add_argument(
         "--runner",
         type=Path,
-        default=Path.home() / "ai/codesage/bench/codesage-bench-runner",
+        default=Path(__file__).resolve().with_name("codesage-bench-runner"),
     )
     ap.add_argument("--arms", default="", help="comma-separated subset of arm names")
     ap.add_argument("--out", type=Path, default=None)
