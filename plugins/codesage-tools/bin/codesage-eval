@@ -139,7 +139,9 @@ if [ "$SAVE_HISTORY" -eq 1 ]; then
     mkdir -p "$history_dir"
     timestamp="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
     out_file="$history_dir/${timestamp}__${name}-session-eval.md"
-    if ! "$RUNNER" "${runner_args[@]}" > "$out_file" 2>&1; then
+    if "$RUNNER" "${runner_args[@]}" > "$out_file" 2>&1; then
+        :
+    else
         rc=$?
         echo "error: bench runner failed (rc=$rc) — see $out_file" >&2
         exit 1

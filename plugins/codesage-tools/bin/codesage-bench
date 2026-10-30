@@ -112,7 +112,9 @@ for corpus in "${corpora[@]}"; do
         fi
         output="$(cat "$out_file")"
     else
-        if ! output="$("$RUNNER" "${runner_args[@]}" 2>&1)"; then
+        if output="$("$RUNNER" "${runner_args[@]}" 2>&1)"; then
+            :
+        else
             rc=$?
             echo "    RUNNER FAILED rc=$rc"
             overall_fail=1

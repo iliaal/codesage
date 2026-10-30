@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- `/codesage-bench` and `/codesage-eval` report the actual runner exit status in failure diagnostics.
+
 ## [0.45.0] - 2026-10-24
 
 ### Added
