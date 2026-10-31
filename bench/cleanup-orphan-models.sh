@@ -49,4 +49,10 @@ if [ ! -d "$repo/.codesage" ]; then
 fi
 
 echo "==> $repo"
+# Explicit relative paths belong to the caller, not the repository we enter.
+# Bare command names retain their normal PATH lookup in the target directory.
+case "$codesage_bin" in
+    /*) ;;
+    */*) codesage_bin="$PWD/$codesage_bin" ;;
+esac
 ( cd "$repo" && "$codesage_bin" cleanup "${args[@]}" )
