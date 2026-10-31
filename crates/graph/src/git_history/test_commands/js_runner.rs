@@ -14,8 +14,8 @@ use codesage_protocol::TestCommand;
 use serde_json::Value;
 
 use super::{
-    SOURCE_CONVENTION, command, extension, parent_dir, path_arg, read_regular_bounded,
-    read_source_bounded, safe_relative_dir, shell_quote,
+    SOURCE_CONVENTION, command, extension, parent_dir, read_regular_bounded, read_source_bounded,
+    safe_relative_dir, shell_quote,
 };
 
 const VITEST_CONFIGS: [&str; 8] = [
@@ -69,13 +69,98 @@ impl JsRunner {
     }
 
     /// `bun test` reads a bare argument as a name filter and only a `./`
-    /// prefixed one as a file path.
-    fn arg(self, rel: &str) -> String {
-        match self {
-            Self::Bun => shell_quote(&format!("./{rel}")),
-            _ => path_arg(rel),
+    /// prefixed one as a file path. Playwright compiles each argument into a
+    /// regular expression, so a path with regex metacharacters is escaped.
+    /// The result is the argument the runner must receive, before any shell
+    /// quoting.
+    fn raw_arg(self, rel: &str) -> String {
+        let arg = match self {
+            Self::Bun => return format!("./{rel}"),
+            Self::Playwright if has_regex_meta(rel) => regex_escape(rel),
+            _ => rel.to_string(),
+        };
+        if arg.starts_with('-') {
+            format!("./{arg}")
+        } else {
+            arg
         }
     }
+
+    #[cfg(test)]
+    fn arg(self, rel: &str) -> String {
+        shell_quote(&self.raw_arg(rel))
+    }
+
+    /// Why no argument spelling selects exactly `rel`, if none does.
+    /// `node --test` expands every argument as a glob, treats a backslash as
+    /// an escape that then matches nothing, and reads a leading `-` as an
+    /// option even after `./` or `--`. Bun and Vite resolve test files as
+    /// module specifiers, cutting them at `?` and reading `\` as a separator.
+    fn unspellable(self, rel: &str) -> Option<&'static str> {
+        match self {
+            Self::NodeTest if rel.starts_with('-') => Some(
+                "`node --test` reads an argument starting with `-` as an option, even after `./` \
+                 or `--`, and has no literal-path form",
+            ),
+            Self::NodeTest if has_node_glob_magic(rel) => {
+                Some("`node --test` expands each argument as a glob and has no literal-path form")
+            }
+            Self::Bun if rel.contains(['?', '\\']) => Some(
+                "`bun test` cuts a file argument at `?` and reads `\\` as a path separator, so it \
+                 has no literal-path form",
+            ),
+            Self::Vitest if rel.contains(['?', '\\']) => Some(
+                "vitest loads test files through Vite, which reads `?` as a query and `\\` as a \
+                 path separator, so the file cannot be run",
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a regex reading of `rel` can select another file. A `.` in the
+/// file name is left alone: it widens the match by one byte within the same
+/// directory, and keeping it keeps ordinary paths readable. A `.` in a
+/// directory component matches whole sibling directories (`app/a.b/` also
+/// selects `app/aab/`), so it counts.
+fn has_regex_meta(rel: &str) -> bool {
+    rel.contains([
+        '\\', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|',
+    ]) || rel
+        .rsplit_once('/')
+        .is_some_and(|(dirs, _)| dirs.contains('.'))
+}
+
+fn regex_escape(rel: &str) -> String {
+    let mut out = String::with_capacity(rel.len() * 2);
+    for c in rel.chars() {
+        if "\\^$.*+?()[]{}|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Whether `npx` hands `arg` to its `sh -c` unquoted while `sh` still
+/// expands it. npm's `escape.sh` (`@npmcli/promise-spawn`) quotes an
+/// argument only when it holds one of ``\t\n\r "#$&'()*;<>?\\`|~``, so a
+/// bracket or brace with none of those is globbed again and can name a
+/// sibling file instead (`app/[slug]` matches `app/s`).
+fn npx_reexpands(arg: &str) -> bool {
+    arg.contains(['[', ']', '{', '}'])
+        && !arg.contains([
+            '\t', '\n', '\r', ' ', '"', '#', '$', '&', '\'', '(', ')', '*', ';', '<', '>', '?',
+            '\\', '`', '|', '~',
+        ])
+}
+
+/// Bytes that make Node's test-file glob match something other than the
+/// literal path. A bare `(` is literal; it opens an extglob only after
+/// `!`, `@`, or `+` (`?(` and `*(` are already caught by `?` and `*`).
+fn has_node_glob_magic(rel: &str) -> bool {
+    rel.contains(['*', '?', '[', ']', '{', '}', '\\'])
+        || ["!(", "@(", "+("].iter().any(|op| rel.contains(op))
 }
 
 #[derive(Default)]
@@ -312,59 +397,103 @@ pub(super) fn resolve(
 /// so its config and local binaries apply and the caller's working
 /// directory is left at the project root. The directory is written
 /// `./<dir>` after `--` so `cd` never reads it as `-` (`$OLDPWD`), an
-/// option, or a `CDPATH` lookup.
-pub(super) fn commands(root: Option<&Path>, paths: &[String]) -> (Vec<TestCommand>, Vec<String>) {
+/// option, or a `CDPATH` lookup. Jest reads a bare argument as a path
+/// regex, so a group holding a regex metacharacter switches to
+/// `--runTestsByPath`, which takes its arguments as literal paths. A group
+/// whose argument `npx` would glob a second time runs through `npx -c`,
+/// whose single command string keeps the quoting given here.
+pub(super) fn commands(root: Option<&Path>, paths: &[String]) -> JsCommands {
+    let mut out = JsCommands::default();
     let Some(root) = root else {
-        return (Vec::new(), paths.to_vec());
+        out.unresolved = paths.to_vec();
+        return out;
     };
     let mut memo = PackageMemo::default();
     let mut groups: BTreeMap<(String, JsRunner), Vec<String>> = BTreeMap::new();
-    let mut unresolved = Vec::new();
     for path in paths {
         match resolve(root, path, &mut memo) {
             Some(key) => groups.entry(key).or_default().push(path.clone()),
-            None => unresolved.push(path.clone()),
+            None => out.unresolved.push(path.clone()),
         }
     }
-    let commands = groups
-        .into_iter()
-        .map(|((dir, runner), mut covers)| {
-            covers.sort();
-            let args: Vec<String> = covers
-                .iter()
-                .map(|p| {
-                    let rel = if dir.is_empty() {
-                        p.as_str()
-                    } else {
-                        p.strip_prefix(&format!("{dir}/")).unwrap_or(p)
-                    };
-                    runner.arg(rel)
-                })
-                .collect();
-            let run = format!("{} {}", runner.invocation(), args.join(" "));
-            let text = if dir.is_empty() {
-                run
+    let mut unspellable: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for ((dir, runner), mut paths) in groups {
+        paths.sort();
+        let mut covers = Vec::new();
+        let mut rels = Vec::new();
+        for p in paths {
+            let rel = if dir.is_empty() {
+                p.as_str()
             } else {
-                format!("(cd -- {} && {run})", shell_quote(&format!("./{dir}")))
+                p.strip_prefix(&format!("{dir}/")).unwrap_or(&p)
             };
-            command(text, covers, runner.framework(), SOURCE_CONVENTION)
-        })
+            match runner.unspellable(rel) {
+                Some(reason) => unspellable.entry(reason).or_default().push(p.clone()),
+                None => {
+                    rels.push(rel.to_string());
+                    covers.push(p.clone());
+                }
+            }
+        }
+        if covers.is_empty() {
+            continue;
+        }
+        let invocation = if runner == JsRunner::Jest && rels.iter().any(|r| has_regex_meta(r)) {
+            "npx jest --runTestsByPath"
+        } else {
+            runner.invocation()
+        };
+        let raw: Vec<String> = rels.iter().map(|r| runner.raw_arg(r)).collect();
+        let args: Vec<String> = raw.iter().map(|a| shell_quote(a)).collect();
+        let run = match invocation.strip_prefix("npx ") {
+            Some(bin) if raw.iter().any(|a| npx_reexpands(a)) => {
+                format!(
+                    "npx -c {}",
+                    shell_quote(&format!("{bin} {}", args.join(" ")))
+                )
+            }
+            _ => format!("{invocation} {}", args.join(" ")),
+        };
+        let text = if dir.is_empty() {
+            run
+        } else {
+            format!("(cd -- {} && {run})", shell_quote(&format!("./{dir}")))
+        };
+        out.commands
+            .push(command(text, covers, runner.framework(), SOURCE_CONVENTION));
+    }
+    out.notes = unspellable
+        .into_iter()
+        .map(|(reason, paths)| format!("no command emitted for {}: {reason}", capped_list(&paths)))
         .collect();
-    (commands, unresolved)
+    out
 }
 
-pub(super) fn unresolved_note(paths: &[String]) -> String {
+#[derive(Default)]
+pub(super) struct JsCommands {
+    pub commands: Vec<TestCommand>,
+    /// Paths no evidence names a runner for.
+    pub unresolved: Vec<String>,
+    /// Paths whose runner has no argument that selects only that file.
+    pub notes: Vec<String>,
+}
+
+fn capped_list(paths: &[String]) -> String {
     let shown: Vec<&str> = paths
         .iter()
         .take(NOTE_PATH_CAP)
         .map(String::as_str)
         .collect();
     let more = paths.len().saturating_sub(NOTE_PATH_CAP);
-    let list = if more > 0 {
+    if more > 0 {
         format!("{} and {more} more", shown.join(", "))
     } else {
         shown.join(", ")
-    };
+    }
+}
+
+pub(super) fn unresolved_note(paths: &[String]) -> String {
+    let list = capped_list(paths);
     format!(
         "no JavaScript/TypeScript test runner named for {list}: no runner import, `package.json` \
          `scripts.test`, runner dependency, `jest` key, or vitest config names one, so no command \
@@ -483,5 +612,62 @@ mod tests {
         let note = unresolved_note(&paths);
         assert!(note.contains("t4.test.js and 2 more"), "{note}");
         assert!(!note.contains("t5.test.js"), "{note}");
+    }
+
+    #[test]
+    fn route_segment_paths_follow_each_runner_argument_grammar() {
+        let slug = "app/[slug]/page.test.ts";
+        let group = "app/(group)/x.test.ts";
+        assert_eq!(
+            JsRunner::Playwright.arg(slug),
+            r"'app/\[slug\]/page\.test\.ts'"
+        );
+        assert_eq!(
+            JsRunner::Playwright.arg(group),
+            r"'app/\(group\)/x\.test\.ts'"
+        );
+        assert_eq!(JsRunner::Playwright.arg("e/a.spec.ts"), "e/a.spec.ts");
+        for runner in [JsRunner::Vitest, JsRunner::Mocha, JsRunner::Jest] {
+            assert_eq!(runner.arg(slug), "'app/[slug]/page.test.ts'");
+            assert_eq!(runner.unspellable(slug), None);
+        }
+        assert_eq!(JsRunner::Bun.arg(slug), "'./app/[slug]/page.test.ts'");
+        assert_eq!(JsRunner::Bun.unspellable(slug), None);
+        assert!(JsRunner::Bun.unspellable("app/q?/a.test.ts").is_some());
+
+        for magic in [
+            slug,
+            "a/*.test.js",
+            "a/b?.test.js",
+            "a/{x,y}.test.js",
+            "a/b\\c.test.js",
+            "a/!(x)/t.test.js",
+            "a/@(x)/t.test.js",
+            "a/+(x)/t.test.js",
+        ] {
+            assert!(JsRunner::NodeTest.unspellable(magic).is_some(), "{magic}");
+        }
+        for literal in [group, "a/!neg/t.test.js", "a/x+y/t.test.js", "#a.test.js"] {
+            assert_eq!(JsRunner::NodeTest.unspellable(literal), None, "{literal}");
+        }
+
+        assert!(JsRunner::NodeTest.unspellable("-d/x.test.js").is_some());
+        assert!(JsRunner::Bun.unspellable(r"app/a\b/x.test.ts").is_some());
+        for unloadable in ["app/q?/a.test.ts", r"app/a\b/x.test.ts"] {
+            assert!(
+                JsRunner::Vitest.unspellable(unloadable).is_some(),
+                "{unloadable}"
+            );
+        }
+        assert!(has_regex_meta("app/v1.2/x.test.js"));
+        assert!(!has_regex_meta("src/a.test.js"));
+        assert!(!has_regex_meta("a.test.js"));
+
+        assert!(npx_reexpands("app/[slug]/page.test.js"));
+        assert!(npx_reexpands("app/{a,b}/t.test.js"));
+        assert!(!npx_reexpands("app/(group)/x.test.js"));
+        assert!(!npx_reexpands(r"app/\[slug\]/page\.test\.js"));
+        assert!(!npx_reexpands("app/[a b]/t.test.js"));
+        assert!(!npx_reexpands("src/a.test.js"));
     }
 }

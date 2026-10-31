@@ -365,11 +365,12 @@ fn convention_commands(
     }
     if !js.is_empty() {
         js.sort();
-        let (js_commands, unresolved) = js_runner::commands(root, &js);
-        out.extend(js_commands);
-        if !unresolved.is_empty() {
-            notes.push(js_runner::unresolved_note(&unresolved));
+        let js = js_runner::commands(root, &js);
+        out.extend(js.commands);
+        if !js.unresolved.is_empty() {
+            notes.push(js_runner::unresolved_note(&js.unresolved));
         }
+        notes.extend(js.notes);
     }
     for class in java.keys().filter(|c| !flag_safe(c)) {
         notes.push(dropped_token_note("Java test class", class));

@@ -1070,6 +1070,187 @@ fn bun_and_playwright_commands_follow_their_evidence() {
     );
 }
 
+/// A Next.js tree holding a source file and its test per stem: a dynamic
+/// `[slug]` segment, a `(group)` route group, an ordinary directory.
+fn route_fixture(package_json: &str, test_body: &str, stems: &[&str]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "package.json", package_json);
+    for stem in stems {
+        let name = stem.rsplit('/').next().unwrap();
+        write(
+            root,
+            &format!("{stem}.js"),
+            "export function f() { return 1; }\n",
+        );
+        write(
+            root,
+            &format!("{stem}.test.js"),
+            &test_body.replace("NAME", name),
+        );
+    }
+    dir
+}
+
+const ROUTE_STEMS: [&str; 3] = ["app/[slug]/page", "app/(group)/x", "src/a"];
+const ROUTE_SOURCES: [&str; 3] = ["app/[slug]/page.js", "app/(group)/x.js", "src/a.js"];
+
+#[test]
+fn jest_route_segment_paths_run_by_literal_path() {
+    let dir = route_fixture(
+        r#"{"name":"app","scripts":{"test":"jest"}}"#,
+        "import { f } from './NAME';\ntest('f', () => { f(); });\n",
+        &ROUTE_STEMS,
+    );
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &ROUTE_SOURCES);
+    let cmd = find(
+        &r,
+        r"npx -c 'jest --runTestsByPath '\''app/(group)/x.test.js'\'' '\''app/[slug]/page.test.js'\'' src/a.test.js'",
+    );
+    assert_eq!(cmd.framework, "jest");
+    assert_eq!(cmd.covers.len(), 3, "{:?}", cmd.covers);
+
+    let dir = route_fixture(
+        r#"{"name":"app","scripts":{"test":"jest"}}"#,
+        "import { f } from './NAME';\ntest('f', () => { f(); });\n",
+        &["app/(group)/x", "src/a"],
+    );
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &["app/(group)/x.js", "src/a.js"]);
+    find(
+        &r,
+        "npx jest --runTestsByPath 'app/(group)/x.test.js' src/a.test.js",
+    );
+}
+
+#[test]
+fn bracketed_paths_bypass_the_npx_reglob() {
+    let dir = route_fixture(
+        r#"{"name":"app","scripts":{"test":"mocha"}}"#,
+        "import { f } from './NAME.js';\nit('f', () => { f(); });\n",
+        &ROUTE_STEMS,
+    );
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &ROUTE_SOURCES);
+    find(
+        &r,
+        r"npx -c 'mocha '\''app/(group)/x.test.js'\'' '\''app/[slug]/page.test.js'\'' src/a.test.js'",
+    );
+    let dir = route_fixture(
+        r#"{"name":"app","scripts":{"test":"mocha"}}"#,
+        "import { f } from './NAME.js';\nit('f', () => { f(); });\n",
+        &["app/(group)/x", "src/a"],
+    );
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &["app/(group)/x.js", "src/a.js"]);
+    find(&r, "npx mocha 'app/(group)/x.test.js' src/a.test.js");
+}
+
+#[test]
+fn node_test_glob_paths_get_a_note_instead_of_a_command() {
+    let dir = route_fixture(
+        r#"{"name":"app","scripts":{"test":"node --test"}}"#,
+        "import { test } from 'node:test';\nimport { f } from './NAME.js';\ntest('f', () => { f(); });\n",
+        &ROUTE_STEMS,
+    );
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &ROUTE_SOURCES);
+    let cmd = find(&r, "node --test 'app/(group)/x.test.js' src/a.test.js");
+    assert_eq!(cmd.covers, vec!["app/(group)/x.test.js", "src/a.test.js"]);
+    assert!(
+        r.commands
+            .iter()
+            .all(|c| !c.covers.iter().any(|p| p == "app/[slug]/page.test.js")),
+        "{:?}",
+        commands(&r)
+    );
+    assert!(
+        r.notes.iter().any(|n| n
+            .starts_with("no command emitted for app/[slug]/page.test.js: `node --test`")),
+        "{:?}",
+        r.notes
+    );
+}
+
+#[test]
+fn playwright_route_segment_paths_are_regex_escaped() {
+    let dir = route_fixture(
+        r#"{"name":"app","devDependencies":{"@playwright/test":"^1.40"}}"#,
+        "import { test } from '@playwright/test';\nimport { f } from './NAME';\ntest('f', () => { f(); });\n",
+        &ROUTE_STEMS,
+    );
+    let db = indexed(dir.path());
+    let r = recs(dir.path(), &db, &ROUTE_SOURCES);
+    find(
+        &r,
+        r"npx playwright test 'app/\(group\)/x\.test\.js' 'app/\[slug\]/page\.test\.js' src/a.test.js",
+    );
+}
+
+#[test]
+fn dotted_dirs_and_unloadable_paths_follow_each_runner() {
+    let jest = r#"{"name":"app","scripts":{"test":"jest"}}"#;
+    let pw = r#"{"name":"app","devDependencies":{"@playwright/test":"^1.40"}}"#;
+    let vitest = r#"{"name":"app","devDependencies":{"vitest":"^2"}}"#;
+    let body = |module: &str| {
+        format!(
+            "import {{ test }} from '{module}';\nimport {{ f }} from './NAME.js';\ntest('f', () => {{ f(); }});\n"
+        )
+    };
+    let plain = "import { f } from './NAME.js';\ntest('f', () => { f(); });\n".to_string();
+    let cases: [(&str, String, &str, &str, &str); 5] = [
+        (
+            jest,
+            plain.clone(),
+            "app/v1.2/x",
+            "npx jest --runTestsByPath app/v1.2/x.test.js src/a.test.js",
+            "",
+        ),
+        (
+            pw,
+            body("@playwright/test"),
+            "app/v1.2/x",
+            r"npx playwright test 'app/v1\.2/x\.test\.js' src/a.test.js",
+            "",
+        ),
+        (
+            r#"{"name":"app","scripts":{"test":"node --test"}}"#,
+            body("node:test"),
+            "-d/x",
+            "node --test src/a.test.js",
+            "no command emitted for -d/x.test.js: `node --test` reads an argument starting with `-`",
+        ),
+        (
+            vitest,
+            plain.clone(),
+            r"app/a\b/x",
+            "npx vitest run src/a.test.js",
+            r"no command emitted for app/a\b/x.test.js: vitest loads test files through Vite",
+        ),
+        (
+            r#"{"name":"app","scripts":{"test":"bun test"}}"#,
+            body("bun:test"),
+            r"app/a\b/x",
+            "bun test ./src/a.test.js",
+            r"no command emitted for app/a\b/x.test.js: `bun test` cuts a file argument at `?`",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (manifest, test_body, stem, expected, note) in cases {
+        let dir = route_fixture(manifest, &test_body, &[stem, "src/a"]);
+        let db = indexed(dir.path());
+        let r = recs(dir.path(), &db, &[&format!("{stem}.js"), "src/a.js"]);
+        if commands(&r) != vec![expected] {
+            wrong.push(format!("{stem}: commands {:?}", commands(&r)));
+        }
+        if !note.is_empty() && !r.notes.iter().any(|n| n.starts_with(note)) {
+            wrong.push(format!("{stem}: notes {:?}", r.notes));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_test_path_linked_to_a_fifo_does_not_block() {
