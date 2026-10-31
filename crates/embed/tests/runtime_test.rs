@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use codesage_embed::model::{init_for_main, init_ort_dylib, ort_runtime_dylib};
+use codesage_embed::model::{init_for_main, init_ort_dylib, ort_environment, ort_runtime_dylib};
 
 const CHILD: &str = "CODESAGE_TEST_RUNTIME_CHILD";
 const RUNTIME: &str = "CODESAGE_TEST_RUNTIME_PATH";
@@ -19,7 +19,7 @@ fn check_child(loadable: bool) {
         if loadable {
             init_ort_dylib().unwrap();
             // Exercise the actual native API, not just path selection or dlopen.
-            ort::session::Session::builder().unwrap();
+            ort::session::Session::builder(&ort_environment().unwrap()).unwrap();
         } else {
             let error = init_ort_dylib().unwrap_err();
             assert!(format!("{error:#}").contains(expected.to_str().unwrap()));

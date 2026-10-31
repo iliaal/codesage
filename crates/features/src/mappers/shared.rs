@@ -480,6 +480,52 @@ mod tests {
     }
 
     #[test]
+    fn walk_in_linked_worktree_honors_common_info_exclude() {
+        let dir = tempdir().unwrap();
+        let main = dir.path().join("main");
+        let linked = dir.path().join("linked");
+        fs::create_dir_all(main.join("src")).unwrap();
+        fs::write(main.join("src/kept.rs"), b"fn kept() {}").unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&main, &["init", "-q"]);
+        git(&main, &["add", "src/kept.rs"]);
+        git(&main, &["commit", "-qm", "init"]);
+        git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+        fs::write(main.join(".git/info/exclude"), b"src/excluded.rs\n").unwrap();
+        fs::write(linked.join("src/excluded.rs"), b"fn excluded() {}").unwrap();
+        assert!(linked.join(".git").is_file());
+
+        let walked = walk_files(&linked, &linked, 100, None);
+        assert_eq!(walked, vec!["src/kept.rs".to_string()]);
+        let listed = list_dir_files(&linked, &linked.join("src"), None, |_| true);
+        assert_eq!(listed, vec!["src/kept.rs".to_string()]);
+    }
+
+    #[test]
     fn walk_skips_symlinks_and_escape_paths() {
         let dir = tempdir().unwrap();
         let root = dir.path();

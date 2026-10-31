@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use hf_hub::{Repo, RepoType};
+use ort::environment::Environment;
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use tokenizers::Tokenizer;
 use wait_timeout::ChildExt;
@@ -25,6 +26,19 @@ static ORT_DYLIB: LazyLock<Option<PathBuf>> =
     LazyLock::new(|| ort_dylib_path_from_env().or_else(discover_ort_dylib));
 #[cfg(feature = "cuda")]
 static CUDA_PRELOAD: Once = Once::new();
+/// CUDA 12 sonames that pip's `onnxruntime-gpu` CUDA provider links against.
+/// ort's `ep::cuda::CUDA_DYLIBS` follows the CUDA major of ort's own prebuilt
+/// binaries (CUDA 13 since rc.14), not the runtime this crate loads.
+#[cfg(feature = "cuda")]
+const CUDA_DYLIBS: &[&str] = &[
+    "libcudart.so.12",
+    "libcublasLt.so.12",
+    "libcublas.so.12",
+    "libnvrtc.so.12",
+    "libcurand.so.10",
+    "libcufft.so.11",
+];
+static ORT_ENVIRONMENT: Mutex<Option<Environment>> = Mutex::new(None);
 
 pub(crate) fn public_nvidia_lib_dirs() -> Vec<PathBuf> {
     discover_nvidia_lib_dirs().clone()
@@ -435,7 +449,7 @@ pub fn preload_native_libs() {
 
         // ort::ep::cuda::preload_dylibs accepts one CUDA root and one cuDNN root,
         // but pip's nvidia-* packages place the libraries in separate directories.
-        let all_libs: Vec<&str> = ort::ep::cuda::CUDA_DYLIBS
+        let all_libs: Vec<&str> = CUDA_DYLIBS
             .iter()
             .chain(ort::ep::cuda::CUDNN_DYLIBS.iter())
             .copied()
@@ -523,8 +537,9 @@ fn selected_ort_dylib() -> Option<&'static Path> {
 #[cfg(not(target_vendor = "apple"))]
 pub fn init_ort_dylib() -> Result<()> {
     if let Some(path) = selected_ort_dylib() {
-        // rc.13 loads the library inside init_from, not EnvironmentBuilder::commit.
-        // Do not commit default environment options over an application's options.
+        // ort loads the library inside init_from; the returned builder is
+        // dropped unbuilt because ort_environment builds the process's one
+        // Environment after this load.
         drop(
             ort::init_from(path).with_context(|| {
                 format!("loading ONNX Runtime shared library {}", path.display())
@@ -532,6 +547,27 @@ pub fn init_ort_dylib() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The process's ONNX Runtime environment, built on first use after loading the
+/// selected runtime. ort allows one Environment per process and refuses a second
+/// build even after the first is dropped, so it is retained for the process
+/// lifetime and shared by every session. An embedding application that already
+/// built its own Environment makes this fail.
+pub fn ort_environment() -> Result<Environment> {
+    let mut slot = ORT_ENVIRONMENT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(environment) = slot.as_ref() {
+        return Ok(environment.clone());
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    init_ort_dylib()?;
+    let environment = ort::init()
+        .build()
+        .context("creating the ONNX Runtime environment")?;
+    *slot = Some(environment.clone());
+    Ok(environment)
 }
 
 /// Repo-local model names are untrusted: require an allowlisted model and
@@ -1614,7 +1650,7 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
         ..Default::default()
     }));
 
-    let mut builder = Session::builder()?;
+    let mut builder = Session::builder(&ort_environment()?)?;
 
     if graph_pin(pin, device).is_some() {
         // ORT_ENABLE_ALL adds CPU layout passes whose LayerNorm fusion fails on
@@ -3537,6 +3573,22 @@ mod tests {
             ["input_ids", "attention_mask"].into_iter()
         ));
         assert!(!wants_token_type_ids(std::iter::empty()));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_preload_covers_the_cu12_provider_dependencies() {
+        // NEEDED entries of onnxruntime-gpu 1.24's libonnxruntime_providers_cuda.so.
+        for soname in [
+            "libcublasLt.so.12",
+            "libcublas.so.12",
+            "libcurand.so.10",
+            "libcufft.so.11",
+            "libcudart.so.12",
+        ] {
+            assert!(CUDA_DYLIBS.contains(&soname), "{soname} is not preloaded");
+        }
+        assert!(ort::ep::cuda::CUDNN_DYLIBS.contains(&"libcudnn.so.9"));
     }
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]

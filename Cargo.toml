@@ -36,7 +36,7 @@ tree-sitter-java = "0.23.5"
 
 rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 
-ignore = "0.4"
+ignore = "0.4.34"
 globset = "0.4"
 regex = "1"
 
