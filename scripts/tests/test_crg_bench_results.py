@@ -111,6 +111,38 @@ class CrgBenchResultsTests(unittest.TestCase):
                     "reason=expected nonempty string file_path values\n",
                 )
 
+    def test_stream_correlates_initialize_and_search_responses(self):
+        notification = {"jsonrpc": "2.0", "method": "notifications/message",
+                        "params": {"level": "info", "data": "loading"}}
+        pages = [notification, {"id": 1.0, "result": {}}]
+        for request_id, path in ((2, "first.py"), (3, "second.py")):
+            pages.extend([notification, {"id": request_id, **response({"results": [
+                {"file_path": path}]})}])
+        session = object.__new__(self.runner.CrgMcpSession)
+        session._id = 0
+        session._proc = Mock(stdin=io.BytesIO(), stdout=io.BytesIO(
+            ("\n".join(json.dumps(page) for page in pages) + "\n").encode()))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            session._init()
+            self.assertEqual(session.search("first", 10), ["first.py"])
+            self.assertEqual(session.search("second", 10), ["second.py"])
+        self.assertEqual(stderr.getvalue(), "")
+        requests = [json.loads(line) for line in session._proc.stdin.getvalue().splitlines()]
+        self.assertEqual([request.get("id") for request in requests], [1, None, 2, 3])
+
+    def test_stream_ignores_other_ids_and_preserves_matching_error(self):
+        self.session._recv = self.runner.CrgMcpSession._recv.__get__(self.session)
+        pages = [{"id": value, **response({"results": [{"file_path": "wrong.py"}]})}
+                 for value in (None, True, "1", 0, 9)]
+        pages.append({"id": 1, "error": {"code": -32603, "message": "failed"}})
+        self.session._proc = Mock(stdout=io.BytesIO(
+            ("\n".join(json.dumps(page) for page in pages) + "\n").encode()))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(self.session.search("query", 10), [])
+        self.assertIn("expected a successful response object", stderr.getvalue())
+
     def test_cli_continues_after_malformed_page_without_partial_hit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

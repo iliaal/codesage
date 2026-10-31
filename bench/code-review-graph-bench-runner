@@ -64,7 +64,9 @@ class CrgMcpSession:
                 return None
             line = line.strip()
             if line.startswith("{"):
-                return json.loads(line)
+                response = json.loads(line)
+                if type(response.get("id")) in (int, float) and response["id"] == self._id:
+                    return response
 
     def _next_id(self) -> int:
         self._id += 1
