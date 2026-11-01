@@ -1,8 +1,15 @@
 ## [Unreleased]
 
+### Changed
+
+- Embedding and reranking run on `ort` 2.0.0-rc.14; macOS builds bundle ONNX Runtime 1.31 and re-embed existing semantic indexes once.
+
 ### Fixed
 
 - `/codesage-bench` and `/codesage-eval` report the actual runner exit status in failure diagnostics.
+- C and C++ indexing no longer creates functions named `if`, `switch`, `catch`, or a loop macro from statements split across preprocessor arms, and calls in those arms belong to the enclosing function. Existing indexes re-extract on the next `codesage index`.
+- `recommend_tests` and `codesage tests-for` emit JS/TS commands that run the intended files for paths such as `app/[slug]/` or `app/(group)/`; paths a runner cannot take literally get a note instead of a command.
+- Feature mapping honors a linked Git worktree's shared `info/exclude`.
 
 ## [0.45.0] - 2026-10-24
 
