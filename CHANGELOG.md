@@ -1,8 +1,32 @@
 ## [Unreleased]
 
+### Added
+
+- MCP `session` end and `codesage session-end` report `acted_on`: indexed files served on the session's MCP connection, from a handle-only `.codesage/sessions/<id>.calls.jsonl` ledger, against files edited since start; post-edit checks (`review_rehearsal`, `recommend_tests`, `edit_check`, multi-target or aggregate `assess_risk`) count as `checked`. `CODESAGE_SESSION_LEDGER=0` disables it.
+
+### Changed
+
+- MCP tools consolidate to one noun per tool: `assess_risk {targets, aggregate}`, `features`, `bundle`, and `session {action}`; `impact_analysis` no longer advertises `is_file`. `tools/list` advertises 19 tools.
+- MCP `assess_risk` returns its assessment under `files[0]` for a single file, including the retired `target` and `file_path` spellings; `codesage risk --json` still returns the bare assessment.
+- GPU sessions preload the CUDA and cuDNN libraries that the installed onnxruntime-gpu CUDA provider links against, from the directory matching its CUDA major, instead of a fixed CUDA 12 list.
+- `codesage doctor` names the per-project opt-in file and the reindex remedy when a configured model is not allowlisted.
+
+### Deprecated
+
+- MCP tools `assess_risk_batch`, `assess_risk_diff`, `list_features`, `find_feature`, `export_context`, `feature_bundle`, `session_start`, and `session_end`, and their old argument spellings, still dispatch for one release without being listed; each call carries a `cost.notes` deprecation note naming its replacement.
+
+### Removed
+
+- `nomic-ai/nomic-embed-text-v1.5` is no longer an allowlisted embedding model, because it needs task prefixes CodeSage does not supply; projects configured with it fail at load unless the unpinned-model bypass is enabled.
+
 ### Fixed
 
 - Repository refreshes keep using the selected CodeSage executable when PATH contains a relative directory.
+- Python scripts outside a package resolve absolute imports of modules in their own directory; standard-library names, self-imports, and namespace-package directories stay unresolved.
+
+### Security
+
+- `codesage rehearse` with no paths, the installed indexing hooks' worktree digest, the review-state plugin, `codesage-onboard`, and `session` worktree snapshots no longer run a repository-configured `core.fsmonitor` command; rerun `codesage install-hooks` to refresh existing hooks.
 
 ## [0.46.0] - 2026-10-31
 
