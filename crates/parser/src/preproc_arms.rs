@@ -1,105 +1,90 @@
-//! Pick one arm of a C/C++ conditional group whose arms each hold part of a
+//! Reduce a C/C++ conditional group whose arms each hold part of one
 //! statement, before tree-sitter sees the file.
 //!
 //! tree-sitter parses every arm of `#if`/`#else` as if both were compiled.
-//! When each arm opens the same loop or switch header,
+//! When each arm opens the same loop or switch header
 //! (`#ifdef X\n for (a) {\n#else\n for (b) {\n#endif`), the parse sees two
 //! unclosed braces, and error recovery drops the enclosing function
 //! definition with every call in it. An arm that starts with `else` and has
 //! no `if` of its own in the arm is the same shape.
 //!
-//! For such a group the copy handed to the parser keeps one arm as written
-//! and blanks the directive lines. Every other arm stays in place with only
-//! what ties it to code outside the arm blanked: braces it opens or closes
-//! without a partner, and a leading `else`. What remains of it is complete
-//! statements, so its calls are still indexed inside the enclosing function.
-//! An arm no build reaches (`#if 0`, or after `#if 1`), and an arm that
-//! leaves a parenthesis unbalanced (a piece of an expression), is blanked
-//! whole.
-//! Blanking writes spaces and keeps newlines, so the tree's byte offsets and
-//! lines are those of the original source; extractors read node text from
-//! the original. Groups at file scope, groups whose arms are each balanced,
-//! and groups whose arms disagree on how many braces or parentheses they
-//! leave open are left exactly as written.
+//! For such a group the copy handed to the parser keeps the first live arm
+//! as written and blanks the directive lines. Every other arm stays in place
+//! with only what ties it to code outside the arm blanked: braces it opens
+//! or closes without a partner, and a leading `else`. What remains of it is
+//! complete statements, so its calls are still indexed inside the enclosing
+//! function. An arm no build reaches (`#if 0`, or after `#if 1`), and an arm
+//! that leaves a parenthesis unbalanced (a piece of an expression), is
+//! blanked whole. Blanking writes spaces and keeps line breaks, so the
+//! tree's byte offsets and lines are those of the original source;
+//! extractors read node text from the original.
+//!
+//! Only groups whose innermost enclosing brace is a function or statement
+//! body are reduced, and only when no arm closes more braces than the
+//! statement blocks open around the group. Groups at namespace, class,
+//! `extern "C"`, or file scope, groups whose arms close the function body
+//! (`}` / `} catch (...) { }` around a function-try-block), groups whose
+//! arms are each balanced, and groups whose arms disagree on how many braces
+//! or parentheses they leave open are left exactly as written.
 
 use crate::export_macro::{Kind, Lexer};
+use crate::preproc::DeadRegions;
+use anyhow::Result;
+
+/// Tokens between cancellation checks; directives always check.
+const CHECK_EVERY: u32 = 4096;
 
 /// Return a same-length copy of `source` with split conditional groups
 /// reduced, or `None` when no group qualifies.
-pub(crate) fn select_split_arms(source: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn select_split_arms(source: &[u8]) -> Result<Option<Vec<u8>>> {
     if !has_conditional_directive(source) {
-        return None;
+        return Ok(None);
     }
-    let mut stack: Vec<Group> = Vec::new();
-    let mut blanks: Vec<(usize, usize)> = Vec::new();
-    // Brace depth of the code outside every open group, as the parser will
-    // see it once resolved groups are reduced.
-    let mut outer_depth = 0i32;
+    let control = codesage_protocol::work::current();
+    let check = || -> Result<()> {
+        if let Some(control) = &control {
+            control.check()?;
+        }
+        Ok(())
+    };
+    let mut scan = Scan::default();
+    let mut since_check = 0u32;
     for token in Lexer::new(source) {
         if token.kind == Kind::Directive {
-            match directive(&source[token.start..token.end]) {
-                Some(Directive::If(literal)) => {
-                    let depth = outer_depth
-                        + stack
-                            .iter()
-                            .filter_map(|group| group.arms.last())
-                            .map(|arm| arm.braces.net)
-                            .sum::<i32>();
-                    stack.push(Group::open(token.start, token.end, literal, depth));
-                }
-                Some(Directive::Else(literal)) => {
-                    if let Some(group) = stack.last_mut() {
-                        group.arms.push(Arm::new(token.start, token.end, literal));
-                    }
-                }
-                Some(Directive::Endif) => {
-                    if let Some(mut group) = stack.pop() {
-                        group.endif = (token.start, token.end);
-                        let arm = group.resolve(&mut blanks);
-                        match stack.last_mut().and_then(|g| g.arms.last_mut()) {
-                            Some(parent) => parent.absorb(arm),
-                            None => outer_depth += arm.braces.net,
-                        }
-                    }
-                }
-                None => {}
-            }
+            check()?;
+            scan.directive(token.start, token.end, &source[token.start..token.end]);
             continue;
         }
-        let Some(arm) = stack.last_mut().and_then(|group| group.arms.last_mut()) else {
-            match token.kind {
-                Kind::Punct(b'{') => outer_depth += 1,
-                Kind::Punct(b'}') => outer_depth -= 1,
-                _ => {}
-            }
-            continue;
-        };
-        match token.kind {
-            Kind::Ident => arm.push_ident(&source[token.start..token.end], token.start, token.end),
-            Kind::Punct(b) => arm.push_punct(b, token.start),
-            _ => arm.push_other(),
+        since_check += 1;
+        if since_check == CHECK_EVERY {
+            since_check = 0;
+            check()?;
         }
+        scan.token(
+            token.kind,
+            token.start,
+            token.end,
+            &source[token.start..token.end],
+        );
     }
-    if blanks.is_empty() {
-        return None;
+    if scan.blanks.is_empty() {
+        return Ok(None);
     }
     let mut out = source.to_vec();
-    for (start, end) in blanks {
+    for (start, end) in scan.blanks {
         for byte in &mut out[start..end] {
             if *byte != b'\n' && *byte != b'\r' {
                 *byte = b' ';
             }
         }
     }
-    Some(out)
+    Ok(Some(out))
 }
 
 /// Cheap gate: a line whose first non-blank byte is `#` followed by `if`.
 fn has_conditional_directive(source: &[u8]) -> bool {
     let mut line_start = true;
-    let mut i = 0;
-    while i < source.len() {
-        let b = source[i];
+    for (i, &b) in source.iter().enumerate() {
         if b == b'\n' {
             line_start = true;
         } else if line_start && b == b'#' {
@@ -115,9 +100,59 @@ fn has_conditional_directive(source: &[u8]) -> bool {
         } else if !matches!(b, b' ' | b'\t' | b'\r') {
             line_start = false;
         }
-        i += 1;
     }
     false
+}
+
+/// The conditional directives the pre-pass blanked, on a same-length copy
+/// of `source` that is otherwise spaces, or `None` when no blanked `#if` /
+/// `#elif` condition could carry a call. Without the pre-pass a condition
+/// such as `#if !FEATURE(x)` is parsed as an expression, so its calls are
+/// references; reference extraction parses this copy to keep them. Every
+/// blanked directive of the group is copied, so each condition parses in the
+/// same structure as in the original. A directive counts as blanked when the
+/// tree has no directive token where its `#` stands.
+pub(crate) fn blanked_conditions(source: &[u8], dead: &DeadRegions) -> Option<Vec<u8>> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut calls = false;
+    let mut i = 0;
+    while i < source.len() {
+        let line_end = memchr_newline(source, i);
+        let hash = i + source[i..line_end]
+            .iter()
+            .take_while(|b| matches!(b, b' ' | b'\t'))
+            .count();
+        let mut end = line_end;
+        while end > i && end < source.len() && source[end - 1] == b'\\' {
+            end = memchr_newline(source, end + 1);
+        }
+        if source.get(hash) == Some(&b'#') && !dead.has_directive_at(hash) {
+            let word = keyword(&source[hash..end]);
+            if directive(&source[hash..end]).is_some() {
+                spans.push((hash, end));
+                calls |= matches!(word, b"if" | b"elif") && source[hash..end].contains(&b'(');
+            }
+        }
+        i = end + 1;
+    }
+    if !calls {
+        return None;
+    }
+    let mut out: Vec<u8> = source
+        .iter()
+        .map(|&b| if b == b'\n' || b == b'\r' { b } else { b' ' })
+        .collect();
+    for (start, end) in spans {
+        out[start..end].copy_from_slice(&source[start..end]);
+    }
+    Some(out)
+}
+
+fn memchr_newline(source: &[u8], from: usize) -> usize {
+    source[from.min(source.len())..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(source.len(), |p| from + p)
 }
 
 enum Directive {
@@ -126,6 +161,19 @@ enum Directive {
     /// `#elif`, `#elifdef`, `#elifndef`, `#else`.
     Else(Option<bool>),
     Endif,
+}
+
+/// The directive name after `#`, or empty when `text` is not a directive.
+fn keyword(text: &[u8]) -> &[u8] {
+    let Some(rest) = text.strip_prefix(b"#") else {
+        return b"";
+    };
+    let rest = trim_start(rest);
+    let len = rest
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+        .count();
+    &rest[..len]
 }
 
 fn directive(text: &[u8]) -> Option<Directive> {
@@ -212,9 +260,38 @@ enum First {
     Other,
 }
 
-/// Where the arm's token stream stands for deciding whether an `else` is
-/// dangling: at the arm's start, right after a closer with no opener in the
-/// arm, or anywhere else.
+/// What a `{` opens, judged from the token before it and the brace around it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BraceKind {
+    Function,
+    /// A statement block inside a function: `if`/`for`/`while`/`switch`,
+    /// `else`, `do`, `try`, a lambda, or a bare block.
+    Block,
+    /// Namespace, `extern "C"`, class/struct/union/enum, or an initializer.
+    Other,
+}
+
+#[derive(Clone, Copy)]
+struct Open {
+    at: usize,
+    kind: BraceKind,
+    /// Consecutive `Block` braces ending with this one.
+    blocks: i32,
+}
+
+/// The last token, as far as classifying a following `{` needs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prev {
+    /// Starts a statement: file start, `{`, `}`, `;`, or `:`.
+    Boundary,
+    /// Ends a head whose `{` opens a body: `)`, `]`, `else`, `do`, `try`,
+    /// or a trailing function qualifier.
+    BodyHead,
+    Other,
+}
+
+/// Where an `else` stands: at the start of an arm, right after a closer with
+/// no opener in the arm, or anywhere else.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Position {
     Start,
@@ -226,17 +303,38 @@ enum Position {
 #[derive(Clone, Copy)]
 struct Closer {
     at: usize,
-    brace: bool,
     else_after: Option<(usize, usize)>,
 }
 
-#[derive(Default)]
-struct Brackets {
-    /// Offsets of `{` and `(` not yet closed.
-    open_braces: Vec<usize>,
-    open_parens: Vec<usize>,
+/// Where tokens land: the file itself, or a non-kept arm scanned in
+/// isolation. A kept arm writes straight into its enclosing sink, which is
+/// what the parser sees once the group is reduced.
+struct Sink {
+    brace_base: usize,
+    paren_base: usize,
     closers: Vec<Closer>,
+    paren_closed: bool,
     leading_else: Option<(usize, usize)>,
+    position: Position,
+    prev: Prev,
+    /// A nested group was left as written while not balanced, so the sink's
+    /// offsets no longer describe what the parser sees.
+    opaque: bool,
+}
+
+impl Sink {
+    fn new(brace_base: usize, paren_base: usize, prev: Prev) -> Self {
+        Self {
+            brace_base,
+            paren_base,
+            closers: Vec::new(),
+            paren_closed: false,
+            leading_else: None,
+            position: Position::Start,
+            prev,
+            opaque: false,
+        }
+    }
 }
 
 struct Arm {
@@ -245,241 +343,313 @@ struct Arm {
     braces: Depth,
     parens: Depth,
     first: First,
-    position: Position,
-    brackets: Brackets,
-    /// A nested group was left as written while not balanced, so the arm's
-    /// bracket offsets no longer describe what the parser sees.
-    opaque: bool,
+    /// Scanned in its own sink; dropped from the parser's view if reduced.
+    sandboxed: bool,
 }
 
 impl Arm {
-    fn new(start: usize, end: usize, literal: Option<bool>) -> Self {
+    fn new(directive: (usize, usize), literal: Option<bool>, sandboxed: bool) -> Self {
         Self {
-            directive: (start, end),
+            directive,
             literal,
             braces: Depth::default(),
             parens: Depth::default(),
             first: First::Unseen,
-            position: Position::Start,
-            brackets: Brackets::default(),
-            opaque: false,
+            sandboxed,
         }
-    }
-
-    fn see(&mut self, first: First) {
-        if self.first == First::Unseen {
-            self.first = first;
-        }
-    }
-
-    fn take_else(&mut self, span: (usize, usize)) {
-        match self.position {
-            Position::Start => self.brackets.leading_else = Some(span),
-            Position::AfterCloser => {
-                if let Some(closer) = self.brackets.closers.last_mut() {
-                    closer.else_after = Some(span);
-                }
-            }
-            Position::Inside => {}
-        }
-    }
-
-    fn push_ident(&mut self, ident: &[u8], start: usize, end: usize) {
-        let is_else = ident == b"else";
-        if is_else {
-            self.take_else((start, end));
-        }
-        self.position = Position::Inside;
-        self.see(if is_else { First::Else } else { First::Other });
-    }
-
-    fn push_punct(&mut self, b: u8, at: usize) {
-        self.see(First::Other);
-        self.position = Position::Inside;
-        match b {
-            b'{' => {
-                self.braces.step(1);
-                self.brackets.open_braces.push(at);
-            }
-            b'(' => {
-                self.parens.step(1);
-                self.brackets.open_parens.push(at);
-            }
-            b'}' => {
-                self.braces.step(-1);
-                self.close(at, true);
-            }
-            b')' => {
-                self.parens.step(-1);
-                self.close(at, false);
-            }
-            _ => {}
-        }
-    }
-
-    fn close(&mut self, at: usize, brace: bool) {
-        let opener = if brace {
-            self.brackets.open_braces.pop()
-        } else {
-            self.brackets.open_parens.pop()
-        };
-        if opener.is_none() {
-            self.brackets.closers.push(Closer {
-                at,
-                brace,
-                else_after: None,
-            });
-            self.position = Position::AfterCloser;
-        }
-    }
-
-    fn push_other(&mut self) {
-        self.see(First::Other);
-        self.position = Position::Inside;
-    }
-
-    /// Fold in the arm a nested group resolved to, as if its tokens had been
-    /// written in this arm.
-    fn absorb(&mut self, child: Arm) {
-        self.opaque |= child.opaque;
-        self.braces.then(child.braces);
-        self.parens.then(child.parens);
-        if child.first == First::Unseen {
-            return;
-        }
-        self.see(child.first);
-        if let Some(span) = child.brackets.leading_else {
-            self.take_else(span);
-        }
-        if child.first != First::Else || self.position == Position::Start {
-            self.position = Position::Inside;
-        }
-        for closer in child.brackets.closers {
-            self.position = Position::Inside;
-            let opener = if closer.brace {
-                self.brackets.open_braces.pop()
-            } else {
-                self.brackets.open_parens.pop()
-            };
-            if opener.is_none() {
-                self.brackets.closers.push(closer);
-                self.position = Position::AfterCloser;
-            }
-        }
-        if child.position != Position::AfterCloser {
-            self.position = Position::Inside;
-        }
-        self.brackets.open_braces.extend(child.brackets.open_braces);
-        self.brackets.open_parens.extend(child.brackets.open_parens);
-    }
-
-    fn balanced(&self) -> bool {
-        self.braces.balanced() && self.parens.balanced()
     }
 
     /// Parses as a unit on its own: brackets balanced and not a dangling
     /// `else` that needs an `if` outside the arm.
     fn whole(&self) -> bool {
-        self.balanced() && self.first != First::Else
-    }
-
-    /// Blank what ties a non-kept arm to the code around it, leaving its
-    /// remaining statements, and their calls, in place. Returns false when
-    /// the arm must be blanked whole instead.
-    fn detach(&self, blanks: &mut Vec<(usize, usize)>) -> bool {
-        // An unbalanced parenthesis means the arm is a piece of an
-        // expression (`if (a >= 0` / `if ((a > 0 || b)`); with its bracket
-        // removed it would be spliced into the kept arm's expression.
-        if self.opaque || !self.parens.balanced() {
-            return false;
-        }
-        let b = &self.brackets;
-        blanks.extend(b.leading_else);
-        for closer in &b.closers {
-            blanks.push((closer.at, closer.at + 1));
-            blanks.extend(closer.else_after);
-        }
-        blanks.extend(
-            b.open_braces
-                .iter()
-                .chain(&b.open_parens)
-                .map(|&at| (at, at + 1)),
-        );
-        true
+        self.braces.balanced() && self.parens.balanced() && self.first != First::Else
     }
 }
 
 struct Group {
     arms: Vec<Arm>,
-    endif: (usize, usize),
-    /// Brace depth where the group opens. Only groups inside a body are
-    /// reduced: at file scope the split shapes are alternative declaration
-    /// heads, where keeping one arm would also pick which name is indexed,
-    /// and tree-sitter already recovers those without help.
-    depth: i32,
+    kept: Option<usize>,
+    /// The kept arm is a literal `#if 1` / `#elif 1`: later arms are dead.
+    taken: bool,
+    /// The innermost brace around the group is a function or block body.
+    in_body: bool,
+    /// Statement blocks open around the group inside the function body;
+    /// an arm may close at most this many.
+    blocks: i32,
+    prev_at_open: Prev,
+    /// Blanking to apply if the group is reduced.
+    pending: Vec<(usize, usize)>,
 }
 
-impl Group {
-    fn open(start: usize, end: usize, literal: Option<bool>, depth: i32) -> Self {
-        Self {
-            arms: vec![Arm::new(start, end, literal)],
-            endif: (end, end),
-            depth,
+#[derive(Default)]
+struct Scan {
+    braces: Vec<Open>,
+    parens: Vec<usize>,
+    sinks: Vec<Sink>,
+    groups: Vec<Group>,
+    blanks: Vec<(usize, usize)>,
+}
+
+impl Scan {
+    fn sink(&mut self) -> &mut Sink {
+        if self.sinks.is_empty() {
+            self.sinks.push(Sink::new(0, 0, Prev::Boundary));
+        }
+        self.sinks.last_mut().expect("root sink exists")
+    }
+
+    fn token(&mut self, kind: Kind, start: usize, end: usize, text: &[u8]) {
+        if let Some(arm) = self.groups.last_mut().and_then(|g| g.arms.last_mut()) {
+            if arm.first == First::Unseen {
+                arm.first = if text == b"else" {
+                    First::Else
+                } else {
+                    First::Other
+                };
+            }
+            match kind {
+                Kind::Punct(b'{') => arm.braces.step(1),
+                Kind::Punct(b'}') => arm.braces.step(-1),
+                Kind::Punct(b'(') => arm.parens.step(1),
+                Kind::Punct(b')') => arm.parens.step(-1),
+                _ => {}
+            }
+        }
+        match kind {
+            Kind::Ident => {
+                let sink = self.sink();
+                if text == b"else" {
+                    match sink.position {
+                        Position::Start => sink.leading_else = Some((start, end)),
+                        Position::AfterCloser => {
+                            if let Some(closer) = sink.closers.last_mut() {
+                                closer.else_after = Some((start, end));
+                            }
+                        }
+                        Position::Inside => {}
+                    }
+                }
+                sink.position = Position::Inside;
+                sink.prev = if matches!(
+                    text,
+                    b"else"
+                        | b"do"
+                        | b"try"
+                        | b"const"
+                        | b"override"
+                        | b"final"
+                        | b"noexcept"
+                        | b"mutable"
+                ) {
+                    Prev::BodyHead
+                } else {
+                    Prev::Other
+                };
+            }
+            Kind::Punct(b'{') => {
+                let prev = self.sink().prev;
+                let outer = self.braces.last().copied();
+                let in_body = outer.is_some_and(|o| o.kind != BraceKind::Other);
+                let kind = match prev {
+                    Prev::BodyHead if in_body => BraceKind::Block,
+                    Prev::BodyHead => BraceKind::Function,
+                    Prev::Boundary if in_body => BraceKind::Block,
+                    _ => BraceKind::Other,
+                };
+                let blocks = match (kind, outer) {
+                    (BraceKind::Block, Some(o)) if o.kind == BraceKind::Block => o.blocks + 1,
+                    (BraceKind::Block, _) => 1,
+                    _ => 0,
+                };
+                self.braces.push(Open {
+                    at: start,
+                    kind,
+                    blocks,
+                });
+                let sink = self.sink();
+                sink.position = Position::Inside;
+                sink.prev = Prev::Boundary;
+            }
+            Kind::Punct(b'}') => {
+                let base = self.sink().brace_base;
+                if self.braces.len() > base {
+                    self.braces.pop();
+                    self.sink().position = Position::Inside;
+                } else {
+                    let sink = self.sink();
+                    sink.closers.push(Closer {
+                        at: start,
+                        else_after: None,
+                    });
+                    sink.position = Position::AfterCloser;
+                }
+                self.sink().prev = Prev::Boundary;
+            }
+            Kind::Punct(b'(') => {
+                self.parens.push(start);
+                let sink = self.sink();
+                sink.position = Position::Inside;
+                sink.prev = Prev::Other;
+            }
+            Kind::Punct(b')') => {
+                let base = self.sink().paren_base;
+                if self.parens.len() > base {
+                    self.parens.pop();
+                } else {
+                    self.sink().paren_closed = true;
+                }
+                let sink = self.sink();
+                sink.position = Position::Inside;
+                sink.prev = Prev::BodyHead;
+            }
+            Kind::Punct(b) => {
+                let sink = self.sink();
+                sink.position = Position::Inside;
+                sink.prev = match b {
+                    b';' | b':' => Prev::Boundary,
+                    b']' => Prev::BodyHead,
+                    _ => Prev::Other,
+                };
+            }
+            _ => {
+                let sink = self.sink();
+                sink.position = Position::Inside;
+                sink.prev = Prev::Other;
+            }
         }
     }
 
-    /// Record the blanking this group needs and return the arm that stands
-    /// for it in the enclosing arm's accounting. A group left as written
-    /// with arms that are not each balanced returns its first live arm
-    /// marked opaque: its depth still counts, its offsets do not.
-    fn resolve(mut self, blanks: &mut Vec<(usize, usize)>) -> Arm {
-        let Some(kept) = self.arms.iter().position(|arm| arm.literal != Some(false)) else {
-            // Every arm is a literal `#if 0` / `#elif 0`: nothing is parsed
-            // as code in any build, and `preproc::DeadRegions` masks it.
-            return Arm::new(0, 0, None);
-        };
-        if self.arms.iter().all(Arm::whole) {
-            return self.arms.swap_remove(kept);
+    fn directive(&mut self, start: usize, end: usize, text: &[u8]) {
+        match directive(text) {
+            Some(Directive::If(literal)) => {
+                let prev_at_open = self.sink().prev;
+                let outer = self.braces.last().copied();
+                let in_body = outer.is_some_and(|o| o.kind != BraceKind::Other);
+                let blocks = outer.map_or(0, |o| o.blocks);
+                self.groups.push(Group {
+                    arms: Vec::new(),
+                    kept: None,
+                    taken: false,
+                    in_body,
+                    blocks,
+                    prev_at_open,
+                    pending: Vec::new(),
+                });
+                self.start_arm((start, end), literal);
+            }
+            Some(Directive::Else(literal)) => {
+                if self.groups.is_empty() {
+                    return;
+                }
+                self.end_arm(start);
+                self.start_arm((start, end), literal);
+            }
+            Some(Directive::Endif) => {
+                if self.groups.is_empty() {
+                    return;
+                }
+                self.end_arm(start);
+                self.resolve((start, end));
+            }
+            None => {}
         }
-        let split = self.depth > 0
-            && if self.arms.len() == 1 {
-                // Without `#else`, the configuration that skips the arm keeps
-                // nothing, so the arm may only be joined to the surrounding
-                // code when it leaves the depth unchanged (`else ... { }`,
-                // `} else {`). A lone arm that opens a brace (`extern "C" {`
-                // under `#ifdef __cplusplus`) is closed by a matching group
-                // elsewhere and parses as written.
-                let arm = &self.arms[0];
-                arm.braces.net == 0 && arm.parens.net == 0
+    }
+
+    fn start_arm(&mut self, directive: (usize, usize), literal: Option<bool>) {
+        let (braces, parens) = (self.braces.len(), self.parens.len());
+        let group = self
+            .groups
+            .last_mut()
+            .expect("arm belongs to an open group");
+        let index = group.arms.len();
+        let kept = group.kept.is_none() && !group.taken && literal != Some(false);
+        if kept {
+            group.kept = Some(index);
+            group.taken = literal == Some(true);
+        }
+        let prev = group.prev_at_open;
+        group.arms.push(Arm::new(directive, literal, !kept));
+        if !kept {
+            self.sinks.push(Sink::new(braces, parens, prev));
+        }
+    }
+
+    /// Close the current arm. A non-kept arm's offsets are turned into the
+    /// blanking it needs if the group is reduced, then dropped, so each
+    /// offset is visited once however deep the nesting.
+    fn end_arm(&mut self, end: usize) {
+        let group = self
+            .groups
+            .last_mut()
+            .expect("arm belongs to an open group");
+        let arm = group.arms.last().expect("group has an arm");
+        if !arm.sandboxed {
+            return;
+        }
+        let sink = self.sinks.pop().expect("sandboxed arm has a sink");
+        let dead = arm.literal == Some(false) || group.kept.is_some_and(|_| group.taken);
+        // An unbalanced parenthesis means the arm is a piece of an
+        // expression (`if (a >= 0` / `if ((a > 0 || b)`); with its bracket
+        // removed it would be spliced into the kept arm's expression.
+        let expression = sink.paren_closed || self.parens.len() > sink.paren_base;
+        if dead || sink.opaque || expression {
+            group.pending.push((arm.directive.1, end));
+        } else {
+            group.pending.extend(sink.leading_else);
+            for closer in &sink.closers {
+                group.pending.push((closer.at, closer.at + 1));
+                group.pending.extend(closer.else_after);
+            }
+            group.pending.extend(
+                self.braces[sink.brace_base..]
+                    .iter()
+                    .map(|open| (open.at, open.at + 1)),
+            );
+        }
+        self.braces.truncate(sink.brace_base);
+        self.parens.truncate(sink.paren_base);
+    }
+
+    fn resolve(&mut self, endif: (usize, usize)) {
+        let group = self.groups.pop().expect("endif closes an open group");
+        let Some(kept) = group.kept else {
+            // Every arm is a literal `#if 0` / `#elif 0`: no build parses
+            // any of it, and `preproc::DeadRegions` masks it.
+            return;
+        };
+        let whole = group.arms.iter().all(Arm::whole);
+        let first = &group.arms[0];
+        let split = !whole
+            && group.in_body
+            && group.arms.iter().all(|arm| arm.braces.low >= -group.blocks)
+            && if group.arms.len() == 1 {
+                // Without `#else`, the configuration that skips the arm
+                // keeps nothing, so the arm may only be joined to the code
+                // around it when it leaves the depth unchanged (`else ...
+                // { }`, `} else {`). A lone arm that opens a brace is closed
+                // by a matching group elsewhere and parses as written.
+                first.braces.net == 0 && first.parens.net == 0
             } else {
-                let first = &self.arms[0];
-                self.arms.iter().all(|arm| {
+                group.arms.iter().all(|arm| {
                     arm.braces.net == first.braces.net && arm.parens.net == first.parens.net
                 })
             };
-        if !split {
-            let mut arm = self.arms.swap_remove(kept);
-            arm.opaque = true;
-            return arm;
+        if split {
+            self.blanks.extend(group.pending);
+            self.blanks
+                .extend(group.arms.iter().map(|arm| arm.directive));
+            self.blanks.push(endif);
+        } else if !whole {
+            self.sink().opaque = true;
         }
-        // After a literal `#if 1` / `#elif 1` arm, no later arm is reachable.
-        let taken = self.arms[kept].literal == Some(true);
-        for (i, arm) in self.arms.iter().enumerate() {
-            blanks.push(arm.directive);
-            if i == kept {
-                continue;
+        let kept = &group.arms[kept];
+        if let Some(parent) = self.groups.last_mut().and_then(|g| g.arms.last_mut()) {
+            if parent.first == First::Unseen {
+                parent.first = kept.first;
             }
-            let dead = arm.literal == Some(false) || (taken && i > kept);
-            if dead || !arm.detach(blanks) {
-                let end = self
-                    .arms
-                    .get(i + 1)
-                    .map_or(self.endif.0, |next| next.directive.0);
-                blanks.push((arm.directive.1, end));
-            }
+            parent.braces.then(kept.braces);
+            parent.parens.then(kept.parens);
         }
-        blanks.push(self.endif);
-        self.arms.swap_remove(kept)
     }
 }
 
@@ -488,7 +658,7 @@ mod tests {
     use super::select_split_arms;
 
     fn reduced(src: &str) -> Option<String> {
-        let out = select_split_arms(src.as_bytes())?;
+        let out = select_split_arms(src.as_bytes()).unwrap()?;
         assert_eq!(out.len(), src.len());
         for (a, b) in src.bytes().zip(out.iter().copied()) {
             assert!(a == b || b == b' ', "only spaces may be written");
@@ -544,5 +714,46 @@ mod tests {
     fn directives_inside_comments_and_strings_are_not_groups() {
         let src = "void s(int n)\n{\n    const char *t = \"#ifdef X {\";\n    /*\n#else\n    } {\n    */\n    a(t);\n}\n";
         assert_eq!(reduced(src), None);
+    }
+
+    #[test]
+    fn deep_nesting_is_scanned_in_linear_time() {
+        // 50,000 levels: a scan that revisits enclosing levels per directive
+        // takes seconds even in release builds; a linear one takes
+        // milliseconds. The bound is loose enough for a loaded debug run.
+        let depth = 50_000;
+        let mut plain = String::from("void f(void)\n{\n");
+        let mut split = plain.clone();
+        for _ in 0..depth {
+            plain.push_str("#ifdef X\n");
+            split.push_str("#ifdef X\nfor(;;){\n#else\n");
+        }
+        for _ in 0..depth {
+            plain.push_str("#endif\n");
+            split.push_str("for(;;){\n#endif\n");
+        }
+        plain.push_str("}\n");
+        for _ in 0..depth {
+            split.push_str("}\n");
+        }
+        split.push_str("}\n");
+        let started = std::time::Instant::now();
+        assert!(select_split_arms(plain.as_bytes()).unwrap().is_none());
+        assert!(select_split_arms(split.as_bytes()).unwrap().is_some());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "deep nesting took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_stopped_scan_reports_the_stop() {
+        use codesage_protocol::work::{StopReason, WorkControl};
+        let control = WorkControl::new(None);
+        control.cancel(StopReason::ClientCancelled);
+        let _scope = control.enter();
+        let src = "void f(void)\n{\n#ifdef X\n    a();\n#endif\n}\n";
+        assert!(select_split_arms(src.as_bytes()).is_err());
     }
 }

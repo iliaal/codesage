@@ -380,3 +380,140 @@ fn call_in_a_joined_else_if_condition_is_indexed() {
         );
     }
 }
+
+/// Alternative function heads at namespace scope are declarations, not
+/// statements in a body: both stay indexed, as without the pre-pass.
+#[test]
+fn split_heads_at_namespace_scope_parse_as_written() {
+    let source = "namespace ns {
+#ifdef WIDE
+int pick_wide(long a)
+{
+#else
+int pick(int a)
+{
+#endif
+    return c1(a);
+}
+}
+";
+    assert_eq!(
+        callables(source, Language::Cpp, "ns.cpp"),
+        owned(&[("pick_wide", 3, 11), ("pick", 6, 10)])
+    );
+}
+
+/// The arms around a function-try-block close the function body itself
+/// (`}` / `} catch (...) { }`); reducing them would leave the handler at
+/// namespace scope as a function named `catch`.
+#[test]
+fn function_try_block_arms_parse_as_written() {
+    let plain = "#ifdef NO_EXC
+bool parse(int s) {
+#else
+bool parse(int s) try {
+#endif
+  return check(s);
+#ifdef NO_EXC
+}
+#else
+} catch (...) { return fallback(); }
+#endif
+
+int after() { return c2(); }
+";
+    let namespaced = format!("namespace ns {{\n{plain}}}\n");
+    assert_eq!(
+        callables(plain, Language::Cpp, "ftry.cpp"),
+        owned(&[("parse", 4, 10), ("after", 13, 13)])
+    );
+    assert_eq!(
+        callables(&namespaced, Language::Cpp, "ftry_ns.cpp"),
+        owned(&[("parse", 3, 15), ("parse", 5, 11), ("after", 14, 14)])
+    );
+    let closes_function = "bool parse(int s) {
+  if (s) {
+    go(s);
+#ifdef A
+  }
+}
+#else
+  } else { other(); }
+}
+#endif
+int after() { return c2(); }
+";
+    assert_eq!(
+        callables(closes_function, Language::Cpp, "ftry2.cpp"),
+        owned(&[("parse", 1, 6), ("after", 11, 11)])
+    );
+}
+
+/// Inside a function nested in a namespace or `extern "C"` block, a split
+/// loop header is still reduced; the block around the function is not
+/// mistaken for a body.
+#[test]
+fn split_loop_inside_namespace_and_extern_c_functions_keeps_the_function() {
+    let body = "void f1(int n)
+{
+#ifdef X
+    for (int i = 0; i < n; i++) {
+#else
+    for (int i = n; i > 0; i--) {
+#endif
+        b2(n);
+    }
+}
+";
+    let namespaced = format!("namespace ns {{\n{body}}}\n");
+    assert_eq!(
+        callables(&namespaced, Language::Cpp, "ns.cpp"),
+        owned(&[("f1", 2, 11)])
+    );
+    let extern_c = format!(
+        "#ifdef __cplusplus\nextern \"C\" {{\n#endif\n{body}#ifdef __cplusplus\n}}\n#endif\n"
+    );
+    for (language, path) in [(Language::C, "ext.c"), (Language::Cpp, "ext.cpp")] {
+        assert_eq!(
+            callables(&extern_c, language, path),
+            owned(&[("f1", 4, 13)]),
+            "{language:?}"
+        );
+    }
+}
+
+/// A call in the condition of a blanked `#if` stays a reference, as it is
+/// when the group is parsed as written.
+#[test]
+fn call_in_a_blanked_condition_stays_indexed() {
+    let source = "void scatter(int t)
+{
+    if (t == 1) {
+        constant(t);
+#if !SMALLER_BINARY(flat)
+    } else if (t == 2) {
+        flat(t);
+#endif
+    } else {
+        generic(t);
+    }
+}
+";
+    for (language, path) in [(Language::C, "s.c"), (Language::Cpp, "s.cpp")] {
+        assert_eq!(
+            callables(source, language, path),
+            owned(&[("scatter", 1, 12)]),
+            "{language:?}"
+        );
+        assert_eq!(
+            calls(source, language, path),
+            [
+                ("constant".to_string(), 4),
+                ("SMALLER_BINARY".to_string(), 5),
+                ("flat".to_string(), 7),
+                ("generic".to_string(), 10),
+            ],
+            "{language:?}"
+        );
+    }
+}

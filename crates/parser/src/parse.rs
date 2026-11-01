@@ -38,7 +38,7 @@ fn probe_c_header(source: &[u8], accept_ambiguous: bool) -> Result<bool> {
     codesage_protocol::work::checkpoint()?;
     let mut parser = Parser::new();
     parser.set_language(&ts_language(Language::C))?;
-    let prepared = prepare_c_family(source, Language::C);
+    let prepared = prepare_c_family(source, Language::C)?;
     let input = prepared.as_deref().unwrap_or(source);
     let control = codesage_protocol::work::current();
     let mut degraded = false;
@@ -105,14 +105,14 @@ fn probe_c_header(source: &[u8], accept_ambiguous: bool) -> Result<bool> {
 /// (`preproc_arms.rs`). Every extractor reads node text from the original
 /// `source`; each rewrite is byte-for-byte the same length with the same
 /// newlines, so the tree's offsets apply to both.
-fn prepare_c_family(source: &[u8], language: Language) -> Option<Vec<u8>> {
+fn prepare_c_family(source: &[u8], language: Language) -> Result<Option<Vec<u8>>> {
     let neutralized = match language {
         Language::C => crate::export_macro::neutralize_c(source),
         Language::Cpp => crate::export_macro::neutralize(source),
-        _ => return None,
+        _ => return Ok(None),
     };
     let input = neutralized.as_deref().unwrap_or(source);
-    crate::preproc_arms::select_split_arms(input).or(neutralized)
+    Ok(crate::preproc_arms::select_split_arms(input)?.or(neutralized))
 }
 
 /// A parsed tree plus whether tree-sitter had to recover from syntax it
@@ -131,7 +131,7 @@ pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTr
     codesage_protocol::work::checkpoint()?;
     let mut parser = Parser::new();
     parser.set_language(&ts_language(language))?;
-    let prepared = prepare_c_family(source, language);
+    let prepared = prepare_c_family(source, language)?;
     let input = prepared.as_deref().unwrap_or(source);
     let control = codesage_protocol::work::current();
     let mut progress = |_: &tree_sitter::ParseState| {

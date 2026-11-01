@@ -20,6 +20,9 @@ use tree_sitter::Node;
 #[derive(Debug, Default)]
 pub(crate) struct DeadRegions {
     ranges: Vec<(usize, usize)>,
+    /// Start offsets of every directive token (`#if`, `#else`, ...) in the
+    /// tree, in source order.
+    directives: Vec<usize>,
 }
 
 impl DeadRegions {
@@ -34,9 +37,14 @@ impl DeadRegions {
             return Self::default();
         }
         let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut directives: Vec<usize> = Vec::new();
         let mut cursor = root.walk();
         loop {
-            collect_dead_spans(&cursor.node(), source, &mut ranges);
+            let node = cursor.node();
+            if !node.is_named() && node.kind().starts_with('#') {
+                directives.push(node.start_byte());
+            }
+            collect_dead_spans(&node, source, &mut ranges);
             if cursor.goto_first_child() {
                 continue;
             }
@@ -45,7 +53,9 @@ impl DeadRegions {
                     break;
                 }
                 if !cursor.goto_parent() {
-                    return Self::merged(ranges);
+                    let mut regions = Self::merged(ranges);
+                    regions.directives = directives;
+                    return regions;
                 }
             }
         }
@@ -61,6 +71,12 @@ impl DeadRegions {
         idx > 0 && self.ranges[idx - 1].1 > byte
     }
 
+    /// True when the tree has a directive token starting at `byte`. A
+    /// directive the C/C++ pre-pass blanked has none.
+    pub(crate) fn has_directive_at(&self, byte: usize) -> bool {
+        self.directives.binary_search(&byte).is_ok()
+    }
+
     fn merged(mut ranges: Vec<(usize, usize)>) -> Self {
         ranges.sort_unstable();
         let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
@@ -70,7 +86,10 @@ impl DeadRegions {
                 _ => merged.push((start, end)),
             }
         }
-        Self { ranges: merged }
+        Self {
+            ranges: merged,
+            directives: Vec::new(),
+        }
     }
 }
 
