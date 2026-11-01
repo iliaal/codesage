@@ -109,7 +109,7 @@ const PRIMITIVE_KEYS: [&[u8]; 15] = [
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
+pub(crate) enum Kind {
     Ident,
     Str,
     Other,
@@ -140,10 +140,10 @@ enum Form {
 type MacroSpan = (usize, usize, Form);
 
 #[derive(Clone, Copy, Debug)]
-struct Token {
-    kind: Kind,
-    start: usize,
-    end: usize,
+pub(crate) struct Token {
+    pub(crate) kind: Kind,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 /// Return a same-length copy of `source` with export macros blanked, or
@@ -513,72 +513,101 @@ fn declarator_head(tokens: &[Token], source: &[u8], head: usize) -> bool {
 }
 
 fn tokenize(src: &[u8]) -> Vec<Token> {
-    let mut tokens = Vec::new();
-    let mut i = 0;
-    let mut line_start = true;
-    while i < src.len() {
-        let b = src[i];
-        if b == b'\n' {
-            line_start = true;
-            i += 1;
-            continue;
+    Lexer::new(src).collect()
+}
+
+/// Token stream over C/C++ source with comments skipped and each
+/// preprocessor directive (continuations included) as one token. Shared with
+/// `preproc_arms`, which needs the same view of strings, comments, and
+/// directives without materializing the token list.
+pub(crate) struct Lexer<'a> {
+    src: &'a [u8],
+    i: usize,
+    line_start: bool,
+}
+
+impl<'a> Lexer<'a> {
+    pub(crate) fn new(src: &'a [u8]) -> Self {
+        Self {
+            src,
+            i: 0,
+            line_start: true,
         }
-        if b.is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        if b == b'/' && src.get(i + 1) == Some(&b'/') {
-            i = skip_line(src, i);
-            continue;
-        }
-        if b == b'/' && src.get(i + 1) == Some(&b'*') {
-            i = skip_block_comment(src, i);
-            continue;
-        }
-        let at_line_start = std::mem::replace(&mut line_start, false);
-        let kind = if b == b'#' && at_line_start {
-            i = skip_directive(src, i);
-            Kind::Directive
-        } else if b == b'"' {
-            i = skip_quoted(src, i, b'"');
-            Kind::Str
-        } else if b == b'\'' {
-            i = skip_quoted(src, i, b'\'');
-            Kind::Str
-        } else if b.is_ascii_digit()
-            || (b == b'.' && src.get(i + 1).is_some_and(u8::is_ascii_digit))
-        {
-            i = skip_number(src, i);
-            Kind::Other
-        } else if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 {
-            while i < src.len()
-                && (src[i].is_ascii_alphanumeric() || src[i] == b'_' || src[i] >= 0x80)
-            {
-                i += 1;
-            }
-            if src.get(i) == Some(&b'"')
-                && matches!(&src[start..i], b"R" | b"LR" | b"uR" | b"UR" | b"u8R")
-            {
-                i = skip_raw_string(src, i);
-                Kind::Str
-            } else {
-                Kind::Ident
-            }
-        } else if b == b':' && src.get(i + 1) == Some(&b':') {
-            i += 2;
-            Kind::Scope
-        } else {
-            i += 1;
-            Kind::Punct(b)
-        };
-        tokens.push(Token {
-            kind,
-            start,
-            end: i,
-        });
     }
-    tokens
+}
+
+impl Iterator for Lexer<'_> {
+    type Item = Token;
+
+    fn next(&mut self) -> Option<Token> {
+        let src = self.src;
+        let mut i = self.i;
+        while i < src.len() {
+            let b = src[i];
+            if b == b'\n' {
+                self.line_start = true;
+                i += 1;
+                continue;
+            }
+            if b.is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            if b == b'/' && src.get(i + 1) == Some(&b'/') {
+                i = skip_line(src, i);
+                continue;
+            }
+            if b == b'/' && src.get(i + 1) == Some(&b'*') {
+                i = skip_block_comment(src, i);
+                continue;
+            }
+            let at_line_start = std::mem::replace(&mut self.line_start, false);
+            let kind = if b == b'#' && at_line_start {
+                i = skip_directive(src, i);
+                Kind::Directive
+            } else if b == b'"' {
+                i = skip_quoted(src, i, b'"');
+                Kind::Str
+            } else if b == b'\'' {
+                i = skip_quoted(src, i, b'\'');
+                Kind::Str
+            } else if b.is_ascii_digit()
+                || (b == b'.' && src.get(i + 1).is_some_and(u8::is_ascii_digit))
+            {
+                i = skip_number(src, i);
+                Kind::Other
+            } else if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 {
+                while i < src.len()
+                    && (src[i].is_ascii_alphanumeric() || src[i] == b'_' || src[i] >= 0x80)
+                {
+                    i += 1;
+                }
+                if src.get(i) == Some(&b'"')
+                    && matches!(&src[start..i], b"R" | b"LR" | b"uR" | b"UR" | b"u8R")
+                {
+                    i = skip_raw_string(src, i);
+                    Kind::Str
+                } else {
+                    Kind::Ident
+                }
+            } else if b == b':' && src.get(i + 1) == Some(&b':') {
+                i += 2;
+                Kind::Scope
+            } else {
+                i += 1;
+                Kind::Punct(b)
+            };
+            self.i = i;
+            return Some(Token {
+                kind,
+                start,
+                end: i,
+            });
+        }
+        self.i = i;
+        None
+    }
 }
 
 /// Retain literal directives at their original byte offsets without parsing

@@ -1,0 +1,382 @@
+use codesage_parser::{
+    extract::extract_symbols, parse::parse_file, references::extract_references,
+};
+use codesage_protocol::{Language, SymbolKind};
+
+const SPLIT_HEADERS: &str = "void f1(int n)
+{
+#ifdef X
+    for (int i = 0; i < n; i++) {
+#else
+    for (int i = n; i > 0; i--) {
+#endif
+        b2(n);
+    }
+}
+
+void s1(int n)
+{
+#if defined(X)
+    switch (n) {
+#elif defined(Y)
+    switch (n + 2) {
+#else
+    switch (n + 1) {
+#endif
+    case 1:
+        b3(n);
+        break;
+    }
+}
+
+void ws(int n)
+{
+#ifdef X
+    while (n > 0) {
+#else
+    while (n > 1) {
+#endif
+        b4(n);
+    }
+}
+
+void after(void) { b5(); }
+";
+
+fn callables(source: &str, language: Language, path: &str) -> Vec<(String, u32, u32)> {
+    let tree = parse_file(source.as_bytes(), language).unwrap();
+    extract_symbols(&tree, source.as_bytes(), language, path)
+        .unwrap()
+        .into_iter()
+        .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+        .map(|s| (s.name, s.line_start, s.line_end))
+        .collect()
+}
+
+fn calls(source: &str, language: Language, path: &str) -> Vec<(String, u32)> {
+    let tree = parse_file(source.as_bytes(), language).unwrap();
+    extract_references(&tree, source.as_bytes(), language, path)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.kind == codesage_protocol::ReferenceKind::Call)
+        .map(|r| (r.to_name, r.line))
+        .collect()
+}
+
+fn owned(rows: &[(&str, u32, u32)]) -> Vec<(String, u32, u32)> {
+    rows.iter()
+        .map(|&(name, start, end)| (name.to_string(), start, end))
+        .collect()
+}
+
+#[test]
+fn loop_and_switch_headers_split_across_arms_keep_their_function() {
+    for (language, path) in [(Language::C, "split.c"), (Language::Cpp, "split.cpp")] {
+        assert_eq!(
+            callables(SPLIT_HEADERS, language, path),
+            owned(&[
+                ("f1", 1, 10),
+                ("s1", 12, 25),
+                ("ws", 27, 36),
+                ("after", 38, 38)
+            ]),
+            "{language:?}"
+        );
+        assert_eq!(
+            calls(SPLIT_HEADERS, language, path),
+            [
+                ("b2".to_string(), 8),
+                ("b3".to_string(), 22),
+                ("b4".to_string(), 34),
+                ("b5".to_string(), 38),
+            ],
+            "{language:?}"
+        );
+    }
+}
+
+/// At file scope the arms are alternative declaration heads; keeping one would
+/// choose which name is indexed, so the group parses as written.
+#[test]
+fn file_scope_split_function_header_parses_as_written() {
+    let source = "#ifdef WIDE
+static int pick(long a)
+{
+#else
+static int pick(int a)
+{
+#endif
+    return c1(a);
+}
+";
+    assert_eq!(
+        callables(source, Language::C, "pick.c"),
+        owned(&[("pick", 5, 9)])
+    );
+}
+
+#[test]
+fn literal_zero_first_arm_yields_to_the_else_arm() {
+    let source = "void z(int n)
+{
+#if 0
+    while (n > 0) { old(n);
+#else
+    while (n > 1) { live(n);
+#endif
+    }
+}
+";
+    assert_eq!(callables(source, Language::C, "z.c"), owned(&[("z", 1, 9)]));
+    assert_eq!(calls(source, Language::C, "z.c"), [("live".to_string(), 6)]);
+}
+
+#[test]
+fn dangling_else_constexpr_arm_joins_its_if() {
+    let source = "void k1(int x)
+{
+    if (x) {
+        a(x);
+    }
+#if defined(A)
+    else if constexpr (X > 2) {
+        b(x);
+    }
+#endif
+}
+
+void k2(void) { c(); }
+";
+    assert_eq!(
+        callables(source, Language::Cpp, "k.cpp"),
+        owned(&[("k1", 1, 11), ("k2", 13, 13)])
+    );
+    assert_eq!(
+        calls(source, Language::Cpp, "k.cpp"),
+        [
+            ("a".to_string(), 4),
+            ("b".to_string(), 8),
+            ("c".to_string(), 13)
+        ]
+    );
+}
+
+/// Balanced arms are parsed exactly as written: each arm's definition stays
+/// a separate symbol and both arms' calls stay indexed.
+#[test]
+fn balanced_arms_keep_every_alternative() {
+    let source = "#ifdef X
+int pick(int n)
+{
+    return a1(n);
+}
+#else
+int pick(int n)
+{
+    return a2(n);
+}
+#endif
+
+void body(int n)
+{
+#ifdef X
+    a3(n);
+#else
+    a4(n);
+#endif
+}
+";
+    for (language, path) in [(Language::C, "balanced.c"), (Language::Cpp, "balanced.cpp")] {
+        assert_eq!(
+            callables(source, language, path),
+            owned(&[("pick", 2, 5), ("pick", 7, 10), ("body", 13, 20)]),
+            "{language:?}"
+        );
+        assert_eq!(
+            calls(source, language, path),
+            [
+                ("a1".to_string(), 4),
+                ("a2".to_string(), 9),
+                ("a3".to_string(), 16),
+                ("a4".to_string(), 18),
+            ],
+            "{language:?}"
+        );
+    }
+}
+
+/// Arms that leave different depths cannot be reduced to one arm without
+/// unbalancing the file, and a lone arm that opens a brace is closed by a
+/// group elsewhere; both parse as written.
+#[test]
+fn unequal_and_lone_opening_arms_are_left_as_written() {
+    let source = "#ifdef __cplusplus
+extern \"C\" {
+#endif
+int g(void) { return h(); }
+#ifdef __cplusplus
+}
+#endif
+";
+    assert_eq!(
+        callables(source, Language::Cpp, "g.h"),
+        owned(&[("g", 4, 4)])
+    );
+}
+
+/// The arms the parser does not keep stay in place as complete statements,
+/// so a call written in any live arm is still indexed.
+#[test]
+fn calls_in_every_live_arm_stay_indexed() {
+    let source = "void g(int x)
+{
+#ifdef SLOW
+    while ((x = next_a(x)) != 0) {
+#else
+    while ((x = next_b(x)) != 0) {
+#endif
+        body(x);
+    }
+    if (x) {
+        one(x);
+#ifdef WIN
+    } else if (win(x)) {
+        two(x);
+#else
+    } else {
+        three(x);
+#endif
+    }
+}
+
+void h(void) { tail(); }
+";
+    for (language, path) in [(Language::C, "g.c"), (Language::Cpp, "g.cpp")] {
+        assert_eq!(
+            callables(source, language, path),
+            owned(&[("g", 1, 20), ("h", 22, 22)]),
+            "{language:?}"
+        );
+        assert_eq!(
+            calls(source, language, path),
+            [
+                ("next_a".to_string(), 4),
+                ("next_b".to_string(), 6),
+                ("body".to_string(), 8),
+                ("one".to_string(), 11),
+                ("win".to_string(), 13),
+                ("two".to_string(), 14),
+                ("three".to_string(), 17),
+                ("tail".to_string(), 22),
+            ],
+            "{language:?}"
+        );
+    }
+}
+
+/// A split group nested in an arm of another split group: the inner group is
+/// reduced first and the outer arm still keeps its calls.
+#[test]
+fn nested_split_groups_keep_every_live_call() {
+    let source = "int put(int p)
+{
+#ifdef HAVE_UNSETENV
+    if (!p || setv(p) == 0) {
+#else
+# ifndef WIN
+    if (setv(p) == 0) {
+# else
+    if (!wide(p)) {
+        bail(p);
+    }
+    if (setw(p) != 0
+#  ifndef ZTS
+        && wput(p) == 0
+#  endif
+    ) {
+# endif
+#endif
+        store(p);
+    }
+    return p;
+}
+
+void next(void) { tail(); }
+";
+    assert_eq!(
+        callables(source, Language::C, "put.c"),
+        owned(&[("put", 1, 22), ("next", 24, 24)])
+    );
+    assert_eq!(
+        calls(source, Language::C, "put.c"),
+        [
+            ("setv".to_string(), 4),
+            ("setv".to_string(), 7),
+            ("wide".to_string(), 9),
+            ("bail".to_string(), 10),
+            ("setw".to_string(), 12),
+            ("wput".to_string(), 14),
+            ("store".to_string(), 19),
+            ("tail".to_string(), 24),
+        ]
+    );
+}
+
+/// An arm that leaves a parenthesis open is part of an expression; it is not
+/// spliced into the kept arm's condition as a stray statement.
+#[test]
+fn split_condition_arm_does_not_become_a_call() {
+    let source = "int r(int j1, int dig)
+{
+    if (j1 > 0) {
+#ifdef BIASED
+        if (j1 >= 0
+#else
+        if ((j1 > 0 || (j1 == 0 && odd(dig)))
+#endif
+            && dig++ == '9')
+            up(dig);
+    }
+    return dig;
+}
+";
+    assert_eq!(
+        callables(source, Language::C, "r.c"),
+        owned(&[("r", 1, 13)])
+    );
+    assert_eq!(calls(source, Language::C, "r.c"), [("up".to_string(), 10)]);
+}
+
+/// Joining a lone `else` arm to its `if` also recovers calls in the arm's
+/// own condition, which a recovered phantom definition used to swallow.
+#[test]
+fn call_in_a_joined_else_if_condition_is_indexed() {
+    let source = "void handle(int id)
+{
+    if (id == 1) {
+        a(id);
+    }
+#if defined(USE_V)
+    else if (foo(id)) {
+        b(id);
+    }
+#endif
+}
+";
+    for (language, path) in [(Language::C, "cond.c"), (Language::Cpp, "cond.cpp")] {
+        assert_eq!(
+            callables(source, language, path),
+            owned(&[("handle", 1, 11)]),
+            "{language:?}"
+        );
+        assert_eq!(
+            calls(source, language, path),
+            [
+                ("a".to_string(), 4),
+                ("foo".to_string(), 7),
+                ("b".to_string(), 8)
+            ],
+            "{language:?}"
+        );
+    }
+}
