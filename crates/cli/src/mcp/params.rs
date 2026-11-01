@@ -85,16 +85,13 @@ pub(crate) fn one_target_list(
     legacy: Option<&[String]>,
     targets: Option<&[String]>,
 ) -> Result<Vec<String>> {
-    let same = |a: &[String], b: &[String]| {
-        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.trim() == y.trim())
-    };
     match (legacy, targets) {
-        (Some(legacy_values), Some(target_values)) if !same(legacy_values, target_values) => {
+        (Some(legacy_values), Some(target_values)) if !same_list(legacy_values, target_values) => {
             Err(McpError::new(
                 ErrorCode::Param,
                 format!(
                     "{tool}: {}; pass one of them",
-                    list_conflict(legacy_field, legacy_values, target_values)
+                    list_conflict(legacy_field, legacy_values, "targets", target_values)
                 ),
             )
             .into())
@@ -108,22 +105,31 @@ pub(crate) fn one_target_list(
     }
 }
 
+fn same_list(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.trim() == y.trim())
+}
+
 /// Where two file lists stop agreeing, with both spellings: lengths alone say
 /// the request is contradictory without saying which entry to fix.
-fn list_conflict(legacy_field: &str, legacy: &[String], targets: &[String]) -> String {
-    let index = legacy
+fn list_conflict(
+    first_field: &str,
+    first: &[String],
+    second_field: &str,
+    second: &[String],
+) -> String {
+    let index = first
         .iter()
-        .zip(targets)
+        .zip(second)
         .position(|(a, b)| a.trim() != b.trim())
-        .unwrap_or_else(|| legacy.len().min(targets.len()));
+        .unwrap_or_else(|| first.len().min(second.len()));
     let entry = |values: &[String]| match values.get(index) {
         Some(value) => format!("{value:?}"),
         None => format!("nothing ({})", path_count(values.len())),
     };
     format!(
-        "`{legacy_field}` and `targets` name different sets, first at index {index}: {} vs {}",
-        entry(legacy),
-        entry(targets)
+        "`{first_field}` and `{second_field}` name different sets, first at index {index}: {} vs {}",
+        entry(first),
+        entry(second)
     )
 }
 
@@ -359,87 +365,91 @@ impl CouplingParams {
     }
 }
 
+const RISK_TARGETS_DESC: &str = "Files to assess, at least one: each entry is a `file:`, `sym:`, or `chunk:` handle, an indexed path (a leading `./` is ignored), or `path:line`; a symbol target resolves to its file. One file is a list of one. A lone target that matches no indexed path and no file in the working tree is E_NOT_FOUND with the nearest candidates; in a larger set such a path is taken as written and reported with `found: false`, as is a file the working tree holds but the index does not.";
+
 const RISK_VERBOSE_DESC: &str = "Include per-signal decomposition (churn_score, churn_percentile, fix_ratio, total_commits, fix_count, dependent_files, coupled_files, test_gap, in_cycle, cycle_size) and coupled files (`top_coupled`) on each RiskAssessment; default false.";
+
+/// Make an optional field required in the advertised schema. Retired
+/// spellings are accepted for one release but not advertised, so the field a
+/// client sees is the only way to name the input.
+fn require(schema: &mut schemars::Schema, field: &str) {
+    let required = schema
+        .ensure_object()
+        .entry("required")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(list) = required.as_array_mut()
+        && !list.iter().any(|name| name == field)
+    {
+        list.push(serde_json::json!(field));
+    }
+}
+
+fn require_targets(schema: &mut schemars::Schema) {
+    require(schema, "targets");
+}
+
+fn require_target(schema: &mut schemars::Schema) {
+    require(schema, "target");
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = require_targets)]
 pub struct RiskParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
+    #[schemars(description = RISK_TARGETS_DESC)]
+    pub targets: Option<Vec<String>>,
     #[schemars(
-        description = "DEPRECATED, still accepted: pass `target`. Repo-relative file path to assess."
+        description = "false (default): score each target independently, in input order, under `files`. true: also roll the set up as one patch: max/mean over scored files, hotspot, fix-heavy, test-gap, and wide-blast lists, unscored files, cycles touching the patch, and paste-ready summary notes."
     )]
-    pub file_path: Option<String>,
-    #[schemars(description = FILE_TARGET_DESC)]
-    pub target: Option<String>,
+    pub aggregate: Option<bool>,
     #[schemars(description = RISK_VERBOSE_DESC)]
     pub verbose: Option<bool>,
+    /// Retired list spelling of `targets` (formerly on `assess_risk_batch`
+    /// and `assess_risk_diff`).
+    #[schemars(skip)]
+    pub file_paths: Option<Vec<String>>,
+    /// Retired single-file spellings: one path is a batch of one.
+    #[schemars(skip)]
+    pub target: Option<String>,
+    #[schemars(skip)]
+    pub file_path: Option<String>,
 }
 
 impl RiskParams {
-    pub(crate) fn target_arg(&self) -> Result<String> {
-        one_target(
-            "assess_risk",
-            "file_path",
-            self.file_path.as_deref(),
-            self.target.as_deref(),
-        )
-    }
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RiskDiffParams {
-    #[schemars(description = PROJECT_ARG_DESC)]
-    pub project: String,
-    #[schemars(
-        description = "DEPRECATED, still accepted: pass `targets`. Repo-relative file paths in the patch (typically the output of `git diff --name-only`). Must provide at least one path: an empty list is rejected."
-    )]
-    pub file_paths: Option<Vec<String>>,
-    #[schemars(description = FILE_TARGETS_DESC)]
-    pub targets: Option<Vec<String>>,
-    #[schemars(description = RISK_VERBOSE_DESC)]
-    pub verbose: Option<bool>,
-}
-
-impl RiskDiffParams {
+    /// Every spelling the call used must name the same set; picking one
+    /// would answer a question the caller did not ask.
     pub(crate) fn target_args(&self) -> Result<Vec<String>> {
-        one_target_list(
-            "assess_risk_diff",
-            "file_paths",
-            self.file_paths.as_deref(),
-            self.targets.as_deref(),
-        )
-    }
-
-    pub(crate) fn list_fields(&self) -> &'static [&'static str] {
-        list_fields(&self.file_paths, &self.targets)
-    }
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RiskBatchParams {
-    #[schemars(description = PROJECT_ARG_DESC)]
-    pub project: String,
-    #[schemars(
-        description = "DEPRECATED, still accepted: pass `targets`. Repo-relative file paths to score individually. Must provide at least one path: an empty list is rejected. Returns one RiskAssessment per path, in input order. Use when you have a list of files (e.g. from impact analysis or coupling) and want each one's individual score — saves the per-file MCP round-trip overhead vs N separate `assess_risk` calls. For patch-level aggregation (max/mean, summary_notes, cycles), use `assess_risk_diff` instead."
-    )]
-    pub file_paths: Option<Vec<String>>,
-    #[schemars(description = FILE_TARGETS_DESC)]
-    pub targets: Option<Vec<String>>,
-    #[schemars(description = RISK_VERBOSE_DESC)]
-    pub verbose: Option<bool>,
-}
-
-impl RiskBatchParams {
-    pub(crate) fn target_args(&self) -> Result<Vec<String>> {
-        one_target_list(
-            "assess_risk_batch",
-            "file_paths",
-            self.file_paths.as_deref(),
-            self.targets.as_deref(),
-        )
+        let present: Vec<(&str, Vec<String>)> = [
+            ("targets", self.targets.clone()),
+            ("file_paths", self.file_paths.clone()),
+            ("target", self.target.clone().map(|value| vec![value])),
+            ("file_path", self.file_path.clone().map(|value| vec![value])),
+        ]
+        .into_iter()
+        .filter_map(|(field, values)| values.map(|values| (field, values)))
+        .collect();
+        let Some((first_field, first)) = present.first() else {
+            return Err(McpError::new(
+                ErrorCode::Param,
+                "assess_risk: pass `targets`, a list of file targets",
+            )
+            .into());
+        };
+        for (field, values) in &present[1..] {
+            if !same_list(first, values) {
+                return Err(McpError::new(
+                    ErrorCode::Param,
+                    format!(
+                        "assess_risk: {}; pass one of them",
+                        list_conflict(first_field, first, field, values)
+                    ),
+                )
+                .into());
+            }
+        }
+        Ok(first.clone())
     }
 
     pub(crate) fn list_fields(&self) -> &'static [&'static str] {
@@ -481,9 +491,20 @@ pub struct SessionParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Session identifier (alphanumerics, '-', '_', '.', max 128 chars). Use the same id for the matching session_start and session_end. Defaults to \"default\" when omitted."
+        description = "start: persist the current structural state as the session's baseline (reusing an id replaces it). end: compare the current state with that baseline; the baseline stays in place for repeated comparisons."
+    )]
+    pub action: SessionAction,
+    #[schemars(
+        description = "Session identifier (alphanumerics, '-', '_', '.', max 128 chars). Use the same id for the matching start and end. Defaults to \"default\" when omitted."
     )]
     pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionAction {
+    Start,
+    End,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -529,9 +550,10 @@ pub struct ImpactParams {
         description = "What to analyze, in the shared target grammar: a `sym:` or `file:` handle, an indexed path, `path:line`, or a qualified or bare name. `dir:`, `chunk:`, and `feat_` are refused with E_PARAM."
     )]
     pub target: String,
-    #[schemars(
-        description = "DEPRECATED, still accepted: the grammar disambiguates. Treat target as file path (auto-detected if path-like); pass false to force symbol interpretation. Ignored when `target` is a handle, which names its own kind."
-    )]
+    /// Retired hint, accepted for one release and not advertised: the target
+    /// grammar disambiguates. `false` forces symbol interpretation of a
+    /// path-like target; a handle names its own kind and ignores it.
+    #[schemars(skip)]
     pub is_file: Option<bool>,
     #[schemars(
         description = "Recursion depth for transitive impact (default 2, max 6). Over-max requests are capped and reported under `_meta.clamps`."
@@ -561,19 +583,16 @@ pub struct ImpactParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ExportContextParams {
+#[schemars(transform = require_target)]
+pub struct BundleParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Natural language query, or an entity in the shared target grammar: a `sym:`, `file:`, `dir:`, `chunk:`, or feature handle, an indexed path, `path:line`, a qualified or bare name, `route:METHOD path`, or `cmd:name`. Entity ambiguity and misses return resolver errors; only a Text resolution uses semantic search."
+        description = "What to bundle, in the shared target grammar: a `feat_` id, `route:METHOD path`, or `cmd:name` reads the mapped feature's entrypoints, owned files, tests, and context; a `sym:`, `file:`, `dir:`, or `chunk:` handle, an indexed path, `path:line`, or a qualified or bare name reads that entity; anything else is a natural-language query answered by semantic search. Entity ambiguity and misses return resolver errors."
     )]
-    pub target: String,
+    pub target: Option<String>,
     #[schemars(
-        description = "DEPRECATED, still accepted: the grammar disambiguates. For unresolved text, force symbol lookup instead of semantic search; a missing forced symbol returns found:false. Resolved entities always name their own kind."
-    )]
-    pub is_symbol: Option<bool>,
-    #[schemars(
-        description = "Max primary results to include (default 5, max 20). Over-max requests are capped and reported under `_meta.clamps`."
+        description = "Max primary results to include (default 5, max 20); for a feature, max chunks per section. Over-max requests are capped and reported under `_meta.clamps`."
     )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
@@ -581,6 +600,26 @@ pub struct ExportContextParams {
     pub include_callers: Option<bool>,
     #[schemars(description = "Include callee/dependency code in the bundle")]
     pub include_callees: Option<bool>,
+    /// Retired spelling (formerly on `feature_bundle`): a feature lookup
+    /// that reports `found: false` on a miss instead of falling through to
+    /// semantic search.
+    #[schemars(skip)]
+    pub feature_id: Option<String>,
+    /// Retired hint (formerly on `export_context`): for unresolved text,
+    /// force symbol lookup instead of semantic search.
+    #[schemars(skip)]
+    pub is_symbol: Option<bool>,
+}
+
+impl BundleParams {
+    pub(crate) fn target_arg(&self) -> Result<String> {
+        one_target(
+            "bundle",
+            "feature_id",
+            self.feature_id.as_deref(),
+            self.target.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -622,9 +661,13 @@ pub struct SearchParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ListFeaturesParams {
+pub struct FeaturesParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
+    #[schemars(
+        description = "Only the features containing this file as entrypoint, owned code, context, or test: a `file:`, `sym:`, or `chunk:` handle, an indexed path (a leading `./` is ignored), or `path:line`; a symbol target resolves to its file. Omit to list every mapped feature. A spelling that matches no indexed path and no file in the working tree is E_NOT_FOUND with the nearest candidates."
+    )]
+    pub target: Option<String>,
     #[schemars(
         description = "Filter by feature kind: cli-command, route, service, library, test-suite, config, job, unknown"
     )]
@@ -640,72 +683,28 @@ pub struct ListFeaturesParams {
     )]
     pub since: Option<String>,
     #[schemars(
-        description = "Max results (default 100, 0 = no limit, max 500). Over-max requests are capped and reported under `_meta.clamps`."
+        description = "Max results (0 = no limit, max 500). Defaults to 100 when listing and to no limit with `target`. Over-max requests are capped and reported under `_meta.clamps`."
     )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct FindFeatureParams {
-    #[schemars(description = PROJECT_ARG_DESC)]
-    pub project: String,
-    #[schemars(
-        description = "DEPRECATED, still accepted: pass `target`. Repo-relative file path to look up."
-    )]
+    /// Retired spelling of `target` (formerly on `find_feature`).
+    #[schemars(skip)]
     pub file_path: Option<String>,
-    #[schemars(description = FILE_TARGET_DESC)]
-    pub target: Option<String>,
 }
 
-impl FindFeatureParams {
-    pub(crate) fn target_arg(&self) -> Result<String> {
+impl FeaturesParams {
+    /// The file a lookup is scoped to, when the call names one.
+    pub(crate) fn target_arg(&self) -> Result<Option<String>> {
+        if self.file_path.is_none() && self.target.is_none() {
+            return Ok(None);
+        }
         one_target(
-            "find_feature",
+            "features",
             "file_path",
             self.file_path.as_deref(),
             self.target.as_deref(),
         )
-    }
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct FeatureBundleParams {
-    #[schemars(description = PROJECT_ARG_DESC)]
-    pub project: String,
-    #[schemars(
-        description = "DEPRECATED, still accepted: pass `target`. Feature id (e.g. feat_abc123) from `list_features` / `find_feature`."
-    )]
-    pub feature_id: Option<String>,
-    #[schemars(
-        description = "Preferred spelling of the feature, in the feature arm of the shared target grammar: a `feat_` id, `route:METHOD path` (e.g. `route:POST /api/login`), or `cmd:name`. Alias of `feature_id` — pass one, or the same value in both."
-    )]
-    pub target: Option<String>,
-    #[schemars(
-        description = "Include caller chunks for the feature's entry symbol (default false)"
-    )]
-    pub include_callers: Option<bool>,
-    #[schemars(
-        description = "Include callee chunks reached from the feature's entry symbol (default false)"
-    )]
-    pub include_callees: Option<bool>,
-    #[schemars(
-        description = "Max chunks per section (primary, related). Default 5, max 20. Over-max requests are capped and reported under `_meta.clamps`."
-    )]
-    #[serde(default, deserialize_with = "deser_optional_usize")]
-    pub limit: Option<usize>,
-}
-
-impl FeatureBundleParams {
-    pub(crate) fn target_arg(&self) -> Result<String> {
-        one_target(
-            "feature_bundle",
-            "feature_id",
-            self.feature_id.as_deref(),
-            self.target.as_deref(),
-        )
+        .map(Some)
     }
 }
 
@@ -1028,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn list_features_accepts_documented_kind_and_language_strings() {
+    fn features_accepts_documented_kind_and_language_strings() {
         for kind in [
             "cli-command",
             "route",
@@ -1039,7 +1038,7 @@ mod tests {
             "job",
             "unknown",
         ] {
-            let p: ListFeaturesParams = serde_json::from_value(json!({
+            let p: FeaturesParams = serde_json::from_value(json!({
                 "project": "/p",
                 "kind": kind,
             }))
@@ -1057,7 +1056,7 @@ mod tests {
             "typescript",
             "go",
         ] {
-            let p: ListFeaturesParams = serde_json::from_value(json!({
+            let p: FeaturesParams = serde_json::from_value(json!({
                 "project": "/p",
                 "language": lang,
             }))
@@ -1070,12 +1069,79 @@ mod tests {
     }
 
     #[test]
-    fn list_features_rejects_unknown_kind() {
-        let r: Result<ListFeaturesParams, _> = serde_json::from_value(json!({
+    fn features_rejects_unknown_kind() {
+        let r: Result<FeaturesParams, _> = serde_json::from_value(json!({
             "project": "/p",
             "kind": "microservice",
         }));
         assert!(r.is_err(), "unknown feature kind must error");
+    }
+
+    #[test]
+    fn retired_spellings_on_consolidated_tools_name_one_entity() {
+        let features =
+            |value: serde_json::Value| -> FeaturesParams { serde_json::from_value(value).unwrap() };
+        assert_eq!(
+            features(json!({"project": "/p"})).target_arg().unwrap(),
+            None
+        );
+        for spelling in [
+            json!({"project": "/p", "target": "a.rs"}),
+            json!({"project": "/p", "file_path": "a.rs"}),
+            json!({"project": "/p", "file_path": "a.rs", "target": "a.rs"}),
+        ] {
+            assert_eq!(
+                features(spelling.clone()).target_arg().unwrap().as_deref(),
+                Some("a.rs"),
+                "{spelling}"
+            );
+        }
+        let err = features(json!({"project": "/p", "file_path": "a.rs", "target": "b.rs"}))
+            .target_arg()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("features") && err.contains("`file_path`"),
+            "{err}"
+        );
+
+        let bundle =
+            |value: serde_json::Value| -> BundleParams { serde_json::from_value(value).unwrap() };
+        assert_eq!(
+            bundle(json!({"project": "/p", "feature_id": "feat_1"}))
+                .target_arg()
+                .unwrap(),
+            "feat_1"
+        );
+        let err = bundle(json!({"project": "/p", "feature_id": "feat_1", "target": "feat_2"}))
+            .target_arg()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("bundle") && err.contains("`feature_id`"),
+            "{err}"
+        );
+        assert!(
+            bundle(json!({"project": "/p", "target": "x", "is_symbol": true}))
+                .is_symbol
+                .unwrap()
+        );
+
+        for (action, expected) in [("start", SessionAction::Start), ("end", SessionAction::End)] {
+            let p: SessionParams =
+                serde_json::from_value(json!({"project": "/p", "action": action})).unwrap();
+            assert_eq!(p.action, expected);
+        }
+        assert!(serde_json::from_value::<SessionParams>(json!({"project": "/p"})).is_err());
+        assert!(
+            serde_json::from_value::<SessionParams>(json!({"project": "/p", "action": "stop"}))
+                .is_err()
+        );
+
+        let impact: ImpactParams =
+            serde_json::from_value(json!({"project": "/p", "target": "a.rs", "is_file": false}))
+                .unwrap();
+        assert_eq!(impact.is_file, Some(false));
     }
 
     #[test]
@@ -1152,20 +1218,15 @@ mod tests {
             "CouplingParams",
             json!({"project": "/p", "file_path": "a.rs"}),
         );
-        check::<RiskParams>("RiskParams", json!({"project": "/p", "file_path": "a.rs"}));
-        check::<RiskDiffParams>(
-            "RiskDiffParams",
-            json!({"project": "/p", "file_paths": ["a.rs"]}),
-        );
-        check::<RiskBatchParams>(
-            "RiskBatchParams",
-            json!({"project": "/p", "file_paths": ["a.rs"]}),
+        check::<RiskParams>(
+            "RiskParams",
+            json!({"project": "/p", "targets": ["a.rs"], "aggregate": true}),
         );
         check::<TestsForParams>(
             "TestsForParams",
             json!({"project": "/p", "file_paths": ["a.rs"]}),
         );
-        check::<SessionParams>("SessionParams", json!({"project": "/p"}));
+        check::<SessionParams>("SessionParams", json!({"project": "/p", "action": "end"}));
         check::<TracePathParams>(
             "TracePathParams",
             json!({"project": "/p", "from": "a", "to": "b"}),
@@ -1175,18 +1236,15 @@ mod tests {
             json!({"project": "/p", "trace": "   0: main\n"}),
         );
         check::<ImpactParams>("ImpactParams", json!({"project": "/p", "target": "Foo"}));
-        check::<ExportContextParams>(
-            "ExportContextParams",
-            json!({"project": "/p", "target": "Foo"}),
-        );
+        check::<BundleParams>("BundleParams", json!({"project": "/p", "target": "Foo"}));
         check::<SearchParams>("SearchParams", json!({"project": "/p", "query": "auth"}));
-        check::<ListFeaturesParams>("ListFeaturesParams", json!({"project": "/p"}));
-        check::<FindFeatureParams>(
-            "FindFeatureParams",
+        check::<FeaturesParams>("FeaturesParams", json!({"project": "/p"}));
+        check::<FeaturesParams>(
+            "FeaturesParams",
             json!({"project": "/p", "file_path": "a.rs"}),
         );
-        check::<FeatureBundleParams>(
-            "FeatureBundleParams",
+        check::<BundleParams>(
+            "BundleParams",
             json!({"project": "/p", "feature_id": "feat_1"}),
         );
         check::<EmbedTextsParams>(
@@ -1272,37 +1330,51 @@ mod tests {
 
     #[test]
     fn file_and_file_set_aliases_follow_the_same_precedence() {
-        let by_path: RiskParams =
-            serde_json::from_value(json!({"project": "/p", "file_path": "src/a.rs"})).unwrap();
-        assert_eq!(by_path.target_arg().unwrap(), "src/a.rs");
-        let by_target: RiskParams =
-            serde_json::from_value(json!({"project": "/p", "target": "file:src/a.rs"})).unwrap();
-        assert_eq!(by_target.target_arg().unwrap(), "file:src/a.rs");
-        let both: RiskParams = serde_json::from_value(
-            json!({"project": "/p", "file_path": "src/a.rs", "target": "src/a.rs"}),
-        )
-        .unwrap();
-        assert_eq!(both.target_arg().unwrap(), "src/a.rs");
-        let conflict: RiskParams = serde_json::from_value(
-            json!({"project": "/p", "file_path": "src/a.rs", "target": "src/b.rs"}),
-        )
-        .unwrap();
-        let err = conflict.target_arg().unwrap_err().to_string();
-        assert!(
-            err.contains("assess_risk")
-                && err.contains("`file_path`")
-                && err.contains("src/a.rs")
-                && err.contains("src/b.rs"),
-            "{err}"
-        );
-        let missing: RiskParams = serde_json::from_value(json!({"project": "/p"})).unwrap();
-        assert!(
-            missing
-                .target_arg()
-                .unwrap_err()
-                .to_string()
-                .contains("`target`")
-        );
+        // assess_risk takes one file set; each retired spelling (the batch and
+        // diff `file_paths`, the single-file `target` and `file_path`) names it.
+        let risk =
+            |value: serde_json::Value| -> RiskParams { serde_json::from_value(value).unwrap() };
+        for spelling in [
+            json!({"project": "/p", "targets": ["src/a.rs"]}),
+            json!({"project": "/p", "file_paths": ["src/a.rs"]}),
+            json!({"project": "/p", "target": "src/a.rs"}),
+            json!({"project": "/p", "file_path": "src/a.rs"}),
+            json!({"project": "/p", "targets": ["src/a.rs"], "target": "src/a.rs"}),
+            json!({"project": "/p", "file_paths": ["src/a.rs"], "file_path": " src/a.rs "}),
+        ] {
+            assert_eq!(
+                risk(spelling.clone()).target_args().unwrap(),
+                ["src/a.rs"],
+                "{spelling}"
+            );
+        }
+        for (conflict, fields) in [
+            (
+                json!({"project": "/p", "targets": ["src/a.rs"], "target": "src/b.rs"}),
+                ["`targets`", "`target`"],
+            ),
+            (
+                json!({"project": "/p", "targets": ["src/a.rs", "src/b.rs"], "file_path": "src/a.rs"}),
+                ["`targets`", "`file_path`"],
+            ),
+            (
+                json!({"project": "/p", "file_paths": ["src/a.rs"], "targets": ["src/b.rs"]}),
+                ["`targets`", "`file_paths`"],
+            ),
+        ] {
+            let err = risk(conflict).target_args().unwrap_err().to_string();
+            assert!(
+                err.contains("assess_risk")
+                    && fields.iter().all(|field| err.contains(field))
+                    && err.contains("pass one of them"),
+                "{err}"
+            );
+        }
+        let missing = risk(json!({"project": "/p"}))
+            .target_args()
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("`targets`"), "{missing}");
 
         let by_paths: TestsForParams =
             serde_json::from_value(json!({"project": "/p", "file_paths": ["a.rs", "b.rs"]}))

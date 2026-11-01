@@ -439,6 +439,28 @@ pub fn feature_bundle(
     )
 }
 
+/// [`feature_bundle`] with the export fallback: when entry-symbol and
+/// stored-chunk lookup yield no definitions, collect the available Entry and
+/// Owned definitions up to `limit`. This is the feature arm of
+/// [`export_context_for_target`], reached through a feature lookup, so an
+/// unknown ID still returns `found=false` rather than a resolver error.
+pub fn feature_bundle_with_definitions(
+    db: &Database,
+    feature_id: &str,
+    include_callers: bool,
+    include_callees: bool,
+    limit: usize,
+) -> Result<ContextBundle> {
+    build_feature_bundle(
+        db,
+        feature_id,
+        include_callers,
+        include_callees,
+        limit,
+        true,
+    )
+}
+
 fn build_feature_bundle(
     db: &Database,
     feature_id: &str,

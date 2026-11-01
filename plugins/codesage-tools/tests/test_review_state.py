@@ -1851,11 +1851,16 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertIn("not proof of a fix", command)
         self.assertNotIn("flip to `fixed` automatically", command)
 
-    def test_reviewer_uses_risk_batch_and_has_no_write_capable_shell(self):
+    def test_reviewer_uses_per_file_risk_and_has_no_write_capable_shell(self):
         reviewer = self.read("agents/codesage-feature-reviewer.md")
         frontmatter = reviewer.split("---", 2)[1]
 
-        self.assertIn("mcp__codesage__assess_risk_batch", frontmatter)
+        # assess_risk_batch was consolidated into assess_risk; an unadvertised
+        # alias cannot appear in an agent allowlist.
+        self.assertIn("mcp__codesage__assess_risk", frontmatter)
+        self.assertNotIn("mcp__codesage__assess_risk_batch", frontmatter)
+        self.assertIn("mcp__codesage__bundle", frontmatter)
+        self.assertNotIn("mcp__codesage__feature_bundle", frontmatter)
         self.assertNotIn("Bash", frontmatter)
         self.assertNotIn("mcp__codesage__find_coupling", frontmatter)
         self.assertIn("at most 800 lines", reviewer)
@@ -2151,7 +2156,7 @@ class InventoryReportTests(unittest.TestCase):
 
     def test_inventory_accepts_an_enveloped_response_that_is_not_truncated(self):
         feature = {"feature_id": "feat_1", "files": [{"path": "a.rs", "role": "owned"}]}
-        value = {"results": [feature], "tool": "list_features", "cost": {"ms": 3, "bytes": 120},
+        value = {"results": [feature], "tool": "features", "cost": {"ms": 3, "bytes": 120},
                  "index": {"generation": 7, "dirty_paths": ["a.rs"]},
                  "completeness": {"kind": "floor", "kinds": ["floor"]}}
         self.assertEqual(self.state.complete_inventory(value), [feature])
@@ -2190,7 +2195,7 @@ class InventoryReportTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.state.complete_risk(["a.rs", "b.rs"], response)
         self.assertEqual(self.state.complete_risk(["a.rs"], [row]), {"files": [row]})
-        enveloped = {"files": [row], "tool": "assess_risk_batch", "cost": {"ms": 2, "bytes": 90},
+        enveloped = {"files": [row], "tool": "assess_risk", "cost": {"ms": 2, "bytes": 90},
                      "completeness": {"kind": "unscored", "kinds": ["unscored"]}}
         self.assertEqual(self.state.complete_risk(["a.rs"], enveloped), {"files": [row]})
 

@@ -344,14 +344,16 @@ fn input_failures_on_an_onboarded_project_carry_machine_remedies() {
     );
 
     let paths: Vec<String> = (0..501).map(|i| format!("src/f{i}.rs")).collect();
+    // A retired alias answers as its successor, so the remedy names the
+    // advertised tool and the spelling the call actually used.
     let result = server.call(
         "assess_risk_batch",
         json!({"project": project.path(), "file_paths": paths}),
     );
-    let over = failure(&result, "assess_risk_batch");
+    let over = failure(&result, "assess_risk");
     assert_eq!(over.block["error"]["code"], "E_OVER_CAP");
     let remedy = &over.block["error"]["remedy"];
-    assert_eq!(remedy["tool"], "assess_risk_batch", "{remedy}");
+    assert_eq!(remedy["tool"], "assess_risk", "{remedy}");
     assert_eq!(remedy["arguments"]["project"], json!(project.path()));
     assert_eq!(
         remedy["arguments"]["file_paths"].as_array().unwrap().len(),
@@ -361,21 +363,22 @@ fn input_failures_on_an_onboarded_project_carry_machine_remedies() {
     assert!(over.text.contains("at most 500"), "{}", over.text);
 
     let result = server.call(
-        "session_end",
-        json!({"project": project.path(), "session_id": "never-started"}),
+        "session",
+        json!({"project": project.path(), "action": "end", "session_id": "never-started"}),
     );
-    let snapshot = failure(&result, "session_end");
+    let snapshot = failure(&result, "session");
     assert_eq!(snapshot.block["error"]["code"], "E_NOT_FOUND");
     assert_eq!(
         snapshot.block["error"]["remedy"],
-        json!({"tool": "session_start", "arguments": {
-            "project": project.path(), "session_id": "never-started"
+        json!({"tool": "session", "arguments": {
+            "project": project.path(), "action": "start", "session_id": "never-started"
         }})
     );
-    assert!(snapshot.text.contains("session_start"), "{}", snapshot.text);
+    assert!(snapshot.text.contains("action start"), "{}", snapshot.text);
 
-    // An unknown feature is a negative answer, not a failure: the tool keeps
-    // `found: false` so callers check the flag rather than an error code.
+    // An unknown feature is a negative answer, not a failure: the retired
+    // alias keeps `found: false` so callers check the flag rather than an
+    // error code.
     let result = server.call(
         "feature_bundle",
         json!({"project": project.path(), "feature_id": "absent"}),

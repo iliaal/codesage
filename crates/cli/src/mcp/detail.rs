@@ -19,16 +19,12 @@ pub(super) const ROW_TOOLS: &[&str] = &[
     "trace_call_path",
     "from_trace",
     "impact_analysis",
-    "export_context",
+    "bundle",
     "find_coupling",
     "assess_risk",
-    "assess_risk_diff",
-    "assess_risk_batch",
     "recommend_tests",
-    "session_end",
-    "list_features",
-    "find_feature",
-    "feature_bundle",
+    "session",
+    "features",
 ];
 
 const MIN_BUDGET_TOKENS: usize = 256;
@@ -55,8 +51,9 @@ pub(super) struct Options {
 
 pub(super) fn default_detail(tool: &str) -> Detail {
     match tool {
-        "find_references" | "impact_analysis" | "list_dependencies" | "list_features"
-        | "find_feature" | "describe" => Detail::Compact,
+        "find_references" | "impact_analysis" | "list_dependencies" | "features" | "describe" => {
+            Detail::Compact
+        }
         _ => Detail::Standard,
     }
 }
@@ -74,7 +71,7 @@ impl Options {
             ),
         };
         let alias = match tool {
-            "assess_risk" | "assess_risk_diff" | "assess_risk_batch" => arguments
+            "assess_risk" => arguments
                 .get("verbose")
                 .filter(|value| !value.is_null())
                 .map(|value| {
@@ -147,7 +144,7 @@ pub(super) fn prepare(tool: &str, arguments: &mut Map<String, Value>) -> Result<
         arguments.remove("detail");
     }
     match tool {
-        "assess_risk" | "assess_risk_diff" | "assess_risk_batch" => {
+        "assess_risk" => {
             arguments.insert("verbose".into(), json!(options.detail == Detail::Full));
         }
         "impact_analysis" => {
@@ -819,8 +816,7 @@ mod tests {
     fn aliases_have_deterministic_matching_and_conflicts() {
         for (tool, alias, enabled, detail) in [
             ("assess_risk", "verbose", true, "full"),
-            ("assess_risk_diff", "verbose", false, "standard"),
-            ("assess_risk_batch", "verbose", true, "full"),
+            ("assess_risk", "verbose", false, "standard"),
             ("impact_analysis", "summary_only", true, "compact"),
             ("impact_analysis", "summary_only", false, "standard"),
         ] {
@@ -847,10 +843,7 @@ mod tests {
     #[test]
     fn every_advertised_row_tool_has_validated_common_controls() {
         for tool in super::super::CodeSageServer::new().advertised_tools() {
-            if matches!(
-                tool.name.as_ref(),
-                "session_start" | "daemon_stats" | "help"
-            ) {
+            if matches!(tool.name.as_ref(), "daemon_stats" | "help") {
                 continue;
             }
             assert!(

@@ -278,24 +278,20 @@ fn structural_row_emitting_tools_carry_handles() {
         assert_handle(sibling, "handle", "sym:", "impact_analysis");
     }
 
-    let bundle = server.call(
-        &root,
-        "export_context",
-        json!({"target": "inner", "is_symbol": true}),
-    );
+    let bundle = server.call(&root, "bundle", json!({"target": "inner"}));
     assert_eq!(bundle["found"], true, "{bundle}");
-    for row in rows(&bundle, "primary", "export_context") {
-        assert_handle(row, "handle", "chunk:", "export_context");
+    for row in rows(&bundle, "primary", "bundle") {
+        assert_handle(row, "handle", "chunk:", "bundle");
     }
-    for definition in rows(&bundle, "symbol_definitions", "export_context") {
+    for definition in rows(&bundle, "symbol_definitions", "bundle") {
         assert_eq!(
-            assert_handle(definition, "handle", "sym:", "export_context"),
+            assert_handle(definition, "handle", "sym:", "bundle"),
             inner_handle
         );
     }
 
-    let features = server.call(&root, "list_features", json!({}));
-    let feature_id = rows(&features, "results", "list_features")[0]["feature_id"]
+    let features = server.call(&root, "features", json!({}));
+    let feature_id = rows(&features, "results", "features")[0]["feature_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -303,10 +299,10 @@ fn structural_row_emitting_tools_carry_handles() {
         matches!(Handle::parse(&feature_id), Some(Handle::Feature { .. })),
         "{feature_id}"
     );
-    let bundle = server.call(&root, "feature_bundle", json!({"feature_id": feature_id}));
+    let bundle = server.call(&root, "bundle", json!({"target": feature_id}));
     assert_eq!(bundle["found"], true, "{bundle}");
-    for row in rows(&bundle, "primary", "feature_bundle") {
-        assert_handle(row, "handle", "chunk:", "feature_bundle");
+    for row in rows(&bundle, "primary", "bundle feature") {
+        assert_handle(row, "handle", "chunk:", "bundle feature");
     }
 
     // File-shaped rows carry `file:` handles.
@@ -343,13 +339,14 @@ fn structural_row_emitting_tools_carry_handles() {
     let risk = server.call(
         &root,
         "assess_risk",
-        json!({"file_path": "src/helper.rs", "verbose": true}),
+        json!({"targets": ["src/helper.rs"], "verbose": true}),
     );
+    let risk = &rows(&risk, "files", "assess_risk")[0];
     assert_eq!(
-        assert_handle(&risk, "handle", "file:", "assess_risk"),
+        assert_handle(risk, "handle", "file:", "assess_risk"),
         "file:src/helper.rs"
     );
-    for row in rows(&risk, "top_coupled", "assess_risk") {
+    for row in rows(risk, "top_coupled", "assess_risk") {
         assert_handle(row, "handle", "file:", "assess_risk top_coupled");
     }
 
@@ -402,16 +399,16 @@ fn structural_row_emitting_tools_carry_handles() {
         .collect();
     let diff = server.call(
         &root,
-        "assess_risk_diff",
-        json!({"file_paths": cluster_files}),
+        "assess_risk",
+        json!({"targets": cluster_files, "aggregate": true}),
     );
-    for cluster in rows(&diff, "clustered_directories", "assess_risk_diff") {
+    for cluster in rows(&diff, "clustered_directories", "assess_risk aggregate") {
         assert_eq!(
-            assert_handle(cluster, "handle", "dir:", "assess_risk_diff"),
+            assert_handle(cluster, "handle", "dir:", "assess_risk aggregate"),
             format!("dir:{}", cluster["directory"].as_str().unwrap())
         );
-        for row in rows(cluster, "top_files", "assess_risk_diff cluster") {
-            assert_handle(row, "handle", "file:", "assess_risk_diff top_files");
+        for row in rows(cluster, "top_files", "assess_risk aggregate cluster") {
+            assert_handle(row, "handle", "file:", "assess_risk aggregate top_files");
         }
     }
 }

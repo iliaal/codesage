@@ -420,7 +420,7 @@ const PATH_KEYS: &[&str] = &[
     "primary",
     "new_cycles",
     "resolved_cycles",
-    // Entrypoint rows (`project_overview`, `list_features`, `find_feature`) and
+    // Entrypoint rows (`project_overview`, `features`) and
     // the changed file a reachable test resolves to carry no handle.
     "entry_path",
     "via",
@@ -1376,7 +1376,7 @@ mod tests {
         let items: Vec<Value> = (0..20)
             .map(|i| json!({"i": i, "blob": fat_string(500)}))
             .collect();
-        let out = cap_to_budget_with(Value::Array(items), "feature_bundle", 4000);
+        let out = cap_to_budget_with(Value::Array(items), "bundle", 4000);
         let obj = out.as_object().expect("wrapped as object");
         assert_eq!(obj["_meta"]["truncated"], json!(true));
         assert_eq!(obj["_meta"]["approx_tokens_budget"], json!(1000));
@@ -1433,7 +1433,7 @@ mod tests {
             "primary": [{"file_path": "a.rs", "content": "small"}],
             "related": related,
         });
-        let out = cap_to_budget_with(v, "export_context", MCP_BUDGET_CHARS);
+        let out = cap_to_budget_with(v, "bundle", MCP_BUDGET_CHARS);
         let obj = out.as_object().expect("still an object");
         assert_eq!(
             obj["primary"].as_array().unwrap().len(),
@@ -1467,7 +1467,7 @@ mod tests {
             "summary_notes": notes,
             "max_score": 0.9,
         });
-        let out = cap_to_budget_with(v, "assess_risk_diff", MCP_BUDGET_CHARS);
+        let out = cap_to_budget_with(v, "assess_risk", MCP_BUDGET_CHARS);
         let obj = out.as_object().expect("still an object");
         assert_eq!(
             obj["files"].as_array().unwrap().len(),
@@ -1484,7 +1484,7 @@ mod tests {
             .map(|i| json!({"file": format!("src/f{i}.rs"), "blob": fat_string(1000)}))
             .collect();
         let v = json!({ "files": files, "max_score": 0.9 });
-        let out = cap_to_budget_with(v, "assess_risk_diff", MCP_BUDGET_CHARS);
+        let out = cap_to_budget_with(v, "assess_risk", MCP_BUDGET_CHARS);
         let obj = out.as_object().expect("still an object");
         let meta = &obj["_meta"];
         assert_eq!(meta["truncated"], json!(true));
@@ -1504,7 +1504,7 @@ mod tests {
     fn cap_counts_dropped_elements_without_identifiers() {
         let files: Vec<Value> = (0..40).map(|_| json!({"blob": fat_string(1000)})).collect();
         let v = json!({ "files": files });
-        let out = cap_to_budget_with(v, "assess_risk_diff", MCP_BUDGET_CHARS);
+        let out = cap_to_budget_with(v, "assess_risk", MCP_BUDGET_CHARS);
         let obj = out.as_object().expect("still an object");
         let meta = &obj["_meta"];
         assert_eq!(meta["truncated"], json!(true));
@@ -1526,7 +1526,7 @@ mod tests {
             "removed_files": big(300, "src/old"),
             "pass": true,
         });
-        let out = cap_to_budget_with(v, "session_end", MCP_BUDGET_CHARS);
+        let out = cap_to_budget_with(v, "session", MCP_BUDGET_CHARS);
         let serialized = serde_json::to_string(&out).unwrap();
         // Allow fixed JSON envelope overhead, not overshoot that scales with untrimmed arrays.
         assert!(
@@ -1565,7 +1565,7 @@ mod tests {
             .collect();
         let notes: Vec<Value> = (0..20).map(|i| json!(format!("note {i}"))).collect();
         let v = json!({ "files": files, "summary_notes": notes, "max_score": 0.9 });
-        let out = cap_to_budget_with(v, "assess_risk_diff", MCP_BUDGET_CHARS);
+        let out = cap_to_budget_with(v, "assess_risk", MCP_BUDGET_CHARS);
         let obj = out.as_object().expect("still an object");
         assert_eq!(obj["files"].as_array().unwrap().len(), 40);
         assert!(
@@ -1581,7 +1581,7 @@ mod tests {
             .map(|i| json!({"i": i, "blob": fat_string(1000)}))
             .collect();
         let v = json!({ "target_description": "t", "related": related });
-        let out = cap_to_budget_with(v, "export_context", MCP_BUDGET_CHARS);
+        let out = cap_to_budget_with(v, "bundle", MCP_BUDGET_CHARS);
         let meta = &out.as_object().unwrap()["_meta"];
         assert_eq!(meta["field"], json!("related"));
         assert!(meta.get("also_truncated_fields").is_none());
@@ -1600,7 +1600,7 @@ mod tests {
             }],
             "_legend": { "T": "no direct test file" },
         });
-        let out = cap_to_budget_with(v, "assess_risk_batch", MCP_BUDGET_CHARS);
+        let out = cap_to_budget_with(v, "assess_risk", MCP_BUDGET_CHARS);
         let obj = out.as_object().expect("still an object");
         let files = obj["files"].as_array().expect("files array");
         assert_eq!(files.len(), 1, "the single risk entry must survive");
@@ -1759,7 +1759,7 @@ mod tests {
             }],
             "_legend": {},
         });
-        let out = cap_to_budget_with(v.clone(), "assess_risk_batch", MCP_BUDGET_CHARS);
+        let out = cap_to_budget_with(v.clone(), "assess_risk", MCP_BUDGET_CHARS);
         assert_eq!(
             serde_json::to_string(&out).unwrap(),
             serde_json::to_string(&v).unwrap()

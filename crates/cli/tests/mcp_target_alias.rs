@@ -191,10 +191,10 @@ fn target_names_the_entity_across_symbol_and_file_tools() {
     // file the definition lives in.
     let risk = server.ok(
         "assess_risk",
-        json!({"project": project.path(), "target": handle}),
+        json!({"project": project.path(), "targets": [handle]}),
     );
-    assert_eq!(risk["file"], "src/search.rs", "{risk}");
-    assert_eq!(risk["handle"], "file:src/search.rs", "{risk}");
+    assert_eq!(risk["files"][0]["file"], "src/search.rs", "{risk}");
+    assert_eq!(risk["files"][0]["handle"], "file:src/search.rs", "{risk}");
 
     // `file:` handle, `path:line`, and a `./`-prefixed path are the same file.
     for target in [
@@ -215,7 +215,10 @@ fn target_names_the_entity_across_symbol_and_file_tools() {
         "assess_risk",
         json!({"project": project.path(), "file_path": "src/search.rs"}),
     );
-    assert_eq!(legacy["file"], risk["file"], "{legacy}");
+    assert_eq!(
+        legacy["files"][0]["file"], risk["files"][0]["file"],
+        "{legacy}"
+    );
 
     // A file set takes `targets`, resolving each entry the same way.
     let tests = server.ok(
@@ -257,12 +260,15 @@ fn a_file_the_working_tree_holds_is_answered_for_rather_than_refused() {
         "assess_risk",
         json!({"project": project.path(), "target": "lib.rs"}),
     );
-    assert_eq!(risk["file"], "lib.rs", "the file asked about: {risk}");
     assert_eq!(
-        risk["unscored"], true,
+        risk["files"][0]["file"], "lib.rs",
+        "the file asked about: {risk}"
+    );
+    assert_eq!(
+        risk["files"][0]["unscored"], true,
         "a new file is unscored, not a miss: {risk}"
     );
-    assert_eq!(risk["found"], false, "{risk}");
+    assert_eq!(risk["files"][0]["found"], false, "{risk}");
 
     // The same tool still refuses a spelling nothing on disk carries, with
     // the indexed files it might have meant.
@@ -296,10 +302,16 @@ fn a_path_spelled_with_dot_segments_or_doubled_separators_names_the_indexed_file
             "assess_risk",
             json!({"project": project.path(), "target": target}),
         );
-        assert_eq!(risk["file"], "src/search.rs", "{target}: {risk}");
-        assert_eq!(risk["handle"], "file:src/search.rs", "{target}: {risk}");
         assert_eq!(
-            risk["found"], true,
+            risk["files"][0]["file"], "src/search.rs",
+            "{target}: {risk}"
+        );
+        assert_eq!(
+            risk["files"][0]["handle"], "file:src/search.rs",
+            "{target}: {risk}"
+        );
+        assert_eq!(
+            risk["files"][0]["found"], true,
             "{target} names an indexed file: {risk}"
         );
 
@@ -321,8 +333,8 @@ fn a_path_spelled_with_dot_segments_or_doubled_separators_names_the_indexed_file
         "assess_risk",
         json!({"project": project.path(), "target": "src/../src/search.rs"}),
     );
-    assert_eq!(risk["file"], "src/../src/search.rs", "{risk}");
-    assert_eq!(risk["found"], false, "{risk}");
+    assert_eq!(risk["files"][0]["file"], "src/../src/search.rs", "{risk}");
+    assert_eq!(risk["files"][0]["found"], false, "{risk}");
 }
 
 #[test]
@@ -412,7 +424,7 @@ fn a_legacy_argument_and_target_that_disagree_are_a_parameter_error() {
             "target": "src/search.rs"
         }),
     );
-    assert_eq!(risk["file"], "src/search.rs", "{risk}");
+    assert_eq!(risk["files"][0]["file"], "src/search.rs", "{risk}");
 
     // Neither is a parameter error naming the preferred spelling.
     let result = server.call("assess_risk", json!({"project": project.path()}));
@@ -421,7 +433,7 @@ fn a_legacy_argument_and_target_that_disagree_are_a_parameter_error() {
     assert!(
         block["error"]["message"]
             .as_str()
-            .is_some_and(|m| m.contains("`target`")),
+            .is_some_and(|m| m.contains("`targets`")),
         "{block}"
     );
 }

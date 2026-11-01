@@ -245,7 +245,9 @@ fn assert_followups(server: &mut Server, tools: &BTreeMap<String, Value>, first:
                 );
                 if key == "project" {
                     assert!(Path::new(value.as_str().unwrap()).is_absolute());
-                } else if key == "session_id" && tool == "session_start" {
+                } else if key == "action" && tool == "session" {
+                    assert_eq!(value, "start", "only a fresh baseline is suggested");
+                } else if key == "session_id" && tool == "session" {
                     let id = value.as_str().unwrap();
                     assert!(id.starts_with("next-") && id.len() < 128);
                     assert!(
@@ -510,8 +512,8 @@ fn clustered_risk_evidence_emits_an_executable_next() {
         .collect();
     let result = server.call(
         project.path(),
-        "assess_risk_diff",
-        json!({"file_paths": paths}),
+        "assess_risk",
+        json!({"targets": paths, "aggregate": true}),
     );
     let payload = &result["structuredContent"];
     assert_eq!(payload["files"], json!([]));
@@ -541,7 +543,7 @@ fn every_advertised_tool_emits_executable_evidence_derived_terminating_next() {
         .iter()
         .map(|tool| (tool["name"].as_str().unwrap().to_owned(), tool.clone()))
         .collect();
-    let features = server.call(project.path(), "list_features", json!({}));
+    let features = server.call(project.path(), "features", json!({}));
     let feature_id = features["structuredContent"]["results"][0]["feature_id"].clone();
     assert!(feature_id.is_string());
     let mut calls = vec![
@@ -568,26 +570,22 @@ fn every_advertised_tool_emits_executable_evidence_derived_terminating_next() {
             true,
         ),
         ("impact_analysis", json!({"target":"inner"}), true),
-        (
-            "export_context",
-            json!({"target":"outer", "is_symbol":true}),
-            false,
-        ),
+        ("bundle", json!({"target":"outer"}), false),
         (
             "edit_check",
             json!({"file_path":"src/helper.rs", "symbol_name":"inner", "replacement":"pub fn inner() -> u32 { 8 }"}),
             false,
         ),
         ("find_coupling", json!({"file_path":"src/helper.rs"}), true),
-        ("assess_risk", json!({"file_path":"src/helper.rs"}), true),
+        ("assess_risk", json!({"targets":["src/helper.rs"]}), true),
         (
-            "assess_risk_batch",
-            json!({"file_paths":["src/helper.rs"]}),
+            "assess_risk",
+            json!({"targets":["src/helper.rs", "src/lib.rs"]}),
             true,
         ),
         (
-            "assess_risk_diff",
-            json!({"file_paths":["src/helper.rs"]}),
+            "assess_risk",
+            json!({"targets":["src/helper.rs"], "aggregate": true}),
             true,
         ),
         (
@@ -600,11 +598,19 @@ fn every_advertised_tool_emits_executable_evidence_derived_terminating_next() {
             json!({"file_paths":["src/lib.rs"]}),
             true,
         ),
-        ("list_features", json!({}), true),
-        ("find_feature", json!({"file_path":"src/helper.rs"}), true),
-        ("feature_bundle", json!({"feature_id":feature_id}), false),
-        ("session_start", json!({"session_id":"next-test"}), false),
-        ("session_end", json!({"session_id":"next-test"}), true),
+        ("features", json!({}), true),
+        ("features", json!({"target":"src/helper.rs"}), true),
+        ("bundle", json!({"target":feature_id}), false),
+        (
+            "session",
+            json!({"action":"start", "session_id":"next-test"}),
+            false,
+        ),
+        (
+            "session",
+            json!({"action":"end", "session_id":"next-test"}),
+            true,
+        ),
     ];
     if tools.contains_key("help") {
         calls.push(("help", json!({}), false));
@@ -616,7 +622,7 @@ fn every_advertised_tool_emits_executable_evidence_derived_terminating_next() {
         "new tools need a next contract test"
     );
     for (tool, arguments, expected_next) in calls {
-        if tool == "session_end" {
+        if tool == "session" && arguments["action"] == "end" {
             std::fs::write(
                 project.path().join("src/new_file.rs"),
                 "pub fn added() {}\n",
@@ -661,7 +667,8 @@ fn every_advertised_tool_emits_executable_evidence_derived_terminating_next() {
         ("find_symbol", json!({"name":"does_not_exist_anywhere"})),
         ("find_references", json!({"name":"does_not_exist_anywhere"})),
         ("list_dependencies", json!({"file_path":"absent.rs"})),
-        ("find_feature", json!({"file_path":"absent.rs"})),
+        ("features", json!({"target":"absent.rs"})),
+        // The retired alias keeps its feature lookup: a miss is found:false.
         ("feature_bundle", json!({"feature_id":"absent"})),
         ("search", json!({"query":"inner", "limit":0})),
         ("from_trace", json!({"trace":"at external.py:42"})),
@@ -788,28 +795,32 @@ fn high_risk_session_advice_preserves_existing_baselines() {
         .unwrap();
     drop(db);
     let mut server = Server::start();
-    let baseline = server.call(project.path(), "session_start", json!({}));
+    let baseline = server.call(project.path(), "session", json!({"action":"start"}));
     assert_eq!(baseline["structuredContent"]["next"], json!([]));
     let baseline_path = project.path().join(".codesage/sessions/default.json");
     let saved = std::fs::read(&baseline_path).unwrap();
     let risk = server.call(
         project.path(),
         "assess_risk",
-        json!({"target":"file:src/helper.rs"}),
+        json!({"targets":["file:src/helper.rs"]}),
     );
     assert!(
-        risk["structuredContent"]["score"].as_f64().unwrap() >= 0.5,
+        risk["structuredContent"]["files"][0]["score"]
+            .as_f64()
+            .unwrap()
+            >= 0.5,
         "{risk}"
     );
     let start = risk["structuredContent"]["next"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["tool"] == "session_start")
+        .find(|entry| entry["tool"] == "session")
         .unwrap();
+    assert_eq!(start["arguments"]["action"], "start", "{start}");
     let fresh = server.request(
         "tools/call",
-        json!({"name":"session_start","arguments":start["arguments"]}),
+        json!({"name":"session","arguments":start["arguments"]}),
     );
     assert_ne!(fresh["isError"], true, "{fresh}");
     assert_eq!(fresh["structuredContent"]["next"], json!([]));
@@ -908,7 +919,7 @@ fn ambiguous_errors_preserve_remedies_and_offer_executable_candidates() {
         .collect();
     for (tool, arguments) in [
         ("impact_analysis", json!({"target":"run"})),
-        ("export_context", json!({"target":"run", "is_symbol":true})),
+        ("bundle", json!({"target":"run"})),
         (
             "edit_check",
             json!({"file_path":"src/budget.rs", "symbol_name":"budget_symbol", "replacement":"pub fn budget_symbol() {}"}),

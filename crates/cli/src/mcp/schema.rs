@@ -60,7 +60,71 @@ fn strip_nonstandard_schema_formats(value: &mut serde_json::Value) {
 
 /// Tools that write inside the project tree (`.codesage/sessions/<id>.json`)
 /// and therefore must not advertise `readOnlyHint: true`.
-const NON_READONLY_TOOLS: &[&str] = &["session_start", "session_end"];
+const NON_READONLY_TOOLS: &[&str] = &["session"];
+
+/// Output schema of a tool whose argument selects one of two result shapes.
+/// MCP requires an object root, so the shapes merge: properties are the
+/// union (a property both declare with different shapes becomes `anyOf`;
+/// the first description wins when only the prose differs), `required`
+/// keeps only what both require, and definitions are pooled.
+pub(super) fn either_output_schema<A, B>() -> Arc<rmcp::model::JsonObject>
+where
+    A: rmcp::schemars::JsonSchema + std::any::Any,
+    B: rmcp::schemars::JsonSchema + std::any::Any,
+{
+    use serde_json::Value;
+    let first = rmcp::handler::server::tool::schema_for_type::<A>();
+    let second = rmcp::handler::server::tool::schema_for_type::<B>();
+    let mut merged = (*first).clone();
+    merged.remove("title");
+    let properties = merged
+        .entry("properties")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let (Value::Object(properties), Some(Value::Object(others))) =
+        (properties, second.get("properties"))
+    {
+        let without_description = |value: &Value| {
+            let mut value = value.clone();
+            if let Some(object) = value.as_object_mut() {
+                object.remove("description");
+            }
+            value
+        };
+        for (name, other) in others {
+            match properties.get_mut(name) {
+                Some(existing) if without_description(existing) != without_description(other) => {
+                    *existing = serde_json::json!({"anyOf": [existing.clone(), other.clone()]});
+                }
+                Some(_) => {}
+                None => {
+                    properties.insert(name.clone(), other.clone());
+                }
+            }
+        }
+    }
+    let required_by_second: Vec<&Value> = second
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|required| required.iter().collect())
+        .unwrap_or_default();
+    if let Some(Value::Array(required)) = merged.get_mut("required") {
+        required.retain(|name| required_by_second.contains(&name));
+    }
+    for key in ["$defs", "definitions"] {
+        if let Some(Value::Object(others)) = second.get(key)
+            && let Value::Object(definitions) = merged
+                .entry(key)
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        {
+            for (name, definition) in others {
+                definitions
+                    .entry(name.clone())
+                    .or_insert_with(|| definition.clone());
+            }
+        }
+    }
+    Arc::new(merged)
+}
 
 /// Optional render-layer annotations shared by all output schemas.
 pub(super) fn meta_property_schema() -> serde_json::Value {
@@ -88,7 +152,7 @@ pub(super) fn meta_property_schema() -> serde_json::Value {
             "returned": { "type": "integer", "minimum": 0, "description": "element count kept" },
             "approx_tokens_budget": { "type": "integer", "minimum": 0, "description": "approximate token budget applied" },
             "hint": { "type": "string", "description": "suggested next step (refine query, narrow scope, paginate via offset)" },
-            "dropped_files": { "type": "array", "items": { "type": "string" }, "description": "identifiers of elements trimmed from a protected array (e.g. assess_risk_diff `files`)" },
+            "dropped_files": { "type": "array", "items": { "type": "string" }, "description": "identifiers of elements trimmed from a protected array (e.g. assess_risk `files`)" },
             "dropped_count": { "type": "integer", "minimum": 0, "description": "trimmed protected-array elements that had no identifier" },
             "clamps": { "type": "array", "items": { "type": "object", "properties": { "param": { "type": "string" }, "requested": {}, "applied": {} } }, "description": "numeric params adjusted from requested to applied (over-max limits capped, min_jaccard clamped to [0, 1])" },
             "stale_files": { "type": "array", "items": { "type": "string" }, "description": "referenced files that changed on disk since indexing" },
@@ -336,9 +400,10 @@ mod tests {
     }
 
     /// One target grammar means one argument name for it. Every tool that
-    /// names an entity advertises `target` (or `targets` for a file set),
-    /// states the grammar in its description, and keeps the legacy spelling
-    /// optional so the alias window is real on the wire.
+    /// names an entity advertises `target` (or `targets` for a file set) and
+    /// states the grammar in its description. Tools that survived the
+    /// surface consolidation unchanged keep their legacy spelling optional
+    /// and marked deprecated, so that alias window stays real on the wire.
     #[test]
     fn every_entity_naming_tool_advertises_target_and_deprecates_its_legacy_spelling() {
         let server = CodeSageServer::new();
@@ -358,17 +423,13 @@ mod tests {
             ("find_similar", "target", Some("name")),
             ("edit_check", "target", Some("symbol_name")),
             ("list_dependencies", "target", Some("file_path")),
-            ("find_feature", "target", Some("file_path")),
             ("find_coupling", "target", Some("file_path")),
-            ("assess_risk", "target", Some("file_path")),
-            ("feature_bundle", "target", Some("feature_id")),
-            ("assess_risk_batch", "targets", Some("file_paths")),
-            ("assess_risk_diff", "targets", Some("file_paths")),
             ("recommend_tests", "targets", Some("file_paths")),
             ("review_rehearsal", "targets", Some("file_paths")),
             // Already spelled `target`; nothing to alias.
             ("impact_analysis", "target", None),
-            ("export_context", "target", None),
+            ("assess_risk", "targets", None),
+            ("bundle", "target", None),
         ];
         for (tool, argument, legacy) in aliased {
             let schema = input(tool);
@@ -384,7 +445,7 @@ mod tests {
             let Some(legacy) = legacy else {
                 assert!(
                     required.iter().any(|r| r == argument),
-                    "`{tool}` has no alias, so `{argument}` stays required"
+                    "`{tool}` advertises no alias, so `{argument}` stays required"
                 );
                 continue;
             };
@@ -406,6 +467,19 @@ mod tests {
                 properties[legacy]["description"]
             );
         }
+        // `features` lists everything without a target, so its file scope
+        // stays optional.
+        let features = input("features");
+        assert!(
+            features["properties"]["target"]["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("handle"))
+        );
+        assert!(
+            !features["required"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|k| k == "target"))
+        );
         // `trace_call_path` needs both ends of a chain, so it has no single
         // target; each end takes the grammar instead.
         let trace = input("trace_call_path");
@@ -417,16 +491,21 @@ mod tests {
                 "`trace_call_path.{end}` must state the target grammar: {described}"
             );
         }
-        // The flags the grammar replaced are still accepted, and say so.
-        for (tool, flag) in [
+        // Spellings retired by the consolidation are accepted for one release
+        // (`crate::mcp::alias` and the params tests prove it) but no longer
+        // advertised: plan section 10 removes them from the surface.
+        for (tool, retired) in [
             ("impact_analysis", "is_file"),
-            ("export_context", "is_symbol"),
+            ("assess_risk", "target"),
+            ("assess_risk", "file_path"),
+            ("assess_risk", "file_paths"),
+            ("bundle", "feature_id"),
+            ("bundle", "is_symbol"),
+            ("features", "file_path"),
         ] {
-            let schema = input(tool);
-            let described = schema["properties"][flag]["description"].as_str().unwrap();
             assert!(
-                described.starts_with("DEPRECATED"),
-                "`{tool}.{flag}` must be advertised as deprecated: {described}"
+                input(tool)["properties"].get(retired).is_none(),
+                "`{tool}.{retired}` is retired and must not be advertised"
             );
         }
     }
@@ -521,7 +600,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("tool `{name}` missing"))
         };
 
-        let risk = schema("assess_risk");
+        // Every assess_risk shape carries per-file entries under `files`.
+        let risk_root = serde_json::Value::Object((*schema("assess_risk")).clone());
+        let risk = resolve(&risk_root, &risk_root["properties"]["files"]["items"]).clone();
         let required = risk["required"].as_array().expect("required array");
         for key in [
             "churn_score",
@@ -546,17 +627,15 @@ mod tests {
             );
         }
         assert!(
-            risk["properties"].get("verbose").is_none(),
+            risk["properties"].get("verbose").is_none()
+                && risk_root["properties"].get("verbose").is_none(),
             "the verbose switch is a request param, not a response field"
         );
-        for tool in ["assess_risk", "assess_risk_batch", "assess_risk_diff"] {
-            let input = input_schema(tool);
-            assert_eq!(
-                input["properties"]["verbose"]["type"],
-                json!(["boolean", "null"]),
-                "{tool} must accept an optional boolean `verbose`"
-            );
-        }
+        assert_eq!(
+            input_schema("assess_risk")["properties"]["verbose"]["type"],
+            json!(["boolean", "null"]),
+            "assess_risk must accept an optional boolean `verbose`"
+        );
 
         let search = schema("search");
         for key in ["confidence", "margin_pct", "cliff_at"] {
@@ -661,12 +740,7 @@ mod tests {
         let server = CodeSageServer::new();
         let mut tools = server.tool_router.list_all();
         finalize_tools_for_listing(&mut tools);
-        for name in [
-            "impact_analysis",
-            "export_context",
-            "feature_bundle",
-            "trace_call_path",
-        ] {
+        for name in ["impact_analysis", "bundle", "trace_call_path"] {
             let schema = tools
                 .iter()
                 .find(|tool| tool.name.as_ref() == name)
@@ -777,7 +851,10 @@ mod tests {
         let (_dir, db) = risk_fixture();
         let paths = ["Repository.php".to_string(), "New.php".to_string()];
 
-        let single = schema("assess_risk");
+        // One advertised schema covers both the per-file and the aggregate
+        // shape; each per-file entry is a RiskAssessment under `files[]`.
+        let risk = schema("assess_risk");
+        let single = resolve(&risk, &risk["properties"]["files"]["items"]).clone();
         for (path, expect_unscored) in [("Repository.php", false), ("New.php", true)] {
             for verbose in [false, true] {
                 let mut assessment = codesage_graph::assess_risk(&db, path).unwrap();
@@ -799,24 +876,24 @@ mod tests {
                     "{path}: `unscored` is emitted only when true: {response}"
                 );
                 assert_response_keys_described(
-                    &single,
+                    &risk,
                     &single,
                     &response,
-                    &format!("assess_risk({path}, verbose={verbose})"),
+                    &format!("assess_risk files[] ({path}, verbose={verbose})"),
                 );
             }
         }
 
-        let batch = schema("assess_risk_batch");
+        let batch = risk.clone();
         let batch_response =
             serde_json::to_value(codesage_graph::assess_risk_batch(&db, &paths).unwrap()).unwrap();
-        assert_response_keys_described(&batch, &batch, &batch_response, "assess_risk_batch");
+        assert_response_keys_described(&batch, &batch, &batch_response, "assess_risk per-file");
         let item_schema = batch["properties"]["files"]["items"].clone();
         for file in batch_response["files"].as_array().expect("files array") {
-            assert_response_keys_described(&batch, &item_schema, file, "assess_risk_batch.files[]");
+            assert_response_keys_described(&batch, &item_schema, file, "assess_risk files[]");
         }
 
-        let diff = schema("assess_risk_diff");
+        let diff = risk.clone();
         let diff_result = codesage_graph::assess_risk_diff(&db, &paths).unwrap();
         assert_eq!(diff_result.unscored_files, vec!["New.php".to_string()]);
         assert_eq!(diff_result.scored_file_count, 1);
@@ -827,14 +904,19 @@ mod tests {
                 "the mixed fixture must exercise `{key}`: {diff_response}"
             );
         }
-        assert_response_keys_described(&diff, &diff, &diff_response, "assess_risk_diff");
+        assert_response_keys_described(&diff, &diff, &diff_response, "assess_risk aggregate");
         let diff_item = diff["properties"]["files"]["items"].clone();
         for file in diff_response["files"].as_array().expect("files array") {
-            assert_response_keys_described(&diff, &diff_item, file, "assess_risk_diff.files[]");
+            assert_response_keys_described(
+                &diff,
+                &diff_item,
+                file,
+                "assess_risk aggregate files[]",
+            );
         }
 
         // Unmeasured state must not be verbose-gated away or made mandatory.
-        let risk_props = resolve(&single, &single)["properties"].clone();
+        let risk_props = single["properties"].clone();
         assert!(
             risk_props.get("unscored").is_some(),
             "assess_risk schema must describe `unscored`"
@@ -963,22 +1045,12 @@ mod tests {
 
         let search = schema("search");
         requires(&items(&search, &["results"]), "handle", "search");
-        let export = schema("export_context");
+        let bundle = schema("bundle");
+        requires(&items(&bundle, &["primary"]), "handle", "bundle primary");
         requires(
-            &items(&export, &["primary"]),
+            &items(&bundle, &["symbol_definitions"]),
             "handle",
-            "export_context primary",
-        );
-        requires(
-            &items(&export, &["symbol_definitions"]),
-            "handle",
-            "export_context symbol_definitions",
-        );
-        let feature = schema("feature_bundle");
-        requires(
-            &items(&feature, &["primary"]),
-            "handle",
-            "feature_bundle primary",
+            "bundle symbol_definitions",
         );
 
         let trace = schema("trace_call_path");
@@ -1023,22 +1095,14 @@ mod tests {
             "find_coupling coupled",
         );
         let risk = schema("assess_risk");
-        requires(&risk, "handle", "assess_risk");
-        declares(&items(&risk, &["top_coupled"]), "assess_risk top_coupled");
-        let diff = schema("assess_risk_diff");
-        requires(
-            &items(&diff, &["files"]),
-            "handle",
-            "assess_risk_diff files",
-        );
+        let risk_file = items(&risk, &["files"]);
+        requires(&risk_file, "handle", "assess_risk files");
+        let top_coupled = resolve(&risk, &risk_file["properties"]["top_coupled"]).clone();
+        let top_coupled = top_coupled.get("items").cloned().unwrap_or(top_coupled);
+        declares(resolve(&risk, &top_coupled), "assess_risk top_coupled");
         declares(
-            &items(&diff, &["clustered_directories"]),
-            "assess_risk_diff clustered_directories",
-        );
-        requires(
-            &items(&schema("assess_risk_batch"), &["files"]),
-            "handle",
-            "assess_risk_batch files",
+            &items(&risk, &["clustered_directories"]),
+            "assess_risk clustered_directories",
         );
         let tests = schema("recommend_tests");
         declares(&items(&tests, &["coupled"]), "recommend_tests coupled");
@@ -1063,7 +1127,7 @@ mod tests {
                 .annotations
                 .as_ref()
                 .unwrap_or_else(|| panic!("tool `{}` is missing annotations", tool.name));
-            let expect_read_only = !matches!(tool.name.as_ref(), "session_start" | "session_end");
+            let expect_read_only = tool.name != "session";
             assert_eq!(
                 ann.read_only_hint,
                 Some(expect_read_only),
@@ -1082,10 +1146,13 @@ mod tests {
                 writer_count += 1;
             }
         }
-        assert_eq!(writer_count, 2, "session_start + session_end are writers");
+        assert_eq!(
+            writer_count, 1,
+            "session (start persists a snapshot) is the only writer"
+        );
         assert_eq!(
             read_only_count,
-            tools.len() - 2,
+            tools.len() - 1,
             "everything else stays read-only"
         );
     }

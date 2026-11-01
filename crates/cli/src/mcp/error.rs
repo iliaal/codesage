@@ -846,7 +846,7 @@ mod tests {
         arguments.insert("project".into(), json!("/p"));
         arguments.insert("symbol".into(), json!("other"));
         let block = block(&render_error(
-            "export_context",
+            "bundle",
             Some(&arguments),
             &ambiguous_search(),
         ));

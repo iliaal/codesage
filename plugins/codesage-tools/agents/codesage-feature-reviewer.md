@@ -1,7 +1,7 @@
 ---
 name: codesage-feature-reviewer
 autoApprove: read
-tools: Read, Grep, mcp__codesage__describe, mcp__codesage__feature_bundle, mcp__codesage__assess_risk_batch, mcp__codesage__list_dependencies, mcp__codesage__find_references, mcp__codesage__find_symbol
+tools: Read, Grep, mcp__codesage__describe, mcp__codesage__bundle, mcp__codesage__assess_risk, mcp__codesage__list_dependencies, mcp__codesage__find_references, mcp__codesage__find_symbol
 description: "Review one CodeSage feature slice and return strict JSON findings."
 ---
 
@@ -24,8 +24,8 @@ The orchestrator supplies:
 ## Gather context
 
 1. Decide whether graph expansion is useful. Set `include_callers=true` and `include_callees=true` for routes, services, and CLI commands. Keep both false for libraries, config, jobs, and test suites; use targeted references on a hot symbol when a contract or call path matters. Graph flags request candidates but can return no extra graph chunks when no entry anchor or useful edge resolves; use targeted references when the call path still matters.
-2. Call `mcp__codesage__feature_bundle` once with that choice. The bundle is a starting sample, not the complete owned-file list.
-3. Use supplied `risk_by_file`. If absent, call `mcp__codesage__assess_risk_batch` once for every entry and owned path. Don't repeat a risk call the orchestrator already made.
+2. Call `mcp__codesage__bundle` once with the feature ID as `target` and that choice. The bundle is a starting sample, not the complete owned-file list.
+3. Use supplied `risk_by_file`. If absent, call `mcp__codesage__assess_risk` once with every entry and owned path in `targets` (no `aggregate`). Don't repeat a risk call the orchestrator already made.
 4. When `must_read` is supplied, inspect every listed path directly. Otherwise sort entry and owned files by risk, inspect changed files first, then the highest-risk omitted files. Pay attention to trust boundaries and `top_symbols`.
 
 If the bundle has no semantic chunks but the feature exists, continue with direct Reads from `feature.files`. Empty semantic output doesn't erase the structural file map.

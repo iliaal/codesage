@@ -397,12 +397,12 @@ fn detail_aliases_full_snippets_budgets_and_errors_work_over_stdio() {
     for (alias, args, detail) in [
         (
             "assess_risk",
-            json!({"target":"src/lib.rs","verbose":true}),
+            json!({"targets":["src/lib.rs"],"verbose":true}),
             "full",
         ),
         (
             "assess_risk",
-            json!({"target":"src/lib.rs","detail":"full"}),
+            json!({"targets":["src/lib.rs"],"detail":"full"}),
             "full",
         ),
         (
@@ -419,8 +419,9 @@ fn detail_aliases_full_snippets_budgets_and_errors_work_over_stdio() {
         let result = server.call(root.path(), alias, args);
         assert_eq!(result["cost"]["detail"], detail);
         if alias == "assess_risk" {
-            assert!(result.get("churn_score").is_some(), "{result}");
-            assert!(result.get("top_coupled").is_some(), "{result}");
+            let file = &result["files"][0];
+            assert!(file.get("churn_score").is_some(), "{result}");
+            assert!(file.get("top_coupled").is_some(), "{result}");
         }
     }
     let budget = server.call(

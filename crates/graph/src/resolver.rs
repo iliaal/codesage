@@ -2,8 +2,8 @@
 //!
 //! [`resolve_target`] takes the string a caller wrote and says what it names.
 //! The grammar is tried in one fixed order, so the same string means the same
-//! thing to `find_symbol`, `impact_analysis`, `trace_call_path`,
-//! `export_context`, and `feature_bundle`:
+//! thing to `find_symbol`, `impact_analysis`, `trace_call_path`, and
+//! `bundle`:
 //!
 //! 1. a handle: `sym:path#qualified[@line]`, `file:path`, `dir:path`,
 //!    `chunk:path:start-end`, `feat_<hex16>`

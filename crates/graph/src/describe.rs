@@ -352,7 +352,7 @@ impl Builder<'_> {
             budget,
             |b| b.dependencies(path),
         )?;
-        self.section("features", self.expansion("find_feature", json!({"target": file})), budget, |b| {
+        self.section("features", self.expansion("features", json!({"target": file})), budget, |b| {
             let features = b.db.features_for_file(path)?;
             Ok(json!({"total": features.len(), "top": features.iter().take(row_limit(b.options.detail)).map(|f| &f.feature_id).collect::<Vec<_>>()}))
         })?;
@@ -368,7 +368,7 @@ impl Builder<'_> {
         )?;
         self.section(
             "boundaries",
-            self.expansion("assess_risk", json!({"target": file})),
+            self.expansion("assess_risk", json!({"targets": [file]})),
             budget,
             |b| Ok(json!(b.db.trust_boundaries_for_file_path(path)?)),
         )?;
@@ -377,7 +377,7 @@ impl Builder<'_> {
         })?;
         self.section(
             "risk",
-            self.expansion("assess_risk", json!({"target": file})),
+            self.expansion("assess_risk", json!({"targets": [file]})),
             self.options.risk_budget,
             |b| b.risk(&[path.to_string()], false),
         )?;
@@ -611,7 +611,7 @@ impl Builder<'_> {
             callers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             Ok(json!({"by_kind": counts.into_iter().map(|(k, [product, test])| (k, json!({"product": product, "test": test}))).collect::<BTreeMap<_, _>>(), "callers_total": callers.len(), "callers": callers.iter().take(row_limit(b.options.detail)).map(|(h, _)| h).collect::<Vec<_>>(), "counts_floor": true}))
         })?;
-        self.section("callees", self.expansion("export_context", json!({"target": handle, "include_callees": true})), budget, |b| {
+        self.section("callees", self.expansion("bundle", json!({"target": handle, "include_callees": true})), budget, |b| {
             let refs = b.db.references_in_file_range(&symbol.file_path, symbol.line_start, symbol.line_end)?;
             let mut callees = BTreeSet::new();
             for reference in refs.iter().filter(|r| r.kind == ReferenceKind::Call && r.from_symbol.as_deref() == Some(symbol.qualified_name.as_str())) {
@@ -635,7 +635,7 @@ impl Builder<'_> {
             }
             Ok(json!({"top": top, "counts_floor": true, "name_union": seeds.iter().any(|seed| !is_target(seed)), "target_seeded": seeds.iter().any(is_target), "seed_scope": "bare_name", "seed_total": seeds.len(), "seeds": seed_definitions}))
         })?;
-        self.section("features", self.expansion("find_feature", json!({"target": handle})), budget, |b| {
+        self.section("features", self.expansion("features", json!({"target": handle})), budget, |b| {
             let features = b.db.features_for_file(&symbol.file_path)?;
             Ok(json!({"total": features.len(), "top": features.iter().take(row_limit(b.options.detail)).map(|f| &f.feature_id).collect::<Vec<_>>()}))
         })?;
@@ -647,7 +647,7 @@ impl Builder<'_> {
             let rank = 1 + symbols.iter().filter(|s| counts.get(&s.name).copied().unwrap_or(0) > fan_in).count();
             Ok(json!({"rank_in_file": rank, "symbols": symbols.len(), "fan_in": fan_in, "counts_floor": true}))
         })?;
-        self.section("cycles", self.expansion("assess_risk", json!({"target": Handle::file(&symbol.file_path).map(|h| h.to_string())})), budget, |b| {
+        self.section("cycles", self.expansion("assess_risk", json!({"targets": Handle::file(&symbol.file_path).map(|h| vec![h.to_string()])})), budget, |b| {
             let cycles = crate::git_history::ImportCycles::load(b.db)?;
             let component = cycles.components.iter().find(|c| c.contains(&symbol.file_path));
             Ok(json!({"scope": "file_imports", "member": component.is_some(), "size": component.map_or(0, Vec::len), "files": component.map(|c| file_handles(c, row_limit(b.options.detail))).unwrap_or_default()}))
@@ -675,7 +675,7 @@ impl Builder<'_> {
         owned.dedup();
         self.section(
             "identity",
-            self.expansion("feature_bundle", json!({"target": feature.feature_id})),
+            self.expansion("bundle", json!({"target": feature.feature_id})),
             budget,
             |b| {
                 let mut record = serde_json::to_value(feature)?;
@@ -691,7 +691,7 @@ impl Builder<'_> {
                 Ok(record)
             },
         )?;
-        self.section("tests", self.expansion("feature_bundle", json!({"target": feature.feature_id})), budget, |b| {
+        self.section("tests", self.expansion("bundle", json!({"target": feature.feature_id})), budget, |b| {
             let mapped = feature.files.iter().filter(|f| f.role == FeatureFileRole::Test).map(|f| f.path.clone()).collect::<Vec<_>>();
             let command = if feature.test_command.is_some() { feature.test_command.clone() } else {
                 let path = owned.iter().find(|path| b.root.join(path).is_file()).cloned();
@@ -701,7 +701,7 @@ impl Builder<'_> {
         })?;
         self.section(
             "boundaries",
-            self.expansion("feature_bundle", json!({"target": feature.feature_id})),
+            self.expansion("bundle", json!({"target": feature.feature_id})),
             budget,
             |_| Ok(json!(feature.trust_boundaries)),
         )?;
@@ -1674,7 +1674,10 @@ mod tests {
         let incomplete = risk.completeness.as_ref().unwrap();
         assert_eq!(incomplete.reason, "section_deadline");
         assert_eq!(incomplete.recover.tool, "assess_risk");
-        assert_eq!(incomplete.recover.arguments["target"], "file:src/helper.rs");
+        assert_eq!(
+            incomplete.recover.arguments["targets"],
+            json!(["file:src/helper.rs"])
+        );
         let cancelled = WorkControl::new(None);
         let _scope = cancelled.enter();
         cancelled.cancel(StopReason::ClientCancelled);

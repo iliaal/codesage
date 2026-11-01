@@ -24,18 +24,13 @@ fn tool_name(value: &str) -> &'static str {
         "trace_call_path" => "trace_call_path",
         "from_trace" => "from_trace",
         "impact_analysis" => "impact_analysis",
-        "export_context" => "export_context",
+        "bundle" => "bundle",
         "find_coupling" => "find_coupling",
         "assess_risk" => "assess_risk",
-        "assess_risk_batch" => "assess_risk_batch",
-        "assess_risk_diff" => "assess_risk_diff",
         "recommend_tests" => "recommend_tests",
         "review_rehearsal" => "review_rehearsal",
-        "session_start" => "session_start",
-        "session_end" => "session_end",
-        "list_features" => "list_features",
-        "find_feature" => "find_feature",
-        "feature_bundle" => "feature_bundle",
+        "session" => "session",
+        "features" => "features",
         "edit_check" => "edit_check",
         "embed_texts" => "embed_texts",
         "rerank_pairs" => "rerank_pairs",
@@ -646,7 +641,7 @@ mod tests {
     #[test]
     fn disabled_diagnostics_preserve_physical_state_and_persistence() {
         let diagnostics = Diagnostics::new(false);
-        let request = diagnostics.begin_request("session_start", Some("/project"));
+        let request = diagnostics.begin_request("session", Some("/project"));
         let execution = Arc::new(diagnostics.begin_execution("overview_ranking", Some("/project")));
         request.link_execution_ticket(&execution);
         request.set_phase("shared_wait");
@@ -747,7 +742,7 @@ mod tests {
     #[test]
     fn committed_persistence_remains_visible_after_cancellation() {
         let diagnostics = Diagnostics::default();
-        let request = diagnostics.begin_request("session_start", None);
+        let request = diagnostics.begin_request("session", None);
         request.mark_persisted();
         request.finish("cancelled");
         assert!(request.persistence_committed());
@@ -760,7 +755,7 @@ mod tests {
     #[test]
     fn late_persistence_updates_completed_record_and_retention_bytes() {
         let diagnostics = Diagnostics::default();
-        let request = diagnostics.begin_request("session_start", None);
+        let request = diagnostics.begin_request("session", None);
         request.finish("cancelled");
         let previous = diagnostics.snapshot(1)["retention"]["completed_payload_bytes"]
             .as_u64()
