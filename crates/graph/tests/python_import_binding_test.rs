@@ -2889,3 +2889,72 @@ fn python_self_import_getter_membership_keeps_captured_values_and_actual_loads()
         }
     }
 }
+
+#[test]
+fn script_absolute_imports_bind_sibling_modules_outside_packages() {
+    for source in [
+        "import sib\ndef entry():\n    return sib.helper(1)\n",
+        "from sib import helper\ndef entry():\n    return helper(1)\n",
+    ] {
+        let (_root, db) = project(&[
+            ("scripts/run.py", source),
+            ("scripts/sib.py", "def helper(x):\n    return x\n"),
+            ("other/sib.py", "def helper(x):\n    return 0\n"),
+        ]);
+        assert!(trace(&db, "entry", "sym:scripts/sib.py#helper"), "{source}");
+        assert!(!trace(&db, "entry", "sym:other/sib.py#helper"), "{source}");
+        assert!(
+            list_dependencies(&db, "scripts/sib.py")
+                .unwrap()
+                .imported_by
+                .contains(&"scripts/run.py".into()),
+            "{source}"
+        );
+        let pairs = file_import_pairs(&db).unwrap();
+        assert!(
+            pairs
+                .eager
+                .contains(&("scripts/run.py".into(), "scripts/sib.py".into())),
+            "{source}: {pairs:?}"
+        );
+    }
+}
+
+#[test]
+fn script_directory_fallback_skips_packages_stdlib_names_and_the_importer() {
+    let (_root, db) = project(&[
+        ("pkg/__init__.py", ""),
+        (
+            "pkg/views.py",
+            "from html import escape\nfrom helper import run\ndef render():\n    escape('x')\n    run()\n",
+        ),
+        ("pkg/html.py", "def escape(x):\n    return x\n"),
+        ("pkg/helper.py", "def run():\n    return 1\n"),
+        (
+            "scripts/tool.py",
+            "import json\nimport tool\ndef main():\n    json.dumps(1)\n    tool.main()\n",
+        ),
+        ("scripts/json.py", "def dumps(x):\n    return x\n"),
+    ]);
+    assert!(!trace(&db, "render", "sym:pkg/html.py#escape"));
+    assert!(!trace(&db, "render", "sym:pkg/helper.py#run"));
+    assert!(!trace(&db, "main", "sym:scripts/json.py#dumps"));
+    for target in ["pkg/html.py", "pkg/helper.py", "scripts/json.py"] {
+        assert!(
+            list_dependencies(&db, target)
+                .unwrap()
+                .imported_by
+                .is_empty(),
+            "{target}"
+        );
+    }
+    let pairs = file_import_pairs(&db).unwrap();
+    assert!(
+        !pairs
+            .eager
+            .iter()
+            .chain(pairs.lazy_only.iter())
+            .any(|(from, to)| from == "scripts/tool.py" || to == "pkg/html.py"),
+        "{pairs:?}"
+    );
+}
