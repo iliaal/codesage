@@ -598,3 +598,35 @@ fn many_references_with_commented_conditions_stay_fast_and_exact() {
         "took {elapsed:?}"
     );
 }
+
+/// A blanked condition whose call sits on a `\` continuation line stays
+/// indexed.
+#[test]
+fn call_on_a_continuation_line_of_a_blanked_condition_stays_indexed() {
+    let source = "void scatter(int t)
+{
+    if (t == 1) {
+        constant(t);
+#if !SMALL && \\
+    BIG(flat)
+    } else if (t == 2) {
+        flat(t);
+#endif
+    } else {
+        generic(t);
+    }
+}
+";
+    for (language, path) in [(Language::C, "s.c"), (Language::Cpp, "s.cpp")] {
+        assert_eq!(
+            calls(source, language, path),
+            [
+                ("constant".to_string(), 4),
+                ("BIG".to_string(), 6),
+                ("flat".to_string(), 8),
+                ("generic".to_string(), 11),
+            ],
+            "{language:?}"
+        );
+    }
+}

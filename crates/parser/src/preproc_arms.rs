@@ -151,7 +151,10 @@ pub(crate) fn blanked_conditions(source: &[u8], dead: &DeadRegions) -> Option<Ve
 fn has_blanked_call_condition_line(source: &[u8], dead: &DeadRegions) -> bool {
     let mut i = 0;
     while i < source.len() {
-        let line_end = memchr_newline(source, i);
+        let mut line_end = memchr_newline(source, i);
+        while line_end < source.len() && continues_line(source, line_end) {
+            line_end = memchr_newline(source, line_end + 1);
+        }
         let hash = i + source[i..line_end]
             .iter()
             .take_while(|b| matches!(b, b' ' | b'\t'))
@@ -166,6 +169,16 @@ fn has_blanked_call_condition_line(source: &[u8], dead: &DeadRegions) -> bool {
         i = line_end + 1;
     }
     false
+}
+
+/// True when the newline at `nl` is escaped by a trailing `\\` (optionally
+/// followed by `\r`), so the directive continues on the next line.
+fn continues_line(source: &[u8], nl: usize) -> bool {
+    let mut end = nl;
+    if end > 0 && source[end - 1] == b'\r' {
+        end -= 1;
+    }
+    end > 0 && source[end - 1] == b'\\'
 }
 
 fn memchr_newline(source: &[u8], from: usize) -> usize {

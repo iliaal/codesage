@@ -23,7 +23,7 @@
 
 - Repository refreshes keep using the selected CodeSage executable when PATH contains a relative directory.
 - C and C++ functions whose loop, switch, or `else` header is split across `#if`/`#else` arms are indexed with their calls instead of being dropped; existing indexes re-extract on the next `codesage index`.
-- Python scripts outside a package resolve absolute imports of modules in their own directory; standard-library names, self-imports, and namespace-package directories stay unresolved.
+- Python scripts outside a package resolve absolute imports of modules in their own directory; standard-library names, self-imports, and directories an indexed import names as a package stay unresolved.
 
 ### Security
 
