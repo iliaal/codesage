@@ -873,7 +873,35 @@ impl Database {
         module: &str,
     ) -> Result<Option<codesage_protocol::python::PythonModule>> {
         let files = self.all_file_paths()?.into_iter().collect();
-        Ok(codesage_protocol::python::load_module(module, from, &files))
+        codesage_protocol::python::load_module(module, from, &files, |directory| {
+            self.python_directory_imported_as_package(directory)
+        })
+    }
+
+    /// Whether an indexed Python import names `directory` as a package: an
+    /// absolute import of its dotted name or a module below it, or a relative
+    /// import from a file directly inside it.
+    pub fn python_directory_imported_as_package(&self, directory: &str) -> Result<bool> {
+        let mut absolute = self.conn.prepare_cached(
+            "SELECT 1 FROM refs r JOIN files f ON f.id = r.from_file_id
+             WHERE f.language = 'python' AND r.kind = 'import'
+               AND (r.to_name = ?1 OR (r.to_name >= ?1 || '.' AND r.to_name < ?1 || '/'))
+             LIMIT 1",
+        )?;
+        for name in codesage_protocol::python::directory_module_names(directory) {
+            if absolute.exists([&name])? {
+                return Ok(true);
+            }
+        }
+        let mut relative = self.conn.prepare_cached(
+            "SELECT 1 FROM refs r JOIN files f ON f.id = r.from_file_id
+             WHERE f.language = 'python' AND r.kind = 'import'
+               AND r.to_name >= '.' AND r.to_name < '/'
+               AND f.path >= ?1 || '/' AND f.path < ?1 || '0'
+               AND instr(substr(f.path, length(?1) + 2), '/') = 0
+             LIMIT 1",
+        )?;
+        Ok(relative.exists([directory])?)
     }
 
     pub fn python_import_targets(&self, row: &Reference) -> Result<Vec<String>> {
@@ -1025,7 +1053,9 @@ impl Database {
             return Ok(None);
         };
         let Some(mut loaded) =
-            codesage_protocol::python::load_module(module, &row.from_file, indexed)
+            codesage_protocol::python::load_module(module, &row.from_file, indexed, |directory| {
+                self.python_directory_imported_as_package(directory)
+            })?
         else {
             return Ok(None);
         };
@@ -1071,7 +1101,8 @@ impl Database {
                         &format!("{module}{separator}{name}"),
                         &row.from_file,
                         indexed,
-                    ) {
+                        |directory| self.python_directory_imported_as_package(directory),
+                    )? {
                         loaded.loaded.extend(child.loaded);
                         loaded.module_keys.extend(child.module_keys);
                     }

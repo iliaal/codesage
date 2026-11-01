@@ -2958,3 +2958,37 @@ fn script_directory_fallback_skips_packages_stdlib_names_and_the_importer() {
         "{pairs:?}"
     );
 }
+
+#[test]
+fn namespace_package_directories_never_bind_third_party_imports_to_siblings() {
+    for (dir, evidence_path, evidence) in [
+        ("app/api", "main.py", "from app.api import client\n"),
+        ("app/api", "main.py", "import app.api.client\n"),
+        ("app/api", "main.py", "from app.api.client import fetch\n"),
+        ("src/app/api", "main.py", "from app.api import client\n"),
+        ("app/api", "app/api/views.py", "from .client import fetch\n"),
+        ("app/api", "app/api/views.py", "from . import client\n"),
+    ] {
+        let client = format!("{dir}/client.py");
+        let requests = format!("{dir}/requests.py");
+        let (_root, db) = project(&[
+            (
+                &client,
+                "import requests\ndef fetch():\n    return requests.get('x')\n",
+            ),
+            (&requests, "def get(x):\n    return x\n"),
+            (evidence_path, evidence),
+        ]);
+        assert!(
+            !list_dependencies(&db, &requests)
+                .unwrap()
+                .imported_by
+                .contains(&client),
+            "{dir}: {evidence}"
+        );
+        assert!(
+            !trace(&db, "fetch", &format!("sym:{requests}#get")),
+            "{dir}: {evidence}"
+        );
+    }
+}

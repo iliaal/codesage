@@ -1,5 +1,6 @@
-// Union of `sys.stdlib_module_names` from CPython 3.10 through 3.13, plus the
-// top-level modules CPython 3.14 adds. Sorted bytewise for `binary_search`.
+// Union of `sys.stdlib_module_names` from CPython 3.10.12, 3.11.18, 3.12.16, and
+// 3.13.11 with `Python/stdlib_module_names.h` at CPython v3.14.0. Sorted bytewise
+// for `binary_search`.
 pub(crate) const STDLIB_MODULES: &[&str] = &[
     "__future__",
     "_abc",
@@ -7,6 +8,7 @@ pub(crate) const STDLIB_MODULES: &[&str] = &[
     "_android_support",
     "_apple_support",
     "_ast",
+    "_ast_unparse",
     "_asyncio",
     "_bisect",
     "_blake2",
@@ -40,6 +42,7 @@ pub(crate) const STDLIB_MODULES: &[&str] = &[
     "_gdbm",
     "_hashlib",
     "_heapq",
+    "_hmac",
     "_imp",
     "_interpchannels",
     "_interpqueues",
@@ -64,6 +67,7 @@ pub(crate) const STDLIB_MODULES: &[&str] = &[
     "_posixshmem",
     "_posixsubprocess",
     "_py_abc",
+    "_py_warnings",
     "_pydatetime",
     "_pydecimal",
     "_pyio",
@@ -71,6 +75,7 @@ pub(crate) const STDLIB_MODULES: &[&str] = &[
     "_pyrepl",
     "_queue",
     "_random",
+    "_remote_debugging",
     "_scproxy",
     "_sha1",
     "_sha2",
@@ -96,6 +101,7 @@ pub(crate) const STDLIB_MODULES: &[&str] = &[
     "_tkinter",
     "_tokenize",
     "_tracemalloc",
+    "_types",
     "_typing",
     "_uuid",
     "_warnings",
