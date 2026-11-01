@@ -463,10 +463,8 @@ pub fn preload_native_libs() {
             .chain(ort::ep::cuda::CUDNN_DYLIBS.iter())
             .copied()
             .collect();
-        let provider = selected_ort_dylib()
-            .and_then(Path::parent)
-            .map(|dir| dir.join(crate::cuda_preload::CUDA_PROVIDER_FILE));
-        let plan = crate::cuda_preload::plan(provider.as_deref(), &fallback);
+        let provider = crate::cuda_preload::provider_path(selected_ort_dylib());
+        let plan = crate::cuda_preload::plan(provider.as_deref(), &fallback, lib_dirs);
         if let crate::cuda_preload::PlanSource::Fallback(reason) = &plan.source {
             tracing::warn!(%reason, "CUDA provider dependencies not derived; preloading the static CUDA 12 list");
         }

@@ -35,9 +35,9 @@ const MAX_SONAME_LEN: u64 = 4096;
 const LOAD_ORDER: &[&str] = &[
     "libcudart.so",
     "libnvJitLink.so",
+    "libnvrtc.so",
     "libcublasLt.so",
     "libcublas.so",
-    "libnvrtc.so",
     "libcurand.so",
     "libcufft.so",
     "libcusparse.so",
@@ -101,12 +101,12 @@ pub(crate) fn elf_needed<R: ReadAt + ?Sized>(src: &R) -> Result<Vec<String>> {
     let phentsize = usize::from(u16_at(&ehdr, 0x36));
     let phnum = usize::from(u16_at(&ehdr, 0x38));
     ensure!(
-        phentsize >= PHDR_LEN,
-        "program header entry too small: {phentsize}"
+        phentsize == PHDR_LEN,
+        "unexpected ELF64 program header entry size: {phentsize}"
     );
     ensure!(phnum <= MAX_PHNUM, "too many program headers: {phnum}");
     let phdrs = src
-        .read_at(phoff, phentsize * phnum)
+        .read_at(phoff, PHDR_LEN * phnum)
         .context("reading program headers")?;
 
     let mut loads = Vec::new();
@@ -173,8 +173,11 @@ pub(crate) fn elf_needed<R: ReadAt + ?Sized>(src: &R) -> Result<Vec<String>> {
                 "DT_NEEDED string offset {name_off} outside string table of {strtab_len} bytes"
             );
             let window = (strtab_len - name_off).min(MAX_SONAME_LEN);
+            let name_pos = strtab_off
+                .checked_add(name_off)
+                .context("DT_NEEDED string file offset overflows")?;
             let bytes = src
-                .read_at(strtab_off + name_off, usize::try_from(window)?)
+                .read_at(name_pos, usize::try_from(window)?)
                 .context("reading DT_NEEDED string")?;
             let Some(nul) = bytes.iter().position(|&b| b == 0) else {
                 bail!("unterminated DT_NEEDED string at offset {name_off}");
@@ -271,9 +274,26 @@ pub(crate) struct PreloadPlan {
     pub(crate) sonames: Vec<String>,
 }
 
+/// The CUDA provider beside the ONNX Runtime library at `ort_dylib`. A bare
+/// soname or relative path has no trustworthy directory (it would resolve
+/// against the working directory, possibly an untrusted checkout), so it
+/// yields `None`.
+pub(crate) fn provider_path(ort_dylib: Option<&Path>) -> Option<PathBuf> {
+    let dir = ort_dylib?.parent()?;
+    dir.is_absolute().then(|| dir.join(CUDA_PROVIDER_FILE))
+}
+
 /// Sonames from `provider` when it parses and lists any CUDA library;
 /// otherwise `fallback`, with the reason recorded in the plan source.
-pub(crate) fn plan(provider: Option<&Path>, fallback: &[&str]) -> PreloadPlan {
+///
+/// A derived plan also gets `libnvrtc.so.<N>` for the provider's CUDA major
+/// when `lib_dirs` holds it: cuBLASLt `dlopen`s NVRTC by soname at run time,
+/// and its `$ORIGIN` RUNPATH does not reach pip's separate `cuda_nvrtc/lib`.
+pub(crate) fn plan(
+    provider: Option<&Path>,
+    fallback: &[&str],
+    lib_dirs: &[PathBuf],
+) -> PreloadPlan {
     let derived = match provider {
         None => Err("ONNX Runtime library location unknown".to_string()),
         Some(path) if !path.is_file() => Err(format!("{} not found", path.display())),
@@ -290,10 +310,20 @@ pub(crate) fn plan(provider: Option<&Path>, fallback: &[&str]) -> PreloadPlan {
         },
     };
     match derived {
-        Ok((path, sonames)) => PreloadPlan {
-            source: PlanSource::Provider(path),
-            sonames,
-        },
+        Ok((path, mut sonames)) => {
+            if let Some(major) = cuda_major(&sonames) {
+                let nvrtc = format!("libnvrtc.so.{major}");
+                if !sonames.contains(&nvrtc) && resolve_dir(&nvrtc, Some(major), lib_dirs).is_some()
+                {
+                    sonames.push(nvrtc);
+                    sonames.sort_by_key(|n| load_rank(n));
+                }
+            }
+            PreloadPlan {
+                source: PlanSource::Provider(path),
+                sonames,
+            }
+        }
         Err(reason) => PreloadPlan {
             source: PlanSource::Fallback(reason),
             sonames: fallback.iter().map(|s| (*s).to_string()).collect(),
@@ -423,6 +453,22 @@ mod tests {
         wild_phoff[0x20..0x28].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(elf_needed(wild_phoff.as_slice()).is_err());
 
+        let mut wild_load_offset = elf.clone();
+        let load_offset_at = 64 + 8;
+        wild_load_offset[load_offset_at..load_offset_at + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        let strtab_tag = wild_load_offset
+            .windows(8)
+            .position(|w| w == DT_STRTAB.to_le_bytes())
+            .unwrap();
+        wild_load_offset[strtab_tag + 8..strtab_tag + 16]
+            .copy_from_slice(&LOAD_VADDR.to_le_bytes());
+        assert!(elf_needed(wild_load_offset.as_slice()).is_err());
+
+        let mut wild_phentsize = elf.clone();
+        wild_phentsize[0x36..0x38].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(elf_needed(wild_phentsize.as_slice()).is_err());
+
         let mut wild_strtab = elf.clone();
         let strtab_tag = wild_strtab
             .windows(8)
@@ -438,7 +484,7 @@ mod tests {
         let provider = dir.path().join(CUDA_PROVIDER_FILE);
         std::fs::write(&provider, b"\x7fELF\x02\x01truncated").unwrap();
         let fallback = ["libcudart.so.12", "libcudnn.so.9"];
-        let p = plan(Some(&provider), &fallback);
+        let p = plan(Some(&provider), &fallback, &[]);
         assert!(
             matches!(p.source, PlanSource::Fallback(_)),
             "{:?}",
@@ -446,7 +492,7 @@ mod tests {
         );
         assert_eq!(p.sonames, fallback);
 
-        let missing = plan(Some(&dir.path().join("absent.so")), &fallback);
+        let missing = plan(Some(&dir.path().join("absent.so")), &fallback, &[]);
         assert!(matches!(missing.source, PlanSource::Fallback(_)));
         assert_eq!(missing.sonames, fallback);
     }
@@ -467,7 +513,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        let p = plan(Some(&provider), &["libcudart.so.12"]);
+        let p = plan(Some(&provider), &["libcudart.so.12"], &[]);
         assert_eq!(p.source, PlanSource::Provider(provider));
         assert_eq!(
             p.sonames,
@@ -521,5 +567,63 @@ mod tests {
             );
             assert_eq!(resolve_dir("libcublas.so.12", Some(12), dirs), None);
         }
+    }
+
+    #[test]
+    fn cu12_provider_plan_adds_nvrtc_only_when_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join(CUDA_PROVIDER_FILE);
+        std::fs::write(
+            &provider,
+            hand_built_elf(&["libcublasLt.so.12", "libcublas.so.12", "libcudart.so.12"]),
+        )
+        .unwrap();
+        let nvrtc_dir = dir.path().join("nvidia/cuda_nvrtc/lib");
+        touch(&nvrtc_dir.join("libnvrtc.so.12"));
+        touch(&dir.path().join("nvidia/cu13/lib/libnvrtc.so.13"));
+        let dirs = [nvrtc_dir, dir.path().join("nvidia/cu13/lib")];
+
+        let with = plan(Some(&provider), &[], &dirs);
+        assert_eq!(
+            with.sonames,
+            [
+                "libcudart.so.12",
+                "libnvrtc.so.12",
+                "libcublasLt.so.12",
+                "libcublas.so.12"
+            ]
+        );
+
+        let without = plan(Some(&provider), &[], &dirs[1..]);
+        assert_eq!(without.source, PlanSource::Provider(provider.clone()));
+        assert_eq!(
+            without.sonames,
+            ["libcudart.so.12", "libcublasLt.so.12", "libcublas.so.12"]
+        );
+    }
+
+    #[test]
+    fn bare_or_relative_ort_path_has_no_provider() {
+        assert_eq!(provider_path(None), None);
+        assert_eq!(provider_path(Some(Path::new("libonnxruntime.so.1"))), None);
+        assert_eq!(
+            provider_path(Some(Path::new("capi/libonnxruntime.so.1"))),
+            None
+        );
+        assert_eq!(
+            provider_path(Some(Path::new("/opt/ort/libonnxruntime.so.1"))),
+            Some(PathBuf::from("/opt/ort").join(CUDA_PROVIDER_FILE))
+        );
+        let p = plan(
+            provider_path(Some(Path::new("libonnxruntime.so.1"))).as_deref(),
+            &["libcudart.so.12"],
+            &[],
+        );
+        assert!(
+            matches!(p.source, PlanSource::Fallback(_)),
+            "{:?}",
+            p.source
+        );
+        assert_eq!(p.sonames, ["libcudart.so.12"]);
     }
 }
