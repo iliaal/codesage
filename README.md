@@ -551,7 +551,7 @@ Set `device = "cpu"` in `.codesage/config.toml`, then run `codesage index`. The 
 
 ## CUDA setup
 
-ONNX Runtime loads dynamically. CUDA libraries come from pip-installed `nvidia-*-cu12` packages. At first use, the binary discovers them via `CODESAGE_NVIDIA_LIBS`, Python `site-packages`, or standard system paths. `ORT_DYLIB_PATH` can override the ONNX Runtime library location.
+ONNX Runtime loads dynamically. CUDA libraries come from pip-installed `nvidia-*` packages matching the CUDA major of the installed `onnxruntime-gpu` (`nvidia-*-cu12` for 1.24); the binary preloads the CUDA libraries that ONNX Runtime's CUDA provider links against. At first use, the binary discovers them via `CODESAGE_NVIDIA_LIBS`, Python `site-packages`, or standard system paths. `ORT_DYLIB_PATH` can override the ONNX Runtime library location.
 
 Build with GPU support: `cargo build --release -p codesage --features cuda`. Set `device = "gpu"` in config. `codesage doctor` reports how many nvidia lib dirs were discovered.
 
