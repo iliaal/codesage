@@ -59,6 +59,12 @@ if [ -z "$codesage_bin" ]; then
 	exit 1
 fi
 
+# Keep relative PATH entries anchored to the caller before entering each repo.
+case "$codesage_bin" in
+/*) ;;
+*/*) codesage_bin="$PWD/$codesage_bin" ;;
+esac
+
 onboard_bin="$(dirname "$(readlink -f "$0")")/../plugins/codesage-tools/bin/codesage-onboard"
 if [ ! -x "$onboard_bin" ]; then
 	echo "error: $onboard_bin not executable; refresh-hint step will be skipped" >&2

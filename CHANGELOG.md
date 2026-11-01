@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- Repository refreshes keep using the selected CodeSage executable when PATH contains a relative directory.
+
 ## [0.46.0] - 2026-10-31
 
 ### Changed

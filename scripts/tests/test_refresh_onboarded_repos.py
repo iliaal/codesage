@@ -11,6 +11,53 @@ SCRIPT = Path(__file__).resolve().parents[1] / "refresh-onboarded-repos.sh"
 
 
 class RefreshOnboardedReposTests(unittest.TestCase):
+    def test_keeps_path_selected_binary_after_changing_directory(self):
+        for entry in ("tools", "./tools", "tools with spaces", ".", "", "absolute"):
+            with self.subTest(path_entry=entry), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                caller = root / "caller"
+                caller.mkdir()
+                home = root / "home"
+                project = home / "projects" / "target"
+                (project / ".codesage").mkdir(parents=True)
+                (project / ".git").mkdir()
+                copied = root / "checkout" / "scripts" / SCRIPT.name
+                copied.parent.mkdir(parents=True)
+                shutil.copyfile(SCRIPT, copied)
+                onboard = root / "checkout/plugins/codesage-tools/bin/codesage-onboard"
+                onboard.parent.mkdir(parents=True)
+                onboard.write_text("#!/bin/bash\nexit 0\n")
+                onboard.chmod(0o755)
+                relative = "tools" if entry == "absolute" else entry
+                tools = caller / relative
+                tools.mkdir(parents=True, exist_ok=True)
+                binary = tools / "codesage"
+                binary.write_text('''#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["CALL_LOG"], "a") as stream:
+    stream.write(json.dumps([os.getcwd(), sys.argv[1:]]) + "\\n")
+''')
+                binary.chmod(0o755)
+                # A target-local executable must never replace the selected one.
+                decoy = project / relative / "codesage"
+                decoy.parent.mkdir(parents=True, exist_ok=True)
+                decoy.write_text("#!/bin/bash\nexit 99\n")
+                decoy.chmod(0o755)
+                log = root / "calls.jsonl"
+                path_entry = str(tools) if entry == "absolute" else entry
+                result = subprocess.run(
+                    ["bash", str(copied), "--full", "--no-semantic"],
+                    cwd=caller, capture_output=True, text=True,
+                    env={**os.environ, "HOME": str(home), "CALL_LOG": str(log),
+                         "PATH": path_entry + os.pathsep + os.environ["PATH"]},
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                calls = [json.loads(line) for line in log.read_text().splitlines()]
+                self.assertEqual(calls, [
+                    [str(project), ["index", "--full", "--no-semantic"]],
+                    [str(project), ["install-hooks"]],
+                ])
+
     def test_refreshes_hooks_for_repositories_and_linked_worktrees_only(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
