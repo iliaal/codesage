@@ -9,8 +9,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 SCRIPT = Path(__file__).resolve().parents[2] / "bench/code-review-graph-bench-runner"
 
@@ -142,6 +143,76 @@ class CrgBenchResultsTests(unittest.TestCase):
         with contextlib.redirect_stderr(stderr):
             self.assertEqual(self.session.search("query", 10), [])
         self.assertIn("expected a successful response object", stderr.getvalue())
+
+    def pipe_session(self, data, repeat=False):
+        # Real pipes stay open after writing, so EOF cannot hide a blocked read.
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", """import sys, time
+payload = bytes.fromhex(sys.argv[1])
+if sys.argv[2] == 'repeat':
+    while True:
+        sys.stdout.buffer.write(payload)
+        sys.stdout.buffer.flush()
+        time.sleep(.01)
+else:
+    sys.stdout.buffer.write(payload)
+    sys.stdout.buffer.flush()
+    time.sleep(10)
+""", data.hex(), "repeat" if repeat else "once"], stdout=subprocess.PIPE)
+
+        def cleanup():
+            proc.terminate()
+            proc.wait(timeout=5)
+            proc.stdout.close()
+
+        self.addCleanup(cleanup)
+        session = object.__new__(self.runner.CrgMcpSession)
+        session._id = 1
+        session._proc = proc
+        return session
+
+    def test_live_pipe_null_id_error_returns_without_waiting_for_eof(self):
+        error = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse"}}
+        session = self.pipe_session((json.dumps(error) + "\n").encode())
+        self.assertEqual(session._recv(timeout=1), error)
+
+    def test_live_pipe_skips_matching_id_server_request(self):
+        request = {"id": 1, "method": "ping", "result": {"wrong": True}}
+        reply = {"id": 1, "result": {"correct": True}}
+        session = self.pipe_session((json.dumps(request) + "\n" + json.dumps(reply) + "\n").encode())
+        self.assertEqual(session._recv(timeout=1), reply)
+
+    def test_live_pipe_silence_and_partial_line_have_bounded_waits(self):
+        for data in (b"", b'{"id": 1'):
+            with self.subTest(data=data):
+                session = self.pipe_session(data)
+                start = time.monotonic()
+                with self.assertRaisesRegex(ValueError, "timed out waiting"):
+                    session._recv(timeout=.15)
+                self.assertLess(time.monotonic() - start, 2)
+
+    def test_live_pipe_notifications_do_not_restart_deadline(self):
+        session = self.pipe_session(b'{"method":"notifications/message"}\n', repeat=True)
+        start = time.monotonic()
+        with self.assertRaisesRegex(ValueError, "timed out waiting"):
+            session._recv(timeout=.15)
+        self.assertLess(time.monotonic() - start, 2)
+
+    def test_eof_remains_terminal_for_later_queries(self):
+        session = object.__new__(self.runner.CrgMcpSession)
+        session._id = 1
+        session._proc = Mock(stdout=io.BytesIO())
+        self.assertIsNone(session._recv(timeout=.15))
+        self.assertIsNone(session._recv(timeout=.15))
+
+    def test_initialization_failure_closes_process(self):
+        process = Mock(stdin=io.BytesIO())
+        with patch.object(self.runner.subprocess, "Popen", return_value=process), \
+                patch.object(self.runner.CrgMcpSession, "_recv", side_effect=ValueError("timed out")):
+            with self.assertRaisesRegex(ValueError, "timed out"):
+                self.runner.CrgMcpSession(Path.cwd())
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=5)
 
     def test_cli_continues_after_malformed_page_without_partial_hit(self):
         with tempfile.TemporaryDirectory() as directory:

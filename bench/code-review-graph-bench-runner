@@ -28,8 +28,10 @@ import argparse
 import datetime as _dt
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -51,20 +53,56 @@ class CrgMcpSession:
             cwd=str(cwd),
         )
         self._id = 0
-        self._init()
+        try:
+            self._init()
+        except BaseException:
+            self.close()
+            raise
 
     def _send(self, obj: dict) -> None:
         self._proc.stdin.write((json.dumps(obj) + "\n").encode())
         self._proc.stdin.flush()
 
-    def _recv(self) -> dict | None:
+    def _recv(self, timeout: float = 30) -> dict | None:
+        # A reader thread also bounds waits for a partial line, on every platform.
+        if not hasattr(self, "_replies"):
+            replies = self._replies = queue.Queue()
+            stdout = self._proc.stdout
+
+            def read():
+                try:
+                    for line in stdout:
+                        replies.put(line)
+                except (OSError, ValueError) as exc:
+                    replies.put(exc)
+                finally:
+                    replies.put(b"")
+
+            threading.Thread(target=read, daemon=True).start()
+        deadline = time.monotonic() + timeout
         while True:
-            line = self._proc.stdout.readline().decode()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("timed out waiting for CRG response")
+            try:
+                line = self._replies.get(timeout=remaining)
+            except queue.Empty:
+                raise ValueError("timed out waiting for CRG response") from None
+            if isinstance(line, Exception):
+                raise ValueError("failed to read CRG response") from line
+            line = line.decode()
             if not line:
+                self._replies.put(b"")
                 return None
             line = line.strip()
             if line.startswith("{"):
                 response = json.loads(line)
+                # Server requests/notifications are not replies, even with our ID.
+                if "method" in response:
+                    continue
+                # JSON-RPC permits null IDs for errors that cannot identify a request.
+                if response.get("id") is None and "error" in response:
+                    return response
                 if type(response.get("id")) in (int, float) and response["id"] == self._id:
                     return response
 
