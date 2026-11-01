@@ -119,6 +119,26 @@ class GuidanceTests(unittest.TestCase):
         self.assertEqual(first.count("<!-- codesage-onboard-hint-begin -->"), 1)
         self.assertIn("Routing skill path (JSON string)", first)
 
+    def test_ignored_agents_probe_does_not_execute_fsmonitor_command(self):
+        project = self.root / "monitored"
+        subprocess.run(["git", "init", "-q", str(project)], check=True)
+        (project / ".gitignore").write_text("AGENTS.md\n")
+        (project / "AGENTS.md").write_text("Notes\n")
+        hook = self.root / "fsmonitor"
+        marker = self.root / "hook-executed"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+        hook.chmod(0o755)
+        subprocess.run(["git", "-C", str(project), "config", "core.fsmonitor", str(hook)],
+                       check=True)
+        subprocess.run(["git", "-C", str(project), "check-ignore", "-q", "AGENTS.md"],
+                       check=True)
+        self.assertTrue(marker.exists())
+        marker.unlink()
+        self.onboard(PLUGIN, project)
+        self.assertIn("Routing skill path (JSON string)", (project / "AGENTS.md").read_text())
+        self.assertFalse((project / ".claude/CLAUDE.md").exists())
+        self.assertFalse(marker.exists())
+
     def test_emitted_refresh_workflow_uses_current_install_after_cache_path_changes(self):
         previous = self.installed_plugin()
         project = self.root / "project 'quoted' $(touch FORBIDDEN)\n"

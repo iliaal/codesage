@@ -1955,6 +1955,27 @@ class AcknowledgementTests(unittest.TestCase):
         self.assertEqual(len(document["findings"]), 2)
         self.assertEqual(summary["suppressed"], [])
 
+    def test_rename_lookup_does_not_execute_fsmonitor_command(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        monitor_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(monitor_dir.cleanup)
+        monitor = Path(monitor_dir.name)
+        hook = monitor / "fsmonitor"
+        marker = monitor / "hook-executed"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+        hook.chmod(0o755)
+        subprocess.run(["git", "-C", str(self.project), "config", "core.fsmonitor", str(hook)],
+                       check=True)
+        subprocess.run(["git", "-C", str(self.project), "ls-files", "--others",
+                        "--exclude-standard"], capture_output=True, check=True)
+        self.assertTrue(marker.exists())
+        marker.unlink()
+        self.source.rename(self.project / "new.rs")
+        document, summary = self.review(self.document, [{**self.candidate, "file": "new.rs"}])
+        self.assertEqual(document["findings"][0]["file"], "new.rs")
+        self.assertEqual(summary["suppressed"], [self.finding_id])
+        self.assertFalse(marker.exists())
+
     def test_foreign_ack_sweep_is_persisted_and_target_scoped(self):
         document, summary = self.review(self.document, [])
         self.assertEqual(summary["ack_sweep"], [{"finding_id": self.finding_id,
