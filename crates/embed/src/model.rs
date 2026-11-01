@@ -578,7 +578,6 @@ const ALLOWED_MODELS: &[&str] = &[
     "sentence-transformers/all-MiniLM-L6-v2",
     "cross-encoder/ms-marco-MiniLM-L6-v2",
     "jinaai/jina-embeddings-v2-base-code",
-    "nomic-ai/nomic-embed-text-v1.5",
 ];
 
 struct ModelPin {
@@ -655,16 +654,6 @@ const MODEL_PINS: &[ModelPin] = &[
         // of 611 tokens per 1500-byte chunk; data tables are dropped by the
         // chunker before they reach the cap.
         max_seq_length: 1024,
-    },
-    ModelPin {
-        model: "nomic-ai/nomic-embed-text-v1.5",
-        repo: "nomic-ai/nomic-embed-text-v1.5",
-        revision: "e9b6763023c676ca8431644204f50c2b100d9aab",
-        tokenizer_sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
-        onnx_sha256: "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965",
-        onnx_data_sha256: None,
-        cuda_onnx: None,
-        max_seq_length: MAX_SEQ_LENGTH,
     },
 ];
 
@@ -1321,7 +1310,7 @@ pub fn validate_model_allowed(model: &str, allow_any: bool) -> Result<()> {
 /// Where [`validate_model_allowed`] tells the user to opt their project in:
 /// the resolved allowlist path, or the `~` shorthand when no config home
 /// resolves (e.g. HOME-less environments) so the error still names the file.
-fn user_allowlist_display() -> String {
+pub fn user_allowlist_display() -> String {
     user_allowlist_path().map_or_else(
         || "~/.config/codesage/allowed-models".to_string(),
         |path| path.display().to_string(),
@@ -2227,6 +2216,20 @@ mod tests {
                 "{model} should be allowed"
             );
         }
+    }
+
+    #[test]
+    fn prefix_requiring_nomic_model_is_not_allowlisted_but_bypassable() {
+        let nomic = "nomic-ai/nomic-embed-text-v1.5";
+        assert!(!ALLOWED_MODELS.contains(&nomic));
+        assert!(model_pin(nomic).is_none());
+        let err = validate_model_allowed(nomic, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CODESAGE_ALLOW_ANY_MODEL=1"), "{err}");
+        assert!(validate_model_allowed(nomic, true).is_ok());
+        assert!(validate_model_allowed("jinaai/jina-embeddings-v2-base-code", false).is_ok());
+        assert!(validate_model_allowed("cross-encoder/ms-marco-MiniLM-L6-v2", false).is_ok());
     }
 
     #[test]

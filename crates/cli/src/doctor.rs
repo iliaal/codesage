@@ -300,8 +300,11 @@ fn check_models(project: Option<&Path>) -> Check {
             Status::Fail,
             format!(
                 "{} not on the validated-model allowlist; will ERROR at first load, not download. \
-                 Set CODESAGE_ALLOW_ANY_MODEL=1 to run a model you trust.",
-                disallowed.join(", ")
+                 Switch [embedding] to a validated model and reindex, or, to run a model you \
+                 trust, set CODESAGE_ALLOW_ANY_MODEL=1 AND list this project's canonical root \
+                 in {}.",
+                disallowed.join(", "),
+                codesage_embed::model::user_allowlist_display()
             ),
         );
     }
