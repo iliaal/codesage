@@ -26,11 +26,11 @@ held. Numeric evidence lives under `signals`:
 | `reranker_raw`, `reranker_normalized`, `reranker_weight` | Raw cross-encoder score, min-max normalization, and blend weight. Fusion normally skips reranking; the trace records that skip. |
 
 The remaining entries show known-symbol and declaration boosts, path penalties,
-file/directory saturation, and mention anchoring. Opt-in qualified-name, stem,
-version, and platform adjustments are recorded when applied. `stem_scan` identifies
-a definition admitted outside dense/BM25 candidates. `symbol_annotation` reports
-indexed symbols overlapping the chunk; feature ownership and graph risk do not
-contribute to search ranking.
+version demotion, file/directory saturation, and mention anchoring. Opt-in
+qualified-name, stem, and platform adjustments are recorded when applied.
+`stem_scan` identifies a definition admitted outside dense/BM25 candidates.
+`symbol_annotation` reports indexed symbols overlapping the chunk; feature
+ownership and graph risk do not contribute to search ranking.
 
 Repeated declaration matches are summarized in one `definition_boost` transition
 with their count and cumulative boost. MCP budgeting keeps each surviving trace
