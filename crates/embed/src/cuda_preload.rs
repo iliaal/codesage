@@ -138,7 +138,8 @@ pub(crate) fn elf_needed<R: ReadAt + ?Sized>(src: &R) -> Result<Vec<String>> {
     let mut needed = Vec::new();
     let mut strtab = None;
     let mut strsz = None;
-    for entry in dyn_bytes.chunks_exact(DYN_LEN) {
+    let (entries, _) = dyn_bytes.as_chunks::<DYN_LEN>();
+    for entry in entries {
         let tag = u64_at(entry, 0);
         let val = u64_at(entry, 8);
         match tag {

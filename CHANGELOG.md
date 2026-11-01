@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- 0.47.1 publishes the 0.47.0 changes as a GitHub Release; the v0.47.0 tag has none because its source failed the release workflow's Rust 1.99 clippy gate.
+
 ## [0.47.0] - 2026-11-01
 
 ### Added
