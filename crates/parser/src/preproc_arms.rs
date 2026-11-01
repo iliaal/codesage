@@ -112,28 +112,25 @@ fn has_conditional_directive(source: &[u8]) -> bool {
 /// blanked directive of the group is copied, so each condition parses in the
 /// same structure as in the original. A directive counts as blanked when the
 /// tree has no directive token where its `#` stands.
+///
+/// A raw line scan finds candidates cheaply; only directive tokens from the
+/// lexer are copied, so a `#if` line inside a comment, string, or raw string
+/// never becomes code.
 pub(crate) fn blanked_conditions(source: &[u8], dead: &DeadRegions) -> Option<Vec<u8>> {
+    if !has_blanked_call_condition_line(source, dead) {
+        return None;
+    }
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut calls = false;
-    let mut i = 0;
-    while i < source.len() {
-        let line_end = memchr_newline(source, i);
-        let hash = i + source[i..line_end]
-            .iter()
-            .take_while(|b| matches!(b, b' ' | b'\t'))
-            .count();
-        let mut end = line_end;
-        while end > i && end < source.len() && source[end - 1] == b'\\' {
-            end = memchr_newline(source, end + 1);
+    for token in Lexer::new(source) {
+        if token.kind != Kind::Directive || dead.has_directive_at(token.start) {
+            continue;
         }
-        if source.get(hash) == Some(&b'#') && !dead.has_directive_at(hash) {
-            let word = keyword(&source[hash..end]);
-            if directive(&source[hash..end]).is_some() {
-                spans.push((hash, end));
-                calls |= matches!(word, b"if" | b"elif") && source[hash..end].contains(&b'(');
-            }
+        let text = &source[token.start..token.end];
+        if directive(text).is_some() {
+            spans.push((token.start, token.end));
+            calls |= matches!(keyword(text), b"if" | b"elif") && text.contains(&b'(');
         }
-        i = end + 1;
     }
     if !calls {
         return None;
@@ -146,6 +143,29 @@ pub(crate) fn blanked_conditions(source: &[u8], dead: &DeadRegions) -> Option<Ve
         out[start..end].copy_from_slice(&source[start..end]);
     }
     Some(out)
+}
+
+/// A line that looks like `#if ...(` or `#elif ...(` with no directive token
+/// in the tree at its `#`. May match inside comments and strings; the lexer
+/// pass decides.
+fn has_blanked_call_condition_line(source: &[u8], dead: &DeadRegions) -> bool {
+    let mut i = 0;
+    while i < source.len() {
+        let line_end = memchr_newline(source, i);
+        let hash = i + source[i..line_end]
+            .iter()
+            .take_while(|b| matches!(b, b' ' | b'\t'))
+            .count();
+        if source.get(hash) == Some(&b'#')
+            && matches!(keyword(&source[hash..line_end]), b"if" | b"elif")
+            && source[hash..line_end].contains(&b'(')
+            && !dead.has_directive_at(hash)
+        {
+            return true;
+        }
+        i = line_end + 1;
+    }
+    false
 }
 
 fn memchr_newline(source: &[u8], from: usize) -> usize {

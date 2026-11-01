@@ -517,3 +517,84 @@ fn call_in_a_blanked_condition_stays_indexed() {
         );
     }
 }
+
+/// A `#if` line inside a comment, string, or raw string is not a directive:
+/// its calls never become references, whether or not a group was reduced.
+#[test]
+fn directive_lines_in_comments_and_strings_add_no_references() {
+    for (path, language, source, expected) in [
+        (
+            "cmt.c",
+            Language::C,
+            "/*\n#if defined(FOO) && phantom_cmt(x)\n*/\nint f(void) { return g(); }\n",
+            &[("g", 4)][..],
+        ),
+        (
+            "raw.cpp",
+            Language::Cpp,
+            "const char *k = R\"(\n#if raw_phantom(2)\n)\";\nint f() { return g(); }\n",
+            &[("g", 4)][..],
+        ),
+        (
+            "cmt2.c",
+            Language::C,
+            "void f(int n)\n{\n#ifdef X\n    for (;;) {\n#else\n    for (;n;) {\n#endif\n        c(n);\n    }\n}\n/* Example:\n#if HAVE(phantom_feature)\n    use();\n#endif\n*/\nstatic const char *s = \"abc\\\n#if bogus_str(1)\\\n\";\n",
+            &[("c", 8)][..],
+        ),
+    ] {
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|&(name, line)| (name.to_string(), line))
+            .collect();
+        assert_eq!(calls(source, language, path), expected, "{path}");
+    }
+}
+
+/// Merging condition references stays linear in the reference count, and a
+/// commented-out run of `#if` lines is never parsed as code.
+#[test]
+fn many_references_with_commented_conditions_stay_fast_and_exact() {
+    let n = 50_000;
+    let mut source = String::from(
+        "void f(int x)\n{\n#ifdef X\n    for (;;) {\n#else\n    for (;x;) {\n#endif\n",
+    );
+    for _ in 0..n {
+        source.push_str("a();\n");
+    }
+    source.push_str("    }\n}\n/*\n");
+    for _ in 0..n {
+        source.push_str("#if f(x)\n");
+    }
+    source.push_str("*/\n");
+    let started = std::time::Instant::now();
+    let found = calls(&source, Language::C, "dedupe.c");
+    let elapsed = started.elapsed();
+    assert_eq!(found.len(), n);
+    assert!(found.iter().all(|(name, _)| name == "a"));
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "took {elapsed:?}"
+    );
+
+    let groups = 2_000;
+    let mut source = String::from("void g(int x)\n{\n");
+    for _ in 0..n {
+        source.push_str("a();\n");
+    }
+    for _ in 0..groups {
+        source.push_str("    if (x) {\n        a();\n#if FEAT(x)\n    } else if (x) {\n        b();\n#endif\n    }\n");
+    }
+    source.push_str("}\n");
+    let started = std::time::Instant::now();
+    let found = calls(&source, Language::C, "merge.c");
+    let elapsed = started.elapsed();
+    let count = |name: &str| found.iter().filter(|(n, _)| n == name).count();
+    assert_eq!(
+        (count("a"), count("FEAT"), count("b")),
+        (n + groups, groups, groups)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "took {elapsed:?}"
+    );
+}

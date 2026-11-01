@@ -583,14 +583,18 @@ pub fn extract_references(
         let dead = crate::preproc::DeadRegions::scan(tree.root_node(), source, language);
         let extra = tree_references(&tree, source, language, file_path, &dead)?;
         let before = refs.len();
+        let existing: std::collections::HashSet<(u32, u32, ReferenceKind, String)> = refs
+            .iter()
+            .map(|r| (r.line, r.col, r.kind, r.to_name.clone()))
+            .collect();
         for reference in extra {
-            let duplicate = refs[..before].iter().any(|r| {
-                r.line == reference.line
-                    && r.col == reference.col
-                    && r.kind == reference.kind
-                    && r.to_name == reference.to_name
-            });
-            if !duplicate {
+            let key = (
+                reference.line,
+                reference.col,
+                reference.kind,
+                reference.to_name.clone(),
+            );
+            if !existing.contains(&key) {
                 refs.push(reference);
             }
         }
