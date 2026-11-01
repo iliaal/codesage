@@ -6,6 +6,7 @@ import io
 from pathlib import Path
 import runpy
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -50,10 +51,12 @@ class BenchmarkSearchWarningTests(unittest.TestCase):
                         child.communicate.side_effect = [subprocess.TimeoutExpired("codesage", 120),
                                                          ("partial-output", child_stderr)]
                     stderr = io.StringIO()
-                    with mock.patch("subprocess.Popen", return_value=child) as popen, contextlib.redirect_stderr(stderr):
+                    with (tempfile.TemporaryDirectory() as project,
+                          mock.patch("subprocess.Popen", return_value=child) as popen,
+                          contextlib.redirect_stderr(stderr)):
                         if status == "error":
                             popen.side_effect = OSError("broken\nprocess")
-                        output, error, runtime = runner["run_codesage_search"]("/codesage", ROOT, query, 10)
+                        output, error, runtime = runner["run_codesage_search"]("/codesage", Path(project), query, 10)
                     self.assertEqual(error, status)
                     self.assertEqual(output, "" if status == "error" else "partial-output")
                     self.assertEqual(stderr.getvalue(),
@@ -73,8 +76,9 @@ class BenchmarkSearchWarningTests(unittest.TestCase):
         child = mock.Mock(pid=42, returncode=0)
         child.communicate.return_value = ('[{"file_path":"target.py"}]', "embedding model loaded\n")
         stderr = io.StringIO()
-        with mock.patch("subprocess.Popen", return_value=child), contextlib.redirect_stderr(stderr):
-            output, error, _ = runner["run_codesage_search"]("/codesage", ROOT, "good", 10)
+        with (tempfile.TemporaryDirectory() as project, mock.patch("subprocess.Popen", return_value=child),
+              contextlib.redirect_stderr(stderr)):
+            output, error, _ = runner["run_codesage_search"]("/codesage", Path(project), "good", 10)
         self.assertEqual(output, '[{"file_path":"target.py"}]')
         self.assertIsNone(error)
         self.assertEqual(stderr.getvalue(), "")
