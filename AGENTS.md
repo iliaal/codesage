@@ -33,19 +33,23 @@ Run `bash scripts/sanity-check.sh` before `git push` when you've made code chang
 
 ## Search pipeline
 
-Query flows through these stages in order:
+The ranking stages run in this order. Eligibility and tuning flags can skip a
+stage; this is an overview, not a claim that every query uses every adjustment.
+The implementation is in [`search_page`](crates/graph/src/search.rs).
 
-1. **Embed query**: Jina embeddings v2 base-code (768d) via ONNX Runtime
-2. **KNN retrieval**: sqlite-vec, overfetch 5x when the reranker is active
-3. **BM25 fusion**: code-literal queries (backticks, `::`, glob patterns) merge BM25 candidates via RRF; fused scores are rescaled onto the semantic score span so downstream boosts can't swamp them
-4. **Symbol boost**: +0.1 per query token that matches a known symbol in the chunk, plus definition/qualified-name boosts, path penalties, and directory/file saturation (each env-toggleable)
-5. **Symbol annotation**: attach overlapping symbol names to each result
-6. **Cross-encoder rerank**: ms-marco-MiniLM-L6-v2, adaptive blend weight (0.35 identifier-shaped / 0.6 natural-language / 0.5 default); skipped when BM25 fusion already ran
-7. **Query-mention anchoring**: a path, dotted module, or `Type::method` named outright in the query lifts its matching rows onto a slot ladder directly under the top score (each anchored row ends at or above `top * 0.95^(slot+1)`; at most 5 rows, 4 files x 3 chunks, first page only). A path suffix that matches several indexed files anchors nothing. Inert when the query names nothing; disable with `CODESAGE_MENTION_ANCHOR=0`.
-8. **Truncate** to requested limit
-9. **Relevance-cliff disclosure**: the page reports `confidence` (`high` when the largest adjacent relative score drop rounds to ≥20%, else `low`), `margin_pct`, and `cliff_at`. Opt-in `adaptive_limit: true` (CLI `--adaptive-limit`) cuts the page at that drop when `confidence` is `high`; a flat page is returned in full. The cut is page-local, so it composes poorly with `offset` paging.
+1. **Embed and retrieve**: embed the query, then retrieve bounded dense candidates from sqlite-vec. Overfetch is 5× with a reranker, 3× without one when the query matches known symbols, otherwise 1×; language and path constraints apply to candidate selection.
+2. **Lexical fusion**: the default code-literal gate can add BM25 candidates via reciprocal-rank fusion, rescaled onto the dense score span. An empty lexical result does not count as fusion. `CODESAGE_HYBRID=always` / `never` override the gate.
+3. **Symbol and declaration adjustments**: boost known-symbol matches, optionally admit stem-scan candidates, then annotate overlapping indexed symbols. Qualified-name boosting (opt-in) and declaration boosting run after annotation.
+4. **Cross-encoder rerank**: when configured, blend cross-encoder and existing scores. Default weights are 0.35 for a single explicitly identifier-shaped token (such as `Foo`, `foo_bar`, or `Type::method`), 0.6 for the multiword natural-language heuristic, otherwise 0.5. Nonempty BM25 fusion normally skips this stage; `CODESAGE_FUSED_RERANK=1` enables it with weight 0.35. Ordinary reranker errors retain the prior ranking; a stopped request remains an error.
+5. **Post-rerank adjustments**: apply path penalties, version demotion, optional stem-match boosting, then file and directory saturation. These run after blending so the reranker does not dilute them.
+6. **Query-mention anchoring**: explicit paths, dotted modules, or `Type::method` mentions can lift matching candidates after saturation, on the first page only. The scan is limited to the first `limit × overfetch` candidates; an ambiguous path suffix is rejected only when it matches several files in that window. It does not fetch missing files or establish uniqueness across the whole index. Disable with `CODESAGE_MENTION_ANCHOR=0`.
+7. **Pagination**: apply `offset` and `limit` to the ranked candidates.
+8. **Relevance-cliff disclosure**: compute `confidence`, `margin_pct`, and `cliff_at` on that page. Opt-in `adaptive_limit` cuts at the largest adjacent relative score drop when it rounds to at least 20%; otherwise the page stays intact. This is score separation, not answer correctness.
 
-The reranker is optional (configured per-project in config.toml). Without it, the remaining stages still run.
+The reranker is optional. Without it, the other stages still run when eligible,
+with the smaller retrieval overfetch described above. For per-result score
+transitions and skipped-stage explanations, use `search --explain` (MCP
+`explain: true`); see [the diagnosis guide](bench/search-explain.md).
 
 ## Config
 
