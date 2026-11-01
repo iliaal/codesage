@@ -77,9 +77,6 @@ impl DeadRegions {
 /// Record the dead spans `node` itself establishes. Nested conditionals are
 /// reached by the caller's walk and merge into the enclosing span.
 fn collect_dead_spans(node: &Node, source: &[u8], out: &mut Vec<(usize, usize)>) {
-    if std::env::var_os("ZZ_MASK_OFF").is_some() {
-        return;
-    }
     let (own_group_dead, else_chain_dead) = match node.kind() {
         "preproc_if" => match literal_condition(node, source) {
             // `#if 0`: the if-group is skipped in every configuration. A
@@ -100,7 +97,7 @@ fn collect_dead_spans(node: &Node, source: &[u8], out: &mut Vec<(usize, usize)>)
         _ => return,
     };
 
-    if std::env::var_os("ZZ_GUARD_OFF").is_none() && !terminated_by_endif(node) {
+    if !terminated_by_endif(node) {
         return;
     }
 
@@ -283,49 +280,5 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn zz_corpus_dump() {
-        let Some(dir) = std::env::var_os("ZZ_CORPUS") else {
-            return;
-        };
-        let out = std::env::var("ZZ_OUT").unwrap();
-        let mut rows: Vec<String> = Vec::new();
-        let mut stack = vec![std::path::PathBuf::from(dir)];
-        let mut files = 0usize;
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d).unwrap() {
-                let path = e.unwrap().path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                let lang = match path.extension().and_then(|e| e.to_str()) {
-                    Some("c") => Language::C,
-                    Some("h" | "hpp" | "hh" | "hxx" | "cpp" | "cc" | "cxx") => Language::Cpp,
-                    _ => continue,
-                };
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
-                let Ok(tree) = parse_file(&bytes, lang) else {
-                    continue;
-                };
-                let rel = path.to_string_lossy().into_owned();
-                files += 1;
-                for s in crate::extract::extract_symbols(&tree, &bytes, lang, &rel).unwrap() {
-                    rows.push(format!(
-                        "S\t{rel}\t{}\t{:?}\t{}",
-                        s.line_start, s.kind, s.name
-                    ));
-                }
-                for r in crate::references::extract_references(&tree, &bytes, lang, &rel).unwrap() {
-                    rows.push(format!("R\t{rel}\t{}\t{:?}\t{}", r.line, r.kind, r.to_name));
-                }
-            }
-        }
-        rows.sort();
-        std::fs::write(&out, format!("# files={files}\n") + &rows.join("\n")).unwrap();
     }
 }
