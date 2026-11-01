@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use codesage_protocol::work::checkpoint;
 use codesage_protocol::{
-    RiskAssessment, SessionDiff, SessionRiskEntry, SessionRiskRegression, SessionSnapshot,
+    RiskAssessment, SessionActedOn, SessionDiff, SessionRiskEntry, SessionRiskRegression,
+    SessionSnapshot, SessionToolActedOn, SessionWorktree, SessionWorktreeChange,
 };
 use codesage_storage::Database;
 
@@ -256,6 +257,9 @@ pub fn build_session_snapshot_with_top_risk(
     let (cycles, lazy_edges) = compute_cycles(db).context("computing import cycles")?;
     let top_risk_files = ranking.rows.clone();
     let git_head = read_git_head(project_root);
+    let worktree = git_head
+        .as_deref()
+        .and_then(|head| worktree_changes(project_root, head));
 
     let snapshot = SessionSnapshot {
         session_id: session_id.to_string(),
@@ -268,6 +272,7 @@ pub fn build_session_snapshot_with_top_risk(
         lazy_edges,
         top_risk_files,
         git_head,
+        worktree,
     };
 
     checkpoint()?;
@@ -412,6 +417,15 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
 
     let now_unix = now_unix();
     let git_head_after = read_git_head(project_root);
+    checkpoint()?;
+    let acted_on = acted_on(
+        project_root,
+        db,
+        &snapshot,
+        &now_files_set,
+        &new_files,
+        &removed_files,
+    )?;
 
     Ok(SessionDiff {
         session_id: snapshot.session_id,
@@ -431,6 +445,287 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
         summary_notes,
         git_head_before: snapshot.git_head,
         git_head_after,
+        acted_on,
+    })
+}
+
+/// Bound the start-of-session change record on trees with mass changes.
+const MAX_WORKTREE_CHANGES: usize = 10_000;
+/// Bound the per-category path lists in `acted_on`.
+const MAX_ACTED_ON_FILES: usize = 50;
+
+/// Paths that differ from `base` in the working tree (tracked changes plus
+/// untracked, non-ignored files), relative to `project_root`. CodeSage's own
+/// state directory is excluded. `None` when Git cannot answer.
+fn changed_paths(project_root: &Path, base: &str) -> Option<Vec<String>> {
+    let tracked = crate::git_command(project_root)
+        .args([
+            "diff",
+            "--name-only",
+            "--relative",
+            "--no-renames",
+            "--ignore-submodules",
+            "-z",
+            base,
+            "--",
+        ])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let untracked = crate::git_command(project_root)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let mut paths: Vec<String> = tracked
+        .stdout
+        .split(|b| *b == 0)
+        .chain(untracked.stdout.split(|b| *b == 0))
+        .filter(|raw| !raw.is_empty())
+        .filter_map(|raw| String::from_utf8(raw.to_vec()).ok())
+        .filter(|path| !path.starts_with(".codesage/"))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Some(paths)
+}
+
+/// Git blob ids for the regular files among `paths`; deleted or non-regular
+/// paths map to `None`. One `git hash-object` child serves the whole batch.
+fn blob_ids(project_root: &Path, paths: &[String]) -> Option<HashMap<String, Option<String>>> {
+    use std::io::Write;
+    let mut out: HashMap<String, Option<String>> =
+        paths.iter().map(|path| (path.clone(), None)).collect();
+    let hashable: Vec<&String> = paths
+        .iter()
+        .filter(|path| !path.contains('\n'))
+        .filter(|path| {
+            std::fs::symlink_metadata(project_root.join(path)).is_ok_and(|meta| meta.is_file())
+        })
+        .collect();
+    if hashable.is_empty() {
+        return Some(out);
+    }
+    let mut child = crate::git_command(project_root)
+        .args(["hash-object", "--no-filters", "--stdin-paths"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut input = Vec::new();
+    for path in &hashable {
+        input.extend_from_slice(path.as_bytes());
+        input.push(b'\n');
+    }
+    let mut stdin = child.stdin.take()?;
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child.wait_with_output().ok()?;
+    writer.join().ok()?.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ids: Vec<&str> = std::str::from_utf8(&output.stdout).ok()?.lines().collect();
+    if ids.len() != hashable.len() {
+        return None;
+    }
+    for (path, id) in hashable.into_iter().zip(ids) {
+        out.insert(path.clone(), Some(id.to_string()));
+    }
+    Some(out)
+}
+
+fn worktree_changes(project_root: &Path, head: &str) -> Option<SessionWorktree> {
+    let mut paths = changed_paths(project_root, head)?;
+    let truncated = paths.len() > MAX_WORKTREE_CHANGES;
+    paths.truncate(MAX_WORKTREE_CHANGES);
+    let blobs = blob_ids(project_root, &paths)?;
+    Some(SessionWorktree {
+        changes: paths
+            .into_iter()
+            .map(|path| {
+                let blob = blobs.get(&path).cloned().flatten();
+                SessionWorktreeChange { path, blob }
+            })
+            .collect(),
+        truncated,
+    })
+}
+
+/// Files edited since the snapshot and how they were determined.
+fn edited_files(
+    project_root: &Path,
+    snapshot: &SessionSnapshot,
+    new_files: &[String],
+    removed_files: &[String],
+) -> (HashSet<String>, &'static str) {
+    let index_only = || {
+        (
+            new_files.iter().chain(removed_files).cloned().collect(),
+            "index",
+        )
+    };
+    let Some(head) = snapshot.git_head.as_deref() else {
+        return index_only();
+    };
+    let Some(now) = changed_paths(project_root, head) else {
+        return index_only();
+    };
+    let Some(start) = &snapshot.worktree else {
+        return (now.into_iter().collect(), "git_head");
+    };
+    let start: HashMap<&str, &Option<String>> = start
+        .changes
+        .iter()
+        .map(|change| (change.path.as_str(), &change.blob))
+        .collect();
+    let recheck: Vec<String> = now
+        .iter()
+        .filter(|path| start.contains_key(path.as_str()))
+        .cloned()
+        .collect();
+    let Some(blobs) = blob_ids(project_root, &recheck) else {
+        return (now.into_iter().collect(), "git_head");
+    };
+    let now_set: HashSet<&str> = now.iter().map(String::as_str).collect();
+    let mut edited: HashSet<String> = now
+        .iter()
+        .filter(|path| match start.get(path.as_str()) {
+            None => true,
+            Some(before) => blobs.get(*path) != Some(*before),
+        })
+        .cloned()
+        .collect();
+    edited.extend(
+        start
+            .keys()
+            .filter(|path| !now_set.contains(*path))
+            .map(|path| (*path).to_string()),
+    );
+    (edited, "worktree")
+}
+
+fn first_sorted(set: &HashSet<String>) -> Vec<String> {
+    let mut paths: Vec<String> = set.iter().cloned().collect();
+    paths.sort();
+    paths.truncate(MAX_ACTED_ON_FILES);
+    paths
+}
+
+fn acted_on(
+    project_root: &Path,
+    db: &Database,
+    snapshot: &SessionSnapshot,
+    now_files: &HashSet<&str>,
+    new_files: &[String],
+    removed_files: &[String],
+) -> Result<SessionActedOn> {
+    let enabled = crate::session_ledger::ledger_enabled();
+    let ledger = if enabled {
+        let since = u64::try_from(snapshot.created_at.max(0))
+            .unwrap_or(0)
+            .saturating_mul(1000);
+        match crate::session_ledger::read_session_ledger(project_root, &snapshot.session_id, since)
+        {
+            Ok(read) => read,
+            Err(err) => {
+                tracing::warn!(error = %err, "session ledger unreadable; reporting no calls");
+                Default::default()
+            }
+        }
+    } else {
+        Default::default()
+    };
+
+    let mut served: HashSet<String> = HashSet::new();
+    let mut recommended: HashSet<String> = HashSet::new();
+    let mut by_tool: std::collections::BTreeMap<String, (u32, HashSet<String>)> =
+        Default::default();
+    for call in &ledger.calls {
+        let entry = by_tool.entry(call.tool.clone()).or_default();
+        entry.0 = entry.0.saturating_add(1);
+        for handle in &call.target_handles {
+            let Some(path) = crate::session_ledger::handle_path(handle) else {
+                continue;
+            };
+            if call.tool == "recommend_tests" {
+                recommended.insert(path.clone());
+            }
+            served.insert(path.clone());
+            entry.1.insert(path);
+        }
+    }
+
+    let (edited, edited_source) = edited_files(project_root, snapshot, new_files, removed_files);
+    let snapshot_files: HashSet<&str> = snapshot.files.iter().map(String::as_str).collect();
+    let (edited_indexed, edited_unindexed): (HashSet<String>, HashSet<String>) =
+        edited.into_iter().partition(|path| {
+            now_files.contains(path.as_str()) || snapshot_files.contains(path.as_str())
+        });
+
+    let fetched_then_edited: HashSet<String> =
+        served.intersection(&edited_indexed).cloned().collect();
+    let edited_unfetched: HashSet<String> = edited_indexed.difference(&served).cloned().collect();
+    let fetched_unedited = served.difference(&edited_indexed).count();
+    let recommended_tests_edited: HashSet<String> = if recommended.is_empty() {
+        HashSet::new()
+    } else {
+        let tests: HashSet<String> = db
+            .all_file_test_flags()?
+            .into_iter()
+            .filter(|(path, stored, interpretation)| {
+                crate::index::file_is_test(path, *stored, interpretation.as_deref())
+            })
+            .map(|(path, _, _)| path)
+            .collect();
+        recommended
+            .intersection(&edited_indexed)
+            .filter(|path| {
+                tests.contains(*path) || codesage_parser::discover::is_test_like_path(path)
+            })
+            .cloned()
+            .collect()
+    };
+
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    Ok(SessionActedOn {
+        ledger: if !enabled {
+            "disabled"
+        } else if ledger.present {
+            "recorded"
+        } else {
+            "absent"
+        }
+        .to_string(),
+        calls: count(ledger.calls.len()),
+        edited_source: edited_source.to_string(),
+        fetched_then_edited: count(fetched_then_edited.len()),
+        edited_unfetched: count(edited_unfetched.len()),
+        fetched_unedited: count(fetched_unedited),
+        edited_unindexed: count(edited_unindexed.len()),
+        recommended_tests_edited: count(recommended_tests_edited.len()),
+        fetched_then_edited_files: first_sorted(&fetched_then_edited),
+        edited_unfetched_files: first_sorted(&edited_unfetched),
+        recommended_tests_edited_files: first_sorted(&recommended_tests_edited),
+        per_tool: by_tool
+            .into_iter()
+            .map(|(tool, (calls, files))| {
+                let acted = files.intersection(&edited_indexed).count();
+                (
+                    tool,
+                    SessionToolActedOn {
+                        calls,
+                        fetched: count(files.len()),
+                        fetched_then_edited: count(acted),
+                    },
+                )
+            })
+            .collect(),
+        ledger_capped: ledger.capped,
+        worktree_truncated: snapshot
+            .worktree
+            .as_ref()
+            .is_some_and(|worktree| worktree.truncated),
     })
 }
 
@@ -643,7 +938,7 @@ fn now_unix() -> i64 {
 
 /// Reject session ids that contain path separators or other characters
 /// that would let a caller escape the sessions/ directory.
-fn validate_session_id(id: &str) -> Result<()> {
+pub(crate) fn validate_session_id(id: &str) -> Result<()> {
     if id.is_empty() {
         bail!("session_id must not be empty");
     }
@@ -718,7 +1013,7 @@ fn read_snapshot(project_root: &Path, session_id: &str) -> Result<SessionSnapsho
 }
 
 /// Reject repository-planted parent symlinks; the project root may use trusted symlinks.
-fn reject_symlinked_parents(project_root: &Path, target: &Path) -> Result<()> {
+pub(crate) fn reject_symlinked_parents(project_root: &Path, target: &Path) -> Result<()> {
     let Ok(rel) = target.strip_prefix(project_root) else {
         return Ok(());
     };
@@ -884,6 +1179,7 @@ mod tests {
             lazy_edges: 0,
             top_risk_files: Vec::new(),
             git_head: None,
+            worktree: None,
         }
     }
 
@@ -1012,6 +1308,200 @@ mod tests {
                 .all(|e| e.file_name() == "s1.json"),
             "a temp file was left behind"
         );
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = crate::git_command(root)
+            .args([
+                "-c",
+                "user.email=fixture@codesage.test",
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    fn ledger_fixture() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        for (path, is_test) in [
+            ("src/a.rs", false),
+            ("src/b.rs", false),
+            ("src/c.rs", false),
+            ("src/d.rs", false),
+            ("src/e.rs", false),
+            ("tests/a_test.rs", true),
+        ] {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, format!("// {path}\n")).unwrap();
+            db.upsert_file(&codesage_protocol::FileInfo {
+                path: path.into(),
+                language: codesage_protocol::Language::Rust,
+                content_hash: "fixture".into(),
+                is_test,
+            })
+            .unwrap();
+        }
+        std::fs::create_dir(root.join(".codesage")).unwrap();
+        std::fs::write(root.join(".codesage/index.db"), b"").unwrap();
+        git(root, &["init", "-q", "."]);
+        git(root, &["add", "src", "tests"]);
+        git(root, &["commit", "-qm", "initial"]);
+        (dir, db)
+    }
+
+    fn record(root: &Path, tool: &str, handles: &[&str]) {
+        let call = crate::session_ledger::LedgerCall {
+            ts: crate::session_ledger::now_millis(),
+            tool: tool.into(),
+            target_handles: handles.iter().map(|h| (*h).to_string()).collect(),
+            detail: None,
+            bytes: 1,
+        };
+        crate::session_ledger::append_call(
+            root,
+            crate::session_ledger::LedgerScope::Session("s"),
+            &call,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn session_end_correlates_served_files_with_files_edited_during_the_session() {
+        let (dir, db) = ledger_fixture();
+        let root = dir.path();
+        std::fs::write(root.join("src/d.rs"), "// dirty before the session\n").unwrap();
+        std::fs::write(root.join("src/e.rs"), "// dirty before the session\n").unwrap();
+
+        session_start(root, &db, "s").unwrap();
+        record(root, "describe", &["file:src/a.rs"]);
+        record(root, "find_symbol", &["sym:src/c.rs#c", "sym:src/c.rs#d"]);
+        record(
+            root,
+            "recommend_tests",
+            &["file:tests/a_test.rs", "file:src/a.rs"],
+        );
+        record(root, "project_overview", &[]);
+
+        std::fs::write(root.join("src/a.rs"), "// edited\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "// edited\n").unwrap();
+        std::fs::write(root.join("src/e.rs"), "// edited again\n").unwrap();
+        std::fs::write(root.join("tests/a_test.rs"), "// edited\n").unwrap();
+        std::fs::write(root.join("src/unindexed.rs"), "// new\n").unwrap();
+
+        let acted = session_end(root, &db, "s").unwrap().acted_on;
+        assert_eq!(acted.ledger, "recorded");
+        assert_eq!(acted.edited_source, "worktree");
+        assert_eq!(acted.calls, 4);
+        assert_eq!(acted.fetched_then_edited, 2);
+        assert_eq!(
+            acted.fetched_then_edited_files,
+            vec!["src/a.rs", "tests/a_test.rs"]
+        );
+        assert_eq!(acted.edited_unfetched, 2);
+        assert_eq!(acted.edited_unfetched_files, vec!["src/b.rs", "src/e.rs"]);
+        assert_eq!(acted.fetched_unedited, 1, "src/c.rs");
+        assert_eq!(acted.edited_unindexed, 1, "src/unindexed.rs");
+        assert_eq!(acted.recommended_tests_edited, 1);
+        assert_eq!(
+            acted.recommended_tests_edited_files,
+            vec!["tests/a_test.rs"]
+        );
+        let tool = |name: &str| acted.per_tool[name].clone();
+        assert_eq!(
+            tool("describe"),
+            SessionToolActedOn {
+                calls: 1,
+                fetched: 1,
+                fetched_then_edited: 1
+            }
+        );
+        assert_eq!(
+            tool("find_symbol"),
+            SessionToolActedOn {
+                calls: 1,
+                fetched: 1,
+                fetched_then_edited: 0
+            }
+        );
+        assert_eq!(
+            tool("recommend_tests"),
+            SessionToolActedOn {
+                calls: 1,
+                fetched: 2,
+                fetched_then_edited: 2
+            }
+        );
+        assert_eq!(tool("project_overview").fetched, 0);
+    }
+
+    #[test]
+    fn session_without_calls_or_edits_reports_zeros() {
+        let (dir, db) = ledger_fixture();
+        let root = dir.path();
+        std::fs::write(root.join("src/d.rs"), "// dirty before the session\n").unwrap();
+        session_start(root, &db, "s").unwrap();
+
+        let acted = session_end(root, &db, "s").unwrap().acted_on;
+        assert_eq!(acted.ledger, "absent");
+        assert_eq!(acted.edited_source, "worktree");
+        assert_eq!(
+            (
+                acted.calls,
+                acted.fetched_then_edited,
+                acted.edited_unfetched,
+                acted.fetched_unedited,
+                acted.edited_unindexed,
+                acted.recommended_tests_edited,
+            ),
+            (0, 0, 0, 0, 0, 0)
+        );
+        assert!(acted.per_tool.is_empty());
+    }
+
+    #[test]
+    fn ledger_calls_from_before_session_start_are_ignored() {
+        let (dir, db) = ledger_fixture();
+        let root = dir.path();
+        let stale = crate::session_ledger::LedgerCall {
+            ts: 1_000,
+            tool: "describe".into(),
+            target_handles: vec!["file:src/a.rs".into()],
+            detail: None,
+            bytes: 1,
+        };
+        crate::session_ledger::append_call(
+            root,
+            crate::session_ledger::LedgerScope::Session("s"),
+            &stale,
+        )
+        .unwrap();
+        session_start(root, &db, "s").unwrap();
+        std::fs::write(root.join("src/a.rs"), "// edited\n").unwrap();
+
+        let acted = session_end(root, &db, "s").unwrap().acted_on;
+        assert_eq!(acted.calls, 0);
+        assert_eq!(acted.fetched_then_edited, 0);
+        assert_eq!(acted.edited_unfetched_files, vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn session_end_outside_git_falls_back_to_index_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        write_snapshot(dir.path(), &snapshot_with_created_at("nogit", now_unix())).unwrap();
+        let acted = session_end(dir.path(), &db, "nogit").unwrap().acted_on;
+        assert_eq!(acted.edited_source, "index");
+        assert_eq!(acted.edited_unfetched, 0);
     }
 
     #[test]

@@ -788,9 +788,11 @@ impl CodeSageServer {
         let arguments = request.arguments.clone().unwrap_or_default();
         let ticket = (tool != "daemon_stats")
             .then(|| Arc::new(self.state.diagnostics.begin_request(&tool, None)));
+        let resolved_project = std::sync::OnceLock::new();
         let result = self
-            .dispatch_tool_inner(request, context, ticket.clone())
+            .dispatch_tool_inner(request, context, ticket.clone(), &resolved_project)
             .await;
+        let resolved_project = resolved_project.into_inner();
         let response = match result {
             Ok(CallToolResponse::Complete(response)) => response,
             other => {
@@ -821,6 +823,9 @@ impl CodeSageServer {
                 cap,
                 server.state.envelope_enabled,
             );
+            if let Some(project) = resolved_project {
+                server.ledger.record(&project, &tool, &arguments, &response);
+            }
             if let Some(ticket) = rendering_ticket {
                 ticket.finish(result_outcome(&response));
             }
@@ -840,6 +845,7 @@ impl CodeSageServer {
         mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
         ticket: Option<Arc<RequestTicket>>,
+        resolved_project: &std::sync::OnceLock<PathBuf>,
     ) -> Result<CallToolResponse, ErrorData> {
         let arguments: Arc<Map<String, Value>> =
             Arc::new(request.arguments.clone().unwrap_or_default());
@@ -970,6 +976,9 @@ impl CodeSageServer {
                 return Ok(render_error(&tool, Some(&request_arguments), &error.into()).into());
             }
             request_ticket.set_project(&project.to_string_lossy());
+            if project.is_absolute() {
+                let _ = resolved_project.set(project.clone());
+            }
             let scope = Arc::new(ToolRequest {
                 control: request_control,
                 ticket: request_ticket,
