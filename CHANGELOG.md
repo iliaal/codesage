@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.46.0] - 2026-10-31
+
 ### Changed
 
 - Embedding and reranking run on `ort` 2.0.0-rc.14; macOS builds bundle ONNX Runtime 1.31 and re-embed existing semantic indexes once.
@@ -1362,5 +1364,7 @@ Initial public release.
 
 [0.44.1]: https://github.com/iliaal/codesage/releases/tag/v0.44.1
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.45.0...HEAD
 [0.45.0]: https://github.com/iliaal/codesage/releases/tag/v0.45.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.46.0...HEAD
+[0.46.0]: https://github.com/iliaal/codesage/releases/tag/v0.46.0
