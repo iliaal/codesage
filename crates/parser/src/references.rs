@@ -574,6 +574,44 @@ pub fn extract_references(
     language: Language,
     file_path: &str,
 ) -> Result<Vec<Reference>> {
+    let dead = crate::preproc::DeadRegions::scan(tree.root_node(), source, language);
+    let mut refs = tree_references(tree, source, language, file_path, &dead)?;
+    if matches!(language, Language::C | Language::Cpp)
+        && let Some(conditions) = crate::preproc_arms::blanked_conditions(source, &dead)
+    {
+        let tree = crate::parse::parse_file(&conditions, language)?;
+        let dead = crate::preproc::DeadRegions::scan(tree.root_node(), source, language);
+        let extra = tree_references(&tree, source, language, file_path, &dead)?;
+        let before = refs.len();
+        let existing: std::collections::HashSet<(u32, u32, ReferenceKind, String)> = refs
+            .iter()
+            .map(|r| (r.line, r.col, r.kind, r.to_name.clone()))
+            .collect();
+        for reference in extra {
+            let key = (
+                reference.line,
+                reference.col,
+                reference.kind,
+                reference.to_name.clone(),
+            );
+            if !existing.contains(&key) {
+                refs.push(reference);
+            }
+        }
+        if refs.len() > before {
+            refs.sort_by_key(|r| (r.line, r.col));
+        }
+    }
+    Ok(refs)
+}
+
+fn tree_references(
+    tree: &Tree,
+    source: &[u8],
+    language: Language,
+    file_path: &str,
+    dead: &crate::preproc::DeadRegions,
+) -> Result<Vec<Reference>> {
     codesage_protocol::work::checkpoint()?;
     let kind_map = ref_kind_map_for(language);
     let spec = ref_query_for(language);
@@ -581,7 +619,6 @@ pub fn extract_references(
     let name_idx = spec.ref_idx;
 
     let root = tree.root_node();
-    let dead = crate::preproc::DeadRegions::scan(root, source, language);
     let mut cursor = QueryCursor::new();
     let control = codesage_protocol::work::current();
     let mut progress = |_: &tree_sitter::QueryCursorState| {

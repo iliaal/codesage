@@ -782,7 +782,12 @@ mod tests {
                 "macro.c",
                 Language::C,
                 b"void handle(int x)\n{\n    if (x) {\n        a(x);\n    }\n#if defined(A)\n    else ZEND_HASH_FOREACH_VAL(ht, v) {\n        b(x);\n    } ZEND_HASH_FOREACH_END();\n#endif\n}\n",
-                &[("a", 4), ("b", 8), ("ZEND_HASH_FOREACH_END", 9)],
+                &[
+                    ("a", 4),
+                    ("ZEND_HASH_FOREACH_VAL", 7),
+                    ("b", 8),
+                    ("ZEND_HASH_FOREACH_END", 9),
+                ],
             ),
             (
                 "catch.cpp",
@@ -808,6 +813,49 @@ mod tests {
             let expected: Vec<_> = calls
                 .iter()
                 .map(|&(name, line)| (name, line, Some("handle")))
+                .collect();
+            assert_eq!(callers, expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn calls_under_split_loop_and_switch_headers_keep_their_caller() {
+        type Case = (
+            &'static str,
+            Language,
+            &'static [u8],
+            &'static [(&'static str, u32, &'static str)],
+        );
+        let split: &[u8] = b"void f1(int n)\n{\n#ifdef X\n    for (int i = 0; i < n; i++) {\n#else\n    for (int i = n; i > 0; i--) {\n#endif\n        b2(n);\n    }\n}\n\nvoid s1(int n)\n{\n#ifdef X\n    switch (n) {\n#else\n    switch (n + 1) {\n#endif\n    case 1:\n        b3(n);\n        break;\n    }\n}\n\nvoid ws(int n)\n{\n#ifdef X\n    while (n > 0) {\n#else\n    while (n > 1) {\n#endif\n        b4(n);\n    }\n}\n";
+        let split_calls: &[(&str, u32, &str)] =
+            &[("b2", 8, "f1"), ("b3", 20, "s1"), ("b4", 32, "ws")];
+        let cases: [Case; 3] = [
+            ("split.c", Language::C, split, split_calls),
+            ("split.cpp", Language::Cpp, split, split_calls),
+            (
+                "constexpr.cpp",
+                Language::Cpp,
+                b"void k1(int x)\n{\n    if (x) {\n        a(x);\n    }\n#if defined(A)\n    else if constexpr (X > 2) {\n        b(x);\n    }\n#endif\n}\n",
+                &[("a", 4, "k1"), ("b", 8, "k1")],
+            ),
+        ];
+        for (path, language, source, calls) in cases {
+            let info = FileInfo {
+                path: path.to_string(),
+                language,
+                content_hash: content_hash(source),
+                is_test: false,
+            };
+            let parsed = parse_source(&info, source, &JavaTypeContext::default()).unwrap();
+            let callers: Vec<_> = parsed
+                .refs
+                .iter()
+                .filter(|r| r.kind == ReferenceKind::Call)
+                .map(|r| (r.to_name.as_str(), r.line, r.from_symbol.as_deref()))
+                .collect();
+            let expected: Vec<_> = calls
+                .iter()
+                .map(|&(name, line, caller)| (name, line, Some(caller)))
                 .collect();
             assert_eq!(callers, expected, "{path}");
         }

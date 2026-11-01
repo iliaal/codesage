@@ -7,6 +7,7 @@ pub mod header;
 pub mod parse;
 pub mod position;
 mod preproc;
+mod preproc_arms;
 pub mod python_bindings;
 pub mod rationale;
 pub mod references;
