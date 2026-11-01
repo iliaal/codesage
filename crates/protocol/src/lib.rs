@@ -1980,6 +1980,101 @@ pub struct SessionSnapshot {
     /// a git repo or git isn't on PATH.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_head: Option<String>,
+    /// Working-tree changes against `git_head` at snapshot time, so
+    /// `session` `end` can tell edits made during the session from changes
+    /// that already existed. Absent outside Git and in older snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<SessionWorktree>,
+}
+
+/// Paths that differed from `HEAD` (or were untracked) when the snapshot was
+/// taken, each with its Git blob id, or `None` when the path was deleted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionWorktree {
+    pub changes: Vec<SessionWorktreeChange>,
+    /// The change list stopped at its cap; later paths are unrecorded.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct SessionWorktreeChange {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+}
+
+/// Correlation between the files CodeSage served during a session (from the
+/// `.codesage/sessions/<id>.calls.jsonl` ledger) and the files edited since
+/// `session` `start`. Correlation, not causality.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionActedOn {
+    /// `recorded` (ledger read), `absent` (no ledger file for this session),
+    /// or `disabled` (`CODESAGE_SESSION_LEDGER=0`).
+    pub ledger: String,
+    /// Ledger calls made since `session` `start`.
+    pub calls: u32,
+    /// How edited files were determined (`disabled` when the ledger is off,
+    /// with every count zero): `worktree` (Git diff against the
+    /// snapshot HEAD, minus changes already present at `session` `start`),
+    /// `git_head` (Git diff against the snapshot HEAD; the snapshot predates
+    /// the start-of-session change record, so pre-existing changes count),
+    /// or `index` (no Git: indexed files added or removed).
+    pub edited_source: String,
+    /// Indexed files that were served and then edited.
+    pub fetched_then_edited: u32,
+    /// Indexed files edited without having been served.
+    pub edited_unfetched: u32,
+    /// Files served but not edited.
+    pub fetched_unedited: u32,
+    /// Edited files that are in neither the snapshot nor the current index,
+    /// so CodeSage could not have served them. Excluded from the counts above.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub edited_unindexed: u32,
+    /// Paths changed at `session` `start` whose content could not be
+    /// rechecked at `end` (re-hashing failed or missed its deadline). They are
+    /// counted neither as edited nor as unedited.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub edited_unknown: u32,
+    /// Distinct files returned by check tools: `assess_risk` with
+    /// `aggregate: true` or more than one target (ledger tool
+    /// `assess_risk:check`), `recommend_tests`, `review_rehearsal`, and
+    /// `edit_check`. Their input is the caller's own patch or file list, so
+    /// they are excluded from the fetched counts above.
+    #[serde(default)]
+    pub checked: u32,
+    /// Checked files that were edited.
+    #[serde(default)]
+    pub checked_edited: u32,
+    /// Edited test files that a `recommend_tests` call had returned.
+    pub recommended_tests_edited: u32,
+    /// The first 50 paths behind `fetched_then_edited`, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fetched_then_edited_files: Vec<String>,
+    /// The first 50 paths behind `edited_unfetched`, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edited_unfetched_files: Vec<String>,
+    /// The first 50 paths behind `recommended_tests_edited`, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommended_tests_edited_files: Vec<String>,
+    /// Per-tool call count, distinct files returned, and how many of those
+    /// were edited, check tools included.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub per_tool: std::collections::BTreeMap<String, SessionToolActedOn>,
+    /// The ledger reached its size cap, so later calls were not recorded
+    /// and served counts are a lower bound.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ledger_capped: bool,
+    /// The start-of-session change record stopped at its cap.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub worktree_truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct SessionToolActedOn {
+    pub calls: u32,
+    pub fetched: u32,
+    pub fetched_then_edited: u32,
 }
 
 /// Compact MCP response for a `session` start. The full snapshot is still
@@ -2062,6 +2157,9 @@ pub struct SessionDiff {
     pub git_head_before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_head_after: Option<String>,
+    /// Served-versus-edited correlation from the session call ledger.
+    #[serde(default)]
+    pub acted_on: SessionActedOn,
 }
 
 /// Stats from a git history indexing pass. Mirrors IndexStats shape.

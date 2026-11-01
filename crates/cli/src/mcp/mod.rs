@@ -7,6 +7,7 @@ pub(crate) mod envelope;
 pub(crate) mod error;
 pub(crate) mod framing;
 mod help;
+mod ledger;
 mod next;
 mod overlay;
 mod overview_cache;
@@ -228,6 +229,7 @@ fn validate_non_empty_file_list(paths: &[String], tool: &str, fields: &[&str]) -
 pub struct CodeSageServer {
     state: Arc<CodeSageServerState>,
     tool_router: ToolRouter<Self>,
+    ledger: Arc<ledger::ConnectionLedger>,
 }
 
 impl std::fmt::Debug for CodeSageServer {
@@ -251,6 +253,7 @@ impl CodeSageServer {
         Self {
             state,
             tool_router: Self::tool_router(),
+            ledger: Arc::new(ledger::ConnectionLedger::new()),
         }
     }
 

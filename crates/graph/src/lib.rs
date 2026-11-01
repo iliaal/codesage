@@ -23,6 +23,7 @@ mod scc;
 mod search;
 mod semantic;
 mod session;
+pub mod session_ledger;
 mod similar;
 #[doc(hidden)]
 pub mod state_file;

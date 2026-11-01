@@ -540,7 +540,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Diff the current structural state against a session_start snapshot.
+    /// Diff the current structural state against a `session-start` snapshot.
     /// Reports new cycles, removed/added files, and per-file risk regressions.
     /// Exits non-zero when the session fails the gate (new cycles or
     /// max risk regression >= 0.10).

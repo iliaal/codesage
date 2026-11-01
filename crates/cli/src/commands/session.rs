@@ -80,6 +80,35 @@ pub(crate) fn cmd_session_end(session_id: &str, json: bool) -> Result<()> {
                 );
             }
         }
+        let acted = &diff.acted_on;
+        println!(
+            "  acted on ({}, ledger {}): {} fetched then edited, {} edited unfetched, {} fetched unedited, {} checked ({} edited)",
+            acted.edited_source,
+            acted.ledger,
+            acted.fetched_then_edited,
+            acted.edited_unfetched,
+            acted.fetched_unedited,
+            acted.checked,
+            acted.checked_edited,
+        );
+        if acted.edited_unindexed > 0 {
+            println!(
+                "    {} edited files are not indexed",
+                acted.edited_unindexed
+            );
+        }
+        if acted.edited_unknown > 0 {
+            println!(
+                "    {} recorded files could not be rechecked (recheck failed or timed out)",
+                acted.edited_unknown
+            );
+        }
+        if acted.ledger_capped {
+            println!("    ledger reached its size cap; later calls were not recorded");
+        }
+        if acted.worktree_truncated {
+            println!("    worktree snapshot was truncated; edit detection is partial");
+        }
         if !diff.summary_notes.is_empty() {
             println!("  Notes:");
             for n in &diff.summary_notes {

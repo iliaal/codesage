@@ -193,7 +193,7 @@ fn run_child(mut command: Command, input: Option<&[u8]>, deadline: Instant) -> G
 }
 
 /// Stdout of a Git child that exited 0.
-fn git_output(cwd: &Path, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
+pub(crate) fn git_output(cwd: &Path, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
     match run_git(cwd, args, None, deadline) {
         GitRun::Exited {
             code: Some(0),
@@ -204,7 +204,7 @@ fn git_output(cwd: &Path, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
 }
 
 /// Exit code and stdout of a Git child fed `input`, whatever the exit code.
-fn git_output_with_stdin(
+pub(crate) fn git_output_with_stdin(
     cwd: &Path,
     args: &[&str],
     input: &[u8],
