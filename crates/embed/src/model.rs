@@ -1310,7 +1310,7 @@ pub fn validate_model_allowed(model: &str, allow_any: bool) -> Result<()> {
 /// Where [`validate_model_allowed`] tells the user to opt their project in:
 /// the resolved allowlist path, or the `~` shorthand when no config home
 /// resolves (e.g. HOME-less environments) so the error still names the file.
-fn user_allowlist_display() -> String {
+pub fn user_allowlist_display() -> String {
     user_allowlist_path().map_or_else(
         || "~/.config/codesage/allowed-models".to_string(),
         |path| path.display().to_string(),
