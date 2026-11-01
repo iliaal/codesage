@@ -32,7 +32,7 @@ pub use git_hist::{
 };
 pub use overlay::StructuralOverlayFile;
 pub use semantic::{RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes};
-pub use structural::{FingerprintInput, ImportPairs, StoredFingerprint};
+pub use structural::{FingerprintInput, ImportPairs, PythonPackageProbes, StoredFingerprint};
 
 /// Reject unknown stored enums as typed conversion errors; never relabel schema skew.
 pub(super) fn row_enum<T>(

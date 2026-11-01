@@ -31,6 +31,31 @@ const REF_IS_TEST_SQL: &str = "(f.is_test <> 0 OR COALESCE( \
         WHERE s.file_id = r.from_file_id AND s.qualified_name = r.from_symbol), \
      0) <> 0)";
 
+// `CROSS JOIN` pins the join order: driving from the `files.path` range keeps a
+// directory with no relative imports from scanning every relative import row.
+const PYTHON_RELATIVE_IMPORT_IN_DIRECTORY: &str =
+    "SELECT 1 FROM files f CROSS JOIN refs r ON f.id = r.from_file_id
+     WHERE f.path >= ?1 || '/' AND f.path < ?1 || '0'
+       AND instr(substr(f.path, length(?1) + 2), '/') = 0
+       AND f.language = 'python' AND r.kind = 'import'
+       AND r.to_name >= '.' AND r.to_name < '/'
+     LIMIT 1";
+
+/// Memoized [`Database::python_directory_imported_as_package`] answers for one
+/// resolution pass, so many imports from one directory probe it once.
+#[derive(Debug, Default)]
+pub struct PythonPackageProbes {
+    answers: std::cell::RefCell<HashMap<String, bool>>,
+    queries: std::cell::Cell<usize>,
+}
+
+impl PythonPackageProbes {
+    /// Database probes issued so far; cache hits do not count.
+    pub fn queries(&self) -> usize {
+        self.queries.get()
+    }
+}
+
 /// Cross-file import pairs split by whether any load-time directive joins them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImportPairs {
@@ -840,6 +865,7 @@ impl Database {
             return Ok(BTreeMap::new());
         }
         let indexed = self.all_file_paths()?.into_iter().collect();
+        let probes = PythonPackageProbes::default();
         let mut pairs = BTreeMap::new();
         for (from, module, line, col, lazy) in rows {
             let row = Reference {
@@ -854,7 +880,7 @@ impl Database {
                 to: None,
                 from_line: None,
             };
-            for to in self.python_import_targets_indexed(&row, &indexed)? {
+            for to in self.python_import_targets_indexed(&row, &indexed, &probes)? {
                 if from == to {
                     continue;
                 }
@@ -873,12 +899,52 @@ impl Database {
         module: &str,
     ) -> Result<Option<codesage_protocol::python::PythonModule>> {
         let files = self.all_file_paths()?.into_iter().collect();
-        Ok(codesage_protocol::python::load_module(module, from, &files))
+        codesage_protocol::python::load_module(module, from, &files, |directory| {
+            self.python_directory_imported_as_package(directory)
+        })
+    }
+
+    fn python_package_directory(
+        &self,
+        directory: &str,
+        probes: &PythonPackageProbes,
+    ) -> Result<bool> {
+        if let Some(answer) = probes.answers.borrow().get(directory) {
+            return Ok(*answer);
+        }
+        let answer = self.python_directory_imported_as_package(directory)?;
+        probes.queries.set(probes.queries.get() + 1);
+        probes
+            .answers
+            .borrow_mut()
+            .insert(directory.to_string(), answer);
+        Ok(answer)
+    }
+
+    /// Whether an indexed Python import names `directory` as a package: an
+    /// absolute import of its dotted name or a module below it, or a relative
+    /// import from a file directly inside it.
+    pub fn python_directory_imported_as_package(&self, directory: &str) -> Result<bool> {
+        let mut absolute = self.conn.prepare_cached(
+            "SELECT 1 FROM refs r JOIN files f ON f.id = r.from_file_id
+             WHERE f.language = 'python' AND r.kind = 'import'
+               AND (r.to_name = ?1 OR (r.to_name >= ?1 || '.' AND r.to_name < ?1 || '/'))
+             LIMIT 1",
+        )?;
+        for name in codesage_protocol::python::directory_module_names(directory) {
+            if absolute.exists([&name])? {
+                return Ok(true);
+            }
+        }
+        let mut relative = self
+            .conn
+            .prepare_cached(PYTHON_RELATIVE_IMPORT_IN_DIRECTORY)?;
+        Ok(relative.exists([directory])?)
     }
 
     pub fn python_import_targets(&self, row: &Reference) -> Result<Vec<String>> {
         let indexed = self.all_file_paths()?.into_iter().collect();
-        self.python_import_targets_indexed(row, &indexed)
+        self.python_import_targets_indexed(row, &indexed, &PythonPackageProbes::default())
     }
 
     pub fn python_import_sites_load_module(
@@ -888,6 +954,7 @@ impl Database {
     ) -> Result<Option<bool>> {
         use codesage_protocol::python::BINDING_INTERPRETATION;
         let indexed = self.all_file_paths()?.into_iter().collect();
+        let probes = PythonPackageProbes::default();
         let mut pending: Vec<_> = sites
             .iter()
             .map(|site| Reference {
@@ -914,7 +981,7 @@ impl Database {
             {
                 return Ok(None);
             }
-            let Some(loaded) = self.python_import_load_indexed(&row, &indexed)? else {
+            let Some(loaded) = self.python_import_load_indexed(&row, &indexed, &probes)? else {
                 continue;
             };
             if loaded.module_keys.iter().any(|key| key == module) {
@@ -946,6 +1013,7 @@ impl Database {
     ) -> Result<codesage_protocol::python::PythonModuleLoad> {
         use codesage_protocol::python::{BINDING_INTERPRETATION, PythonModuleLoad};
         let indexed = self.all_file_paths()?.into_iter().collect();
+        let probes = PythonPackageProbes::default();
         let mut statements = Vec::new();
         for row in self.references_in_file_range(initializer, 0, u32::MAX)? {
             if row.kind == ReferenceKind::Import && !row.lazy {
@@ -967,7 +1035,7 @@ impl Database {
             let mut pending = vec![row];
             while let Some(row) = pending.pop() {
                 codesage_protocol::work::checkpoint()?;
-                let Some(loaded) = self.python_import_load_indexed(&row, &indexed)? else {
+                let Some(loaded) = self.python_import_load_indexed(&row, &indexed, &probes)? else {
                     continue;
                 };
                 if loaded.module_keys.iter().any(|key| key == child) {
@@ -997,9 +1065,10 @@ impl Database {
         &self,
         row: &Reference,
         indexed: &HashSet<String>,
+        probes: &PythonPackageProbes,
     ) -> Result<Vec<String>> {
         let mut files = self
-            .python_import_load_indexed(row, indexed)?
+            .python_import_load_indexed(row, indexed, probes)?
             .map_or_else(Vec::new, |loaded| loaded.loaded);
         files.sort();
         files.dedup();
@@ -1010,6 +1079,7 @@ impl Database {
         &self,
         row: &Reference,
         indexed: &HashSet<String>,
+        probes: &PythonPackageProbes,
     ) -> Result<Option<codesage_protocol::python::PythonModule>> {
         codesage_protocol::work::checkpoint()?;
         if !self.file_interpretation_matches(
@@ -1025,7 +1095,9 @@ impl Database {
             return Ok(None);
         };
         let Some(mut loaded) =
-            codesage_protocol::python::load_module(module, &row.from_file, indexed)
+            codesage_protocol::python::load_module(module, &row.from_file, indexed, |directory| {
+                self.python_package_directory(directory, probes)
+            })?
         else {
             return Ok(None);
         };
@@ -1071,7 +1143,8 @@ impl Database {
                         &format!("{module}{separator}{name}"),
                         &row.from_file,
                         indexed,
-                    ) {
+                        |directory| self.python_package_directory(directory, probes),
+                    )? {
                         loaded.loaded.extend(child.loaded);
                         loaded.module_keys.extend(child.module_keys);
                     }
@@ -1986,6 +2059,32 @@ mod tests {
     };
 
     use super::Database;
+
+    #[test]
+    fn python_relative_import_probe_drives_from_the_directory_path_range() {
+        let db = Database::open_in_memory().unwrap();
+        let mut stmt = db
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::PYTHON_RELATIVE_IMPORT_IN_DIRECTORY
+            ))
+            .unwrap();
+        let plan = stmt
+            .query_map(["app/api"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(plan.len(), 2, "{plan:?}");
+        assert!(
+            plan[0].starts_with("SEARCH f USING INDEX") && plan[0].contains("(path>? AND path<?)"),
+            "{plan:?}"
+        );
+        assert!(
+            plan[1].starts_with("SEARCH r USING INDEX idx_refs_from_file"),
+            "{plan:?}"
+        );
+    }
 
     #[test]
     fn python_binding_evidence_round_trips_and_is_cleared_on_reindex() {

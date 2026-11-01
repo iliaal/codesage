@@ -2889,3 +2889,148 @@ fn python_self_import_getter_membership_keeps_captured_values_and_actual_loads()
         }
     }
 }
+
+#[test]
+fn script_absolute_imports_bind_sibling_modules_outside_packages() {
+    for source in [
+        "import sib\ndef entry():\n    return sib.helper(1)\n",
+        "from sib import helper\ndef entry():\n    return helper(1)\n",
+    ] {
+        let (_root, db) = project(&[
+            ("scripts/run.py", source),
+            ("scripts/sib.py", "def helper(x):\n    return x\n"),
+            ("other/sib.py", "def helper(x):\n    return 0\n"),
+        ]);
+        assert!(trace(&db, "entry", "sym:scripts/sib.py#helper"), "{source}");
+        assert!(!trace(&db, "entry", "sym:other/sib.py#helper"), "{source}");
+        assert!(
+            list_dependencies(&db, "scripts/sib.py")
+                .unwrap()
+                .imported_by
+                .contains(&"scripts/run.py".into()),
+            "{source}"
+        );
+        let pairs = file_import_pairs(&db).unwrap();
+        assert!(
+            pairs
+                .eager
+                .contains(&("scripts/run.py".into(), "scripts/sib.py".into())),
+            "{source}: {pairs:?}"
+        );
+    }
+}
+
+#[test]
+fn script_directory_fallback_skips_packages_stdlib_names_and_the_importer() {
+    let (_root, db) = project(&[
+        ("pkg/__init__.py", ""),
+        (
+            "pkg/views.py",
+            "from html import escape\nfrom helper import run\ndef render():\n    escape('x')\n    run()\n",
+        ),
+        ("pkg/html.py", "def escape(x):\n    return x\n"),
+        ("pkg/helper.py", "def run():\n    return 1\n"),
+        (
+            "scripts/tool.py",
+            "import json\nimport tool\ndef main():\n    json.dumps(1)\n    tool.main()\n",
+        ),
+        ("scripts/json.py", "def dumps(x):\n    return x\n"),
+    ]);
+    assert!(!trace(&db, "render", "sym:pkg/html.py#escape"));
+    assert!(!trace(&db, "render", "sym:pkg/helper.py#run"));
+    assert!(!trace(&db, "main", "sym:scripts/json.py#dumps"));
+    for target in ["pkg/html.py", "pkg/helper.py", "scripts/json.py"] {
+        assert!(
+            list_dependencies(&db, target)
+                .unwrap()
+                .imported_by
+                .is_empty(),
+            "{target}"
+        );
+    }
+    let pairs = file_import_pairs(&db).unwrap();
+    assert!(
+        !pairs
+            .eager
+            .iter()
+            .chain(pairs.lazy_only.iter())
+            .any(|(from, to)| from == "scripts/tool.py" || to == "pkg/html.py"),
+        "{pairs:?}"
+    );
+}
+
+#[test]
+fn namespace_package_directories_never_bind_third_party_imports_to_siblings() {
+    for (dir, evidence_path, evidence) in [
+        ("app/api", "main.py", "from app.api import client\n"),
+        ("app/api", "main.py", "import app.api.client\n"),
+        ("app/api", "main.py", "from app.api.client import fetch\n"),
+        ("src/app/api", "main.py", "from app.api import client\n"),
+        ("app/api", "app/api/views.py", "from .client import fetch\n"),
+        ("app/api", "app/api/views.py", "from . import client\n"),
+    ] {
+        let client = format!("{dir}/client.py");
+        let requests = format!("{dir}/requests.py");
+        let (_root, db) = project(&[
+            (
+                &client,
+                "import requests\ndef fetch():\n    return requests.get('x')\n",
+            ),
+            (&requests, "def get(x):\n    return x\n"),
+            (evidence_path, evidence),
+        ]);
+        assert!(
+            !list_dependencies(&db, &requests)
+                .unwrap()
+                .imported_by
+                .contains(&client),
+            "{dir}: {evidence}"
+        );
+        assert!(
+            !trace(&db, "fetch", &format!("sym:{requests}#get")),
+            "{dir}: {evidence}"
+        );
+    }
+}
+
+#[test]
+fn package_directory_probes_are_memoized_across_one_resolution_pass() {
+    let sources: Vec<(String, String)> = (0..20)
+        .map(|i| {
+            (
+                format!("tests/test_{i}.py"),
+                "import pytest\nimport helpers\ndef test_it():\n    pytest.approx(helpers.value())\n"
+                    .to_string(),
+            )
+        })
+        .chain([(
+            "tests/helpers.py".to_string(),
+            "def value():\n    return 1\n".to_string(),
+        )])
+        .collect();
+    let files: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect();
+    let (_root, db) = project(&files);
+    let indexed = db.all_file_paths().unwrap().into_iter().collect();
+    let probes = codesage_storage::db::PythonPackageProbes::default();
+    let mut resolved = 0;
+    for (path, _) in &sources {
+        for row in db
+            .references_in_file_range(path, 0, u32::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.kind == ReferenceKind::Import)
+        {
+            let targets = db
+                .python_import_targets_indexed(&row, &indexed, &probes)
+                .unwrap();
+            if targets == ["tests/helpers.py"] {
+                resolved += 1;
+            }
+        }
+    }
+    assert_eq!(resolved, 20);
+    assert_eq!(probes.queries(), 1);
+}
