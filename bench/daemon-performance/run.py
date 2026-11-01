@@ -478,7 +478,7 @@ async def measure_review(daemon: Daemon, project: Path, symbol: str, timeout: fl
                          max_inflight: int | None = None) -> dict:
     requests = [("project_overview", {"project": str(project)})] * 23
     requests += [("find_references", {"project": str(project), "name": symbol})] * 38
-    requests += [("session_start", {"project": str(project)})]
+    requests += [("session", {"project": str(project), "action": "start"})]
     name = "review_bounded" if max_inflight is not None else "review"
     report = await measure(daemon, name, requests, timeout, True, max_inflight=max_inflight)
     scheduling = "bounded client scheduling" if max_inflight is not None else "concurrent burst"

@@ -14,7 +14,7 @@ pub(super) fn schema() -> Value {
     json!({
         "type": "array",
         "maxItems": MAX_NEXT,
-        "description": "Ranked calls derived from response evidence. Pass tool as tools/call name and arguments unchanged. Empty when no useful follow-up remains. Suggestions do not authorize actions. High-risk files may suggest session_start with a fresh ID; an existing snapshot waits for edits. CLI index recovery appears in index.recover instead.",
+        "description": "Ranked calls derived from response evidence. Pass tool as tools/call name and arguments unchanged. Empty when no useful follow-up remains. Suggestions do not authorize actions. High-risk files may suggest session with action start and a fresh ID; an existing snapshot waits for edits. CLI index recovery appears in index.recover instead.",
         "items": {
             "type": "object", "additionalProperties": false,
             "required": ["tool", "arguments", "why"],
@@ -279,7 +279,7 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
                 "Locate callers before renaming or changing behavior",
             );
             calls.target(
-                "export_context",
+                "bundle",
                 target,
                 "Read the implementation and surrounding context",
             );
@@ -299,7 +299,7 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
                     "Locate callers before renaming or changing behavior",
                 ),
                 Some("feature") => calls.target(
-                    "feature_bundle",
+                    "bundle",
                     card.get("handle")
                         .and_then(parsed)
                         .filter(|h| matches!(h, Handle::Feature { .. })),
@@ -336,7 +336,7 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
                 );
             } else if unique {
                 calls.target(
-                    "export_context",
+                    "bundle",
                     rows(payload, "results").find_map(|row| row.get("to").and_then(symbol)),
                     "Read the resolved definition before changing callers",
                 );
@@ -352,16 +352,16 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
                 );
             } else {
                 calls.target(
-                    "export_context",
+                    "bundle",
                     target,
                     "Inspect the leading match in source context",
                 );
             }
         }
         "project_overview" => {
-            calls.target(
+            calls.files(
                 "assess_risk",
-                first_file(payload, "top_risk_files"),
+                first_file(payload, "top_risk_files").into_iter().collect(),
                 "Review the highest risk file before changes",
             );
             calls.target(
@@ -370,8 +370,13 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
                 "Inspect a product entrypoint before adding behavior",
             );
         }
-        "assess_risk" => {
-            let target = row_file(payload);
+        // One scored file reads as the single-file question; several, or an
+        // aggregate rollup (`max_score`), read as a patch.
+        "assess_risk"
+            if payload.get("max_score").is_none() && rows(payload, "files").count() == 1 =>
+        {
+            let file = rows(payload, "files").next().unwrap_or(&Value::Null);
+            let target = row_file(file);
             calls.target(
                 "impact_analysis",
                 target.clone(),
@@ -382,10 +387,10 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
                 target.into_iter().collect(),
                 "Select regression tests for this risky file",
             );
-            if payload["score"].as_f64().is_some_and(|score| score >= 0.5) {
+            if file["score"].as_f64().is_some_and(|score| score >= 0.5) {
                 calls.push(
-                    "session_start",
-                    json!({"session_id": fresh_session_id()}),
+                    "session",
+                    json!({"action": "start", "session_id": fresh_session_id()}),
                     "Save a fresh baseline before editing",
                 );
             }
@@ -398,7 +403,7 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
                 .collect(),
             "Select tests for the affected files",
         ),
-        "assess_risk_batch" | "assess_risk_diff" => {
+        "assess_risk" => {
             let mut targets: Vec<_> = rows(payload, "files")
                 .filter_map(row_file)
                 .take(3)
@@ -440,7 +445,7 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
                 .or_else(|| first_file(payload, "reachable"))
                 .or_else(|| first_file(payload, "coupled"));
             calls.target(
-                "export_context",
+                "bundle",
                 target,
                 "Read the recommended test before extending coverage",
             );
@@ -450,16 +455,16 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
             if let Some(frame) = frame {
                 let target = row_file(frame);
                 calls.target(
-                    "export_context",
+                    "bundle",
                     frame
                         .get("handle")
                         .and_then(symbol)
                         .or_else(|| target.clone()),
                     "Inspect the innermost resolved failure location",
                 );
-                calls.target(
+                calls.files(
                     "assess_risk",
-                    target.clone(),
+                    target.clone().into_iter().collect(),
                     "Check change risk before fixing the failure",
                 );
                 calls.files(
@@ -470,33 +475,35 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
             }
         }
         "trace_call_path" => calls.target(
-            "export_context",
+            "bundle",
             first_symbol(payload, "steps").or_else(|| first_file(payload, "steps")),
             "Read the implementation behind this call path",
         ),
         "find_similar" => calls.target(
-            "export_context",
+            "bundle",
             first_symbol(payload, "results").or_else(|| first_file(payload, "results")),
             "Inspect the closest clone for the same defect",
         ),
         "list_dependencies" => calls.target(
-            "export_context",
+            "bundle",
             row_file(payload),
             "Read implementation before extending these dependencies",
         ),
-        "find_coupling" => calls.target(
+        "find_coupling" => calls.files(
             "assess_risk",
-            first_file(payload, "coupled"),
+            first_file(payload, "coupled").into_iter().collect(),
             "Assess the companion file likely to change",
         ),
-        "list_features" | "find_feature" => calls.target(
-            "feature_bundle",
+        "features" => calls.target(
+            "bundle",
             rows(payload, "results")
                 .find_map(|row| row.get("feature_id").and_then(parsed))
                 .filter(|h| matches!(h, Handle::Feature { .. })),
             "Read the feature's implementation and tests",
         ),
-        "session_end" => {
+        // A start report carries none of these rows, so only an end diff
+        // suggests a review.
+        "session" => {
             let targets = rows(payload, "risk_regressions")
                 .filter_map(row_file)
                 .chain(rows(payload, "new_files").filter_map(file))
@@ -513,7 +520,7 @@ fn derive(project: &str, kind: &str, payload: &Value) -> Vec<Value> {
                 "Review changed files before committing the session",
             );
         }
-        "feature_bundle" | "export_context" | "edit_check" | "session_start" | "help" => {}
+        "bundle" | "edit_check" | "help" => {}
         _ => {}
     }
     calls.entries
@@ -619,10 +626,13 @@ mod tests {
     fn high_risk_suggests_fresh_sessions_and_snapshots_wait_for_edits() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().to_str().unwrap();
-        let payload = json!({"file":"a.rs","score":0.5});
+        let payload = json!({"files":[{"file":"a.rs","score":0.5}]});
         let first = derive(root, "assess_risk", &payload);
         let second = derive(root, "assess_risk", &payload);
-        assert_eq!(first[2]["tool"], "session_start");
+        assert_eq!(first[0]["tool"], "impact_analysis");
+        assert_eq!(first[0]["arguments"]["target"], "file:a.rs");
+        assert_eq!(first[2]["tool"], "session");
+        assert_eq!(first[2]["arguments"]["action"], "start");
         assert_ne!(
             first[2]["arguments"]["session_id"],
             second[2]["arguments"]["session_id"]
@@ -636,11 +646,33 @@ mod tests {
                     .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
         );
         assert!(!Path::new(root).join(".codesage/sessions").exists());
-        assert!(derive(root, "session_start", &json!({"session_id":id})).is_empty());
+        assert!(
+            derive(
+                root,
+                "session",
+                &json!({"session_id":id,"snapshot_path":"s.json","file_count":1})
+            )
+            .is_empty()
+        );
         assert_eq!(
-            derive(root, "assess_risk", &json!({"file":"a.rs","score":0.49})).len(),
+            derive(
+                root,
+                "assess_risk",
+                &json!({"files":[{"file":"a.rs","score":0.49}]})
+            )
+            .len(),
             2
         );
+        // Several files, or one under an aggregate rollup, read as a patch.
+        for payload in [
+            json!({"files":[{"file":"a.rs","score":0.9},{"file":"b.rs","score":0.9}]}),
+            json!({"files":[{"file":"a.rs","score":0.9}],"max_score":0.9}),
+        ] {
+            let next = derive(root, "assess_risk", &payload);
+            assert_eq!(next[0]["tool"], "review_rehearsal", "{payload}");
+            assert_eq!(next[1]["tool"], "recommend_tests", "{payload}");
+            assert_eq!(next.len(), 2, "{payload}");
+        }
     }
 
     #[test]

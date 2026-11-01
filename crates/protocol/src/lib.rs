@@ -1321,7 +1321,7 @@ pub struct TopSymbol {
     #[serde(default, skip_serializing_if = "is_false")]
     pub shared: bool,
     /// Resolution never reached this row: the per-file cap (symbols, rows, or
-    /// wall clock) or the shared `assess_risk_diff` / `assess_risk_batch`
+    /// wall clock) or the shared multi-file `assess_risk`
     /// request budget ran out first, or this name's own row count exceeded
     /// what was left of the row budget. The count is then the name-based
     /// upper bound rather than a resolved caller count.
@@ -1349,7 +1349,7 @@ pub struct AuthorConcentration {
 /// keeps it true; the MCP tools clear it unless the caller passed
 /// `verbose: true`, because agents branch on `score`, `notes`,
 /// `trust_boundaries`, and `top_symbols` and the rest was measured at ~48% of
-/// an `assess_risk_batch` payload. `cycle_files` is NOT gated: the `notes[]`
+/// a multi-file `assess_risk` payload. `cycle_files` is NOT gated: the `notes[]`
 /// cycle lines name its members, and the staleness scan discovers those
 /// members only through the serialized field. `Serialize` is hand-written
 /// below to apply the switch; the `#[serde]` attributes here drive
@@ -1375,7 +1375,7 @@ pub struct RiskAssessment {
     /// absence of history is absence of evidence. Four situations produce it:
     /// a brand-new file, a path excluded from git indexing, `codesage
     /// git-index` never run, and history that fell outside the indexer's
-    /// window. A `notes[]` line names the state. `assess_risk_diff`
+    /// window. A `notes[]` line names the state. Aggregate `assess_risk`
     /// excludes these files from `max_score` / `mean_score` and lists them
     /// under `unscored_files`. Not gated by `verbose`: it qualifies `score`
     /// itself, so it must reach every caller that reads the score.
@@ -1550,7 +1550,7 @@ pub struct RiskDiffAssessment {
     /// not a clean low-risk patch.
     #[serde(default, skip_serializing_if = "is_false")]
     pub empty_input: bool,
-    /// Per-file decomposition. Same shape as a single `assess_risk` call.
+    /// Per-file decomposition. Same shape as each per-file `assess_risk` entry.
     pub files: Vec<RiskAssessment>,
     /// Highest score among the patch's *scored* files. The signal that should
     /// drive the agent's caution: split the patch, add tests, request review.
@@ -1645,7 +1645,7 @@ impl RiskDiffAssessment {
     }
 }
 
-/// Result of `assess_risk_batch`: per-file decomposition for a list of
+/// Result of `assess_risk` without `aggregate`: per-file decomposition for a list of
 /// files, no patch-level aggregation. Use when the agent has a list of
 /// files (e.g. from impact analysis or coupling) and wants individual
 /// risk scores for each in one round-trip, avoiding the per-file MCP
@@ -1654,12 +1654,12 @@ impl RiskDiffAssessment {
 /// Differs from [`RiskDiffAssessment`] in that it does *not* compute
 /// max/mean across the set, rollup arrays, summary notes, cycles, or
 /// directory clustering; those are patch-aggregate concerns. If the
-/// agent wants "is this patch risky as a whole?", use `assess_risk_diff`
-/// instead. If it wants "give me each of these files' scores", use
-/// `assess_risk_batch`.
+/// agent wants "is this patch risky as a whole?", call `assess_risk` with
+/// `aggregate: true` instead. If it wants "give me each of these files'
+/// scores", omit `aggregate`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RiskBatchAssessment {
-    /// Per-file decomposition, in the order of the request's `file_paths`.
+    /// Per-file decomposition, in the order of the request's targets.
     /// One [`RiskAssessment`] per input path. Ordering preserved so the
     /// agent can zip with its own list. There is no cross-file aggregate to
     /// correct here, so an unmeasured file is disclosed per entry:
@@ -1686,7 +1686,7 @@ impl RiskBatchAssessment {
 }
 
 /// A strongly-connected component in the file-level import graph that
-/// contains at least one file from a patch. Reported by `assess_risk_diff`
+/// contains at least one file from a patch. Reported by aggregate `assess_risk`
 /// as `cycles_touching_patch` when any member of the patch participates
 /// in a cycle. Members are mutually reachable through `import`,
 /// `include`, `inheritance`, or `trait_use` references, so they can't
@@ -1933,7 +1933,7 @@ pub struct InlineTestModule {
 }
 
 /// One file in `SessionSnapshot.top_risk_files`. Captured at session start
-/// so `session_end` can compute per-file risk-score deltas without needing
+/// so a `session` end can compute per-file risk-score deltas without needing
 /// to re-derive the snapshot's risk inputs.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionRiskEntry {
@@ -1941,9 +1941,9 @@ pub struct SessionRiskEntry {
     pub score: f64,
 }
 
-/// Snapshot of repo structural state captured at `session_start`. Persisted
+/// Snapshot of repo structural state captured by a `session` start. Persisted
 /// as JSON under `.codesage/sessions/<session_id>.json` and consumed by the
-/// matching `session_end` call to compute a `SessionDiff`. The snapshot is
+/// matching `session` end call to compute a `SessionDiff`. The snapshot is
 /// intentionally compact (no per-symbol detail) so even large monorepos
 /// produce ≤ a few MB per session.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1982,7 +1982,7 @@ pub struct SessionSnapshot {
     pub git_head: Option<String>,
 }
 
-/// Compact MCP response for `session_start`. The full snapshot is still
+/// Compact MCP response for a `session` start. The full snapshot is still
 /// persisted on disk as `SessionSnapshot`; the tool response deliberately
 /// avoids returning the full file list so MCP budget truncation cannot make
 /// the advertised shape ambiguous.
@@ -1999,7 +1999,7 @@ pub struct SessionStartReport {
     pub git_head: Option<String>,
 }
 
-/// Per-file risk regression observed between `session_start` and `session_end`.
+/// Per-file risk regression observed between a `session` start and end.
 /// Only emitted for files that appeared in `SessionSnapshot.top_risk_files`
 /// (the baseline set) and whose risk score went up by at least 0.05.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2011,8 +2011,8 @@ pub struct SessionRiskRegression {
 }
 
 /// Diff between a `SessionSnapshot` and the current state of the repo,
-/// returned by `session_end`. The headline `pass` flag closes the loop: an
-/// agent that calls session_start before edits and session_end after sees
+/// returned by a `session` end. The headline `pass` flag closes the loop: an
+/// agent that starts a session before edits and ends it after sees
 /// `pass=false` when its work introduced cycles or regressed top-risk
 /// files materially.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2028,10 +2028,10 @@ pub struct SessionDiff {
     pub file_count_after: u32,
     pub symbol_count_before: u32,
     pub symbol_count_after: u32,
-    /// Files indexed at session_end that were not in the snapshot.
+    /// Files indexed at session end that were not in the snapshot.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub new_files: Vec<String>,
-    /// Files in the snapshot that are not in the index at session_end.
+    /// Files in the snapshot that are not in the index at session end.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub removed_files: Vec<String>,
     /// Cycles that exist now and didn't at snapshot time. Each inner Vec
@@ -2045,7 +2045,7 @@ pub struct SessionDiff {
     /// Lazy-only import pairs (every directive a function-body or TypeScript
     /// type-only import) that
     /// would close or enlarge a cycle if counted as load-time edges, excluded
-    /// from cycle detection at `session_end`. Absent when zero.
+    /// from cycle detection at session end. Absent when zero.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub lazy_edges: u32,
     /// Per-file risk-score regressions (delta ≥ 0.05) for files in the
@@ -2196,8 +2196,8 @@ pub struct FeatureEntrypoint {
 /// so an agent can quote it in conversation and have the same record
 /// surface in the next session.
 ///
-/// Designed as a *retrieval surface*, not a workflow object: `find_feature`
-/// answers "what feature owns this file?", `feature_bundle` returns the
+/// Designed as a *retrieval surface*, not a workflow object: `features` with
+/// a target answers "what feature owns this file?", `bundle` returns the
 /// curated context an agent would want before reviewing or modifying the
 /// slice. A file may appear in multiple features (a shared helper imported
 /// by two routes); the goal is recall, not partition.
@@ -2258,9 +2258,8 @@ pub struct FeatureRecord {
     pub files: Vec<FeatureFileRef>,
 }
 
-/// Envelope around `Vec<FeatureRecord>` for the `list_features` and
-/// `find_feature` MCP tools, in the `{"results": [...]}` shape
-/// `render_with_kind` produces.
+/// Envelope around `Vec<FeatureRecord>` for the `features` MCP tool, in the
+/// `{"results": [...]}` shape `render_with_kind` produces.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FeatureListResults {
     pub results: Vec<FeatureRecord>,
@@ -2969,7 +2968,7 @@ impl ReviewSeverity {
 }
 
 /// One predicted review objection for a patch. Composed from the same signals
-/// that back `assess_risk_diff`, `recommend_tests`, session checks, and feature
+/// that back aggregate `assess_risk`, `recommend_tests`, session checks, and feature
 /// mapping; it adds no new analysis.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewObjection {
@@ -2988,7 +2987,7 @@ pub struct ReviewObjection {
 }
 
 /// Predicted review objections for a patch, severity-ranked. Read-only,
-/// pre-commit. Reuses `assess_risk_diff`, `recommend_tests`, drift, and feature
+/// pre-commit. Reuses aggregate `assess_risk`, `recommend_tests`, drift, and feature
 /// mapping rather than duplicating their logic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewRehearsal {

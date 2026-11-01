@@ -40,16 +40,16 @@ The rows follow the capabilities that GitNexus, SocratiCode, code-review-graph, 
 | Change impact / blast-radius analysis | ✓ via `impact_analysis`, configurable depth, symbol or file target |
 | Call-flow / "who-touches-X" tracing | ✓ via `find_references` + `impact_analysis` composition |
 | Per-file risk score (churn, fix ratio, blast radius, coupling, test gap, cycles, trust boundaries) | ✓ via `assess_risk`, seven-signal blend |
-| Patch-level risk aggregation (max/mean, hotspots, test-gap files) | ✓ via `assess_risk_diff`; per-file batch via `assess_risk_batch` |
+| Patch-level risk aggregation (max/mean, hotspots, test-gap files) | ✓ via `assess_risk` with `aggregate: true`; per-file scores for a set via `assess_risk` `targets` |
 | Historical co-change / coupling | ✓ via `find_coupling`, decay-weighted with τ=180d |
 | Near-clone / structural-similarity detection | ✓ via `find_similar` / `codesage similar`, MinHash over AST shape, identifiers ignored |
 | Test-recommendation for a changed file set | ✓ via `recommend_tests`, sibling conventions for 7 frameworks + co-change |
 | Pre-commit review prediction (severity-ranked objections for a patch) | ✓ via `review_rehearsal`, composes risk-diff + recommend-tests + drift + feature mapping |
-| Curated context bundle for downstream LLM | ✓ via `export_context`, callers + callees optional |
-| Session-baseline diff (did this session decay the index?) | ✓ via `session_start` / `session_end`, cycle + risk regressions |
-| Cycle / SCC detection in the import graph | ✓ folded into `assess_risk` and `assess_risk_diff.cycles_touching_patch` |
-| Feature-slice mapping (behavior-keyed bundles) | ✓ via `codesage map` / `features-list` / `feature-show` / `feature-for`, MCP `list_features` / `find_feature` |
-| Curated feature bundle (entry + owned + tests + context for one slice) | ✓ via `codesage feature-bundle <id>` and MCP `feature_bundle` |
+| Curated context bundle for downstream LLM | ✓ via `bundle`, callers + callees optional |
+| Session-baseline diff (did this session decay the index?) | ✓ via `session` (`action: start` / `end`), cycle + risk regressions |
+| Cycle / SCC detection in the import graph | ✓ folded into `assess_risk` and its aggregate `cycles_touching_patch` |
+| Feature-slice mapping (behavior-keyed bundles) | ✓ via `codesage map` / `features-list` / `feature-show` / `feature-for`, MCP `features` (with `target` for one file) |
+| Curated feature bundle (entry + owned + tests + context for one slice) | ✓ via `codesage feature-bundle <id>` and MCP `bundle` with a `feat_` target |
 | Trust-boundary derivation (network / fs / secrets / process-exec / db / etc.) | ✓ per-file table from imports/includes/calls and Java framework roles, aggregated per feature, feeds `assess_risk` |
 | Local deployment (no Docker, no managed services) | ✓ one application binary + one SQLite file per project; Linux inference needs ONNX Runtime |
 | Auto-refresh on commit/merge/checkout/rebase | ✓ git hooks installed by `codesage install-hooks` |
@@ -75,7 +75,7 @@ The `project_cache` gauges report cached canonical roots and raw paths, capped a
 
 For comparison or troubleshooting, set `CODESAGE_OVERVIEW_CACHE=0` to disable ranking reuse or `CODESAGE_DIAGNOSTICS=0` to disable diagnostic collection. Set these before starting the daemon; an existing daemon keeps its original environment. Diagnostics-disabled mode still reports scheduler limits and outstanding work. Neither switch disables admission limits or cancellation.
 
-The daemon shares the indexed risk ranking across `project_overview` and `session_start`, while refreshing Git and working-file annotations for each call. It bounds requests and physical work separately. Cancelling one caller does not cancel a shared ranking needed by another caller. Timeout, cancellation, saturation, shutdown, database contention, and incomplete analysis produce explicit tool errors. A client timeout alone does not prove work stopped: native inference or a download can continue until its worker exits. Check `work_continuing` and the execution diagnostics before interpreting a timeout as reclaimed capacity.
+The daemon shares the indexed risk ranking across `project_overview` and `session` start, while refreshing Git and working-file annotations for each call. It bounds requests and physical work separately. Cancelling one caller does not cancel a shared ranking needed by another caller. Timeout, cancellation, saturation, shutdown, database contention, and incomplete analysis produce explicit tool errors. A client timeout alone does not prove work stopped: native inference or a download can continue until its worker exits. Check `work_continuing` and the execution diagnostics before interpreting a timeout as reclaimed capacity.
 
 The daemon is a same-UID co-trust boundary, not a same-UID isolation boundary. Its socket is private to the Unix user and checks peer credentials, but any process running as that user can ask the daemon to open any onboarded project index. Run untrusted agents under a separate Unix user when project isolation matters. MCP calls are agent-safety capped; CLI commands remain operator tools and can request larger limits or file lists.
 
@@ -225,7 +225,7 @@ Common pipelines using `codesage` with `git`. Each is one shell line and how to 
 git diff --cached --name-only | codesage risk-diff
 ```
 
-Pipes the staged file list through `assess_risk_diff`. Output shows the max risk score, files in each risk bucket (hotspot, fix-heavy, test-gap, wide blast radius), and paste-ready summary notes for the commit message or PR description. If `max_score >= 0.6` or `test_gap_files` is non-empty, add tests, split the patch, or call it out in the PR description. Check `unscored_files` too: those files have no indexed git history, so `max_score` did not evaluate them at all.
+Pipes the staged file list through the patch risk rollup (MCP `assess_risk` with `aggregate: true`). Output shows the max risk score, files in each risk bucket (hotspot, fix-heavy, test-gap, wide blast radius), and paste-ready summary notes for the commit message or PR description. If `max_score >= 0.6` or `test_gap_files` is non-empty, add tests, split the patch, or call it out in the PR description. Check `unscored_files` too: those files have no indexed git history, so `max_score` did not evaluate them at all.
 
 ### Tests to run after editing
 
@@ -282,7 +282,7 @@ Lists high-risk files touched in recent history, for example when deciding where
 codesage features-list --since main --json | jq '.results[] | {id: .feature_id, title}'
 ```
 
-`--since <ref>` (also on MCP `list_features`) keeps only slices whose entry, owned, or context files changed since the ref, via `git diff <ref>...HEAD`. Scopes a review to the features a branch actually moved instead of the whole map.
+`--since <ref>` (also on MCP `features`) keeps only slices whose entry, owned, or context files changed since the ref, via `git diff <ref>...HEAD`. Scopes a review to the features a branch actually moved instead of the whole map.
 
 ### Three checks for one file
 
@@ -304,7 +304,7 @@ codesage feature-show feat_<id> --json       # one slice + its file refs + trust
 codesage feature-bundle feat_<id> --json     # bundle the slice's code for an LLM
 ```
 
-Use when answering "what slice owns this file?" or "give me the whole flow behind /users". The bundle is the same shape as `export_context` but anchored on the feature's curated file list instead of semantic search results.
+Use when answering "what slice owns this file?" or "give me the whole flow behind /users". The bundle is the same shape as any MCP `bundle` but anchored on the feature's curated file list instead of semantic search results.
 
 Python route slices include literal Flask Blueprint prefixes from constructors and same-file registrations, FastAPI `APIRouter` constructor prefixes, and Django include chains resolved within the project. Repeated mounts produce separate route slices. Dynamic prefixes, cross-file Blueprint registrations, and FastAPI `include_router` expansion remain unresolved.
 

@@ -60,7 +60,7 @@ CODESAGE_RETRIEVAL_TOOLS = [
     "mcp__codesage__find_references",
     "mcp__codesage__list_dependencies",
     "mcp__codesage__impact_analysis",
-    "mcp__codesage__export_context",
+    "mcp__codesage__bundle",
 ]
 
 BASE_TOOLS = ["Grep", "Read", "Glob"]

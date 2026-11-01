@@ -31,6 +31,7 @@ mod trace_locate;
 pub use brief::build_edit_brief;
 pub use bundle::{
     export_context, export_context_for_symbol, export_context_for_target, feature_bundle,
+    feature_bundle_with_definitions,
 };
 pub use call_path::trace_call_path;
 pub use describe::{DescribeOptions, DescribeParameterError, describe, describe_with_ranking};

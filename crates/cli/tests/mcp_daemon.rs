@@ -152,8 +152,12 @@ fn mcp_shim_starts_daemon_and_lists_tools() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
-    assert!(tool_names.contains(&"list_features"));
+    assert!(tool_names.contains(&"features"));
     assert!(tool_names.contains(&"search"));
+    assert!(
+        !tool_names.contains(&"list_features"),
+        "retired names dispatch but are not advertised: {tool_names:?}"
+    );
 
     drop(child.child.stdin.take());
     let _ = child.child.kill();
@@ -846,15 +850,17 @@ fn tools_call_file_list_tools_reject_empty_lists() {
     let mut session = McpSession::start(runtime.path());
     session.initialize();
 
-    for (id, tool) in [
-        (2, "assess_risk_diff"),
-        (3, "assess_risk_batch"),
-        (4, "recommend_tests"),
+    // The retired aliases reach the same validation as their successor.
+    for (id, tool, field) in [
+        (2, "assess_risk", "targets"),
+        (3, "assess_risk_diff", "file_paths"),
+        (4, "assess_risk_batch", "file_paths"),
+        (5, "recommend_tests", "file_paths"),
     ] {
         let resp = session.request(
             id,
             &format!(
-                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{tool}","arguments":{{"project":"{}","file_paths":[]}}}}}}"#,
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{tool}","arguments":{{"project":"{}","{field}":[]}}}}}}"#,
                 project.path().display()
             ),
         );
@@ -892,7 +898,7 @@ fn tools_call_session_start_returns_summary_not_full_snapshot() {
     let resp = session.request(
         2,
         &format!(
-            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"session_start","arguments":{{"project":"{}","session_id":"wire"}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"session","arguments":{{"project":"{}","action":"start","session_id":"wire"}}}}}}"#,
             project.path().display()
         ),
     );
@@ -901,7 +907,7 @@ fn tools_call_session_start_returns_summary_not_full_snapshot() {
     assert_ne!(
         resp["result"]["isError"],
         Value::Bool(true),
-        "session_start should succeed: {resp}"
+        "session start should succeed: {resp}"
     );
     let structured = &resp["result"]["structuredContent"];
     assert!(
@@ -1365,7 +1371,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
     let features = session.request(
         3,
         &format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"list_features","arguments":{{"project":"{root}"}}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"features","arguments":{{"project":"{root}"}}}}}}"#
         ),
     );
     let feature_id = features["result"]["structuredContent"]["results"][0]["feature_id"]
@@ -1373,7 +1379,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
         .unwrap_or_else(|| panic!("fixture Cargo.toml should map a library feature: {features}"))
         .to_string();
 
-    // Preserve order: session_end requires the preceding session_start.
+    // Preserve order: session end requires the preceding session start.
     let calls: Vec<(&str, Value, &[&str])> = vec![
         (
             "help",
@@ -1453,8 +1459,8 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
             &["results"],
         ),
         (
-            "export_context",
-            serde_json::json!({"target": "outer_step", "is_symbol": true}),
+            "bundle",
+            serde_json::json!({"target": "outer_step"}),
             &["symbol_definitions", "primary"],
         ),
         (
@@ -1465,43 +1471,45 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
         (
             "assess_risk",
             // top_coupled requires verbose output.
-            serde_json::json!({"file_path": "src/helper.rs", "verbose": true}),
-            &["found", "score", "notes", "top_coupled", "top_symbols"],
+            serde_json::json!({"targets": ["src/helper.rs"], "verbose": true}),
+            &[
+                "files",
+                "/files/0/found",
+                "/files/0/score",
+                "/files/0/notes",
+                "/files/0/top_coupled",
+                "/files/0/top_symbols",
+            ],
         ),
         (
-            "assess_risk_diff",
-            serde_json::json!({"file_paths": ["src/helper.rs", "src/util.rs"]}),
+            "assess_risk",
+            serde_json::json!({"targets": ["src/helper.rs", "src/util.rs"], "aggregate": true}),
             &["files", "max_score", "max_risk_file", "summary_notes"],
-        ),
-        (
-            "assess_risk_batch",
-            serde_json::json!({"file_paths": ["src/helper.rs", "src/util.rs"]}),
-            &["files"],
         ),
         (
             "recommend_tests",
             serde_json::json!({"file_paths": ["src/helper.rs"]}),
             &["primary", "notes"],
         ),
-        ("list_features", serde_json::json!({}), &["results"]),
+        ("features", serde_json::json!({}), &["results"]),
         (
-            "find_feature",
-            serde_json::json!({"file_path": "src/helper.rs"}),
+            "features",
+            serde_json::json!({"target": "src/helper.rs"}),
             &["results"],
         ),
         (
-            "feature_bundle",
-            serde_json::json!({"feature_id": feature_id}),
+            "bundle",
+            serde_json::json!({"target": feature_id}),
             &["found", "target_description", "primary"],
         ),
         (
-            "session_start",
-            serde_json::json!({"session_id": "inv"}),
+            "session",
+            serde_json::json!({"action": "start", "session_id": "inv"}),
             &["session_id", "file_count", "symbol_count", "snapshot_path"],
         ),
         (
-            "session_end",
-            serde_json::json!({"session_id": "inv"}),
+            "session",
+            serde_json::json!({"action": "end", "session_id": "inv"}),
             &["session_id", "new_files", "summary_notes"],
         ),
     ];
@@ -1518,7 +1526,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
     );
 
     for (index, (tool, args, required)) in calls.iter().enumerate() {
-        if *tool == "session_end" {
+        if *tool == "session" && args["action"] == "end" {
             // An unchanged tree would exercise only an empty session diff.
             std::fs::write(
                 project.path().join("src/added_mid_session.rs"),
@@ -1561,10 +1569,15 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
             !payload_keys.is_empty(),
             "{tool} shipped empty structuredContent, which Claude Code renders as `{{}}`: {resp}"
         );
+        let structured_value = Value::Object(structured.clone());
         for key in *required {
-            let value = structured.get(*key).unwrap_or_else(|| {
-                panic!("{tool}: structuredContent has no `{key}`: {structured:?}")
-            });
+            // A leading `/` is a JSON pointer into nested per-file entries.
+            let value = if key.starts_with('/') {
+                structured_value.pointer(key)
+            } else {
+                structured.get(*key)
+            }
+            .unwrap_or_else(|| panic!("{tool}: structuredContent has no `{key}`: {structured:?}"));
             assert!(
                 carries_data(value),
                 "{tool}: `{key}` carries no data ({value}) — the fixture is not exercising this \
@@ -1842,8 +1855,8 @@ fn session_start_reuses_all_cached_rows_beyond_the_overview_cap() {
     let session_start = call_mcp_tool(
         &mut session,
         3,
-        "session_start",
-        serde_json::json!({"project": project.path(), "session_id": "cached-top-50"}),
+        "session",
+        serde_json::json!({"project": project.path(), "action": "start", "session_id": "cached-top-50"}),
     );
     let session_rows = session_start["top_risk_file_count"]
         .as_u64()
@@ -1998,8 +2011,8 @@ fn assert_runtime_toggle_results(diagnostics_enabled: bool, cache_enabled: bool)
     let mut reference_session = call_mcp_tool(
         &mut baseline,
         3,
-        "session_start",
-        serde_json::json!({"project": project.path(), "session_id": "runtime-toggles"}),
+        "session",
+        serde_json::json!({"project": project.path(), "action": "start", "session_id": "runtime-toggles"}),
     );
     let snapshot_path = reference_session["snapshot_path"].as_str().unwrap();
     let mut reference_snapshot: Value =
@@ -2056,8 +2069,8 @@ fn assert_runtime_toggle_results(diagnostics_enabled: bool, cache_enabled: bool)
     let mut started = call_mcp_tool(
         &mut session,
         4,
-        "session_start",
-        serde_json::json!({"project": project.path(), "session_id": "runtime-toggles-disabled"}),
+        "session",
+        serde_json::json!({"project": project.path(), "action": "start", "session_id": "runtime-toggles-disabled"}),
     );
     assert_eq!(started["session_id"], "runtime-toggles-disabled");
     assert_eq!(
@@ -2109,10 +2122,10 @@ fn assert_runtime_toggle_results(diagnostics_enabled: bool, cache_enabled: bool)
         assert!(!cache_enabled);
         assert_eq!(stats["tools"]["project_overview"]["requests"], 2);
         assert_eq!(stats["tools"]["project_overview"]["executions"], 4);
-        assert_eq!(stats["tools"]["session_start"]["requests"], 1);
-        assert_eq!(stats["tools"]["session_start"]["executions"], 2);
+        assert_eq!(stats["tools"]["session"]["requests"], 1);
+        assert_eq!(stats["tools"]["session"]["executions"], 2);
         let executions = stats["recent_executions"].as_array().unwrap();
-        for (tool, expected) in [("project_overview", 2), ("session_start", 1)] {
+        for (tool, expected) in [("project_overview", 2), ("session", 1)] {
             for class in ["interactive", "analysis"] {
                 let rows: Vec<_> = executions
                     .iter()
@@ -2396,11 +2409,13 @@ fn assess_risk_default_response_omits_verbose_fields() {
     };
     let object = |v: Value| v.as_object().cloned().expect("object");
 
-    let default = object(call(
+    // One file is a batch of one; its entry carries the single-file shape.
+    let entry = |v: Value| object(v["files"][0].clone());
+    let default = entry(call(
         &mut session,
         2,
         "assess_risk",
-        object(serde_json::json!({"file_path": "src/helper.rs"})),
+        object(serde_json::json!({"targets": ["src/helper.rs"]})),
     ));
     assert_eq!(default["found"], Value::Bool(true), "{default:?}");
     assert!(carries_data(&default["score"]), "{default:?}");
@@ -2411,11 +2426,11 @@ fn assess_risk_default_response_omits_verbose_fields() {
             "assess_risk default response must omit `{key}`: {default:?}"
         );
     }
-    let verbose = object(call(
+    let verbose = entry(call(
         &mut session,
         3,
         "assess_risk",
-        object(serde_json::json!({"file_path": "src/helper.rs", "verbose": true})),
+        object(serde_json::json!({"targets": ["src/helper.rs"], "verbose": true})),
     ));
     for key in VERBOSE_ONLY {
         assert!(
@@ -2433,12 +2448,17 @@ fn assess_risk_default_response_omits_verbose_fields() {
     );
 
     let files = serde_json::json!(["src/helper.rs", "src/util.rs"]);
-    for (id, tool) in [(4u64, "assess_risk_batch"), (5, "assess_risk_diff")] {
+    for (id, aggregate) in [(4u64, false), (5, true)] {
+        let tool = if aggregate {
+            "assess_risk aggregate"
+        } else {
+            "assess_risk"
+        };
         let default = object(call(
             &mut session,
             id,
-            tool,
-            object(serde_json::json!({"file_paths": files})),
+            "assess_risk",
+            object(serde_json::json!({"targets": files, "aggregate": aggregate})),
         ));
         let entries = default["files"].as_array().expect("files array");
         assert!(!entries.is_empty(), "{tool}: {default:?}");
@@ -2454,8 +2474,8 @@ fn assess_risk_default_response_omits_verbose_fields() {
         let verbose = object(call(
             &mut session,
             id + 10,
-            tool,
-            object(serde_json::json!({"file_paths": files, "verbose": true})),
+            "assess_risk",
+            object(serde_json::json!({"targets": files, "aggregate": aggregate, "verbose": true})),
         ));
         let entries = verbose["files"].as_array().expect("files array");
         assert!(
@@ -2561,7 +2581,7 @@ fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
     assert_eq!(
         mcp_report["next"],
         serde_json::json!([{
-            "tool": "export_context",
+            "tool": "bundle",
             "arguments": {
                 "project": project.path(),
                 "target": mcp_steps[0]["handle"]

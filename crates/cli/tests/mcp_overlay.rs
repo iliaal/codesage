@@ -84,7 +84,7 @@ impl Server {
 
     fn call(&mut self, root: &Path, tool: &str, mut arguments: Value) -> Value {
         arguments["project"] = json!(root);
-        if !matches!(tool, "session_start" | "session_end" | "edit_check") {
+        if tool != "edit_check" {
             arguments["detail"] = json!("full");
         }
         let result = self.request("tools/call", json!({"name":tool, "arguments":arguments}));
@@ -210,7 +210,11 @@ fn edited_symbols_references_graph_bundles_and_sessions_use_current_source() {
     let dir = fixture();
     let root = dir.path();
     let mut server = Server::start();
-    let clean = server.call(root, "session_start", json!({"session_id":"before"}));
+    let clean = server.call(
+        root,
+        "session",
+        json!({"action":"start", "session_id":"before"}),
+    );
     assert_ne!(clean["index"]["structural"], "overlay");
     let before = std::fs::read(root.join(".codesage/index.db")).unwrap();
     edited(root);
@@ -267,20 +271,18 @@ fn edited_symbols_references_graph_bundles_and_sessions_use_current_source() {
         file_card["card"]["sections"]["identity"]["data"]["indexed"]["dirty"], true,
         "{file_card}"
     );
-    for tool in ["assess_risk", "assess_risk_batch", "assess_risk_diff"] {
-        let args = if tool == "assess_risk" {
-            json!({"target":"src/leaf.rs"})
-        } else {
-            json!({"targets":["src/leaf.rs"]})
-        };
-        let risk = server.call(root, tool, args);
+    for args in [
+        json!({"targets":["src/leaf.rs"]}),
+        json!({"targets":["src/leaf.rs"], "aggregate": true}),
+    ] {
+        let risk = server.call(root, "assess_risk", args);
         assert_overlay(&risk);
         assert!(risk.to_string().contains("new_leaf"), "{risk}");
         assert!(!risk.to_string().contains("old_leaf"), "{risk}");
     }
     let bundle = server.call(
         root,
-        "feature_bundle",
+        "bundle",
         json!({"target":"feat_1111111111111111", "include_callees":true}),
     );
     assert_overlay(&bundle);
@@ -295,9 +297,10 @@ fn edited_symbols_references_graph_bundles_and_sessions_use_current_source() {
         "{bundle}"
     );
     assert_eq!(bundle["index"]["features"], "indexed");
+    // The retired alias keeps its own feature lookup and reads the same rows.
     let feature_export = server.call(
         root,
-        "export_context",
+        "feature_bundle",
         json!({"target":"feat_1111111111111111", "include_callees":true}),
     );
     assert_overlay(&feature_export);
@@ -305,7 +308,7 @@ fn edited_symbols_references_graph_bundles_and_sessions_use_current_source() {
     assert_eq!(feature_export["primary"], bundle["primary"]);
     let exported = server.call(
         root,
-        "export_context",
+        "bundle",
         json!({"target":"sym:src/leaf.rs#new_leaf", "include_callers":true}),
     );
     assert_overlay(&exported);
@@ -317,7 +320,7 @@ fn edited_symbols_references_graph_bundles_and_sessions_use_current_source() {
         }),
         "{exported}"
     );
-    for tool in ["list_dependencies", "find_feature", "find_similar"] {
+    for tool in ["list_dependencies", "features", "find_similar"] {
         let result = server.call(root, tool, json!({"target":"sym:src/leaf.rs#new_leaf"}));
         assert_overlay(&result);
     }
@@ -326,7 +329,7 @@ fn edited_symbols_references_graph_bundles_and_sessions_use_current_source() {
         assert_overlay(&result);
         assert!(!result.to_string().contains("old_leaf"), "{result}");
     }
-    let features = server.call(root, "list_features", json!({}));
+    let features = server.call(root, "features", json!({}));
     assert_overlay(&features);
     assert_eq!(features["index"]["features"], "indexed");
     let trace = server.call(root, "from_trace", json!({
@@ -340,7 +343,11 @@ fn edited_symbols_references_graph_bundles_and_sessions_use_current_source() {
         overview["file_count"].as_u64().unwrap() + 1,
         clean["file_count"].as_u64().unwrap()
     );
-    let after = server.call(root, "session_start", json!({"session_id":"after"}));
+    let after = server.call(
+        root,
+        "session",
+        json!({"action":"start", "session_id":"after"}),
+    );
     assert_overlay(&after);
     assert_eq!(
         after["file_count"].as_u64().unwrap() + 1,
@@ -356,7 +363,11 @@ fn edited_symbols_references_graph_bundles_and_sessions_use_current_source() {
             .len(),
         3
     );
-    let diff = server.call(root, "session_end", json!({"session_id":"before"}));
+    let diff = server.call(
+        root,
+        "session",
+        json!({"action":"end", "session_id":"before"}),
+    );
     assert_overlay(&diff);
     assert!(
         diff["removed_files"]
@@ -462,8 +473,8 @@ fn cached_overview_directory_and_session_rankings_use_changed_risk() {
     );
     server.call(
         root,
-        "session_start",
-        json!({"session_id":"ranking-before"}),
+        "session",
+        json!({"action":"start", "session_id":"ranking-before"}),
     );
     let clean_directory = server.call(root, "describe", json!({"target":"dir:src"}));
     assert_eq!(
@@ -482,8 +493,9 @@ fn cached_overview_directory_and_session_rankings_use_changed_risk() {
     )
     .unwrap();
     std::fs::remove_file(root.join("src/gone.rs")).unwrap();
-    let risk = server.call(root, "assess_risk", json!({"target":"src/leaf.rs"}));
+    let risk = server.call(root, "assess_risk", json!({"targets":["src/leaf.rs"]}));
     assert_overlay(&risk);
+    let risk = risk["files"][0].clone();
     let current_score = risk["score"].as_f64().unwrap();
     assert!(
         current_score > old_score + 0.05,
@@ -517,14 +529,22 @@ fn cached_overview_directory_and_session_rankings_use_changed_risk() {
         "{directory}"
     );
 
-    let after = server.call(root, "session_start", json!({"session_id":"ranking-after"}));
+    let after = server.call(
+        root,
+        "session",
+        json!({"action":"start", "session_id":"ranking-after"}),
+    );
     assert_overlay(&after);
     let snapshot: Value = serde_json::from_slice(
         &std::fs::read(root.join(".codesage/sessions/ranking-after.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(snapshot["top_risk_files"], current["top_risk_files"]);
-    let diff = server.call(root, "session_end", json!({"session_id":"ranking-before"}));
+    let diff = server.call(
+        root,
+        "session",
+        json!({"action":"end", "session_id":"ranking-before"}),
+    );
     assert_overlay(&diff);
     assert!(
         diff["risk_regressions"]
@@ -646,7 +666,7 @@ fn overlay_bundles_keep_late_target_bodies_and_number_raw_path_comments() {
             "sym:app/x.py#late_function".to_string(),
             format!("app/x.py:{}", line + 1),
         ] {
-            let bundle = server.call(root, "export_context", json!({"target":target}));
+            let bundle = server.call(root, "bundle", json!({"target":target}));
             assert_overlay(&bundle);
             assert!(
                 bundle["primary"]
@@ -666,7 +686,7 @@ fn overlay_bundles_keep_late_target_bodies_and_number_raw_path_comments() {
         "# app/x.py\ndef changed():\n    pass\n",
     )
     .unwrap();
-    let bundle = server.call(root, "export_context", json!({"target":"file:app/x.py"}));
+    let bundle = server.call(root, "bundle", json!({"target":"file:app/x.py"}));
     assert_overlay(&bundle);
     let source = bundle["primary"]
         .as_array()

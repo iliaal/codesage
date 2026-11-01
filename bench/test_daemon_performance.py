@@ -782,7 +782,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["scenario"], "review_bounded")
         self.assertEqual(result["summary"]["successes"], 62)
         self.assertEqual(Counter(row["tool"] for row in result["requests"]),
-                         {"project_overview": 23, "find_references": 38, "session_start": 1})
+                         {"project_overview": 23, "find_references": 38, "session": 1})
         self.assertEqual(result["requests"][-1]["outcome"], "success")
         self.assertTrue(all(row["stable_sha256"] for row in result["requests"]))
         self.assertTrue(all(row["client_scheduling_wait_s"] >= 0 for row in result["requests"]))

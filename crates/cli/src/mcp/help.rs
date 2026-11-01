@@ -158,6 +158,11 @@ pub(super) fn answer(server: &CodeSageServer, params: &HelpParams) -> anyhow::Re
             } else {
                 result.subject = Some(operator.clone());
             }
+        } else if let Some(retired) = super::alias::retired(name) {
+            return Err(invalid(format!(
+                "help: `{name}` is a retired alias of `{}`; select tool={:?}",
+                retired.successor, retired.successor
+            )));
         } else {
             return Err(invalid(format!(
                 "help: unknown tool {name:?}; omit selectors to list tools"
@@ -556,7 +561,7 @@ mod tests {
             let arguments = json!({"project": "/project", "targets": ["src/0.rs"], "detail": "standard", "budget_tokens": 1024}).as_object().unwrap().clone();
             let result = super::super::detail::finish(
                 rmcp::model::CallToolResult::structured(payload),
-                "assess_risk_diff",
+                "assess_risk",
                 &arguments,
                 std::time::Duration::ZERO,
                 4096,

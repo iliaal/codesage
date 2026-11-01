@@ -128,7 +128,7 @@ fn is_true(value: &Value) -> bool {
 
 /// Collect every incompleteness signal the payload already carries.
 /// Keys are matched at any depth: `unscored` is top-level on `assess_risk` and
-/// per row on `assess_risk_batch`, and `_meta` nests `truncated` and `clamps`.
+/// per row on `assess_risk`, and `_meta` nests `truncated` and `clamps`.
 pub(super) fn scan(payload: &Map<String, Value>, out: &mut Signals) {
     scan_object_at(payload, 0, out);
 }
@@ -252,8 +252,10 @@ fn coverage_gap(coverage: &Value) -> bool {
 
 /// Broader CLI equivalent of an MCP tool. MCP caps are tighter than the
 /// operator surface, so the CLI is the documented remedy when a walk or a page
-/// stopped at an MCP bound. No argument is interpolated into the string.
-fn cli_command(tool: &str) -> Option<&'static str> {
+/// stopped at an MCP bound. No argument is interpolated into the string;
+/// arguments only select which command answers the call's question.
+fn cli_command(tool: &str, arguments: &Map<String, Value>) -> Option<&'static str> {
+    let has = |key: &str| arguments.get(key).is_some_and(|value| !value.is_null());
     Some(match tool {
         "describe" => "codesage describe",
         "project_overview" => "codesage overview",
@@ -265,18 +267,21 @@ fn cli_command(tool: &str) -> Option<&'static str> {
         "impact_analysis" => "codesage impact",
         "trace_call_path" => "codesage trace",
         "from_trace" => "codesage from-trace",
-        "export_context" => "codesage export",
+        "bundle" if has("feature_id") => "codesage feature-bundle",
+        "bundle" => "codesage export",
         "find_coupling" => "codesage coupling",
-        "assess_risk" => "codesage risk",
-        "assess_risk_batch" => "codesage risk-batch",
-        "assess_risk_diff" => "codesage risk-diff",
+        "assess_risk" if arguments.get("aggregate") == Some(&Value::Bool(true)) => {
+            "codesage risk-diff"
+        }
+        "assess_risk" => "codesage risk-batch",
         "recommend_tests" => "codesage tests-for",
         "review_rehearsal" => "codesage rehearse",
-        "session_start" => "codesage session-start",
-        "session_end" => "codesage session-end",
-        "list_features" => "codesage features-list",
-        "find_feature" => "codesage feature-for",
-        "feature_bundle" => "codesage feature-bundle",
+        "session" if arguments.get("action").and_then(Value::as_str) == Some("end") => {
+            "codesage session-end"
+        }
+        "session" => "codesage session-start",
+        "features" if has("target") || has("file_path") => "codesage feature-for",
+        "features" => "codesage features-list",
         _ => return None,
     })
 }
@@ -325,7 +330,7 @@ fn recover(
             }
             (!out.is_empty()).then_some(Value::Object(out))
         }
-        Kind::Bounded => match cli_command(tool) {
+        Kind::Bounded => match cli_command(tool, arguments) {
             Some(command) => Some(json!({"command": command})),
             None => {
                 let retry = json!({"tool": tool, "arguments": arguments});
@@ -728,13 +733,7 @@ impl CodeSageServer {
             block["history"] = json!("indexed");
             if matches!(
                 tool,
-                "feature_bundle"
-                    | "export_context"
-                    | "find_feature"
-                    | "list_features"
-                    | "describe"
-                    | "review_rehearsal"
-                    | "project_overview"
+                "bundle" | "features" | "describe" | "review_rehearsal" | "project_overview"
             ) {
                 block["features"] = json!("indexed");
             }
@@ -954,7 +953,8 @@ pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
                     "bytes": {"type": "integer", "minimum": 0},
                     "detail": {"enum": ["compact", "standard", "full"]},
                     "budget_tokens": {"type": "integer", "minimum": 0},
-                    "budget_exceeded": {"const": true, "description": "The response cannot fit without dropping its remaining result or evidence."}
+                    "budget_exceeded": {"const": true, "description": "The response cannot fit without dropping its remaining result or evidence."},
+                    "notes": {"type": "array", "items": {"type": "string"}, "description": super::help::field_description("cost.notes")}
                 }
             }),
         ),
@@ -1333,7 +1333,7 @@ mod tests {
         assert_eq!(recover["arguments"]["offset"], 15);
         assert_eq!(recover["arguments"]["query"], "q");
 
-        let unpaged = envelope_of(payload, "assess_risk_diff", json!({"project": "/p"}));
+        let unpaged = envelope_of(payload, "assess_risk", json!({"project": "/p"}));
         let recover = &unpaged["completeness"]["recover"];
         assert_eq!(recover["total"], 69);
         assert!(recover.get("arguments").is_none());

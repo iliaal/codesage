@@ -1357,7 +1357,8 @@ fn describe_stdio_warm_cache_preserves_missing_partial_and_measured_history() {
             if expand["tool"] == "describe" {
                 assert_eq!(expanded["structuredContent"]["card"], *warm);
             } else {
-                let assessed = &expanded["structuredContent"];
+                // The expansion asks about one file, a batch of one.
+                let assessed = &expanded["structuredContent"]["files"][0];
                 assert_eq!(assessed["score"], warm["sections"]["risk"]["data"]["score"]);
                 assert_eq!(
                     assessed["unscored"].as_bool().unwrap_or(false),

@@ -142,11 +142,33 @@ impl Drop for ExecutionResources {
     }
 }
 
-fn class_for(tool: &str) -> WorkClass {
+/// `bundle` needs the native lane only when its target may fall through to
+/// semantic search. A feature lookup, a handle, or a forced symbol resolves
+/// structurally and keeps the interactive lane `feature_bundle` used, so
+/// parallel review agents do not queue behind embedding work.
+fn bundle_is_structural(arguments: &Map<String, Value>) -> bool {
+    use codesage_protocol::Handle;
+    if arguments.get("feature_id").is_some_and(|v| !v.is_null())
+        || arguments.get("is_symbol") == Some(&Value::Bool(true))
+    {
+        return true;
+    }
+    arguments
+        .get("target")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|target| {
+            target.starts_with("route:")
+                || target.starts_with("cmd:")
+                || Handle::parse(target).is_some()
+        })
+}
+
+fn class_for(tool: &str, arguments: &Map<String, Value>) -> WorkClass {
     match tool {
-        "search" | "export_context" | "embed_texts" | "rerank_pairs" => WorkClass::Native,
-        "project_overview" | "review_rehearsal" | "assess_risk" | "assess_risk_batch"
-        | "assess_risk_diff" | "session_start" | "session_end" | "impact_analysis"
+        "bundle" if bundle_is_structural(arguments) => WorkClass::Interactive,
+        "search" | "bundle" | "embed_texts" | "rerank_pairs" => WorkClass::Native,
+        "project_overview" | "review_rehearsal" | "assess_risk" | "session" | "impact_analysis"
         | "recommend_tests" | "trace_call_path" | "find_similar" => WorkClass::Analysis,
         _ => WorkClass::Interactive,
     }
@@ -176,16 +198,12 @@ fn validate_arguments(request: &CallToolRequestParams) -> Result<(), serde_json:
         "trace_call_path" => validate!(TracePathParams),
         "from_trace" => validate!(FromTraceParams),
         "impact_analysis" => validate!(ImpactParams),
-        "export_context" => validate!(ExportContextParams),
+        "bundle" => validate!(BundleParams),
         "find_coupling" => validate!(CouplingParams),
         "assess_risk" => validate!(RiskParams),
-        "assess_risk_diff" => validate!(RiskDiffParams),
-        "assess_risk_batch" => validate!(RiskBatchParams),
         "recommend_tests" => validate!(TestsForParams),
-        "session_start" | "session_end" => validate!(SessionParams),
-        "list_features" => validate!(ListFeaturesParams),
-        "find_feature" => validate!(FindFeatureParams),
-        "feature_bundle" => validate!(FeatureBundleParams),
+        "session" => validate!(SessionParams),
+        "features" => validate!(FeaturesParams),
         _ => Ok(()),
     }
 }
@@ -666,7 +684,7 @@ impl CodeSageServer {
                 return self.render::<codesage_protocol::SessionStartReport>(
                     &project,
                     Err(error),
-                    "session_start",
+                    "session",
                 );
             }
         };
@@ -714,7 +732,7 @@ impl CodeSageServer {
                         snapshot,
                     ))
                 });
-            let mut rendered = server.render(&project, result, "session_start");
+            let mut rendered = server.render(&project, result, "session");
             if recomputed {
                 disclose_ranking_recomputation(&mut rendered);
             }
@@ -740,7 +758,7 @@ impl CodeSageServer {
     }
 
     /// `include_tests: true` ranks test files too; that ranking is not the
-    /// one `session_start` shares, so it never touches the overview cache.
+    /// one `session` start shares, so it never touches the overview cache.
     pub(super) async fn overview_including_tests(
         &self,
         request: Arc<ToolRequest>,
@@ -773,17 +791,35 @@ impl CodeSageServer {
                 ticket.mark_persisted();
                 Ok(super::session_start_report(root, snapshot))
             });
-            server.render(&project, result, "session_start")
+            server.render(&project, result, "session")
         })
         .await
     }
 
     pub(super) async fn dispatch_tool(
         &self,
-        request: CallToolRequestParams,
+        mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let started = Instant::now();
+        let notes = super::alias::deprecation_notes(&request.name, request.arguments.as_ref());
+        if let Err(error) = super::alias::rewrite(&mut request) {
+            let tool = request.name.to_string();
+            let arguments = request.arguments.clone().unwrap_or_default();
+            let mut result = render_mcp_error(&tool, Some(&arguments), error);
+            normalize_error(&mut result, &tool, Some(&arguments), None);
+            return Ok(CallToolResponse::Complete(
+                super::detail::finish_with_notes(
+                    result,
+                    &tool,
+                    &arguments,
+                    started.elapsed(),
+                    super::render::MCP_BUDGET_CHARS,
+                    self.state.envelope_enabled,
+                    &notes,
+                ),
+            ));
+        }
         let tool = request.name.to_string();
         let arguments = request.arguments.clone().unwrap_or_default();
         let ticket = (tool != "daemon_stats")
@@ -803,7 +839,7 @@ impl CodeSageServer {
         let server = self.clone();
         let rendering_ticket = ticket.clone();
         tokio::task::spawn_blocking(move || {
-            let cap = if matches!(tool.as_str(), "export_context" | "feature_bundle") {
+            let cap = if tool == "bundle" {
                 arguments
                     .get("project")
                     .and_then(Value::as_str)
@@ -813,13 +849,14 @@ impl CodeSageServer {
             } else {
                 super::render::MCP_BUDGET_CHARS
             };
-            let response = super::detail::finish(
+            let response = super::detail::finish_with_notes(
                 response,
                 &tool,
                 &arguments,
                 started.elapsed(),
                 cap,
                 server.state.envelope_enabled,
+                &notes,
             );
             if let Some(ticket) = rendering_ticket {
                 ticket.finish(result_outcome(&response));
@@ -870,7 +907,7 @@ impl CodeSageServer {
             return Ok(CallToolResult::structured(snapshot).into());
         }
         let tool = request.name.to_string();
-        let class = class_for(&tool);
+        let class = class_for(&tool, &arguments);
         let ticket = ticket.expect("non-diagnostic request ticket");
         let tool_name = tool.clone();
         ticket.set_class(class_name(class));
@@ -1187,7 +1224,7 @@ mod tests {
         index_fixture(&root.path().join(".codesage"), "old", 2);
         index_fixture(&root.path().join("replacement"), "new", 3);
         let server = CodeSageServer::new();
-        let request = fixture_request(&server, root.path(), "session_start");
+        let request = fixture_request(&server, root.path(), "session");
         let cached = server.ranking_for(&request).await.unwrap();
         assert!(cached.stable);
         assert_eq!(cached.ranking.rows().len(), 2);
@@ -1315,7 +1352,7 @@ mod tests {
         index_fixture(&root.path().join(".codesage"), "cached", 2);
         index_fixture(&root.path().join("replacement"), "opened", 3);
         let server = CodeSageServer::new();
-        let request = fixture_request(&server, root.path(), "session_start");
+        let request = fixture_request(&server, root.path(), "session");
         let cached = server.ranking_for(&request).await.unwrap();
         let paths = root.path().to_path_buf();
         let hooks = SnapshotHooks {
@@ -1392,7 +1429,7 @@ mod tests {
             .unwrap();
         let canonical = state.db_path.parent().unwrap().parent().unwrap();
         assert_eq!(canonical, original);
-        let request = fixture_request(&server, canonical, "session_start");
+        let request = fixture_request(&server, canonical, "session");
         let cached = server.ranking_for(&request).await.unwrap();
         let transitions = Arc::new(AtomicUsize::new(0));
         let observed_transitions = transitions.clone();
@@ -1469,7 +1506,7 @@ mod tests {
         server
             .resolve_project_inner(project.to_str().unwrap())
             .unwrap();
-        let request = fixture_request(&server, &project, "session_start");
+        let request = fixture_request(&server, &project, "session");
         let cached = server.ranking_for(&request).await.unwrap();
         let hook_project = project.clone();
         let hooks = SnapshotHooks {
@@ -1533,7 +1570,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         index_fixture(&root.path().join(".codesage"), "retained", 2);
         let server = CodeSageServer::new();
-        let request = fixture_request(&server, root.path(), "session_start");
+        let request = fixture_request(&server, root.path(), "session");
         let cached = server.ranking_for(&request).await.unwrap();
         let snapshot = server
             .with_cached_snapshot(
@@ -1591,7 +1628,7 @@ mod tests {
         request.ticket.finish("cancelled");
         let response = status(&stopped_result(
             StopReason::ClientCancelled,
-            "session_start",
+            "session",
             None,
             &request.ticket,
         ));
@@ -1612,7 +1649,7 @@ mod tests {
         assert_eq!(
             status(&stopped_result(
                 StopReason::ClientCancelled,
-                "session_start",
+                "session",
                 None,
                 &request.ticket
             ))["work_continuing"],
@@ -1637,7 +1674,7 @@ mod tests {
             overview.structured_content.as_ref().unwrap()["file_count"],
             2
         );
-        let session_request = fixture_request(&server, root.path(), "session_start");
+        let session_request = fixture_request(&server, root.path(), "session");
         let session = server
             .cached_session_start(
                 session_request.clone(),
@@ -1830,7 +1867,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         index_fixture(&root.path().join(".codesage"), "session", 2);
         let server = single_slot_server();
-        let request = fixture_request(&server, root.path(), "session_start");
+        let request = fixture_request(&server, root.path(), "session");
         let cached = server.ranking_for(&request).await.unwrap();
         rusqlite::Connection::open(root.path().join(".codesage/index.db"))
             .unwrap()
@@ -2005,6 +2042,38 @@ mod tests {
     }
 
     #[test]
+    fn bundle_work_class_follows_whether_semantic_search_can_run() {
+        let class = |arguments: Value| class_for("bundle", arguments.as_object().unwrap());
+        for structural in [
+            json!({"target": "feat_1111111111111111"}),
+            json!({"target": "route:POST /api/login"}),
+            json!({"target": "cmd:serve"}),
+            json!({"target": "sym:src/lib.rs#run"}),
+            json!({"target": "file:src/lib.rs"}),
+            json!({"target": "dir:src"}),
+            json!({"target": "chunk:src/lib.rs:1-4"}),
+            json!({"feature_id": "absent"}),
+            json!({"target": "run", "is_symbol": true}),
+        ] {
+            assert!(
+                class(structural.clone()) == WorkClass::Interactive,
+                "{structural}"
+            );
+        }
+        for semantic in [
+            json!({"target": "where is the login handler"}),
+            json!({"target": "run"}),
+            json!({"target": "src/lib.rs"}),
+            json!({"target": "run", "is_symbol": false}),
+        ] {
+            assert!(class(semantic.clone()) == WorkClass::Native, "{semantic}");
+        }
+        assert!(class_for("search", &Map::new()) == WorkClass::Native);
+        assert!(class_for("features", &Map::new()) == WorkClass::Interactive);
+        assert!(class_for("session", &Map::new()) == WorkClass::Analysis);
+    }
+
+    #[test]
     fn normalize_error_synthesizes_a_contract_block_for_bare_text_failures() {
         let mut bare = CallToolResult::error(vec![ContentBlock::text("boom from a foreign path")]);
         normalize_error(&mut bare, "find_symbol", None, None);
@@ -2042,21 +2111,20 @@ mod tests {
     #[test]
     fn cancellation_response_keeps_persistence_and_physical_state() {
         let diagnostics = super::super::diagnostics::Diagnostics::default();
-        let request = diagnostics.begin_request("session_start", None);
-        let execution = Arc::new(diagnostics.begin_execution("session_start", None));
+        let request = diagnostics.begin_request("session", None);
+        let execution = Arc::new(diagnostics.begin_execution("session", None));
         execution.set_phase("running");
         request.link_execution_ticket(&execution);
         request.finish("cancelled");
         request.mark_persisted();
-        let stopped =
-            || stopped_result(StopReason::ClientCancelled, "session_start", None, &request);
+        let stopped = || stopped_result(StopReason::ClientCancelled, "session", None, &request);
         let metadata = status(&stopped());
         assert_eq!(metadata["request_id"], request.id());
         assert_eq!(metadata["persistence_committed"], true);
         assert_eq!(metadata["phase"], "running");
         assert_eq!(metadata["work_continuing"], true);
         assert_eq!(metadata["status"], "cancelled");
-        assert_eq!(metadata["tool"], "session_start");
+        assert_eq!(metadata["tool"], "session");
         assert_eq!(metadata["error"]["code"], "E_CANCELLED");
         execution.finish("cancelled");
         assert_eq!(status(&stopped())["work_continuing"], false);

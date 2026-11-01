@@ -803,7 +803,7 @@ fn feature_commands(
         let ids: Vec<String> = dropped.into_iter().collect();
         notes.push(format!(
             "feature test_command dropped from `commands` for {} (contains a line break or NUL); \
-             see `feature_bundle` for the raw value",
+             see `bundle` on the feature for the raw value",
             ids.join(", ")
         ));
     }

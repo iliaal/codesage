@@ -229,7 +229,7 @@ impl Server {
         self.request(
             "tools/call",
             json!({
-                "name": "export_context", "arguments": {
+                "name": "bundle", "arguments": {
                     "project": root, "target": target,
                     "include_callers": true, "include_callees": true
                 }
@@ -376,7 +376,7 @@ fn directory_exports_keep_literal_case_and_component_boundaries_in_both_adapters
     let result = server.request(
         "tools/call",
         json!({
-            "name": "export_context", "arguments": {
+            "name": "bundle", "arguments": {
                 "project": root.path(), "target": "dir:module", "limit": 1
             }
         }),
@@ -445,6 +445,7 @@ fn the_legacy_symbol_hint_preserves_its_unresolved_name_miss() {
     let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(cli["found"], false);
     let mut server = Server::start();
+    // The retired alias and its `is_symbol` hint still force symbol lookup.
     let result = server.request(
         "tools/call",
         json!({
@@ -606,27 +607,43 @@ fn a_real_mapped_go_library_exports_entry_and_owned_definitions_without_chunks()
         limited["symbol_definitions"][0]["handle"],
         "sym:anchor.go#PublicAnchor"
     );
-    let limited_mcp = server.request("tools/call", json!({
-        "name": "export_context", "arguments": {"project": root.path(), "target": target, "limit": 1}
-    }));
+    let limited_mcp = server.request(
+        "tools/call",
+        json!({
+            "name": "bundle", "arguments": {"project": root.path(), "target": target, "limit": 1}
+        }),
+    );
     assert_ne!(limited_mcp["isError"], true, "{limited_mcp}");
     assert_eq!(
         limited_mcp["structuredContent"]["symbol_definitions"],
         limited["symbol_definitions"]
     );
 
+    // One feature bundle: the retired `feature_bundle` alias reads the same
+    // structural definitions a feature target reads through `bundle`.
     let standalone = server.request(
         "tools/call",
         json!({
-            "name": "feature_bundle", "arguments": {"project": root.path(), "target": target}
+            "name": "feature_bundle", "arguments": {"project": root.path(), "target": target, "limit": 1}
         }),
     );
     assert_ne!(standalone["isError"], true, "{standalone}");
-    assert!(
-        standalone["structuredContent"]
-            .get("symbol_definitions")
-            .is_none()
+    assert_eq!(
+        standalone["structuredContent"]["symbol_definitions"],
+        limited["symbol_definitions"]
     );
+    for key in [
+        "found",
+        "primary",
+        "related",
+        "symbol_definitions",
+        "target_description",
+    ] {
+        assert_eq!(
+            standalone["structuredContent"][key], limited_mcp["structuredContent"][key],
+            "{key}"
+        );
+    }
 }
 
 #[test]

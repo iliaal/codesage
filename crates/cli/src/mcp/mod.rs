@@ -1,3 +1,4 @@
+mod alias;
 mod detail;
 mod diagnostics;
 mod dispatch;
@@ -22,18 +23,18 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use codesage_graph::{
-    assess_risk, assess_risk_batch, assess_risk_diff, export_context, export_context_for_target,
-    feature_bundle, find_coupling, find_references, find_similar, find_symbol, from_trace,
-    impact_analysis_report, list_dependencies, recommend_tests_with_reachability, search_page,
-    session_end, session_start, trace_call_path,
+    assess_risk_batch, assess_risk_diff, export_context, export_context_for_target,
+    feature_bundle_with_definitions, find_coupling, find_references, find_similar, find_symbol,
+    from_trace, impact_analysis_report, list_dependencies, recommend_tests_with_reachability,
+    search_page, session_end, session_start, trace_call_path,
 };
 use codesage_protocol::{
     CallPathReport, CallPathRequest, ContextBundle, CouplingReport, DependencyEntry,
     DescribeResult, ExportRequest, FeatureListResults, FindReferencesRequest,
     FindReferencesResults, FindSimilarResults, FindSymbolRequest, FindSymbolResults,
     FromTraceReport, FromTraceRequest, ImpactOptions, ImpactReport, ImpactRequest, ImpactTarget,
-    ProjectOverview, ReviewRehearsal, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment,
-    SearchRequest, SearchResults, SessionDiff, SessionStartReport, TestRecommendations,
+    ProjectOverview, ReviewRehearsal, RiskBatchAssessment, RiskDiffAssessment, SearchRequest,
+    SearchResults, SessionDiff, SessionStartReport, TestRecommendations,
 };
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -314,7 +315,7 @@ impl ServerHandler for CodeSageServer {
                  Use find_symbol to locate definitions, find_references to trace callers \
                  and imports, list_dependencies for file-level dependency mapping, search \
                  for natural-language semantic code search, impact_analysis to estimate \
-                 blast radius of a change, and export_context to bundle code for an LLM.",
+                 blast radius of a change, and bundle to gather source for an LLM.",
             )
     }
 
@@ -367,7 +368,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "describe",
-        description = "Inspect one indexed file, symbol, feature, or directory: facts, dependencies, tests, risk, and follow-up calls. Use project_overview for project orientation or export_context for source bundles. Ambiguous targets return candidates; unavailable sections disclose recovery.",
+        description = "Inspect one indexed file, symbol, feature, or directory: facts, dependencies, tests, risk, and follow-up calls. Use project_overview for project orientation or bundle for source. Ambiguous targets return candidates; unavailable sections disclose recovery.",
         output_schema = schema_for_type::<DescribeResult>()
     )]
     async fn describe_tool(
@@ -454,7 +455,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "review_rehearsal",
-        description = "Review an explicit patch file set before committing: ranked objections about risk, tests, cycles, boundaries, and scope, with evidence and suggested checks. Use assess_risk_diff for risk alone. Inspect each objection against the actual patch; this read-only analysis does not run tests.",
+        description = "Review an explicit patch file set before committing: ranked objections about risk, tests, cycles, boundaries, and scope, with evidence and suggested checks. Use assess_risk for risk alone. Inspect each objection against the actual patch; this read-only analysis does not run tests.",
         output_schema = schema_for_type::<ReviewRehearsal>()
     )]
     async fn review_rehearsal_tool(
@@ -760,7 +761,7 @@ impl CodeSageServer {
         Parameters(params): Parameters<FromTraceParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            // Unlike list_features, zero selects the default frame limit.
+            // Unlike features, zero selects the default frame limit.
             let (limit, clamp) = capped_limit_tracked(
                 params.limit.filter(|&l| l > 0),
                 MAX_MCP_TRACE_FRAMES,
@@ -822,40 +823,52 @@ impl CodeSageServer {
     }
 
     #[tool(
-        name = "export_context",
-        description = "Bundle source and definitions for an entity or free-form question, optionally with callers and callees. Exact entities resolve before model inference; text uses semantic search. Use describe for a compact fact card or feature_bundle for a mapped feature. Resolve ambiguity with returned handles.",
+        name = "bundle",
+        description = "Bundle source and definitions for a feature, symbol, file, directory, or free-form question, optionally with callers and callees. Exact entities resolve before model inference; text uses semantic search. Use describe for a compact fact card. Inspect found and completeness; resolve ambiguity with returned handles.",
         output_schema = schema_for_type::<ContextBundle>()
     )]
-    async fn export_context_tool(
-        &self,
-        Parameters(params): Parameters<ExportContextParams>,
-    ) -> CallToolResult {
+    async fn bundle_tool(&self, Parameters(params): Parameters<BundleParams>) -> CallToolResult {
         self.blocking(move |s| {
             let (limit, limit_clamp) =
                 capped_limit_tracked(params.limit, 5, MAX_MCP_CONTEXT_LIMIT, "limit");
             let clamps = limit_clamp.as_slice();
-            let req = ExportRequest::from_target(
-                params.target,
-                params.is_symbol.unwrap_or(false),
-                limit,
-                params.include_callers.unwrap_or(false),
-                params.include_callees.unwrap_or(false),
-            );
             let budget = s.bundle_budget_chars(&params.project);
             let mut semantic = false;
-            let bundle = s
-                .with_project_context_db(&params.project, |db| export_context_for_target(db, &req))
-                .and_then(|bundle| match bundle {
-                    Some(bundle) => Ok(bundle),
-                    None => {
-                        semantic = true;
-                        let query = req.query.as_deref().unwrap_or_default();
-                        s.with_project_query(&params.project, query, |db, emb, rr| {
-                            export_context(db, emb, rr, &req)
-                        })
-                    }
-                });
-            let result = s.render_budget(&params.project, bundle, "export_context", budget);
+            let bundle = params.target_arg().and_then(|target| {
+                // The retired `feature_id` spelling keeps `feature_bundle`'s
+                // lookup (`found: false` on a miss, never a semantic search)
+                // and returns what a `feat_` target returns for a hit.
+                if params.feature_id.is_some() {
+                    return s.with_project_context_db(&params.project, |db| {
+                        feature_bundle_with_definitions(
+                            db,
+                            &target,
+                            params.include_callers.unwrap_or(false),
+                            params.include_callees.unwrap_or(false),
+                            limit,
+                        )
+                    });
+                }
+                let req = ExportRequest::from_target(
+                    target,
+                    params.is_symbol.unwrap_or(false),
+                    limit,
+                    params.include_callers.unwrap_or(false),
+                    params.include_callees.unwrap_or(false),
+                );
+                s.with_project_context_db(&params.project, |db| export_context_for_target(db, &req))
+                    .and_then(|bundle| match bundle {
+                        Some(bundle) => Ok(bundle),
+                        None => {
+                            semantic = true;
+                            let query = req.query.as_deref().unwrap_or_default();
+                            s.with_project_query(&params.project, query, |db, emb, rr| {
+                                export_context(db, emb, rr, &req)
+                            })
+                        }
+                    })
+            });
+            let result = s.render_budget(&params.project, bundle, "bundle", budget);
             let result =
                 render::annotate_test_override(result, semantic && Self::test_override_active());
             render::annotate_clamps(result, clamps)
@@ -892,101 +905,65 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk",
-        description = "Assess one file's change risk from history and structural signals. Missing history leaves a partial score, not evidence of safety. Use assess_risk_batch for independent file scores or assess_risk_diff for patch rollups. Inspect the evidence before deciding which checks to run.",
-        output_schema = schema_for_type::<RiskAssessment>()
+        description = "Assess change risk for one or more files from history and structural signals. Each target gets its own score; aggregate: true adds patch rollups, hotspots, test gaps, unscored files, and touched import cycles. Missing history leaves a partial score, not evidence of safety. Touched cycles may predate the patch.",
+        output_schema = schema::either_output_schema::<RiskBatchAssessment, RiskDiffAssessment>()
     )]
     async fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> CallToolResult {
         self.blocking(move |s| {
-            let verbose = params.verbose.unwrap_or(false);
-            s.render(
-                &params.project,
-                params
-                    .target_arg()
-                    .and_then(|target| {
-                        s.with_project_root_db(&params.project, |root, db| {
-                            let file_path = dispatch::resolve_file_target(root, db, &target)?;
-                            assess_risk(db, &file_path)
-                        })
-                    })
-                    .map(|mut a| {
-                        a.set_verbose(verbose);
-                        a
-                    }),
-                "assess_risk",
-            )
-        })
-        .await
-    }
-
-    #[tool(
-        name = "assess_risk_diff",
-        description = "Aggregate risk across an explicit patch file set, including hotspots, test gaps, unscored files, and touched import cycles. Use assess_risk_batch for independent scores without patch rollups. Touched cycles may predate the patch; compare the base before claiming a new cycle.",
-        output_schema = schema_for_type::<RiskDiffAssessment>()
-    )]
-    async fn assess_risk_diff_tool(
-        &self,
-        Parameters(params): Parameters<RiskDiffParams>,
-    ) -> CallToolResult {
-        self.blocking(move |s| {
             let fields = params.list_fields();
             let verbose = params.verbose.unwrap_or(false);
-            s.render(
-                &params.project,
-                params
-                    .target_args()
-                    .and_then(|targets| {
-                        validate_non_empty_file_list(&targets, "assess_risk_diff", fields)?;
-                        s.with_project_root_db(&params.project, |root, db| {
-                            let file_paths = dispatch::resolve_file_targets(root, db, &targets)?;
-                            assess_risk_diff(db, &file_paths)
-                        })
+            let targets = params.target_args().and_then(|targets| {
+                validate_non_empty_file_list(&targets, "assess_risk", fields)?;
+                Ok(targets)
+            });
+            // A list is a set: an unmatched path travels to the per-file
+            // `found: false` disclosure instead of costing every other input
+            // its answer, however long the list. Only the retired single-file
+            // spellings keep their contract of refusing a miss with the
+            // nearest indexed candidates.
+            let strict = params.single_spelling_only();
+            let resolve = move |root: &Path,
+                                db: &codesage_storage::Database,
+                                targets: &[String]| match targets {
+                [target] if strict => Ok(vec![dispatch::resolve_file_target(root, db, target)?]),
+                _ => dispatch::resolve_file_targets(root, db, targets),
+            };
+            if params.aggregate.unwrap_or(false) {
+                let result = targets.and_then(|targets| {
+                    s.with_project_root_db(&params.project, |root, db| {
+                        assess_risk_diff(db, &resolve(root, db, &targets)?)
                     })
-                    .map(|mut a| {
+                });
+                s.render(
+                    &params.project,
+                    result.map(|mut a| {
                         a.set_verbose(verbose);
                         a
                     }),
-                "assess_risk_diff",
-            )
-        })
-        .await
-    }
-
-    #[tool(
-        name = "assess_risk_batch",
-        description = "Score each file in a set independently, without patch aggregation. Use assess_risk for one file or assess_risk_diff for patch rollups and touched cycles. Inspect each file's unscored marker; missing history does not imply low risk.",
-        output_schema = schema_for_type::<RiskBatchAssessment>()
-    )]
-    async fn assess_risk_batch_tool(
-        &self,
-        Parameters(params): Parameters<RiskBatchParams>,
-    ) -> CallToolResult {
-        self.blocking(move |s| {
-            let fields = params.list_fields();
-            let verbose = params.verbose.unwrap_or(false);
-            s.render(
-                &params.project,
-                params
-                    .target_args()
-                    .and_then(|targets| {
-                        validate_non_empty_file_list(&targets, "assess_risk_batch", fields)?;
-                        s.with_project_root_db(&params.project, |root, db| {
-                            let file_paths = dispatch::resolve_file_targets(root, db, &targets)?;
-                            assess_risk_batch(db, &file_paths)
-                        })
+                    "assess_risk",
+                )
+            } else {
+                let result = targets.and_then(|targets| {
+                    s.with_project_root_db(&params.project, |root, db| {
+                        assess_risk_batch(db, &resolve(root, db, &targets)?)
                     })
-                    .map(|mut a| {
+                });
+                s.render(
+                    &params.project,
+                    result.map(|mut a| {
                         a.set_verbose(verbose);
                         a
                     }),
-                "assess_risk_batch",
-            )
+                    "assess_risk",
+                )
+            }
         })
         .await
     }
 
     #[tool(
         name = "recommend_tests",
-        description = "Recommend tests for changed files using naming conventions, co-change history, and bounded graph reachability. Put priority inputs first because they share a walk budget. Use assess_risk_diff for patch risk. These recommendations are a lower bound, not permission to skip required suites.",
+        description = "Recommend tests for changed files using naming conventions, co-change history, and bounded graph reachability. Put priority inputs first because they share a walk budget. Use assess_risk for patch risk. These recommendations are a lower bound, not permission to skip required suites.",
         output_schema = schema_for_type::<TestRecommendations>()
     )]
     async fn recommend_tests_tool(
@@ -1016,168 +993,124 @@ impl CodeSageServer {
     }
 
     #[tool(
-        name = "session_start",
-        description = "Save current structural state before authorized edits, using a distinct session_id for concurrent sessions. Reusing an ID replaces its baseline. Inspect index.structural for overlay or dirty fallback. Pair with session_end to inspect graph changes. Use project_overview for orientation without persisting a snapshot.",
-        output_schema = schema_for_type::<SessionStartReport>()
+        name = "session",
+        description = "Save structural state before authorized edits (action start), then compare against it (action end): cycles, risk changes, added or removed files. Use a distinct session_id for concurrent sessions; reusing one replaces its baseline. Inspect index.structural for overlay or dirty fallback. Use review_rehearsal for patch objections without a baseline.",
+        output_schema = schema::either_output_schema::<SessionStartReport, SessionDiff>()
     )]
-    async fn session_start_tool(
-        &self,
-        Parameters(params): Parameters<SessionParams>,
-    ) -> CallToolResult {
-        if let Ok(request) = dispatch::CURRENT_REQUEST.try_with(Arc::clone) {
-            return self
-                .cached_session_start(
-                    request,
-                    params.project,
-                    params.session_id.unwrap_or_else(|| "default".to_string()),
-                )
-                .await;
+    async fn session_tool(&self, Parameters(params): Parameters<SessionParams>) -> CallToolResult {
+        let session_id = params.session_id.unwrap_or_else(|| "default".to_string());
+        match params.action {
+            SessionAction::Start => self.start_session(params.project, session_id).await,
+            SessionAction::End => self.end_session(params.project, session_id).await,
         }
-        self.blocking(move |s| {
-            let session_id = params
-                .session_id
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
-            s.render(
-                &params.project,
-                s.with_project_root_db(&params.project, |root, db| {
-                    let snapshot = session_start(root, db, &session_id)?;
-                    Ok(session_start_report(root, snapshot))
-                }),
-                "session_start",
-            )
-        })
-        .await
     }
 
     #[tool(
-        name = "list_features",
-        description = "Discover mapped behavior slices, filtered by kind, language, or tag. Each feature groups entrypoints, owned files, context, tests, and trust boundaries. Use find_feature to locate a file's features or feature_bundle to read a selected slice.",
+        name = "features",
+        description = "Discover mapped behavior slices, filtered by kind, language, tag, or changes since a ref; with target, only slices containing that file as entrypoint, owned code, context, or test. Each feature groups entrypoints, owned files, context, tests, and trust boundaries. An empty target result means no mapped feature claims the file. Use bundle to read a slice.",
         output_schema = schema_for_type::<FeatureListResults>()
     )]
-    async fn list_features_tool(
+    async fn features_tool(
         &self,
-        Parameters(params): Parameters<ListFeaturesParams>,
+        Parameters(params): Parameters<FeaturesParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
             let kind = params.kind;
             let language = params.language;
             let tag = params.tag.clone();
             let since = params.since.clone();
-            // Limit zero remains unbounded; response budgeting still applies.
-            let (limit, limit_clamp) =
-                capped_limit_or_unbounded(params.limit, 100, MAX_MCP_FEATURE_LIMIT, "limit");
-            let clamps = limit_clamp.as_slice();
-            // SQL LIMIT precedes the diff filter: overfetch to the scan cap, then truncate.
-            // Explicit limit zero also removes the scan cap.
-            let query_limit = if since.is_some() && limit != 0 {
-                MAX_MCP_FEATURE_SCAN_LIMIT
-            } else {
-                limit
+            let target = params.target_arg();
+            let default_limit = match &target {
+                Ok(Some(_)) => 0,
+                _ => 100,
             };
-            let result = s.render(
-                &params.project,
+            // Limit zero remains unbounded; response budgeting still applies.
+            let (limit, limit_clamp) = capped_limit_or_unbounded(
+                params.limit,
+                default_limit,
+                MAX_MCP_FEATURE_LIMIT,
+                "limit",
+            );
+            let clamps = limit_clamp.as_slice();
+            let result = target.and_then(|target| {
                 s.with_project_root_db(&params.project, |root, db| {
-                    let mut features =
-                        db.list_features(kind, language, tag.as_deref(), query_limit)?;
+                    let mut features = match &target {
+                        Some(target) => {
+                            let file = dispatch::resolve_file_target(root, db, target)?;
+                            let mut features = db.features_for_file(&file)?;
+                            if kind.is_some() || language.is_some() || tag.is_some() {
+                                // Reuse the listing's filter semantics (SQL tag
+                                // substring) instead of re-deriving them in memory.
+                                let allowed: std::collections::HashSet<String> = db
+                                    .list_features(kind, language, tag.as_deref(), 0)?
+                                    .into_iter()
+                                    .map(|feature| feature.feature_id)
+                                    .collect();
+                                features.retain(|feature| allowed.contains(&feature.feature_id));
+                            }
+                            features
+                        }
+                        None => {
+                            // SQL LIMIT precedes the diff filter: overfetch to the scan
+                            // cap, then truncate. Explicit limit zero also removes the cap.
+                            let query_limit = if since.is_some() && limit != 0 {
+                                MAX_MCP_FEATURE_SCAN_LIMIT
+                            } else {
+                                limit
+                            };
+                            db.list_features(kind, language, tag.as_deref(), query_limit)?
+                        }
+                    };
                     if let Some(git_ref) = since.as_deref() {
                         let changed = codesage_graph::changed_files_since(root, git_ref)?;
                         features
                             .retain(|f| codesage_graph::feature_touched_since(&f.files, &changed));
-                        if limit > 0 && features.len() > limit {
-                            features.truncate(limit);
-                        }
+                    }
+                    if limit > 0 && features.len() > limit {
+                        features.truncate(limit);
                     }
                     Ok(features)
-                }),
-                "list_features",
-            );
-            render::annotate_clamps(result, clamps)
-        })
-        .await
-    }
-
-    #[tool(
-        name = "find_feature",
-        description = "Find mapped features containing a file as entrypoint, owned code, context, or test. An empty result means no mapped feature claims the file. Use list_features to discover slices or feature_bundle to read a matched feature.",
-        output_schema = schema_for_type::<FeatureListResults>()
-    )]
-    async fn find_feature_tool(
-        &self,
-        Parameters(params): Parameters<FindFeatureParams>,
-    ) -> CallToolResult {
-        self.blocking(move |s| {
-            s.render(
-                &params.project,
-                params.target_arg().and_then(|target| {
-                    s.with_project_root_db(&params.project, |root, db| {
-                        let file = dispatch::resolve_file_target(root, db, &target)?;
-                        db.features_for_file(&file)
-                    })
-                }),
-                "find_feature",
-            )
-        })
-        .await
-    }
-
-    #[tool(
-        name = "feature_bundle",
-        description = "Read source and definitions for a mapped feature's entrypoints, owned files, tests, and context. Use list_features or find_feature to discover the feature; use export_context for other targets. Inspect found and completeness before treating an empty bundle as a missing feature.",
-        output_schema = schema_for_type::<ContextBundle>()
-    )]
-    async fn feature_bundle_tool(
-        &self,
-        Parameters(params): Parameters<FeatureBundleParams>,
-    ) -> CallToolResult {
-        self.blocking(move |s| {
-            let include_callers = params.include_callers.unwrap_or(false);
-            let include_callees = params.include_callees.unwrap_or(false);
-            let (limit, limit_clamp) =
-                capped_limit_tracked(params.limit, 5, MAX_MCP_CONTEXT_LIMIT, "limit");
-            // Select the configured model's table; the default table may contain no chunks.
-            let budget = s.bundle_budget_chars(&params.project);
-            let result = s.render_budget(
-                &params.project,
-                params.target_arg().and_then(|feature_id| {
-                    s.with_project_context_db(&params.project, |db| {
-                        feature_bundle(db, &feature_id, include_callers, include_callees, limit)
-                    })
-                }),
-                "feature_bundle",
-                budget,
-            );
-            render::annotate_clamps(result, limit_clamp.as_slice())
-        })
-        .await
-    }
-
-    #[tool(
-        name = "session_end",
-        description = "Compare current structural state with a session_start baseline: cycles, risk changes, and added or removed files. Inspect index.structural for overlay or dirty fallback. Requires the matching saved session_id; the baseline remains available for repeated comparisons. Use review_rehearsal for patch objections without a baseline.",
-        output_schema = schema_for_type::<SessionDiff>()
-    )]
-    async fn session_end_tool(
-        &self,
-        Parameters(params): Parameters<SessionParams>,
-    ) -> CallToolResult {
-        self.blocking(move |s| {
-            let session_id = params
-                .session_id
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
-            let result = s
-                .with_project_root_db(&params.project, |root, db| {
-                    session_end(root, db, &session_id)
                 })
-                .map_err(|e| missing_snapshot_error(&params.project, &session_id, e));
-            s.render(&params.project, result, "session_end")
+            });
+            let result = s.render(&params.project, result, "features");
+            render::annotate_clamps(result, clamps)
         })
         .await
     }
 }
 
-/// A missing snapshot file is the one `session_end` failure with a machine remedy.
+impl CodeSageServer {
+    async fn start_session(&self, project: String, session_id: String) -> CallToolResult {
+        if let Ok(request) = dispatch::CURRENT_REQUEST.try_with(Arc::clone) {
+            return self
+                .cached_session_start(request, project, session_id)
+                .await;
+        }
+        self.blocking(move |s| {
+            s.render(
+                &project,
+                s.with_project_root_db(&project, |root, db| {
+                    let snapshot = session_start(root, db, &session_id)?;
+                    Ok(session_start_report(root, snapshot))
+                }),
+                "session",
+            )
+        })
+        .await
+    }
+
+    async fn end_session(&self, project: String, session_id: String) -> CallToolResult {
+        self.blocking(move |s| {
+            let result = s
+                .with_project_root_db(&project, |root, db| session_end(root, db, &session_id))
+                .map_err(|e| missing_snapshot_error(&project, &session_id, e));
+            s.render(&project, result, "session")
+        })
+        .await
+    }
+}
+
+/// A missing snapshot file is the one `session` end failure with a machine remedy.
 fn missing_snapshot_error(project: &str, session_id: &str, error: anyhow::Error) -> anyhow::Error {
     let missing = error.chain().any(|cause| {
         cause
@@ -1189,11 +1122,11 @@ fn missing_snapshot_error(project: &str, session_id: &str, error: anyhow::Error)
     }
     error::McpError::new(
         error::ErrorCode::NotFound,
-        format!("no session snapshot `{session_id}`; call session_start first"),
+        format!("no session snapshot `{session_id}`; call session with action start first"),
     )
     .remedy(error::Remedy::Call {
-        tool: "session_start".to_owned(),
-        arguments: serde_json::json!({ "project": project, "session_id": session_id }),
+        tool: "session".to_owned(),
+        arguments: serde_json::json!({ "project": project, "action": "start", "session_id": session_id }),
     })
     .source(error)
     .into()
@@ -1491,7 +1424,7 @@ mod tests {
 
     #[test]
     fn inject_default_project_creates_missing_arguments() {
-        let line = r#"{"method":"tools/call","params":{"name":"list_features"}}"#;
+        let line = r#"{"method":"tools/call","params":{"name":"features"}}"#;
         let out = inject_default_project_line(line, "/abs/proj");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["params"]["arguments"]["project"], json!("/abs/proj"));
@@ -1571,9 +1504,10 @@ mod tests {
 
         let server = CodeSageServer::new();
         let result = server
-            .export_context_tool(Parameters(ExportContextParams {
+            .bundle_tool(Parameters(BundleParams {
                 project: root.to_str().unwrap().to_string(),
-                target: "target".to_string(),
+                target: Some("target".to_string()),
+                feature_id: None,
                 is_symbol: Some(true),
                 limit: Some(5),
                 include_callers: Some(false),
@@ -1685,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn list_features_limit_zero_is_unbounded() {
+    fn features_limit_zero_is_unbounded() {
         assert_eq!(
             capped_limit_or_unbounded(None, 100, MAX_MCP_FEATURE_LIMIT, "limit").0,
             100
@@ -1728,12 +1662,7 @@ mod tests {
 
     #[test]
     fn empty_file_lists_are_rejected_with_the_cli_sentence() {
-        for tool in [
-            "assess_risk_diff",
-            "assess_risk_batch",
-            "recommend_tests",
-            "review_rehearsal",
-        ] {
+        for tool in ["assess_risk", "recommend_tests", "review_rehearsal"] {
             let err = validate_non_empty_file_list(&[], tool, &["targets"])
                 .unwrap_err()
                 .to_string();
