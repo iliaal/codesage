@@ -2992,3 +2992,45 @@ fn namespace_package_directories_never_bind_third_party_imports_to_siblings() {
         );
     }
 }
+
+#[test]
+fn package_directory_probes_are_memoized_across_one_resolution_pass() {
+    let sources: Vec<(String, String)> = (0..20)
+        .map(|i| {
+            (
+                format!("tests/test_{i}.py"),
+                "import pytest\nimport helpers\ndef test_it():\n    pytest.approx(helpers.value())\n"
+                    .to_string(),
+            )
+        })
+        .chain([(
+            "tests/helpers.py".to_string(),
+            "def value():\n    return 1\n".to_string(),
+        )])
+        .collect();
+    let files: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect();
+    let (_root, db) = project(&files);
+    let indexed = db.all_file_paths().unwrap().into_iter().collect();
+    let probes = codesage_storage::db::PythonPackageProbes::default();
+    let mut resolved = 0;
+    for (path, _) in &sources {
+        for row in db
+            .references_in_file_range(path, 0, u32::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.kind == ReferenceKind::Import)
+        {
+            let targets = db
+                .python_import_targets_indexed(&row, &indexed, &probes)
+                .unwrap();
+            if targets == ["tests/helpers.py"] {
+                resolved += 1;
+            }
+        }
+    }
+    assert_eq!(resolved, 20);
+    assert_eq!(probes.queries(), 1);
+}

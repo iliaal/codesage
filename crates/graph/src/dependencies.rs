@@ -8,12 +8,14 @@ use codesage_protocol::{
 use codesage_storage::Database;
 
 use crate::rust_modules::{RustImportEvidence, RustModules};
+use codesage_storage::db::PythonPackageProbes;
 
 pub(crate) fn resolve_outgoing(
     db: &Database,
     entry: &mut DependencyEntry,
     modules: &RustModules,
     indexed: &HashSet<String>,
+    probes: &PythonPackageProbes,
 ) -> Result<()> {
     let raw = RawDependencyImports {
         imports: std::mem::take(&mut entry.imports),
@@ -49,8 +51,18 @@ pub(crate) fn resolve_outgoing(
             let mut unresolved_sites = Vec::new();
             let mut ambiguous = false;
             for row in &sites {
-                let (files, uncertain) =
-                    resolve_site(db, row, modules, indexed, &symbols, &rows, &evidence)?;
+                let (files, uncertain) = resolve_site(
+                    db,
+                    row,
+                    modules,
+                    &IndexedFiles {
+                        paths: indexed,
+                        python_probes: probes,
+                    },
+                    &symbols,
+                    &rows,
+                    &evidence,
+                )?;
                 if files.is_empty() {
                     unresolved_sites.push(*row);
                 }
@@ -151,18 +163,27 @@ fn file_handle(file: String) -> Option<String> {
     Handle::file(file).map(|handle| handle.to_string())
 }
 
+struct IndexedFiles<'a> {
+    paths: &'a HashSet<String>,
+    python_probes: &'a PythonPackageProbes,
+}
+
 fn resolve_site(
     db: &Database,
     row: &Reference,
     modules: &RustModules,
-    indexed: &HashSet<String>,
+    indexed: &IndexedFiles<'_>,
     symbols: &[Symbol],
     rows: &[Reference],
     evidence: &RustImportEvidence,
 ) -> Result<(BTreeSet<String>, bool)> {
     let mut files = BTreeSet::new();
     if codesage_protocol::python::is_python_path(&row.from_file) {
-        files.extend(db.python_import_targets_indexed(row, indexed)?);
+        files.extend(db.python_import_targets_indexed(
+            row,
+            indexed.paths,
+            indexed.python_probes,
+        )?);
         return Ok((files, false));
     }
     if row.from_file.ends_with(".rs") {
@@ -195,7 +216,7 @@ fn resolve_site(
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|file| {
-                        indexed.contains(file)
+                        indexed.paths.contains(file)
                             && modules.same_crate(&row.from_file, file) == Some(true)
                     }),
             );
@@ -206,7 +227,7 @@ fn resolve_site(
                     .candidates(&row.from_file, parent)
                     .unwrap_or_default()
                 {
-                    if indexed.contains(&file)
+                    if indexed.paths.contains(&file)
                         && modules.same_crate(&row.from_file, &file) == Some(true)
                         && (tail == "*" || {
                             let definitions = db.symbols_for_file(&file)?;
@@ -233,7 +254,7 @@ fn resolve_site(
         files.extend(
             crate::bundle::path_import_candidates(&row.to_name, &row.from_file)
                 .into_iter()
-                .filter(|file| indexed.contains(file)),
+                .filter(|file| indexed.paths.contains(file)),
         );
         if files.is_empty()
             && (row.from_file.ends_with(".php") || row.from_file.ends_with(".java"))

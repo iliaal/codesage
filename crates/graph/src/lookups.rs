@@ -568,11 +568,12 @@ pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec
     let all_refs = db.import_include_refs_all()?;
     let modules = crate::rust_modules::RustModules::from_imports(db, &all_refs)?;
     let indexed: HashSet<String> = db.all_file_paths()?.into_iter().collect();
+    let probes = codesage_storage::db::PythonPackageProbes::default();
     let mut out = Vec::with_capacity(file_paths.len());
     for file_path in file_paths {
         let mut entry = db.list_file_dependencies(file_path)?;
         if entry.found {
-            crate::dependencies::resolve_outgoing(db, &mut entry, &modules, &indexed)?;
+            crate::dependencies::resolve_outgoing(db, &mut entry, &modules, &indexed, &probes)?;
             resolve_path_imported_by(&mut entry, &all_refs, &modules);
             if let Some(note) = modules.note(&entry.file_path, &entry.imported_by) {
                 entry.note = Some(match entry.note.take() {

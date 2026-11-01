@@ -41,6 +41,21 @@ const PYTHON_RELATIVE_IMPORT_IN_DIRECTORY: &str =
        AND r.to_name >= '.' AND r.to_name < '/'
      LIMIT 1";
 
+/// Memoized [`Database::python_directory_imported_as_package`] answers for one
+/// resolution pass, so many imports from one directory probe it once.
+#[derive(Debug, Default)]
+pub struct PythonPackageProbes {
+    answers: std::cell::RefCell<HashMap<String, bool>>,
+    queries: std::cell::Cell<usize>,
+}
+
+impl PythonPackageProbes {
+    /// Database probes issued so far; cache hits do not count.
+    pub fn queries(&self) -> usize {
+        self.queries.get()
+    }
+}
+
 /// Cross-file import pairs split by whether any load-time directive joins them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImportPairs {
@@ -850,6 +865,7 @@ impl Database {
             return Ok(BTreeMap::new());
         }
         let indexed = self.all_file_paths()?.into_iter().collect();
+        let probes = PythonPackageProbes::default();
         let mut pairs = BTreeMap::new();
         for (from, module, line, col, lazy) in rows {
             let row = Reference {
@@ -864,7 +880,7 @@ impl Database {
                 to: None,
                 from_line: None,
             };
-            for to in self.python_import_targets_indexed(&row, &indexed)? {
+            for to in self.python_import_targets_indexed(&row, &indexed, &probes)? {
                 if from == to {
                     continue;
                 }
@@ -886,6 +902,23 @@ impl Database {
         codesage_protocol::python::load_module(module, from, &files, |directory| {
             self.python_directory_imported_as_package(directory)
         })
+    }
+
+    fn python_package_directory(
+        &self,
+        directory: &str,
+        probes: &PythonPackageProbes,
+    ) -> Result<bool> {
+        if let Some(answer) = probes.answers.borrow().get(directory) {
+            return Ok(*answer);
+        }
+        let answer = self.python_directory_imported_as_package(directory)?;
+        probes.queries.set(probes.queries.get() + 1);
+        probes
+            .answers
+            .borrow_mut()
+            .insert(directory.to_string(), answer);
+        Ok(answer)
     }
 
     /// Whether an indexed Python import names `directory` as a package: an
@@ -911,7 +944,7 @@ impl Database {
 
     pub fn python_import_targets(&self, row: &Reference) -> Result<Vec<String>> {
         let indexed = self.all_file_paths()?.into_iter().collect();
-        self.python_import_targets_indexed(row, &indexed)
+        self.python_import_targets_indexed(row, &indexed, &PythonPackageProbes::default())
     }
 
     pub fn python_import_sites_load_module(
@@ -921,6 +954,7 @@ impl Database {
     ) -> Result<Option<bool>> {
         use codesage_protocol::python::BINDING_INTERPRETATION;
         let indexed = self.all_file_paths()?.into_iter().collect();
+        let probes = PythonPackageProbes::default();
         let mut pending: Vec<_> = sites
             .iter()
             .map(|site| Reference {
@@ -947,7 +981,7 @@ impl Database {
             {
                 return Ok(None);
             }
-            let Some(loaded) = self.python_import_load_indexed(&row, &indexed)? else {
+            let Some(loaded) = self.python_import_load_indexed(&row, &indexed, &probes)? else {
                 continue;
             };
             if loaded.module_keys.iter().any(|key| key == module) {
@@ -979,6 +1013,7 @@ impl Database {
     ) -> Result<codesage_protocol::python::PythonModuleLoad> {
         use codesage_protocol::python::{BINDING_INTERPRETATION, PythonModuleLoad};
         let indexed = self.all_file_paths()?.into_iter().collect();
+        let probes = PythonPackageProbes::default();
         let mut statements = Vec::new();
         for row in self.references_in_file_range(initializer, 0, u32::MAX)? {
             if row.kind == ReferenceKind::Import && !row.lazy {
@@ -1000,7 +1035,7 @@ impl Database {
             let mut pending = vec![row];
             while let Some(row) = pending.pop() {
                 codesage_protocol::work::checkpoint()?;
-                let Some(loaded) = self.python_import_load_indexed(&row, &indexed)? else {
+                let Some(loaded) = self.python_import_load_indexed(&row, &indexed, &probes)? else {
                     continue;
                 };
                 if loaded.module_keys.iter().any(|key| key == child) {
@@ -1030,9 +1065,10 @@ impl Database {
         &self,
         row: &Reference,
         indexed: &HashSet<String>,
+        probes: &PythonPackageProbes,
     ) -> Result<Vec<String>> {
         let mut files = self
-            .python_import_load_indexed(row, indexed)?
+            .python_import_load_indexed(row, indexed, probes)?
             .map_or_else(Vec::new, |loaded| loaded.loaded);
         files.sort();
         files.dedup();
@@ -1043,6 +1079,7 @@ impl Database {
         &self,
         row: &Reference,
         indexed: &HashSet<String>,
+        probes: &PythonPackageProbes,
     ) -> Result<Option<codesage_protocol::python::PythonModule>> {
         codesage_protocol::work::checkpoint()?;
         if !self.file_interpretation_matches(
@@ -1059,7 +1096,7 @@ impl Database {
         };
         let Some(mut loaded) =
             codesage_protocol::python::load_module(module, &row.from_file, indexed, |directory| {
-                self.python_directory_imported_as_package(directory)
+                self.python_package_directory(directory, probes)
             })?
         else {
             return Ok(None);
@@ -1106,7 +1143,7 @@ impl Database {
                         &format!("{module}{separator}{name}"),
                         &row.from_file,
                         indexed,
-                        |directory| self.python_directory_imported_as_package(directory),
+                        |directory| self.python_package_directory(directory, probes),
                     )? {
                         loaded.loaded.extend(child.loaded);
                         loaded.module_keys.extend(child.module_keys);

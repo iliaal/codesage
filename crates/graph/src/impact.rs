@@ -112,6 +112,7 @@ pub(crate) struct WalkCache {
     reference_bytes: usize,
     file_imports: Option<Arc<Vec<Reference>>>,
     python_indexed: Option<Arc<HashSet<String>>>,
+    python_probes: codesage_storage::db::PythonPackageProbes,
     python_imports: HashMap<codesage_protocol::python::PythonImportSite, Arc<Vec<String>>>,
     import_matches: HashMap<String, Arc<Vec<usize>>>,
     rust_modules: Option<Arc<crate::rust_modules::RustModules>>,
@@ -225,7 +226,8 @@ impl WalkCache {
                 indexed
             }
         };
-        let targets = Arc::new(db.python_import_targets_indexed(row, &indexed)?);
+        let targets =
+            Arc::new(db.python_import_targets_indexed(row, &indexed, &self.python_probes)?);
         let bytes = targets.iter().fold(
             targets
                 .capacity()
