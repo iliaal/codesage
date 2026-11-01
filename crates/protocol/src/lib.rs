@@ -2013,7 +2013,8 @@ pub struct SessionActedOn {
     pub ledger: String,
     /// Ledger calls made since `session_start`.
     pub calls: u32,
-    /// How edited files were determined: `worktree` (Git diff against the
+    /// How edited files were determined (`disabled` when the ledger is off,
+    /// with every count zero): `worktree` (Git diff against the
     /// snapshot HEAD, minus changes already present at `session_start`),
     /// `git_head` (Git diff against the snapshot HEAD; the snapshot predates
     /// the start-of-session change record, so pre-existing changes count),
@@ -2029,6 +2030,15 @@ pub struct SessionActedOn {
     /// so CodeSage could not have served them. Excluded from the counts above.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub edited_unindexed: u32,
+    /// Distinct files returned by check tools (`assess_risk_batch`,
+    /// `assess_risk_diff`, `recommend_tests`, `review_rehearsal`,
+    /// `edit_check`). Their input is the caller's own patch or file list, so
+    /// they are excluded from the fetched counts above.
+    #[serde(default)]
+    pub checked: u32,
+    /// Checked files that were edited.
+    #[serde(default)]
+    pub checked_edited: u32,
     /// Edited test files that a `recommend_tests` call had returned.
     pub recommended_tests_edited: u32,
     /// The first 50 paths behind `fetched_then_edited`, sorted.
@@ -2040,8 +2050,8 @@ pub struct SessionActedOn {
     /// The first 50 paths behind `recommended_tests_edited`, sorted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recommended_tests_edited_files: Vec<String>,
-    /// Per-tool call count, distinct files served, and how many of those
-    /// were edited.
+    /// Per-tool call count, distinct files returned, and how many of those
+    /// were edited, check tools included.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub per_tool: std::collections::BTreeMap<String, SessionToolActedOn>,
     /// The ledger reached its size cap, so later calls were not recorded

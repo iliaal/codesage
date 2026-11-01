@@ -259,6 +259,7 @@ pub fn build_session_snapshot_with_top_risk(
     let git_head = read_git_head(project_root);
     let worktree = git_head
         .as_deref()
+        .filter(|_| crate::session_ledger::ledger_enabled())
         .and_then(|head| worktree_changes(project_root, head));
 
     let snapshot = SessionSnapshot {
@@ -425,6 +426,7 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
         &now_files_set,
         &new_files,
         &removed_files,
+        crate::session_ledger::ledger_enabled(),
     )?;
 
     Ok(SessionDiff {
@@ -453,13 +455,57 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
 const MAX_WORKTREE_CHANGES: usize = 10_000;
 /// Bound the per-category path lists in `acted_on`.
 const MAX_ACTED_ON_FILES: usize = 50;
+/// Files above this size, or past the per-capture hashing budget, get a
+/// size and mtime fingerprint instead of a Git blob id.
+const MAX_HASHED_FILE_BYTES: u64 = 8 << 20;
+const MAX_HASHED_TOTAL_BYTES: u64 = 256 << 20;
+/// Shared deadline for the Git children behind one worktree capture or
+/// comparison; a child still running at the deadline is killed.
+const WORKTREE_GIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Tools whose input is the caller's own patch or file list. Their handles
+/// echo files the agent already chose or changed, so they count as checked,
+/// not fetched.
+const CHECK_TOOLS: &[&str] = &[
+    "assess_risk_batch",
+    "assess_risk_diff",
+    "recommend_tests",
+    "review_rehearsal",
+    "edit_check",
+];
+
+/// Run an observational Git child with the repository's fsmonitor hook
+/// disabled, optional locks off, and a deadline; `None` unless it exits 0.
+fn observe_git(
+    project_root: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+    deadline: std::time::Instant,
+) -> Option<Vec<u8>> {
+    let mut full = vec!["-c", "core.fsmonitor=false"];
+    full.extend_from_slice(args);
+    match input {
+        None => crate::drift::git_output(project_root, &full, deadline),
+        Some(input) => {
+            match crate::drift::git_output_with_stdin(project_root, &full, input, deadline) {
+                Some((Some(0), stdout)) => Some(stdout),
+                _ => None,
+            }
+        }
+    }
+}
 
 /// Paths that differ from `base` in the working tree (tracked changes plus
 /// untracked, non-ignored files), relative to `project_root`. CodeSage's own
-/// state directory is excluded. `None` when Git cannot answer.
-fn changed_paths(project_root: &Path, base: &str) -> Option<Vec<String>> {
-    let tracked = crate::git_command(project_root)
-        .args([
+/// state directory is excluded. `None` when Git cannot answer in time.
+fn changed_paths(
+    project_root: &Path,
+    base: &str,
+    deadline: std::time::Instant,
+) -> Option<Vec<String>> {
+    let tracked = observe_git(
+        project_root,
+        &[
             "diff",
             "--name-only",
             "--relative",
@@ -468,19 +514,19 @@ fn changed_paths(project_root: &Path, base: &str) -> Option<Vec<String>> {
             "-z",
             base,
             "--",
-        ])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())?;
-    let untracked = crate::git_command(project_root)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())?;
+        ],
+        None,
+        deadline,
+    )?;
+    let untracked = observe_git(
+        project_root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        None,
+        deadline,
+    )?;
     let mut paths: Vec<String> = tracked
-        .stdout
         .split(|b| *b == 0)
-        .chain(untracked.stdout.split(|b| *b == 0))
+        .chain(untracked.split(|b| *b == 0))
         .filter(|raw| !raw.is_empty())
         .filter_map(|raw| String::from_utf8(raw.to_vec()).ok())
         .filter(|path| !path.starts_with(".codesage/"))
@@ -490,42 +536,58 @@ fn changed_paths(project_root: &Path, base: &str) -> Option<Vec<String>> {
     Some(paths)
 }
 
-/// Git blob ids for the regular files among `paths`; deleted or non-regular
-/// paths map to `None`. One `git hash-object` child serves the whole batch.
-fn blob_ids(project_root: &Path, paths: &[String]) -> Option<HashMap<String, Option<String>>> {
-    use std::io::Write;
-    let mut out: HashMap<String, Option<String>> =
-        paths.iter().map(|path| (path.clone(), None)).collect();
-    let hashable: Vec<&String> = paths
-        .iter()
-        .filter(|path| !path.contains('\n'))
-        .filter(|path| {
-            std::fs::symlink_metadata(project_root.join(path)).is_ok_and(|meta| meta.is_file())
-        })
-        .collect();
+fn stat_fingerprint(meta: &std::fs::Metadata) -> String {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    format!("stat:{}:{mtime}", meta.len())
+}
+
+/// Content fingerprints for `paths`: a Git blob id for regular files within
+/// the hashing bounds, a `stat:<len>:<mtime_ns>` fingerprint for larger
+/// ones, and `None` for deleted or non-regular paths. One `git hash-object`
+/// child serves the batch.
+fn blob_ids(
+    project_root: &Path,
+    paths: &[String],
+    deadline: std::time::Instant,
+) -> Option<HashMap<String, Option<String>>> {
+    let mut out: HashMap<String, Option<String>> = HashMap::with_capacity(paths.len());
+    let mut hashable: Vec<&String> = Vec::new();
+    let mut budget = MAX_HASHED_TOTAL_BYTES;
+    for path in paths {
+        let fingerprint = match std::fs::symlink_metadata(project_root.join(path)) {
+            Ok(meta) if meta.is_file() => {
+                if path.contains('\n') || meta.len() > MAX_HASHED_FILE_BYTES || meta.len() > budget
+                {
+                    Some(stat_fingerprint(&meta))
+                } else {
+                    budget -= meta.len();
+                    hashable.push(path);
+                    None
+                }
+            }
+            _ => None,
+        };
+        out.insert(path.clone(), fingerprint);
+    }
     if hashable.is_empty() {
         return Some(out);
     }
-    let mut child = crate::git_command(project_root)
-        .args(["hash-object", "--no-filters", "--stdin-paths"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
     let mut input = Vec::new();
     for path in &hashable {
         input.extend_from_slice(path.as_bytes());
         input.push(b'\n');
     }
-    let mut stdin = child.stdin.take()?;
-    let writer = std::thread::spawn(move || stdin.write_all(&input));
-    let output = child.wait_with_output().ok()?;
-    writer.join().ok()?.ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let ids: Vec<&str> = std::str::from_utf8(&output.stdout).ok()?.lines().collect();
+    let stdout = observe_git(
+        project_root,
+        &["hash-object", "--no-filters", "--stdin-paths"],
+        Some(&input),
+        deadline,
+    )?;
+    let ids: Vec<&str> = std::str::from_utf8(&stdout).ok()?.lines().collect();
     if ids.len() != hashable.len() {
         return None;
     }
@@ -536,10 +598,11 @@ fn blob_ids(project_root: &Path, paths: &[String]) -> Option<HashMap<String, Opt
 }
 
 fn worktree_changes(project_root: &Path, head: &str) -> Option<SessionWorktree> {
-    let mut paths = changed_paths(project_root, head)?;
+    let deadline = std::time::Instant::now() + WORKTREE_GIT_BUDGET;
+    let mut paths = changed_paths(project_root, head, deadline)?;
     let truncated = paths.len() > MAX_WORKTREE_CHANGES;
     paths.truncate(MAX_WORKTREE_CHANGES);
-    let blobs = blob_ids(project_root, &paths)?;
+    let blobs = blob_ids(project_root, &paths, deadline)?;
     Some(SessionWorktree {
         changes: paths
             .into_iter()
@@ -565,10 +628,11 @@ fn edited_files(
             "index",
         )
     };
+    let deadline = std::time::Instant::now() + WORKTREE_GIT_BUDGET;
     let Some(head) = snapshot.git_head.as_deref() else {
         return index_only();
     };
-    let Some(now) = changed_paths(project_root, head) else {
+    let Some(now) = changed_paths(project_root, head, deadline) else {
         return index_only();
     };
     let Some(start) = &snapshot.worktree else {
@@ -584,7 +648,7 @@ fn edited_files(
         .filter(|path| start.contains_key(path.as_str()))
         .cloned()
         .collect();
-    let Some(blobs) = blob_ids(project_root, &recheck) else {
+    let Some(blobs) = blob_ids(project_root, &recheck, deadline) else {
         return (now.into_iter().collect(), "git_head");
     };
     let now_set: HashSet<&str> = now.iter().map(String::as_str).collect();
@@ -619,12 +683,19 @@ fn acted_on(
     now_files: &HashSet<&str>,
     new_files: &[String],
     removed_files: &[String],
+    enabled: bool,
 ) -> Result<SessionActedOn> {
-    let enabled = crate::session_ledger::ledger_enabled();
-    let ledger = if enabled {
-        let since = u64::try_from(snapshot.created_at.max(0))
-            .unwrap_or(0)
-            .saturating_mul(1000);
+    if !enabled {
+        return Ok(SessionActedOn {
+            ledger: "disabled".to_string(),
+            edited_source: "disabled".to_string(),
+            ..Default::default()
+        });
+    }
+    let since = u64::try_from(snapshot.created_at.max(0))
+        .unwrap_or(0)
+        .saturating_mul(1000);
+    let ledger =
         match crate::session_ledger::read_session_ledger(project_root, &snapshot.session_id, since)
         {
             Ok(read) => read,
@@ -632,16 +703,15 @@ fn acted_on(
                 tracing::warn!(error = %err, "session ledger unreadable; reporting no calls");
                 Default::default()
             }
-        }
-    } else {
-        Default::default()
-    };
+        };
 
     let mut served: HashSet<String> = HashSet::new();
+    let mut checked: HashSet<String> = HashSet::new();
     let mut recommended: HashSet<String> = HashSet::new();
     let mut by_tool: std::collections::BTreeMap<String, (u32, HashSet<String>)> =
         Default::default();
     for call in &ledger.calls {
+        let check = CHECK_TOOLS.contains(&call.tool.as_str());
         let entry = by_tool.entry(call.tool.clone()).or_default();
         entry.0 = entry.0.saturating_add(1);
         for handle in &call.target_handles {
@@ -651,7 +721,11 @@ fn acted_on(
             if call.tool == "recommend_tests" {
                 recommended.insert(path.clone());
             }
-            served.insert(path.clone());
+            if check {
+                checked.insert(path.clone());
+            } else {
+                served.insert(path.clone());
+            }
             entry.1.insert(path);
         }
     }
@@ -667,6 +741,7 @@ fn acted_on(
         served.intersection(&edited_indexed).cloned().collect();
     let edited_unfetched: HashSet<String> = edited_indexed.difference(&served).cloned().collect();
     let fetched_unedited = served.difference(&edited_indexed).count();
+    let checked_edited = checked.intersection(&edited_indexed).count();
     let recommended_tests_edited: HashSet<String> = if recommended.is_empty() {
         HashSet::new()
     } else {
@@ -689,20 +764,15 @@ fn acted_on(
 
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     Ok(SessionActedOn {
-        ledger: if !enabled {
-            "disabled"
-        } else if ledger.present {
-            "recorded"
-        } else {
-            "absent"
-        }
-        .to_string(),
+        ledger: if ledger.present { "recorded" } else { "absent" }.to_string(),
         calls: count(ledger.calls.len()),
         edited_source: edited_source.to_string(),
         fetched_then_edited: count(fetched_then_edited.len()),
         edited_unfetched: count(edited_unfetched.len()),
         fetched_unedited: count(fetched_unedited),
         edited_unindexed: count(edited_unindexed.len()),
+        checked: count(checked.len()),
+        checked_edited: count(checked_edited),
         recommended_tests_edited: count(recommended_tests_edited.len()),
         fetched_then_edited_files: first_sorted(&fetched_then_edited),
         edited_unfetched_files: first_sorted(&edited_unfetched),
@@ -1402,14 +1472,15 @@ mod tests {
         assert_eq!(acted.ledger, "recorded");
         assert_eq!(acted.edited_source, "worktree");
         assert_eq!(acted.calls, 4);
-        assert_eq!(acted.fetched_then_edited, 2);
+        assert_eq!(acted.fetched_then_edited, 1);
+        assert_eq!(acted.fetched_then_edited_files, vec!["src/a.rs"]);
+        assert_eq!(acted.edited_unfetched, 3);
         assert_eq!(
-            acted.fetched_then_edited_files,
-            vec!["src/a.rs", "tests/a_test.rs"]
+            acted.edited_unfetched_files,
+            vec!["src/b.rs", "src/e.rs", "tests/a_test.rs"]
         );
-        assert_eq!(acted.edited_unfetched, 2);
-        assert_eq!(acted.edited_unfetched_files, vec!["src/b.rs", "src/e.rs"]);
         assert_eq!(acted.fetched_unedited, 1, "src/c.rs");
+        assert_eq!((acted.checked, acted.checked_edited), (2, 2));
         assert_eq!(acted.edited_unindexed, 1, "src/unindexed.rs");
         assert_eq!(acted.recommended_tests_edited, 1);
         assert_eq!(
@@ -1442,6 +1513,120 @@ mod tests {
             }
         );
         assert_eq!(tool("project_overview").fetched, 0);
+    }
+
+    #[test]
+    fn post_edit_checks_do_not_count_as_fetched_then_edited() {
+        let (dir, db) = ledger_fixture();
+        let root = dir.path();
+        session_start(root, &db, "s").unwrap();
+        record(root, "describe", &["file:src/a.rs"]);
+        std::fs::write(root.join("src/a.rs"), "// edited\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "// edited\n").unwrap();
+        record(
+            root,
+            "review_rehearsal",
+            &["file:src/a.rs", "file:src/b.rs"],
+        );
+        record(root, "assess_risk_diff", &["file:src/b.rs"]);
+
+        let acted = session_end(root, &db, "s").unwrap().acted_on;
+        assert_eq!(acted.fetched_then_edited_files, vec!["src/a.rs"]);
+        assert_eq!(acted.edited_unfetched_files, vec!["src/b.rs"]);
+        assert_eq!(acted.fetched_unedited, 0);
+        assert_eq!((acted.checked, acted.checked_edited), (2, 2));
+        assert_eq!(acted.per_tool["review_rehearsal"].fetched_then_edited, 2);
+    }
+
+    #[test]
+    fn disabled_ledger_reports_nothing_and_skips_edit_detection() {
+        let (dir, db) = ledger_fixture();
+        let root = dir.path();
+        session_start(root, &db, "s").unwrap();
+        record(root, "describe", &["file:src/a.rs"]);
+        std::fs::write(root.join("src/a.rs"), "// edited\n").unwrap();
+        let snapshot = read_snapshot(root, "s").unwrap();
+        let now: HashSet<&str> = snapshot.files.iter().map(String::as_str).collect();
+        let acted = acted_on(root, &db, &snapshot, &now, &[], &[], false).unwrap();
+        assert_eq!(acted.ledger, "disabled");
+        assert_eq!(acted.edited_source, "disabled");
+        assert_eq!(
+            (
+                acted.calls,
+                acted.fetched_then_edited,
+                acted.edited_unfetched
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_git_children_do_not_run_the_repository_fsmonitor_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, db) = ledger_fixture();
+        let root = dir.path();
+        let marker = root.join("fsmonitor-fired");
+        let hook = root.join("fsmonitor-hook.sh");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(root, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        std::fs::write(root.join("src/d.rs"), "// dirty before the session\n").unwrap();
+
+        session_start(root, &db, "s").unwrap();
+        std::fs::write(root.join("src/a.rs"), "// edited\n").unwrap();
+        let acted = session_end(root, &db, "s").unwrap().acted_on;
+        assert_eq!(acted.edited_unfetched_files, vec!["src/a.rs"]);
+        assert!(!marker.exists(), "session git children ran core.fsmonitor");
+
+        let out = crate::git_command(root).arg("status").output().unwrap();
+        assert!(out.status.success());
+        assert!(
+            marker.exists(),
+            "the marker hook must fire for ordinary git status"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_untracked_files_get_a_stat_fingerprint_instead_of_a_hash() {
+        let (dir, db) = ledger_fixture();
+        let root = dir.path();
+        let big = std::fs::File::create(root.join("big.bin")).unwrap();
+        big.set_len(2 << 30).unwrap();
+        drop(big);
+
+        let started = std::time::Instant::now();
+        session_start(root, &db, "s").unwrap();
+        let elapsed = started.elapsed();
+        let snapshot = read_snapshot(root, "s").unwrap();
+        let change = snapshot
+            .worktree
+            .unwrap()
+            .changes
+            .into_iter()
+            .find(|change| change.path == "big.bin")
+            .unwrap();
+        assert!(
+            change
+                .blob
+                .as_deref()
+                .unwrap()
+                .starts_with("stat:2147483648:"),
+            "{change:?}"
+        );
+        assert!(elapsed < WORKTREE_GIT_BUDGET, "{elapsed:?}");
+
+        let acted = session_end(root, &db, "s").unwrap().acted_on;
+        assert_eq!(acted.edited_source, "worktree");
+        assert_eq!(
+            acted.edited_unindexed, 0,
+            "an untouched large file is not an edit"
+        );
     }
 
     #[test]

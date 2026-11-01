@@ -17,13 +17,16 @@ pub const LEDGER_SUFFIX: &str = ".calls.jsonl";
 const SESSIONS_DIR: &str = "sessions";
 const CONNECTIONS_DIR: &str = "connections";
 
-/// Record and byte bounds match the daemon diagnostics ring (`DETAIL_LIMIT`
-/// records, `BYTE_LIMIT` bytes): a ledger stops growing at the byte bound,
-/// and each ledger directory keeps at most this many ledgers.
+/// A ledger stops growing at [`MAX_LEDGER_BYTES`]. Each ledger directory is
+/// pruned to [`MAX_LEDGER_FILES`] files and [`MAX_LEDGER_TOTAL_BYTES`] bytes,
+/// oldest mtime first, after deleting ledgers older than [`MAX_LEDGER_AGE`].
 pub const MAX_LEDGER_FILES: usize = 256;
 pub const MAX_LEDGER_BYTES: u64 = 2 * 1024 * 1024;
-/// Oldest ledgers are evicted first once a directory exceeds this total.
 pub const MAX_LEDGER_TOTAL_BYTES: u64 = 8 * MAX_LEDGER_BYTES;
+pub const MAX_LEDGER_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 86_400);
+/// A prune also runs each time a ledger grows past another multiple of this
+/// step, so ledgers that keep growing after creation stay within the bound.
+const PRUNE_STEP_BYTES: u64 = 256 * 1024;
 const MAX_HANDLES: usize = 64;
 const MAX_HANDLE_BYTES: usize = 1024;
 
@@ -53,6 +56,12 @@ const SKIP_KEYS: &[&str] = &[
     "error",
     "snapshot_path",
     "structural_overlay_paths",
+    "unindexed_files",
+    "unsupported_files",
+    "unscored_files",
+    "no_symbol_files",
+    "failed_paths",
+    "omitted_files",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,8 +85,9 @@ pub enum LedgerScope<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
-    /// The line was written; `created` when the ledger was empty before it.
-    Written { created: bool },
+    /// The line was written; `prune` when the ledger was just created or
+    /// crossed a prune step, so the caller should prune its directory.
+    Written { prune: bool },
     /// The ledger is at its byte cap and the line was dropped.
     Capped,
 }
@@ -154,7 +164,10 @@ pub fn append_call(
     }
     file.write_all(&line)
         .with_context(|| format!("appending ledger {}", path.display()))?;
-    Ok(AppendOutcome::Written { created: len == 0 })
+    let after = len.saturating_add(line.len() as u64);
+    Ok(AppendOutcome::Written {
+        prune: len == 0 || len / PRUNE_STEP_BYTES != after / PRUNE_STEP_BYTES,
+    })
 }
 
 /// Drop a session's ledger so a reused id starts empty.
@@ -170,14 +183,28 @@ pub fn reset_session_ledger(project_root: &Path, session_id: &str) -> Result<()>
     }
 }
 
-/// Evict the oldest ledgers (by mtime) in the directory holding `keep` until
-/// at most [`MAX_LEDGER_FILES`] files and [`MAX_LEDGER_TOTAL_BYTES`] remain.
-/// `keep` itself is never evicted.
+/// In the directory holding `keep`, delete ledgers older than
+/// [`MAX_LEDGER_AGE`], then the oldest (by mtime) until at most
+/// [`MAX_LEDGER_FILES`] files and [`MAX_LEDGER_TOTAL_BYTES`] remain.
+/// `keep` itself is never deleted.
 pub fn prune_ledgers(keep: &Path) -> Result<usize> {
-    prune_ledgers_with_limits(keep, MAX_LEDGER_FILES, MAX_LEDGER_TOTAL_BYTES)
+    prune_ledgers_with_limits(
+        keep,
+        MAX_LEDGER_FILES,
+        MAX_LEDGER_TOTAL_BYTES,
+        MAX_LEDGER_AGE,
+    )
 }
 
-fn prune_ledgers_with_limits(keep: &Path, max_files: usize, max_bytes: u64) -> Result<usize> {
+fn prune_ledgers_with_limits(
+    keep: &Path,
+    max_files: usize,
+    max_bytes: u64,
+    max_age: std::time::Duration,
+) -> Result<usize> {
+    let cutoff = SystemTime::now()
+        .checked_sub(max_age)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let dir = keep.parent().context("ledger path has no parent")?;
     let mut ledgers = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
@@ -204,8 +231,8 @@ fn prune_ledgers_with_limits(keep: &Path, max_files: usize, max_bytes: u64) -> R
     let mut files = 1usize;
     let mut bytes = std::fs::symlink_metadata(keep).map_or(0, |meta| meta.len());
     let mut removed = 0;
-    for (_, len, path) in ledgers {
-        if files < max_files && bytes.saturating_add(len) <= max_bytes {
+    for (mtime, len, path) in ledgers {
+        if mtime >= cutoff && files < max_files && bytes.saturating_add(len) <= max_bytes {
             files += 1;
             bytes = bytes.saturating_add(len);
             continue;
@@ -265,6 +292,9 @@ pub(crate) fn read_session_ledger(
 
 /// File, symbol, and chunk handles a response served, in traversal order,
 /// deduplicated and capped. Bare paths count only under path-named keys.
+/// Objects marked `status: "unresolved"` or `found: false` are skipped. The
+/// result can still echo caller input; pass it through [`retain_indexed`]
+/// before recording.
 pub fn response_handles(value: &Value, project_root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -293,6 +323,11 @@ fn collect(
     }
     match value {
         Value::Object(map) => {
+            if map.get("status").and_then(Value::as_str) == Some("unresolved")
+                || map.get("found").and_then(Value::as_bool) == Some(false)
+            {
+                return;
+            }
             for (key, child) in map {
                 if SKIP_KEYS.contains(&key.as_str()) {
                     continue;
@@ -330,6 +365,23 @@ fn collect(
         }
         _ => {}
     }
+}
+
+/// Keep only handles whose file is in the index, so a path the caller typed
+/// (an unresolved stack frame, a missing or unindexed file) is never recorded.
+pub fn retain_indexed(db: &codesage_storage::Database, handles: Vec<String>) -> Vec<String> {
+    let mut indexed: std::collections::HashMap<String, bool> = Default::default();
+    handles
+        .into_iter()
+        .filter(|handle| {
+            let Some(path) = handle_path(handle) else {
+                return false;
+            };
+            *indexed
+                .entry(path)
+                .or_insert_with_key(|path| matches!(db.file_id_for_path(path), Ok(Some(_))))
+        })
+        .collect()
 }
 
 /// The repository-relative file a ledger handle names.
@@ -420,7 +472,7 @@ mod tests {
         let first = call("describe", &["file:src/a.rs"]);
         assert_eq!(
             append_call(dir.path(), LedgerScope::Session("s"), &first).unwrap(),
-            AppendOutcome::Written { created: true }
+            AppendOutcome::Written { prune: true }
         );
         let path = ledger_path(dir.path(), LedgerScope::Session("s")).unwrap();
         let mut file = std::fs::OpenOptions::new()
@@ -474,7 +526,10 @@ mod tests {
         let file = std::fs::File::options().write(true).open(&keep).unwrap();
         file.set_modified(now - day * 365).unwrap();
 
-        assert_eq!(prune_ledgers_with_limits(&keep, 3, u64::MAX).unwrap(), 1);
+        assert_eq!(
+            prune_ledgers_with_limits(&keep, 3, u64::MAX, day * 3650).unwrap(),
+            1
+        );
         assert!(!sessions.join(format!("aged{LEDGER_SUFFIX}")).exists());
         assert!(sessions.join(format!("old{LEDGER_SUFFIX}")).exists());
         assert!(
@@ -483,9 +538,94 @@ mod tests {
         );
         assert!(snapshot.exists(), "snapshots are not ledgers");
 
-        assert_eq!(prune_ledgers_with_limits(&keep, 256, 7).unwrap(), 1);
+        assert_eq!(
+            prune_ledgers_with_limits(&keep, 256, 7, day * 3650).unwrap(),
+            1
+        );
         assert!(!sessions.join(format!("old{LEDGER_SUFFIX}")).exists());
         assert!(sessions.join(format!("recent{LEDGER_SUFFIX}")).exists());
+    }
+
+    #[test]
+    fn prune_deletes_ledgers_past_the_age_cap_under_the_count_and_byte_bounds() {
+        let dir = onboarded();
+        let sessions = dir.path().join(".codesage").join(SESSIONS_DIR);
+        std::fs::create_dir_all(&sessions).unwrap();
+        let now = SystemTime::now();
+        let day = std::time::Duration::from_secs(86_400);
+        for (name, age_days) in [("stale", 31u32), ("fresh", 29), ("active", 0)] {
+            let path = sessions.join(format!("{name}{LEDGER_SUFFIX}"));
+            std::fs::write(&path, b"{}\n").unwrap();
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(now - day * age_days).unwrap();
+        }
+        let keep = sessions.join(format!("active{LEDGER_SUFFIX}"));
+        assert_eq!(prune_ledgers(&keep).unwrap(), 1);
+        assert!(!sessions.join(format!("stale{LEDGER_SUFFIX}")).exists());
+        assert!(sessions.join(format!("fresh{LEDGER_SUFFIX}")).exists());
+    }
+
+    #[test]
+    fn append_requests_a_prune_on_creation_and_at_each_step() {
+        let dir = onboarded();
+        let scope = LedgerScope::Session("grow");
+        assert_eq!(
+            append_call(dir.path(), scope, &call("search", &[])).unwrap(),
+            AppendOutcome::Written { prune: true }
+        );
+        assert_eq!(
+            append_call(dir.path(), scope, &call("search", &[])).unwrap(),
+            AppendOutcome::Written { prune: false }
+        );
+        let path = ledger_path(dir.path(), scope).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_len(PRUNE_STEP_BYTES - 1).unwrap();
+        assert_eq!(
+            append_call(dir.path(), scope, &call("search", &[])).unwrap(),
+            AppendOutcome::Written { prune: true }
+        );
+    }
+
+    #[test]
+    fn response_handles_skip_unresolved_missing_and_unindexed_evidence() {
+        let root = Path::new("/repo");
+        let trace = json!({"frames": [
+            {"status": "unresolved", "file": "app/secret_trace_path.py"},
+            {"status": "resolved", "file": "src/real.py"}
+        ]});
+        assert_eq!(response_handles(&trace, root), vec!["file:src/real.py"]);
+        let missing = json!({"found": false, "file": "src/missing.rs", "imports": []});
+        assert!(response_handles(&missing, root).is_empty());
+        let tests = json!({
+            "unindexed_files": ["src/new.rs"],
+            "unsupported_files": ["CHANGELOG.md"],
+            "unscored_files": ["src/u.rs"],
+            "no_symbol_files": ["src/n.rs"],
+            "primary": ["tests/t.rs"]
+        });
+        assert_eq!(response_handles(&tests, root), vec!["file:tests/t.rs"]);
+    }
+
+    #[test]
+    fn retain_indexed_drops_handles_for_files_outside_the_index() {
+        let db = codesage_storage::Database::open_in_memory().unwrap();
+        db.upsert_file(&codesage_protocol::FileInfo {
+            path: "src/a.rs".into(),
+            language: codesage_protocol::Language::Rust,
+            content_hash: "x".into(),
+            is_test: false,
+        })
+        .unwrap();
+        let kept = retain_indexed(
+            &db,
+            vec![
+                "file:src/a.rs".into(),
+                "sym:src/a.rs#f".into(),
+                "file:app/secret_trace_path.py".into(),
+                "chunk:src/b.rs:1-2".into(),
+            ],
+        );
+        assert_eq!(kept, vec!["file:src/a.rs", "sym:src/a.rs#f"]);
     }
 
     #[test]

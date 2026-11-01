@@ -70,9 +70,15 @@ fn session_ledger_records_handles_only_and_session_end_correlates_edits() {
     .unwrap();
     std::fs::write(root.join("src/b.rs"), "pub fn beta() -> u32 {\n    20\n}\n").unwrap();
 
-    let end = call(
+    call(
         &mut session,
         6,
+        "review_rehearsal",
+        json!({"project": root, "targets": ["src/a.rs", "src/b.rs"]}),
+    );
+    let end = call(
+        &mut session,
+        7,
         "session_end",
         json!({"project": root, "session_id": "ledger"}),
     );
@@ -88,7 +94,11 @@ fn session_ledger_records_handles_only_and_session_end_correlates_edits() {
         .iter()
         .map(|line| line["tool"].as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["describe", "find_symbol", "search"], "{raw}");
+    assert_eq!(
+        tools,
+        ["describe", "find_symbol", "search", "review_rehearsal"],
+        "{raw}"
+    );
     for line in &lines {
         let mut keys: Vec<&str> = line
             .as_object()
@@ -129,7 +139,6 @@ fn session_ledger_records_handles_only_and_session_end_correlates_edits() {
     let acted = &end["acted_on"];
     assert_eq!(acted["ledger"], "recorded", "{end}");
     assert_eq!(acted["edited_source"], "worktree", "{end}");
-    assert_eq!(acted["calls"], 3, "{end}");
     assert_eq!(acted["fetched_then_edited"], 1, "{end}");
     assert_eq!(
         acted["fetched_then_edited_files"],
@@ -143,6 +152,8 @@ fn session_ledger_records_handles_only_and_session_end_correlates_edits() {
         "{end}"
     );
     assert_eq!(acted["fetched_unedited"], 1, "{end}");
+    assert_eq!(acted["calls"], 4, "{end}");
+    assert_eq!(acted["checked_edited"], 2, "rehearsal after edits: {end}");
     assert_eq!(
         acted["per_tool"]["describe"],
         json!({"calls": 1, "fetched": 1, "fetched_then_edited": 1}),
@@ -153,6 +164,54 @@ fn session_ledger_records_handles_only_and_session_end_correlates_edits() {
         json!({"calls": 1, "fetched": 1, "fetched_then_edited": 0}),
         "{end}"
     );
+}
+
+#[test]
+fn argument_derived_paths_never_enter_the_ledger() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    onboard(root);
+    std::fs::write(root.join("src/new_unindexed.rs"), "pub fn n() {}\n").unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let _cleanup = DaemonCleanup(runtime.path().to_path_buf());
+    let mut session = McpSession::start(runtime.path(), &[]);
+    session.initialize();
+    call(
+        &mut session,
+        2,
+        "session_start",
+        json!({"project": root, "session_id": "priv"}),
+    );
+    let trace = call(
+        &mut session,
+        3,
+        "from_trace",
+        json!({"project": root, "trace": "Traceback (most recent call last):\n  File \"app/secret_trace_path.py\", line 3, in handler\n    run()\nValueError: boom\n"}),
+    );
+    assert!(trace.to_string().contains("secret_trace_path"), "{trace}");
+    let deps = call(
+        &mut session,
+        4,
+        "list_dependencies",
+        json!({"project": root, "file_path": "src/missing_dep.rs"}),
+    );
+    assert!(deps.to_string().contains("missing_dep"), "{deps}");
+    let tests = call(
+        &mut session,
+        5,
+        "recommend_tests",
+        json!({"project": root, "targets": ["src/new_unindexed.rs"]}),
+    );
+    assert!(tests.to_string().contains("new_unindexed"), "{tests}");
+
+    let raw = std::fs::read_to_string(root.join(".codesage/sessions/priv.calls.jsonl")).unwrap();
+    assert_eq!(raw.lines().count(), 3, "{raw}");
+    for leaked in ["secret_trace_path", "missing_dep", "new_unindexed"] {
+        assert!(
+            !raw.contains(leaked),
+            "{leaked} leaked into the ledger: {raw}"
+        );
+    }
 }
 
 #[test]
@@ -219,6 +278,11 @@ fn disabled_ledger_writes_nothing_and_reports_disabled() {
     onboard(root);
     let runtime = tempfile::tempdir().unwrap();
     let _cleanup = DaemonCleanup(runtime.path().to_path_buf());
+    std::fs::write(
+        root.join("src/c.rs"),
+        "pub fn gamma() -> u32 {\n    30\n}\n",
+    )
+    .unwrap();
     let mut session = McpSession::start(runtime.path(), &[("CODESAGE_SESSION_LEDGER", "0")]);
     session.initialize();
     call(
@@ -239,6 +303,11 @@ fn disabled_ledger_writes_nothing_and_reports_disabled() {
         "describe",
         json!({"project": root, "target": "src/a.rs"}),
     );
+    std::fs::write(
+        root.join("src/a.rs"),
+        "pub fn alpha() -> u32 {\n    10\n}\n",
+    )
+    .unwrap();
     let end = call(
         &mut session,
         5,
@@ -246,6 +315,13 @@ fn disabled_ledger_writes_nothing_and_reports_disabled() {
         json!({"project": root, "session_id": "off"}),
     );
     assert_eq!(end["acted_on"]["ledger"], "disabled", "{end}");
+    assert_eq!(end["acted_on"]["edited_source"], "disabled", "{end}");
+    assert_eq!(end["acted_on"]["edited_unfetched"], 0, "{end}");
+    let snapshot: Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(".codesage/sessions/off.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(snapshot.get("worktree").is_none(), "{snapshot}");
     let sessions = root.join(".codesage/sessions");
     assert!(!sessions.join("connections").exists());
     assert!(!sessions.join("off.calls.jsonl").exists());

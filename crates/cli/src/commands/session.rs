@@ -82,12 +82,14 @@ pub(crate) fn cmd_session_end(session_id: &str, json: bool) -> Result<()> {
         }
         let acted = &diff.acted_on;
         println!(
-            "  acted on ({}, ledger {}): {} fetched then edited, {} edited unfetched, {} fetched unedited",
+            "  acted on ({}, ledger {}): {} fetched then edited, {} edited unfetched, {} fetched unedited, {} checked ({} edited)",
             acted.edited_source,
             acted.ledger,
             acted.fetched_then_edited,
             acted.edited_unfetched,
             acted.fetched_unedited,
+            acted.checked,
+            acted.checked_edited,
         );
         if !diff.summary_notes.is_empty() {
             println!("  Notes:");

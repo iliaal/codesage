@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use codesage_graph::session_ledger::{
     AppendOutcome, LedgerCall, LedgerScope, append_call, ledger_enabled, now_millis, prune_ledgers,
-    reset_session_ledger, response_handles,
+    reset_session_ledger, response_handles, retain_indexed,
 };
 use parking_lot::Mutex;
 use rmcp::model::CallToolResult;
@@ -92,7 +92,9 @@ impl ConnectionLedger {
         }
         let structured = response.structured_content.as_ref();
         let target_handles = match structured {
-            Some(value) if ok && HANDLE_TOOLS.contains(&tool) => response_handles(value, project),
+            Some(value) if ok && HANDLE_TOOLS.contains(&tool) => {
+                indexed_only(project, response_handles(value, project))
+            }
             _ => Vec::new(),
         };
         let cost = structured.and_then(|value| value.get("cost"));
@@ -123,7 +125,7 @@ impl ConnectionLedger {
             None => LedgerScope::Connection(&self.connection),
         };
         match append_call(project, scope, &call) {
-            Ok(AppendOutcome::Written { created: true }) => {
+            Ok(AppendOutcome::Written { prune: true }) => {
                 let pruned = codesage_graph::session_ledger::ledger_path(project, scope)
                     .and_then(|path| prune_ledgers(&path));
                 if let Err(error) = pruned {
@@ -136,6 +138,21 @@ impl ConnectionLedger {
     }
 }
 
+/// Drop every handle whose file is not in the project's index; an unreadable
+/// index drops them all rather than record unverified, caller-supplied paths.
+fn indexed_only(project: &Path, handles: Vec<String>) -> Vec<String> {
+    if handles.is_empty() {
+        return handles;
+    }
+    match codesage_storage::Database::open_read_only(&project.join(".codesage").join("index.db")) {
+        Ok(db) => retain_indexed(&db, handles),
+        Err(error) => {
+            tracing::debug!(error = %error, "session ledger index check failed; dropping handles");
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,7 +161,16 @@ mod tests {
     fn onboarded() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".codesage")).unwrap();
-        std::fs::write(dir.path().join(".codesage/index.db"), b"").unwrap();
+        let db = codesage_storage::Database::open(&dir.path().join(".codesage/index.db")).unwrap();
+        for path in ["src/a.rs", "src/b.rs"] {
+            db.upsert_file(&codesage_protocol::FileInfo {
+                path: path.into(),
+                language: codesage_protocol::Language::Rust,
+                content_hash: "x".into(),
+                is_test: false,
+            })
+            .unwrap();
+        }
         dir
     }
 
@@ -200,6 +226,34 @@ mod tests {
             ]
         );
         assert_eq!(lines(&connection).len(), 1);
+    }
+
+    #[test]
+    fn handles_outside_the_index_are_never_recorded() {
+        let dir = onboarded();
+        let ledger = ConnectionLedger::with_enabled(true);
+        ledger.record(
+            dir.path(),
+            "from_trace",
+            &Map::new(),
+            &result(json!({"frames": [
+                {"status": "resolved", "file": "src/a.rs"},
+                {"status": "resolved", "file": "app/secret_trace_path.py"}
+            ]})),
+        );
+        let connection = dir
+            .path()
+            .join(".codesage/sessions/connections")
+            .join(format!("{}.calls.jsonl", ledger.connection));
+        assert_eq!(
+            lines(&connection)[0]["target_handles"],
+            json!(["file:src/a.rs"])
+        );
+        assert!(
+            !std::fs::read_to_string(&connection)
+                .unwrap()
+                .contains("secret")
+        );
     }
 
     #[test]
