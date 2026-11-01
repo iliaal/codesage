@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.47.1] - 2026-11-01
+
 ### Fixed
 
 - 0.47.1 publishes the 0.47.0 changes as a GitHub Release; the v0.47.0 tag has none because its source failed the release workflow's Rust 1.99 clippy gate.
@@ -1403,5 +1405,7 @@ Initial public release.
 
 [0.46.0]: https://github.com/iliaal/codesage/releases/tag/v0.46.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.47.0...HEAD
 [0.47.0]: https://github.com/iliaal/codesage/releases/tag/v0.47.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.47.1...HEAD
+[0.47.1]: https://github.com/iliaal/codesage/releases/tag/v0.47.1
