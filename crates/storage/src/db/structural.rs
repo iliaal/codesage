@@ -31,6 +31,16 @@ const REF_IS_TEST_SQL: &str = "(f.is_test <> 0 OR COALESCE( \
         WHERE s.file_id = r.from_file_id AND s.qualified_name = r.from_symbol), \
      0) <> 0)";
 
+// `CROSS JOIN` pins the join order: driving from the `files.path` range keeps a
+// directory with no relative imports from scanning every relative import row.
+const PYTHON_RELATIVE_IMPORT_IN_DIRECTORY: &str =
+    "SELECT 1 FROM files f CROSS JOIN refs r ON f.id = r.from_file_id
+     WHERE f.path >= ?1 || '/' AND f.path < ?1 || '0'
+       AND instr(substr(f.path, length(?1) + 2), '/') = 0
+       AND f.language = 'python' AND r.kind = 'import'
+       AND r.to_name >= '.' AND r.to_name < '/'
+     LIMIT 1";
+
 /// Cross-file import pairs split by whether any load-time directive joins them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImportPairs {
@@ -893,14 +903,9 @@ impl Database {
                 return Ok(true);
             }
         }
-        let mut relative = self.conn.prepare_cached(
-            "SELECT 1 FROM refs r JOIN files f ON f.id = r.from_file_id
-             WHERE f.language = 'python' AND r.kind = 'import'
-               AND r.to_name >= '.' AND r.to_name < '/'
-               AND f.path >= ?1 || '/' AND f.path < ?1 || '0'
-               AND instr(substr(f.path, length(?1) + 2), '/') = 0
-             LIMIT 1",
-        )?;
+        let mut relative = self
+            .conn
+            .prepare_cached(PYTHON_RELATIVE_IMPORT_IN_DIRECTORY)?;
         Ok(relative.exists([directory])?)
     }
 
@@ -2017,6 +2022,32 @@ mod tests {
     };
 
     use super::Database;
+
+    #[test]
+    fn python_relative_import_probe_drives_from_the_directory_path_range() {
+        let db = Database::open_in_memory().unwrap();
+        let mut stmt = db
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::PYTHON_RELATIVE_IMPORT_IN_DIRECTORY
+            ))
+            .unwrap();
+        let plan = stmt
+            .query_map(["app/api"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(plan.len(), 2, "{plan:?}");
+        assert!(
+            plan[0].starts_with("SEARCH f USING INDEX") && plan[0].contains("(path>? AND path<?)"),
+            "{plan:?}"
+        );
+        assert!(
+            plan[1].starts_with("SEARCH r USING INDEX idx_refs_from_file"),
+            "{plan:?}"
+        );
+    }
 
     #[test]
     fn python_binding_evidence_round_trips_and_is_cleared_on_reindex() {
