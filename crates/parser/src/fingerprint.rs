@@ -214,6 +214,9 @@ fn file_fingerprints_with_control(
         } else {
             captured
         };
+        if crate::extract::is_recovered_statement(&def, &name, kind, language, source) {
+            continue;
+        }
         let line_start = def.start_position().row as u32 + 1;
         let line_end = def.end_position().row as u32 + 1;
         // Same-line definitions can share a storage key despite distinct spans.

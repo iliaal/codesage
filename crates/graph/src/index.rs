@@ -764,6 +764,56 @@ mod tests {
     }
 
     #[test]
+    fn call_in_partial_preprocessor_arm_belongs_to_enclosing_function() {
+        type Case = (
+            &'static str,
+            Language,
+            &'static [u8],
+            &'static [(&'static str, u32)],
+        );
+        let cases: [Case; 3] = [
+            (
+                "damaged.c",
+                Language::C,
+                b"void handle(int id)\n{\n    if (id == 1) {\n        a(id);\n    }\n#if defined(USE_V)\n    else if (id == 2) {\n        b(id);\n    }\n#endif\n    else {\n        c(id);\n    }\n}\n",
+                &[("a", 4), ("b", 8), ("c", 12)],
+            ),
+            (
+                "macro.c",
+                Language::C,
+                b"void handle(int x)\n{\n    if (x) {\n        a(x);\n    }\n#if defined(A)\n    else ZEND_HASH_FOREACH_VAL(ht, v) {\n        b(x);\n    } ZEND_HASH_FOREACH_END();\n#endif\n}\n",
+                &[("a", 4), ("b", 8), ("ZEND_HASH_FOREACH_END", 9)],
+            ),
+            (
+                "catch.cpp",
+                Language::Cpp,
+                b"void handle(int id)\n{\n    try {\n        a(id);\n    }\n#if defined(E)\n    catch (const std::exception &e) {\n        b(e);\n    }\n#endif\n    catch (...) {\n        c();\n    }\n}\n",
+                &[("a", 4), ("b", 8), ("c", 12)],
+            ),
+        ];
+        for (path, language, source, calls) in cases {
+            let info = FileInfo {
+                path: path.to_string(),
+                language,
+                content_hash: content_hash(source),
+                is_test: false,
+            };
+            let parsed = parse_source(&info, source, &JavaTypeContext::default()).unwrap();
+            let callers: Vec<_> = parsed
+                .refs
+                .iter()
+                .filter(|r| r.kind == ReferenceKind::Call)
+                .map(|r| (r.to_name.as_str(), r.line, r.from_symbol.as_deref()))
+                .collect();
+            let expected: Vec<_> = calls
+                .iter()
+                .map(|&(name, line)| (name, line, Some("handle")))
+                .collect();
+            assert_eq!(callers, expected, "{path}");
+        }
+    }
+
+    #[test]
     fn structural_reader_rejects_header_context_snapshot_drift() {
         let root = tempfile::tempdir().unwrap();
         for (path, language) in [("api.h", Language::C), ("api.cpp", Language::Cpp)] {

@@ -336,7 +336,7 @@ pub fn extract_symbols(
         } else {
             captured_name.clone()
         };
-        if name.is_empty() {
+        if name.is_empty() || is_recovered_statement(&def_node, &name, kind, language, source) {
             continue;
         }
 
@@ -406,6 +406,135 @@ pub fn extract_symbols(
 
     codesage_protocol::work::checkpoint()?;
     Ok(symbols)
+}
+
+/// A function definition tree-sitter error recovery made out of a statement,
+/// typically an `else if (...) {...}` or `catch (...) {...}` arm left alone
+/// inside a preprocessor group. Dropping it leaves its span, and the calls in
+/// its body, to the real definition that encloses it.
+///
+/// - A C/C++ statement keyword can never name a function.
+/// - A definition whose return type is `else` is a dangling `else` arm,
+///   whatever the following statement or macro is.
+/// - C++ has no nested functions, so a typeless definition directly inside a
+///   function or lambda body is a statement such as `catch (...) {...}` or
+///   `Q_FOREACH(x, list) {...}`; C keeps GNU nested functions.
+pub(crate) fn is_recovered_statement(
+    def: &Node,
+    name: &str,
+    kind: SymbolKind,
+    language: Language,
+    source: &[u8],
+) -> bool {
+    if !matches!(language, Language::C | Language::Cpp)
+        || !matches!(kind, SymbolKind::Function | SymbolKind::Method)
+    {
+        return false;
+    }
+    if matches!(
+        name,
+        "if" | "else" | "while" | "for" | "switch" | "do" | "return" | "case" | "sizeof" | "goto"
+    ) {
+        return true;
+    }
+    if def.kind() != "function_definition" {
+        return false;
+    }
+    if def
+        .child_by_field_name("type")
+        .is_some_and(|ty| ty.utf8_text(source) == Ok("else"))
+    {
+        return true;
+    }
+    language == Language::Cpp && nested_in_function_body(def, name, source)
+}
+
+/// Only a typeless, non-template definition directly owned by a real function
+/// or lambda body counts: a macro-opened namespace or macro-annotated class
+/// head (`NLOHMANN_JSON_NAMESPACE_BEGIN namespace detail {`,
+/// `class GTEST_API_ Impl {`) also parses as a `function_definition`, but its
+/// declarator is not a function declarator, and the real definitions inside it
+/// carry a return type.
+///
+/// A constructor or destructor is typeless too, so one that error recovery
+/// swallowed into a function body still counts as real: its name starts with
+/// `~`, is qualified, or names an enclosing class.
+fn nested_in_function_body(def: &Node, name: &str, source: &[u8]) -> bool {
+    if def.child_by_field_name("type").is_some() || name.starts_with('~') {
+        return false;
+    }
+    let own_name = unwrap_declarator(*def)
+        .filter(|node| node.kind() == "function_declarator")
+        .and_then(|node| node.child_by_field_name("declarator"));
+    if own_name
+        .is_some_and(|node| matches!(node.kind(), "qualified_identifier" | "destructor_name"))
+    {
+        return false;
+    }
+    let mut node = *def;
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "template_declaration" if node == *def => return false,
+            "compound_statement" => match parent.parent() {
+                Some(owner)
+                    if owner.kind() == "lambda_expression"
+                        || (owner.kind() == "function_definition" && declares_function(owner)) =>
+                {
+                    return !names_enclosing_class(owner, name, source);
+                }
+                Some(owner) if owner.kind() == "function_definition" => return false,
+                _ => node = parent,
+            },
+            "field_declaration_list" | "declaration_list" | "translation_unit" => return false,
+            _ => node = parent,
+        }
+    }
+    false
+}
+
+fn names_enclosing_class(mut node: Node, name: &str, source: &[u8]) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "class_specifier" | "struct_specifier")
+            && let Some(class) = parent.child_by_field_name("name")
+        {
+            let class = match class.kind() {
+                "template_type" => class.child_by_field_name("name").unwrap_or(class),
+                _ => class,
+            };
+            if class.utf8_text(source) == Ok(name) {
+                return true;
+            }
+        }
+        node = parent;
+    }
+    false
+}
+
+fn declares_function(definition: Node) -> bool {
+    unwrap_declarator(definition).is_some_and(|node| match node.kind() {
+        "function_declarator" | "operator_cast" => true,
+        "qualified_identifier" => node
+            .child_by_field_name("name")
+            .is_some_and(|name| name.kind() == "operator_cast"),
+        _ => false,
+    })
+}
+
+/// The definition's declarator with pointer, reference, parenthesized, and
+/// attribute wrappers removed.
+fn unwrap_declarator(definition: Node) -> Option<Node> {
+    let mut declarator = definition.child_by_field_name("declarator");
+    while let Some(node) = declarator {
+        declarator = match node.kind() {
+            "pointer_declarator" => node.child_by_field_name("declarator"),
+            "attributed_declarator" => node.named_child(0),
+            "reference_declarator" | "parenthesized_declarator" => node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind().ends_with("declarator")),
+            _ => return Some(node),
+        };
+    }
+    None
 }
 
 pub(crate) fn definition_capture<'tree>(
