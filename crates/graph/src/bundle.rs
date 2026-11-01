@@ -111,7 +111,7 @@ pub fn export_context(
 
     let query = req.query.as_deref().unwrap_or_default();
     if query.is_empty() {
-        anyhow::bail!("export_context requires either `query` or `symbol`");
+        anyhow::bail!("bundle (CLI: export) requires a non-empty target");
     }
 
     let search_req = SearchRequest {
@@ -182,7 +182,7 @@ pub fn export_context_for_target(
         .or(req.query.as_deref())
         .unwrap_or_default();
     if input.trim().is_empty() {
-        anyhow::bail!("export_context requires either `query` or `symbol`");
+        anyhow::bail!("bundle (CLI: export) requires a non-empty target");
     }
     let (resolution, symbols) = resolve_symbols(db, input, ResolveOptions::default())?;
     if resolution.kind == TargetKind::Text {

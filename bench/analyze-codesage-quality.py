@@ -50,6 +50,8 @@ RETRIEVAL_CODESAGE_TOOLS = {
     "find_symbol",
     "find_references",
     "impact_analysis",
+    "bundle",
+    # Retired alias of `bundle`; older transcripts still carry it.
     "export_context",
     "list_dependencies",
 }
@@ -1644,7 +1646,7 @@ def render(
     )
     out.append(
         f"- **CodeSage retrieval tool calls** (search, find_symbol, find_references, "
-        f"impact_analysis, export_context, list_dependencies): {retr_total}"
+        f"impact_analysis, bundle/export_context, list_dependencies): {retr_total}"
     )
     if retr:
         parts = ", ".join(f"`{k}`={v}" for k, v in sorted(retr.items(), key=lambda kv: -kv[1]))

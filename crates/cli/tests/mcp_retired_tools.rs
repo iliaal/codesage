@@ -248,6 +248,78 @@ fn tools_list_advertises_one_noun_per_tool_and_no_retired_name() {
     assert!(risk["inputSchema"]["properties"].get("aggregate").is_some());
 }
 
+/// Names in descriptions and schemas are advertisements too: an agent that
+/// reads `tools/list` must never be pointed at a tool it cannot list.
+#[test]
+fn no_retired_name_appears_anywhere_in_tools_list() {
+    let mut server = Server::start();
+    let listing = server.raw("tools/list", json!({}));
+    let tools = listing["result"]["tools"].as_array().expect("tools array");
+    assert!(!tools.is_empty());
+    for tool in tools {
+        for part in ["name", "description", "inputSchema", "outputSchema"] {
+            assert!(tool.get(part).is_some(), "{} lacks {part}", tool["name"]);
+        }
+        let serialized = tool.to_string();
+        for retired in RETIRED {
+            if let Some(at) = serialized.find(retired) {
+                let context: String = serialized[at.saturating_sub(160)..]
+                    .chars()
+                    .take(320)
+                    .collect();
+                panic!("{} names retired `{retired}`: {context}", tool["name"]);
+            }
+        }
+    }
+}
+
+/// One-element lists are sets, as they were for the retired batch and diff
+/// tools: an unmatched path is a `found: false` entry. Only the retired
+/// single-file spellings refuse it with the nearest candidates.
+#[test]
+fn lone_list_entries_are_reported_and_single_spellings_are_refused() {
+    let project = tempfile::tempdir().unwrap();
+    onboard(project.path());
+    let root = project.path();
+    let mut server = Server::start();
+    for (tool, arguments) in [
+        ("assess_risk_batch", json!({"file_paths": ["helper.rs"]})),
+        ("assess_risk_diff", json!({"file_paths": ["helper.rs"]})),
+        ("assess_risk_batch", json!({"targets": ["helper.rs"]})),
+        ("assess_risk", json!({"targets": ["helper.rs"]})),
+        ("assess_risk", json!({"file_paths": ["helper.rs"]})),
+        (
+            "assess_risk",
+            json!({"targets": ["helper.rs"], "aggregate": true}),
+        ),
+    ] {
+        let mut with_project = arguments.clone();
+        with_project["project"] = json!(root);
+        let result = server.ok(tool, with_project);
+        assert_eq!(
+            result["files"][0]["file"], "helper.rs",
+            "{tool} {arguments}: {result}"
+        );
+        assert_eq!(
+            result["files"][0]["found"], false,
+            "{tool} {arguments}: {result}"
+        );
+    }
+    for arguments in [
+        json!({"target": "helper.rs"}),
+        json!({"file_path": "helper.rs"}),
+    ] {
+        let mut with_project = arguments.clone();
+        with_project["project"] = json!(root);
+        let result = server.call("assess_risk", with_project);
+        assert_eq!(error_code(&result), "E_NOT_FOUND", "{arguments}: {result}");
+        assert!(
+            result.to_string().contains("file:src/helper.rs"),
+            "the refusal names the indexed candidate: {result}"
+        );
+    }
+}
+
 #[test]
 fn every_retired_name_and_spelling_answers_as_its_successor() {
     let project = tempfile::tempdir().unwrap();
@@ -265,6 +337,25 @@ fn every_retired_name_and_spelling_answers_as_its_successor() {
             new["tool"], current.0,
             "the envelope names the advertised tool: {new}"
         );
+        // The legacy form says what replaces it; the current form is silent.
+        let notes = old["cost"]["notes"].as_array().unwrap_or_else(|| {
+            panic!(
+                "{} {} carries no deprecation note: {old}",
+                retired.0, retired.1
+            )
+        });
+        assert!(!notes.is_empty(), "{old}");
+        for note in notes {
+            let note = note.as_str().unwrap();
+            assert!(
+                note.starts_with("deprecated: ") && note.contains(&format!("`{}`", current.0)),
+                "{} {}: the note must name `{}`: {note}",
+                retired.0,
+                retired.1,
+                current.0
+            );
+        }
+        assert!(new["cost"].get("notes").is_none(), "{new}");
         assert_eq!(
             comparable(old),
             comparable(new),
@@ -323,15 +414,15 @@ fn every_retired_name_and_spelling_answers_as_its_successor() {
     ] {
         same(
             &mut server,
-            ("find_feature", spelling.clone()),
-            ("features", json!({"target": "src/helper.rs"})),
-        );
-        same(
-            &mut server,
-            ("features", spelling),
+            ("find_feature", spelling),
             ("features", json!({"target": "src/helper.rs"})),
         );
     }
+    same(
+        &mut server,
+        ("features", json!({"file_path": "src/helper.rs"})),
+        ("features", json!({"target": "src/helper.rs"})),
+    );
     let owned = server.ok(
         "features",
         json!({"project": root, "target": "src/helper.rs"}),
@@ -491,6 +582,12 @@ fn unknown_tools_and_contradictory_spellings_are_refused() {
             vec!["`target`", "features"],
         ),
         ("session", json!({"session_id": "x"}), vec!["action"]),
+        (
+            "session_start",
+            json!({"session_id": "x", "detail": "full"}),
+            vec!["`detail`"],
+        ),
+        ("bundle", json!({"target": "  "}), vec!["`target`", "empty"]),
     ] {
         let mut with_project = arguments.clone();
         with_project["project"] = json!(root);

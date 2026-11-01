@@ -285,7 +285,9 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
     let _policy = crate::git_history::CompletePolicy::enter_current();
     validate_session_id(session_id)?;
     let snapshot = read_snapshot(project_root, session_id).with_context(|| {
-        format!("loading session snapshot '{session_id}' (was session_start called?)")
+        format!(
+            "loading session snapshot '{session_id}' (was session {{action:\"start\"}} called?)"
+        )
     })?;
 
     let now_files = db.all_file_paths().context("listing indexed files")?;

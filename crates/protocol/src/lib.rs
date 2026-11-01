@@ -1653,9 +1653,9 @@ impl RiskDiffAssessment {
 /// Differs from [`RiskDiffAssessment`] in that it does *not* compute
 /// max/mean across the set, rollup arrays, summary notes, cycles, or
 /// directory clustering; those are patch-aggregate concerns. If the
-/// agent wants "is this patch risky as a whole?", use `assess_risk_diff`
-/// instead. If it wants "give me each of these files' scores", use
-/// `assess_risk_batch`.
+/// agent wants "is this patch risky as a whole?", call `assess_risk` with
+/// `aggregate: true` instead. If it wants "give me each of these files'
+/// scores", omit `aggregate`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RiskBatchAssessment {
     /// Per-file decomposition, in the order of the request's targets.

@@ -916,15 +916,18 @@ impl CodeSageServer {
                 validate_non_empty_file_list(&targets, "assess_risk", fields)?;
                 Ok(targets)
             });
-            // A lone target keeps the single-file contract: a miss is refused
-            // with the nearest indexed candidates. In a larger set an unmatched
-            // path travels to the per-file `found: false` disclosure instead of
-            // costing every other input its answer.
-            let resolve =
-                |root: &Path, db: &codesage_storage::Database, targets: &[String]| match targets {
-                    [target] => Ok(vec![dispatch::resolve_file_target(root, db, target)?]),
-                    _ => dispatch::resolve_file_targets(root, db, targets),
-                };
+            // A list is a set: an unmatched path travels to the per-file
+            // `found: false` disclosure instead of costing every other input
+            // its answer, however long the list. Only the retired single-file
+            // spellings keep their contract of refusing a miss with the
+            // nearest indexed candidates.
+            let strict = params.single_spelling_only();
+            let resolve = move |root: &Path,
+                                db: &codesage_storage::Database,
+                                targets: &[String]| match targets {
+                [target] if strict => Ok(vec![dispatch::resolve_file_target(root, db, target)?]),
+                _ => dispatch::resolve_file_targets(root, db, targets),
+            };
             if params.aggregate.unwrap_or(false) {
                 let result = targets.and_then(|targets| {
                     s.with_project_root_db(&params.project, |root, db| {

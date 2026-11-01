@@ -142,8 +142,31 @@ impl Drop for ExecutionResources {
     }
 }
 
-fn class_for(tool: &str) -> WorkClass {
+/// `bundle` needs the native lane only when its target may fall through to
+/// semantic search. A feature lookup, a handle, or a forced symbol resolves
+/// structurally and keeps the interactive lane `feature_bundle` used, so
+/// parallel review agents do not queue behind embedding work.
+fn bundle_is_structural(arguments: &Map<String, Value>) -> bool {
+    use codesage_protocol::Handle;
+    if arguments.get("feature_id").is_some_and(|v| !v.is_null())
+        || arguments.get("is_symbol") == Some(&Value::Bool(true))
+    {
+        return true;
+    }
+    arguments
+        .get("target")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|target| {
+            target.starts_with("route:")
+                || target.starts_with("cmd:")
+                || Handle::parse(target).is_some()
+        })
+}
+
+fn class_for(tool: &str, arguments: &Map<String, Value>) -> WorkClass {
     match tool {
+        "bundle" if bundle_is_structural(arguments) => WorkClass::Interactive,
         "search" | "bundle" | "embed_texts" | "rerank_pairs" => WorkClass::Native,
         "project_overview" | "review_rehearsal" | "assess_risk" | "session" | "impact_analysis"
         | "recommend_tests" | "trace_call_path" | "find_similar" => WorkClass::Analysis,
@@ -779,19 +802,23 @@ impl CodeSageServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let started = Instant::now();
+        let notes = super::alias::deprecation_notes(&request.name, request.arguments.as_ref());
         if let Err(error) = super::alias::rewrite(&mut request) {
             let tool = request.name.to_string();
             let arguments = request.arguments.clone().unwrap_or_default();
             let mut result = render_mcp_error(&tool, Some(&arguments), error);
             normalize_error(&mut result, &tool, Some(&arguments), None);
-            return Ok(CallToolResponse::Complete(super::detail::finish(
-                result,
-                &tool,
-                &arguments,
-                started.elapsed(),
-                super::render::MCP_BUDGET_CHARS,
-                self.state.envelope_enabled,
-            )));
+            return Ok(CallToolResponse::Complete(
+                super::detail::finish_with_notes(
+                    result,
+                    &tool,
+                    &arguments,
+                    started.elapsed(),
+                    super::render::MCP_BUDGET_CHARS,
+                    self.state.envelope_enabled,
+                    &notes,
+                ),
+            ));
         }
         let tool = request.name.to_string();
         let arguments = request.arguments.clone().unwrap_or_default();
@@ -822,13 +849,14 @@ impl CodeSageServer {
             } else {
                 super::render::MCP_BUDGET_CHARS
             };
-            let response = super::detail::finish(
+            let response = super::detail::finish_with_notes(
                 response,
                 &tool,
                 &arguments,
                 started.elapsed(),
                 cap,
                 server.state.envelope_enabled,
+                &notes,
             );
             if let Some(ticket) = rendering_ticket {
                 ticket.finish(result_outcome(&response));
@@ -879,7 +907,7 @@ impl CodeSageServer {
             return Ok(CallToolResult::structured(snapshot).into());
         }
         let tool = request.name.to_string();
-        let class = class_for(&tool);
+        let class = class_for(&tool, &arguments);
         let ticket = ticket.expect("non-diagnostic request ticket");
         let tool_name = tool.clone();
         ticket.set_class(class_name(class));
@@ -2011,6 +2039,38 @@ mod tests {
             snapshot["counters"]["execution_outcomes"]["database-busy"],
             1
         );
+    }
+
+    #[test]
+    fn bundle_work_class_follows_whether_semantic_search_can_run() {
+        let class = |arguments: Value| class_for("bundle", arguments.as_object().unwrap());
+        for structural in [
+            json!({"target": "feat_1111111111111111"}),
+            json!({"target": "route:POST /api/login"}),
+            json!({"target": "cmd:serve"}),
+            json!({"target": "sym:src/lib.rs#run"}),
+            json!({"target": "file:src/lib.rs"}),
+            json!({"target": "dir:src"}),
+            json!({"target": "chunk:src/lib.rs:1-4"}),
+            json!({"feature_id": "absent"}),
+            json!({"target": "run", "is_symbol": true}),
+        ] {
+            assert!(
+                class(structural.clone()) == WorkClass::Interactive,
+                "{structural}"
+            );
+        }
+        for semantic in [
+            json!({"target": "where is the login handler"}),
+            json!({"target": "run"}),
+            json!({"target": "src/lib.rs"}),
+            json!({"target": "run", "is_symbol": false}),
+        ] {
+            assert!(class(semantic.clone()) == WorkClass::Native, "{semantic}");
+        }
+        assert!(class_for("search", &Map::new()) == WorkClass::Native);
+        assert!(class_for("features", &Map::new()) == WorkClass::Interactive);
+        assert!(class_for("session", &Map::new()) == WorkClass::Analysis);
     }
 
     #[test]

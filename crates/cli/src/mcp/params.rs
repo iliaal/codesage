@@ -365,7 +365,7 @@ impl CouplingParams {
     }
 }
 
-const RISK_TARGETS_DESC: &str = "Files to assess, at least one: each entry is a `file:`, `sym:`, or `chunk:` handle, an indexed path (a leading `./` is ignored), or `path:line`; a symbol target resolves to its file. One file is a list of one. A lone target that matches no indexed path and no file in the working tree is E_NOT_FOUND with the nearest candidates; in a larger set such a path is taken as written and reported with `found: false`, as is a file the working tree holds but the index does not.";
+const RISK_TARGETS_DESC: &str = "Files to assess, at least one: each entry is a `file:`, `sym:`, or `chunk:` handle, an indexed path (a leading `./` is ignored), or `path:line`; a symbol target resolves to its file. One file is a list of one. A path the index does not hold is taken as written and reported with `found: false`, whatever the list length.";
 
 const RISK_VERBOSE_DESC: &str = "Include per-signal decomposition (churn_score, churn_percentile, fix_ratio, total_commits, fix_count, dependent_files, coupled_files, test_gap, in_cycle, cycle_size) and coupled files (`top_coupled`) on each RiskAssessment; default false.";
 
@@ -454,6 +454,15 @@ impl RiskParams {
 
     pub(crate) fn list_fields(&self) -> &'static [&'static str] {
         list_fields(&self.file_paths, &self.targets)
+    }
+
+    /// True when the call named its file only through a retired single-file
+    /// spelling (`target`, `file_path`), whose miss is refused with the
+    /// nearest candidates rather than reported as an unindexed entry.
+    pub(crate) fn single_spelling_only(&self) -> bool {
+        self.targets.is_none()
+            && self.file_paths.is_none()
+            && (self.target.is_some() || self.file_path.is_some())
     }
 }
 
@@ -613,12 +622,20 @@ pub struct BundleParams {
 
 impl BundleParams {
     pub(crate) fn target_arg(&self) -> Result<String> {
-        one_target(
+        let target = one_target(
             "bundle",
             "feature_id",
             self.feature_id.as_deref(),
             self.target.as_deref(),
-        )
+        )?;
+        if target.trim().is_empty() {
+            return Err(McpError::new(
+                ErrorCode::Param,
+                "bundle: `target` is empty; pass an entity in the target grammar or a question",
+            )
+            .into());
+        }
+        Ok(target)
     }
 }
 

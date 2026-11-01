@@ -323,13 +323,28 @@ pub(super) fn add_snippets(value: &mut Value, root: &std::path::Path) {
     visit(value, root, &mut std::collections::HashMap::new());
 }
 
+#[cfg(test)]
 pub(super) fn finish(
+    result: CallToolResult,
+    tool: &str,
+    arguments: &Map<String, Value>,
+    elapsed: Duration,
+    cap: usize,
+    envelope_enabled: bool,
+) -> CallToolResult {
+    finish_with_notes(result, tool, arguments, elapsed, cap, envelope_enabled, &[])
+}
+
+/// [`finish`], recording `notes` (deprecation notices) under `cost.notes`
+/// before the byte count is taken.
+pub(super) fn finish_with_notes(
     mut result: CallToolResult,
     tool: &str,
     arguments: &Map<String, Value>,
     elapsed: Duration,
     cap: usize,
     envelope_enabled: bool,
+    notes: &[String],
 ) -> CallToolResult {
     let rendering = std::time::Instant::now();
     let options = Options::parse(tool, arguments).unwrap_or(Options {
@@ -342,7 +357,7 @@ pub(super) fn finish(
                 && let Ok(mut value) = serde_json::from_str::<Value>(&text.text)
                 && value.pointer("/error/code").is_some()
             {
-                stamp_cost(&mut value, options, elapsed, None);
+                stamp_cost(&mut value, options, elapsed, None, notes);
                 *content = ContentBlock::text(value.to_string());
             }
         }
@@ -352,7 +367,7 @@ pub(super) fn finish(
         return result;
     };
     if !ROW_TOOLS.contains(&tool) {
-        stamp_cost(value, options, elapsed, None);
+        stamp_cost(value, options, elapsed, None, notes);
         super::render::rerender_json_text(&mut result);
         return result;
     }
@@ -380,16 +395,31 @@ pub(super) fn finish(
     let retry = (serde_json::to_vec(&retry_arguments).map_or(usize::MAX, |value| value.len())
         <= 1024)
         .then(|| json!({"tool":tool,"arguments":retry_arguments}));
-    stamp_cost(value, options, elapsed, Some(budget));
+    stamp_cost(value, options, elapsed, Some(budget), notes);
     trim_to_budget(value, budget, retry.as_ref(), envelope_enabled);
-    stamp_cost(value, options, elapsed + rendering.elapsed(), Some(budget));
+    stamp_cost(
+        value,
+        options,
+        elapsed + rendering.elapsed(),
+        Some(budget),
+        notes,
+    );
     super::render::rerender_json_text(&mut result);
     result
 }
 
-fn stamp_cost(value: &mut Value, options: Options, elapsed: Duration, cap: Option<usize>) {
+fn stamp_cost(
+    value: &mut Value,
+    options: Options,
+    elapsed: Duration,
+    cap: Option<usize>,
+    notes: &[String],
+) {
     if let Some(cost) = value.get_mut("cost").and_then(Value::as_object_mut) {
         cost.remove("budget_exceeded");
+    }
+    if !notes.is_empty() {
+        value["cost"]["notes"] = json!(notes);
     }
     value["cost"]["ms"] = json!(elapsed.as_millis() as u64);
     value["cost"]["detail"] = json!(options.detail.as_str());

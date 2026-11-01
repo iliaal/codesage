@@ -11,8 +11,9 @@ use super::error::{ErrorCode, McpError};
 pub(super) struct Retired {
     pub name: &'static str,
     pub successor: &'static str,
-    /// Arguments the retired tool accepted besides `project` and the common
-    /// row controls. Anything else was a parameter error before and stays one.
+    /// Arguments the retired tool accepted besides `project`, including the
+    /// `detail` / `budget_tokens` row controls where it took them. Anything
+    /// else was a parameter error before and stays one.
     accepted: &'static [&'static str],
     /// Arguments that make the successor answer the retired tool's question.
     implied: &'static [(&'static str, Implied)],
@@ -36,34 +37,54 @@ impl Implied {
     }
 }
 
-const COMMON: &[&str] = &["project", "detail", "budget_tokens"];
+const COMMON: &[&str] = &["project"];
 
 pub(super) const RETIRED: &[Retired] = &[
     Retired {
         name: "assess_risk_batch",
         successor: "assess_risk",
-        accepted: &["file_paths", "targets", "verbose"],
+        accepted: &[
+            "file_paths",
+            "targets",
+            "verbose",
+            "detail",
+            "budget_tokens",
+        ],
         implied: &[],
         renamed: &[],
     },
     Retired {
         name: "assess_risk_diff",
         successor: "assess_risk",
-        accepted: &["file_paths", "targets", "verbose"],
+        accepted: &[
+            "file_paths",
+            "targets",
+            "verbose",
+            "detail",
+            "budget_tokens",
+        ],
         implied: &[("aggregate", Implied::True)],
         renamed: &[],
     },
     Retired {
         name: "list_features",
         successor: "features",
-        accepted: &["kind", "language", "tag", "since", "limit"],
+        accepted: &[
+            "kind",
+            "language",
+            "tag",
+            "since",
+            "limit",
+            "detail",
+            "budget_tokens",
+        ],
         implied: &[],
         renamed: &[],
     },
     Retired {
         name: "find_feature",
         successor: "features",
-        accepted: &["file_path", "target"],
+        accepted: &["file_path", "target", "detail", "budget_tokens"],
         implied: &[],
         renamed: &[],
     },
@@ -76,6 +97,8 @@ pub(super) const RETIRED: &[Retired] = &[
             "limit",
             "include_callers",
             "include_callees",
+            "detail",
+            "budget_tokens",
         ],
         implied: &[],
         renamed: &[],
@@ -89,6 +112,8 @@ pub(super) const RETIRED: &[Retired] = &[
             "limit",
             "include_callers",
             "include_callees",
+            "detail",
+            "budget_tokens",
         ],
         implied: &[],
         // `bundle` reads `feature_id` as a feature lookup, so a bare word
@@ -99,6 +124,7 @@ pub(super) const RETIRED: &[Retired] = &[
     Retired {
         name: "session_start",
         successor: "session",
+        // Not a row tool before the consolidation: `detail` stays refused.
         accepted: &["session_id"],
         implied: &[("action", Implied::Str("start"))],
         renamed: &[],
@@ -106,11 +132,69 @@ pub(super) const RETIRED: &[Retired] = &[
     Retired {
         name: "session_end",
         successor: "session",
-        accepted: &["session_id"],
+        accepted: &["session_id", "detail", "budget_tokens"],
         implied: &[("action", Implied::Str("end"))],
         renamed: &[],
     },
 ];
+
+/// Argument spellings each tool still accepts for one release, with the
+/// spelling that replaces them.
+const LEGACY_SPELLINGS: &[(&str, &str, &str)] = &[
+    ("assess_risk", "target", "`targets`"),
+    ("assess_risk", "file_path", "`targets`"),
+    ("assess_risk", "file_paths", "`targets`"),
+    ("features", "file_path", "`target`"),
+    ("bundle", "feature_id", "`target`"),
+    ("bundle", "is_symbol", "a `sym:` handle as `target`"),
+    (
+        "impact_analysis",
+        "is_file",
+        "a `file:` or `sym:` handle as `target`",
+    ),
+    ("find_symbol", "name", "`target`"),
+    ("find_similar", "name", "`target`"),
+    ("list_dependencies", "file_path", "`target`"),
+    ("find_coupling", "file_path", "`target`"),
+    ("recommend_tests", "file_paths", "`targets`"),
+    ("review_rehearsal", "file_paths", "`targets`"),
+    ("edit_check", "symbol_name", "`target`"),
+];
+
+/// `cost.notes` lines for a call that used a retired tool name or argument
+/// spelling. `tool` is the name the caller sent and `arguments` the
+/// arguments it sent, before any rewrite.
+pub(super) fn deprecation_notes(
+    tool: &str,
+    arguments: Option<&serde_json::Map<String, Value>>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let successor = match retired(tool) {
+        Some(retired) => {
+            let implied = retired
+                .implied
+                .iter()
+                .map(|(key, value)| format!(" with `{key}: {}`", value.value()))
+                .collect::<String>();
+            notes.push(format!(
+                "deprecated: `{}` is a retired alias of `{}`{implied}; call `{}` directly, the alias is removed in the next minor release",
+                retired.name, retired.successor, retired.successor
+            ));
+            retired.successor
+        }
+        None => tool,
+    };
+    if let Some(arguments) = arguments {
+        for (owner, key, preferred) in LEGACY_SPELLINGS {
+            if *owner == successor && arguments.contains_key(*key) {
+                notes.push(format!(
+                    "deprecated: `{key}` on `{successor}` is accepted for one more release; pass {preferred}"
+                ));
+            }
+        }
+    }
+    notes
+}
 
 pub(super) fn retired(name: &str) -> Option<&'static Retired> {
     RETIRED.iter().find(|retired| retired.name == name)
@@ -218,6 +302,54 @@ mod tests {
                 assert_eq!(arguments[*key], value.value(), "{}", retired.name);
             }
         }
+    }
+
+    #[test]
+    fn retired_names_and_spellings_name_their_replacement_in_notes() {
+        for retired in RETIRED {
+            let notes = deprecation_notes(retired.name, None);
+            assert_eq!(notes.len(), 1, "{}", retired.name);
+            assert!(
+                notes[0].contains(&format!("retired alias of `{}`", retired.successor)),
+                "{notes:?}"
+            );
+        }
+        let arguments = json!({"project": "/p", "file_paths": ["a.rs"]});
+        let notes = deprecation_notes("assess_risk_batch", arguments.as_object());
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(
+            notes[1].contains("`file_paths` on `assess_risk`") && notes[1].contains("`targets`")
+        );
+        for (tool, key) in LEGACY_SPELLINGS.iter().map(|(tool, key, _)| (*tool, *key)) {
+            let arguments = json!({"project": "/p", key: "x"});
+            let notes = deprecation_notes(tool, arguments.as_object());
+            assert_eq!(notes.len(), 1, "{tool}.{key}: {notes:?}");
+            assert!(
+                notes[0].contains(&format!("`{key}` on `{tool}`")),
+                "{notes:?}"
+            );
+        }
+        let current = json!({"project": "/p", "targets": ["a.rs"]});
+        assert!(deprecation_notes("assess_risk", current.as_object()).is_empty());
+        let primary = json!({"project": "/p", "name": "run"});
+        assert!(
+            deprecation_notes("find_references", primary.as_object()).is_empty(),
+            "`name` is find_references' primary spelling"
+        );
+    }
+
+    #[test]
+    fn session_start_keeps_refusing_row_controls_it_never_took() {
+        let mut request = call("session_start", json!({"project": "/p", "detail": "full"}));
+        let error = rewrite(&mut request).unwrap_err();
+        assert!(error.to_string().contains("`detail`"), "{error}");
+        let mut request = call("session_end", json!({"project": "/p", "detail": "full"}));
+        assert_eq!(rewrite(&mut request).unwrap(), Some("session_end"));
+        let mut request = call(
+            "list_features",
+            json!({"project": "/p", "budget_tokens": 512}),
+        );
+        assert_eq!(rewrite(&mut request).unwrap(), Some("list_features"));
     }
 
     #[test]

@@ -953,7 +953,8 @@ pub(super) fn schema_properties() -> Vec<(&'static str, Value)> {
                     "bytes": {"type": "integer", "minimum": 0},
                     "detail": {"enum": ["compact", "standard", "full"]},
                     "budget_tokens": {"type": "integer", "minimum": 0},
-                    "budget_exceeded": {"const": true, "description": "The response cannot fit without dropping its remaining result or evidence."}
+                    "budget_exceeded": {"const": true, "description": "The response cannot fit without dropping its remaining result or evidence."},
+                    "notes": {"type": "array", "items": {"type": "string"}, "description": super::help::field_description("cost.notes")}
                 }
             }),
         ),
