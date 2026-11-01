@@ -615,17 +615,95 @@ fn worktree_changes(project_root: &Path, head: &str) -> Option<SessionWorktree> 
     })
 }
 
-/// Files edited since the snapshot and how they were determined.
+/// Whether a path recorded at snapshot time still has its recorded content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recheck {
+    Same,
+    Changed,
+    /// Hashing failed or missed its deadline.
+    Unknown,
+}
+
+/// Compare each path against its start record using the fingerprint kind
+/// that record stored, independent of the hashing budget: a `stat:` record
+/// compares size and mtime, a blob id is re-hashed (one `git hash-object`
+/// batch under `deadline`), and a deleted or non-regular record compares
+/// presence. A file now larger than [`MAX_HASHED_FILE_BYTES`] cannot match a
+/// blob record, which was only taken at or below that size.
+fn recheck_start_records(
+    project_root: &Path,
+    start: &HashMap<&str, &Option<String>>,
+    paths: &[String],
+    deadline: std::time::Instant,
+) -> HashMap<String, Recheck> {
+    let mut out = HashMap::with_capacity(paths.len());
+    let mut rehash: Vec<(&String, &str)> = Vec::new();
+    for path in paths {
+        let Some(&before) = start.get(path.as_str()) else {
+            continue;
+        };
+        let meta = std::fs::symlink_metadata(project_root.join(path))
+            .ok()
+            .filter(std::fs::Metadata::is_file);
+        let verdict = match (before.as_deref(), meta) {
+            (None, None) => Recheck::Same,
+            (None, Some(_)) | (Some(_), None) => Recheck::Changed,
+            (Some(stat), Some(meta)) if stat.starts_with("stat:") => {
+                if stat_fingerprint(&meta) == stat {
+                    Recheck::Same
+                } else {
+                    Recheck::Changed
+                }
+            }
+            (Some(_), Some(meta)) if meta.len() > MAX_HASHED_FILE_BYTES => Recheck::Changed,
+            (Some(blob), Some(_)) => {
+                rehash.push((path, blob));
+                continue;
+            }
+        };
+        out.insert(path.clone(), verdict);
+    }
+    if rehash.is_empty() {
+        return out;
+    }
+    let mut input = Vec::new();
+    for (path, _) in &rehash {
+        input.extend_from_slice(path.as_bytes());
+        input.push(b'\n');
+    }
+    let ids = observe_git(
+        project_root,
+        &["hash-object", "--no-filters", "--stdin-paths"],
+        Some(&input),
+        deadline,
+    )
+    .and_then(|stdout| String::from_utf8(stdout).ok())
+    .map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+    .filter(|ids| ids.len() == rehash.len());
+    for (index, (path, blob)) in rehash.into_iter().enumerate() {
+        let verdict = match &ids {
+            Some(ids) if ids[index] == blob => Recheck::Same,
+            Some(_) => Recheck::Changed,
+            None => Recheck::Unknown,
+        };
+        out.insert(path.clone(), verdict);
+    }
+    out
+}
+
+/// Files edited since the snapshot, how they were determined, and how many
+/// recorded paths could not be rechecked.
 fn edited_files(
     project_root: &Path,
     snapshot: &SessionSnapshot,
     new_files: &[String],
     removed_files: &[String],
-) -> (HashSet<String>, &'static str) {
+) -> (HashSet<String>, &'static str, usize) {
     let index_only = || {
         (
             new_files.iter().chain(removed_files).cloned().collect(),
             "index",
+            0,
         )
     };
     let deadline = std::time::Instant::now() + WORKTREE_GIT_BUDGET;
@@ -636,7 +714,7 @@ fn edited_files(
         return index_only();
     };
     let Some(start) = &snapshot.worktree else {
-        return (now.into_iter().collect(), "git_head");
+        return (now.into_iter().collect(), "git_head", 0);
     };
     let start: HashMap<&str, &Option<String>> = start
         .changes
@@ -648,15 +726,17 @@ fn edited_files(
         .filter(|path| start.contains_key(path.as_str()))
         .cloned()
         .collect();
-    let Some(blobs) = blob_ids(project_root, &recheck, deadline) else {
-        return (now.into_iter().collect(), "git_head");
-    };
+    let verdicts = recheck_start_records(project_root, &start, &recheck, deadline);
+    let unknown = verdicts
+        .values()
+        .filter(|verdict| **verdict == Recheck::Unknown)
+        .count();
     let now_set: HashSet<&str> = now.iter().map(String::as_str).collect();
     let mut edited: HashSet<String> = now
         .iter()
-        .filter(|path| match start.get(path.as_str()) {
-            None => true,
-            Some(before) => blobs.get(*path) != Some(*before),
+        .filter(|path| {
+            !start.contains_key(path.as_str())
+                || verdicts.get(path.as_str()) == Some(&Recheck::Changed)
         })
         .cloned()
         .collect();
@@ -666,7 +746,7 @@ fn edited_files(
             .filter(|path| !now_set.contains(*path))
             .map(|path| (*path).to_string()),
     );
-    (edited, "worktree")
+    (edited, "worktree", unknown)
 }
 
 fn first_sorted(set: &HashSet<String>) -> Vec<String> {
@@ -730,7 +810,8 @@ fn acted_on(
         }
     }
 
-    let (edited, edited_source) = edited_files(project_root, snapshot, new_files, removed_files);
+    let (edited, edited_source, edited_unknown) =
+        edited_files(project_root, snapshot, new_files, removed_files);
     let snapshot_files: HashSet<&str> = snapshot.files.iter().map(String::as_str).collect();
     let (edited_indexed, edited_unindexed): (HashSet<String>, HashSet<String>) =
         edited.into_iter().partition(|path| {
@@ -771,6 +852,7 @@ fn acted_on(
         edited_unfetched: count(edited_unfetched.len()),
         fetched_unedited: count(fetched_unedited),
         edited_unindexed: count(edited_unindexed.len()),
+        edited_unknown: count(edited_unknown),
         checked: count(checked.len()),
         checked_edited: count(checked_edited),
         recommended_tests_edited: count(recommended_tests_edited.len()),
@@ -1626,6 +1708,44 @@ mod tests {
         assert_eq!(
             acted.edited_unindexed, 0,
             "an untouched large file is not an edit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_budget_exhausted_start_rechecks_each_path_with_its_recorded_kind() {
+        let (dir, db) = ledger_fixture();
+        let root = dir.path();
+        std::fs::create_dir(root.join("data")).unwrap();
+        let count = (MAX_HASHED_TOTAL_BYTES / MAX_HASHED_FILE_BYTES) as usize + 1;
+        for index in 0..count {
+            let file = std::fs::File::create(root.join(format!("data/big{index:02}.bin"))).unwrap();
+            file.set_len(MAX_HASHED_FILE_BYTES).unwrap();
+        }
+        session_start(root, &db, "s").unwrap();
+        let blobs: HashMap<String, Option<String>> = read_snapshot(root, "s")
+            .unwrap()
+            .worktree
+            .unwrap()
+            .changes
+            .into_iter()
+            .map(|change| (change.path, change.blob))
+            .collect();
+        let kind = |index: usize| blobs[&format!("data/big{index:02}.bin")].clone().unwrap();
+        assert!(!kind(count - 2).starts_with("stat:"), "{blobs:?}");
+        assert!(kind(count - 1).starts_with("stat:"), "{blobs:?}");
+
+        std::fs::remove_file(root.join("data/big00.bin")).unwrap();
+        let acted = session_end(root, &db, "s").unwrap().acted_on;
+        assert_eq!(acted.edited_source, "worktree");
+        assert_eq!(acted.edited_unindexed, 1, "only data/big00.bin changed");
+        assert_eq!(acted.edited_unknown, 0);
+
+        std::fs::write(root.join(format!("data/big{:02}.bin", count - 1)), b"x").unwrap();
+        let acted = session_end(root, &db, "s").unwrap().acted_on;
+        assert_eq!(
+            acted.edited_unindexed, 2,
+            "the stat-recorded file changed too"
         );
     }
 

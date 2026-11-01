@@ -2030,6 +2030,11 @@ pub struct SessionActedOn {
     /// so CodeSage could not have served them. Excluded from the counts above.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub edited_unindexed: u32,
+    /// Paths changed at `session_start` whose content could not be rechecked
+    /// at `session_end` (re-hashing failed or missed its deadline). They are
+    /// counted neither as edited nor as unedited.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub edited_unknown: u32,
     /// Distinct files returned by check tools (`assess_risk_batch`,
     /// `assess_risk_diff`, `recommend_tests`, `review_rehearsal`,
     /// `edit_check`). Their input is the caller's own patch or file list, so
