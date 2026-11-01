@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.47.0] - 2026-11-01
+
 ### Added
 
 - MCP `session` end and `codesage session-end` report `acted_on`: indexed files served on the session's MCP connection, from a handle-only `.codesage/sessions/<id>.calls.jsonl` ledger, against files edited since start; post-edit checks (`review_rehearsal`, `recommend_tests`, `edit_check`, multi-target or aggregate `assess_risk`) count as `checked`. `CODESAGE_SESSION_LEDGER=0` disables it.
@@ -1395,5 +1397,7 @@ Initial public release.
 
 [0.45.0]: https://github.com/iliaal/codesage/releases/tag/v0.45.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.46.0...HEAD
 [0.46.0]: https://github.com/iliaal/codesage/releases/tag/v0.46.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.47.0...HEAD
+[0.47.0]: https://github.com/iliaal/codesage/releases/tag/v0.47.0
