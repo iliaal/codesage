@@ -483,27 +483,35 @@ Parsing happens in parallel via Rayon; SQLite writes are batched. Re-running `co
 
 ## Search pipeline
 
-A query flows through seven stages:
-
 ```mermaid
 flowchart LR
-    Q[Query string] --> E[Embed<br/>Jina code v2]
-    E --> K[KNN retrieval<br/>sqlite-vec<br/>overfetch 5x]
-    K --> B[Symbol boost<br/>+0.1 per token match]
-    B --> R[Cross-encoder rerank<br/>ms-marco<br/>adaptive blend]
-    R --> A[Symbol annotation]
-    A --> T[Top-N results]
+    Q[Query] --> E[Embed + dense retrieval]
+    E --> F[Optional BM25 fusion]
+    F --> S[Symbol boost + annotation<br/>declaration adjustments]
+    S --> R[Optional rerank]
+    R --> P[Path/version adjustments<br/>file/directory saturation]
+    P --> A[Mention anchoring]
+    A --> T[Offset + limit]
+    T --> C[Page cliff<br/>optional adaptive cut]
 ```
 
-1. Embed the query with Jina embeddings v2 base-code (768d) via ONNX Runtime. Chunks carry file path and symbol context, prepended before they were embedded at index time.
-2. Retrieve nearest neighbours from sqlite-vec, overfetching 5x when the reranker is active.
-3. For code-literal queries only (backticks, `::`, glob patterns, or a rare indexed token), merge BM25 candidates by reciprocal rank fusion. Most queries skip this.
-4. Boost chunks whose content matches known symbol names, then apply definition, path, version and saturation adjustments.
-5. Re-score with ms-marco-MiniLM-L6-v2 and blend with the semantic score. The weight adapts to query shape: 0.35 for a bare identifier, 0.6 for natural language, 0.5 otherwise. Skipped when BM25 fusion ran, since the rare-token match is already the stronger signal there.
-6. Annotate each result with overlapping function and class names.
-7. Truncate to the requested limit.
+The ranking stages run in this order. Eligibility and tuning flags can skip a
+stage; this is an overview, not a claim that every query uses every adjustment.
+The implementation is in [`search_page`](crates/graph/src/search.rs).
 
-The reranker is optional. Set or remove it in `config.toml`; every other stage still runs without it.
+1. **Embed and retrieve**: embed the query, then retrieve bounded dense candidates from sqlite-vec. Overfetch is 5× with a reranker, 3× without one when the query matches known symbols, otherwise 1×; language and path constraints apply to candidate selection.
+2. **Lexical fusion**: the default code-literal gate can add BM25 candidates via reciprocal-rank fusion, rescaled onto the dense score span. An empty lexical result does not count as fusion. `CODESAGE_HYBRID=always` / `never` override the gate.
+3. **Symbol and declaration adjustments**: boost known-symbol matches, optionally admit stem-scan candidates, then annotate overlapping indexed symbols. Qualified-name boosting (opt-in) and declaration boosting run after annotation.
+4. **Cross-encoder rerank**: when configured, blend cross-encoder and existing scores. Default weights are 0.35 for a single explicitly identifier-shaped token (such as `Foo`, `foo_bar`, or `Type::method`), 0.6 for the multiword natural-language heuristic, otherwise 0.5. Nonempty BM25 fusion normally skips this stage; `CODESAGE_FUSED_RERANK=1` enables it with weight 0.35. Ordinary reranker errors retain the prior ranking; a stopped request remains an error.
+5. **Post-rerank adjustments**: apply path penalties, version demotion, optional stem-match boosting, then file and directory saturation. These run after blending so the reranker does not dilute them.
+6. **Query-mention anchoring**: explicit paths, dotted modules, or `Type::method` mentions can lift matching candidates after saturation, on the first page only. The scan is limited to the first `limit × overfetch` candidates; an ambiguous path suffix is rejected only when it matches several files in that window. It does not fetch missing files or establish uniqueness across the whole index. Disable with `CODESAGE_MENTION_ANCHOR=0`.
+7. **Pagination**: apply `offset` and `limit` to the ranked candidates.
+8. **Relevance-cliff disclosure**: compute `confidence`, `margin_pct`, and `cliff_at` on that page. Opt-in `adaptive_limit` cuts at the largest adjacent relative score drop when it rounds to at least 20%; otherwise the page stays intact. This is score separation, not answer correctness.
+
+The reranker is optional. Without it, the other stages still run when eligible,
+with the smaller retrieval overfetch described above. For per-result score
+transitions and skipped-stage explanations, use `search --explain` (MCP
+`explain: true`); see [the diagnosis guide](bench/search-explain.md).
 
 If an attempted BM25 lookup fails, search returns the available dense results with `lexical_fallback_reason`, including on empty pages. MCP marks the result partial and recommends `codesage index --full`; human CLI output prints a warning to stderr. A successful lexical lookup with no matches does not report a failure.
 
