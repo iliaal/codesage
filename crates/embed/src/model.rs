@@ -26,9 +26,11 @@ static ORT_DYLIB: LazyLock<Option<PathBuf>> =
     LazyLock::new(|| ort_dylib_path_from_env().or_else(discover_ort_dylib));
 #[cfg(feature = "cuda")]
 static CUDA_PRELOAD: Once = Once::new();
-/// CUDA 12 sonames that pip's `onnxruntime-gpu` CUDA provider links against.
-/// ort's `ep::cuda::CUDA_DYLIBS` follows the CUDA major of ort's own prebuilt
-/// binaries (CUDA 13 since rc.14), not the runtime this crate loads.
+/// Fallback preload set, used only when the ONNX Runtime CUDA provider next to
+/// the selected runtime is absent or unparseable: the CUDA 12 sonames pip's
+/// `onnxruntime-gpu` 1.24 provider links against. ort's `ep::cuda::CUDA_DYLIBS`
+/// follows the CUDA major of ort's own prebuilt binaries (CUDA 13 since rc.14),
+/// not the runtime this crate loads.
 #[cfg(feature = "cuda")]
 const CUDA_DYLIBS: &[&str] = &[
     "libcudart.so.12",
@@ -76,7 +78,7 @@ fn discover_nvidia_lib_dirs() -> &'static Vec<PathBuf> {
     })
 }
 
-fn collect_nvidia_lib_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn collect_nvidia_lib_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut lib_dirs: Vec<PathBuf> = Vec::new();
     for root in roots {
         if !root.is_dir() {
@@ -90,8 +92,10 @@ fn collect_nvidia_lib_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
             lib_dirs.push(root_lib);
         }
         if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                let lib_dir = entry.path().join("lib");
+            let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            children.sort();
+            for child in children {
+                let lib_dir = child.join("lib");
                 if lib_dir.is_dir() && !lib_dirs.contains(&lib_dir) {
                     lib_dirs.push(lib_dir);
                 }
@@ -397,7 +401,8 @@ fn verify_cuda_libs_mapped(maps: &str) -> anyhow::Result<()> {
              into this process — ORT silently fell back to CPU. Refusing to continue.\n\
              Missing: libcuda={missing_libcuda}, libcudart={missing_cudart}\n\
              Fixes: (1) confirm the binary was built with `--features cuda`; \
-             (2) install nvidia-*-cu12 pip packages (cuda-runtime, cudnn, cublas, cudart, \
+             (2) install the nvidia-* pip packages for the CUDA major onnxruntime-gpu was built \
+             against (cuda-runtime, cudnn, cublas, cudart, \
              nvrtc); (3) set CODESAGE_NVIDIA_LIBS to the directory containing them; \
              (4) check `codesage doctor` for nvidia-lib discovery details. \
              To override (e.g. for tests), set CODESAGE_ALLOW_CPU_FALLBACK=1.",
@@ -411,7 +416,7 @@ fn verify_cuda_libs_mapped(maps: &str) -> anyhow::Result<()> {
              is loaded into this process — ORT may be running inference on CPU. \
              Refusing to continue.\n\
              Missing: libcudnn=true, libcublas=true\n\
-             Fixes: install nvidia-cudnn-cu12 and nvidia-cublas-cu12, set \
+             Fixes: install the nvidia cuDNN and cuBLAS pip packages for onnxruntime-gpu's CUDA major, set \
              CODESAGE_NVIDIA_LIBS to the directory containing them, and check \
              `codesage doctor` for nvidia-lib discovery details. \
              To override (e.g. for tests), set CODESAGE_ALLOW_CPU_FALLBACK=1."
@@ -436,6 +441,12 @@ pub fn init_for_main() {
 /// it runs only from the session loader when a session actually requests the
 /// CUDA execution provider, never at startup.
 ///
+/// The sonames are the CUDA/cuDNN `DT_NEEDED` entries of the
+/// `libonnxruntime_providers_cuda.so` beside the selected ONNX Runtime, so the
+/// preload follows the CUDA major that provider was built against; the static
+/// list applies only when that file is absent or unparseable. Directory choice
+/// follows `cuda_preload::resolve_dir`.
+///
 /// Writes no environment variables: this runs from whatever thread builds the
 /// session, where a `set_var` would race every concurrent `getenv` in the
 /// process. Discovery and absolute-path preloading do not require a startup hook.
@@ -447,24 +458,39 @@ pub fn preload_native_libs() {
             return;
         }
 
-        // ort::ep::cuda::preload_dylibs accepts one CUDA root and one cuDNN root,
-        // but pip's nvidia-* packages place the libraries in separate directories.
-        let all_libs: Vec<&str> = CUDA_DYLIBS
+        let fallback: Vec<&str> = CUDA_DYLIBS
             .iter()
             .chain(ort::ep::cuda::CUDNN_DYLIBS.iter())
             .copied()
             .collect();
-        for lib_name in all_libs {
-            for dir in lib_dirs {
-                let path = dir.join(lib_name);
-                if path.exists() {
-                    if let Err(e) = ort::util::preload_dylib(path) {
-                        tracing::warn!(lib = lib_name, error = %e, "CUDA preload failed");
-                    }
-                    break;
-                }
-            }
+        let provider = crate::cuda_preload::provider_path(selected_ort_dylib());
+        let plan = crate::cuda_preload::plan(provider.as_deref(), &fallback, lib_dirs);
+        if let crate::cuda_preload::PlanSource::Fallback(reason) = &plan.source {
+            tracing::warn!(%reason, "CUDA provider dependencies not derived; preloading the static CUDA 12 list");
         }
+        let cuda_major = crate::cuda_preload::cuda_major(&plan.sonames);
+
+        // ort::ep::cuda::preload_dylibs accepts one CUDA root and one cuDNN root,
+        // but pip's nvidia-* packages place the libraries in separate directories.
+        let mut chosen = Vec::with_capacity(plan.sonames.len());
+        for lib_name in &plan.sonames {
+            let dir = crate::cuda_preload::resolve_dir(lib_name, cuda_major, lib_dirs);
+            if let Some(dir) = dir
+                && let Err(e) = ort::util::preload_dylib(dir.join(lib_name))
+            {
+                tracing::warn!(lib = %lib_name, error = %e, "CUDA preload failed");
+            }
+            chosen.push(format!(
+                "{lib_name}={}",
+                dir.map_or_else(|| "<not found>".to_string(), |d| d.display().to_string())
+            ));
+        }
+        tracing::debug!(
+            source = ?plan.source,
+            cuda_major = ?cuda_major,
+            preload = %chosen.join(", "),
+            "CUDA preload plan"
+        );
     });
 }
 

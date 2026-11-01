@@ -1,5 +1,7 @@
 pub mod chunk;
 pub mod config;
+#[cfg(any(feature = "cuda", test))]
+mod cuda_preload;
 pub mod fingerprint;
 pub mod model;
 pub mod reranker;

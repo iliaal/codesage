@@ -73,7 +73,7 @@ Built-in exclusions cover dependencies, build outputs, and caches; configured pa
 
 ## CUDA setup
 
-ONNX Runtime loads dynamically. CUDA libraries come from pip-installed `nvidia-*-cu12` packages. At first use, the binary discovers them in this order:
+ONNX Runtime loads dynamically. CUDA libraries come from pip-installed `nvidia-*` packages matching the CUDA major of the installed `onnxruntime-gpu` (CUDA 12 for 1.24: the `nvidia-*-cu12` packages). At first use, the binary discovers them in this order:
 
 1. `CODESAGE_NVIDIA_LIBS` env var, if set (an explicit nvidia root directory).
 2. Python `site.getsitepackages()` + `site.getusersitepackages()`, joined with `/nvidia`. Works with both system-wide pip installs and `--user` installs.
@@ -82,6 +82,8 @@ ONNX Runtime loads dynamically. CUDA libraries come from pip-installed `nvidia-*
 `ORT_DYLIB_PATH` can override the ONNX Runtime library location. Left unset, the binary probes the same site-packages locations for `libonnxruntime.so*`.
 
 `codesage doctor` reports how many nvidia lib dirs were discovered and warns if none.
+
+Before the first CUDA session, the binary preloads exactly the CUDA/cuDNN sonames listed as `DT_NEEDED` by the `libonnxruntime_providers_cuda.so` beside the selected ONNX Runtime library, so the preload follows whatever CUDA major that provider links against, plus `libnvrtc.so.<N>` for the provider's CUDA major when a discovered directory holds it (cuBLASLt loads NVRTC by soname at run time). Each soname loads from the first discovered directory that holds it, ranked: a `cu<N>` bundle directory matching the provider's `libcudart.so.<N>`, then per-library directories such as `nvidia/curand/lib`, then bundles for another CUDA major (pip's `nvidia/cu13/lib` also ships `libcurand.so.10`). Discovery sorts directory entries, so the choice is stable across runs. If the provider file is missing or unparseable, or `ORT_DYLIB_PATH` is a bare soname or relative path, a static CUDA 12 list (plus ort's cuDNN 9 list) is preloaded with a warning. `RUST_LOG=codesage_embed=debug` logs the plan as `CUDA preload plan`.
 
 If CUDA is requested (`device = "gpu"`) but fails to register, session creation fails instead of falling back to CPU. On Linux builds with the `cuda` feature, the post-session check reads `/proc/self/maps` and fails if either `libcuda.so` or `libcudart.so` is absent, or if both `libcudnn` and `libcublas` are absent. The embedder and reranker share this check.
 
