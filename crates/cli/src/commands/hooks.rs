@@ -164,7 +164,7 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
            list=\"$(mktemp)\" || return 1\n\
            budget=\"$(mktemp)\" || {{ rm -f \"$list\"; return 1; }}\n\
            trap 'rm -f \"$list\" \"$budget\"' EXIT INT TERM\n\
-           {{ git diff --name-only -z HEAD -- . ':(exclude).codesage' && git ls-files -z -o --exclude-standard -- . ':(exclude).codesage'; }} >\"$list\" || return 1\n\
+           {{ git -c core.fsmonitor=false diff --name-only -z HEAD -- . ':(exclude).codesage' && git -c core.fsmonitor=false ls-files -z -o --exclude-standard -- . ':(exclude).codesage'; }} >\"$list\" || return 1\n\
            printf 268435456 >\"$budget\" || return 1\n\
            # shellcheck disable=SC2016 # the inner script runs in its own sh; nothing here expands\n\
            sums=\"$(xargs -0 sh -c '\n\
@@ -727,9 +727,9 @@ mod tests {
         );
         assert!(
             body.contains(
-                "{ git diff --name-only -z HEAD -- . ':(exclude).codesage' && git ls-files -z -o --exclude-standard -- . ':(exclude).codesage'; } >\"$list\" || return 1"
+                "{ git -c core.fsmonitor=false diff --name-only -z HEAD -- . ':(exclude).codesage' && git -c core.fsmonitor=false ls-files -z -o --exclude-standard -- . ':(exclude).codesage'; } >\"$list\" || return 1"
             ),
-            "tracked and untracked names must be listed NUL-delimited into one list with both stages checked, got:\n{body}"
+            "tracked and untracked names must be listed NUL-delimited into one list with both stages checked and no repository fsmonitor command run, got:\n{body}"
         );
         assert!(
             body.contains("sums=\"$(xargs -0 sh -c '"),
@@ -832,6 +832,38 @@ mod tests {
             .unwrap();
         assert!(status.success(), "git commit failed");
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
+
+        let monitor_dir = tempfile::tempdir().unwrap();
+        let monitor_log = monitor_dir.path().join("fsmonitor.log");
+        let monitor = monitor_dir.path().join("fsmonitor-marker.sh");
+        std::fs::write(
+            &monitor,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n",
+                monitor_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&monitor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["config", "core.fsmonitor", monitor.to_str().unwrap()])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let armed = std::process::Command::new("git")
+            .args(["ls-files", "-o", "--exclude-standard"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(armed.status.success());
+        assert!(
+            !std::fs::read_to_string(&monitor_log)
+                .unwrap_or_default()
+                .is_empty(),
+            "fixture fsmonitor hook did not fire for plain git"
+        );
+        std::fs::write(&monitor_log, "").unwrap();
 
         let stub = root.join("codesage-stub");
         std::fs::write(
@@ -948,6 +980,11 @@ mod tests {
         let content = wait_for("hook skip:");
         assert_eq!(content.matches("hook skip:").count(), 2, "{content}");
         assert_eq!(content.matches("hook start").count(), 5, "{content}");
+        assert_eq!(
+            std::fs::read_to_string(&monitor_log).unwrap(),
+            "",
+            "the worktree digest executed the repository fsmonitor command"
+        );
     }
 
     /// Pins `core.hooksPath` repo-locally: product code reads it through the
@@ -1594,7 +1631,7 @@ mod tests {
         std::fs::write(
             &shim,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = diff ]; then echo 'simulated git failure' >&2; exit 128; fi\nexec '{}' \"$@\"\n",
+                "#!/bin/sh\nsub=\"$1\"\n[ \"$1\" = -c ] && sub=\"$3\"\nif [ \"$sub\" = diff ]; then echo 'simulated git failure' >&2; exit 128; fi\nexec '{}' \"$@\"\n",
                 real_git.trim()
             ),
         )

@@ -35,3 +35,16 @@ pub fn git_command(root: &Path) -> Command {
     }
     command
 }
+
+/// [`git_command`] for children that read the index or working tree (`diff`
+/// against the work tree or index, `ls-files`, `status`). Each child gets
+/// `-c core.fsmonitor=false`, so a repository-configured fsmonitor hook command
+/// is never executed; command-line configuration outranks local, included, and
+/// per-worktree files and an inherited `GIT_CONFIG_PARAMETERS` or
+/// `GIT_CONFIG_COUNT` value for the same key. Output is unchanged: Git falls back
+/// to its own stat scan. Every other inherited configuration key is preserved.
+pub fn git_worktree_command(root: &Path) -> Command {
+    let mut command = git_command(root);
+    command.args(["-c", "core.fsmonitor=false"]);
+    command
+}

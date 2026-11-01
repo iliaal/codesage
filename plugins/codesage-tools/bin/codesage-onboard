@@ -172,7 +172,7 @@ fi
 hint_mode="claude"
 hint_file="$project/.claude/CLAUDE.md"
 if [ -f "$project/AGENTS.md" ] && [ -e "$project/.git" ]; then
-    if git -C "$project" check-ignore -q AGENTS.md 2>/dev/null; then
+    if git -C "$project" -c core.fsmonitor=false check-ignore -q AGENTS.md 2>/dev/null; then
         hint_mode="agents"
         hint_file="$project/AGENTS.md"
     fi

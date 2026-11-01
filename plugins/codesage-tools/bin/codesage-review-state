@@ -601,8 +601,8 @@ def rename_priors(project, priors):
     if not candidates:
         return priors
     result = subprocess.run(
-        ["git", "-C", str(project), "ls-files", "--cached", "--others",
-         "--exclude-standard", "-z"], capture_output=True, check=False,
+        ["git", "-C", str(project), "-c", "core.fsmonitor=false", "ls-files", "--cached",
+         "--others", "--exclude-standard", "-z"], capture_output=True, check=False,
     )
     if result.returncode:
         return priors

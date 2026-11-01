@@ -502,3 +502,73 @@ fn inherited_environment_child() {
     assert_eq!(std::env::vars_os().collect::<Vec<_>>(), environment_before);
     println!("git-isolation-checked");
 }
+
+#[cfg(unix)]
+#[test]
+fn worktree_command_overrides_inherited_fsmonitor_and_keeps_other_config() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fixture(&root, "fsm", 1);
+    std::fs::write(root.join("fsm-a.rs"), "pub fn changed() {}\n").unwrap();
+    let log = dir.path().join("fsmonitor.log");
+    let hook = dir.path().join("fsmonitor-marker.sh");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let hook = hook.to_str().unwrap();
+    let parameters = format!("'core.fsmonitor'='{hook}' 'codesage.parameters'='retained'");
+    let inherit = |mut command: Command, via_count: bool| {
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        if via_count {
+            command
+                .env("GIT_CONFIG_COUNT", "2")
+                .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+                .env("GIT_CONFIG_VALUE_0", hook)
+                .env("GIT_CONFIG_KEY_1", "codesage.count")
+                .env("GIT_CONFIG_VALUE_1", "retained");
+        } else {
+            command.env("GIT_CONFIG_PARAMETERS", &parameters);
+        }
+        command
+    };
+    for via_count in [false, true] {
+        std::fs::write(&log, "").unwrap();
+        let mut plain = inherit(codesage_graph::git_command(&root), via_count);
+        let plain = plain
+            .args(["diff", "--name-only", "HEAD", "--"])
+            .output()
+            .unwrap();
+        assert!(plain.status.success(), "{plain:?}");
+        assert!(
+            !std::fs::read_to_string(&log).unwrap().is_empty(),
+            "fixture hook did not fire for plain git (via_count={via_count})"
+        );
+        std::fs::write(&log, "").unwrap();
+
+        let mut hardened = inherit(codesage_graph::git_worktree_command(&root), via_count);
+        let hardened = hardened
+            .args(["diff", "--name-only", "HEAD", "--"])
+            .output()
+            .unwrap();
+        assert!(hardened.status.success(), "{hardened:?}");
+        assert_eq!(hardened.stdout, plain.stdout, "via_count={via_count}");
+        assert_eq!(hardened.stdout, b"fsm-a.rs\n");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+
+        let key = if via_count {
+            "codesage.count"
+        } else {
+            "codesage.parameters"
+        };
+        let mut retained = inherit(codesage_graph::git_worktree_command(&root), via_count);
+        let retained = retained.args(["config", "--get", key]).output().unwrap();
+        assert!(retained.status.success(), "{retained:?}");
+        assert_eq!(retained.stdout, b"retained\n");
+    }
+}

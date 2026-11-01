@@ -34,7 +34,7 @@ pub use bundle::{
 };
 pub use call_path::trace_call_path;
 pub use describe::{DescribeOptions, DescribeParameterError, describe, describe_with_ranking};
-pub use git::git_command;
+pub use git::{git_command, git_worktree_command};
 pub use git_history::{
     IndexMode, ReachabilityOptions, abbreviate_paths, assess_risk, assess_risk_batch,
     assess_risk_diff, changed_files_since, feature_touched_since, find_coupling,
