@@ -396,7 +396,7 @@ fn has_unborn_head(root: &Path) -> Result<bool> {
 /// survive (a non-UTF-8 byte sequence is replaced, not rejected).
 /// Empty when git exits unsuccessfully.
 fn working_tree_changes(root: &Path) -> Result<Vec<String>> {
-    let mut out = codesage_graph::git_command(root)
+    let mut out = codesage_graph::git_worktree_command(root)
         .args([
             "diff",
             "--no-renames",
@@ -411,7 +411,7 @@ fn working_tree_changes(root: &Path) -> Result<Vec<String>> {
         if !has_unborn_head(root)? {
             return Ok(Vec::new());
         }
-        out = codesage_graph::git_command(root)
+        out = codesage_graph::git_worktree_command(root)
             .args([
                 "diff",
                 "--cached",
@@ -431,7 +431,7 @@ fn working_tree_changes(root: &Path) -> Result<Vec<String>> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
-    let untracked = codesage_graph::git_command(root)
+    let untracked = codesage_graph::git_worktree_command(root)
         .args(["ls-files", "-z", "-o", "--exclude-standard", "--", "."])
         .output()?;
     if !untracked.status.success() {
@@ -488,7 +488,8 @@ pub(crate) fn cmd_rehearse(files: Vec<String>, json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::working_tree_changes;
+    use super::{resolve_patch_files, working_tree_changes};
+    use std::path::Path;
     use std::process::Command;
 
     fn git(root: &std::path::Path, args: &[&str]) {
@@ -686,5 +687,189 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[cfg(unix)]
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    #[cfg(unix)]
+    /// An inert command-form fsmonitor hook that only records its invocation.
+    fn marker_hook(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let hook = dir.join("fsmonitor-marker.sh");
+        let log = dir.join("fsmonitor.log");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&log, "").unwrap();
+        (hook, log)
+    }
+
+    #[cfg(unix)]
+    /// Proves the fixture is armed: plain Git in `root` runs the hook.
+    fn assert_plain_git_runs_hook(root: &Path, log: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        assert!(
+            !std::fs::read_to_string(log).unwrap().is_empty(),
+            "fixture hook did not fire for plain git {args:?}"
+        );
+        std::fs::write(log, "").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_hook_silent(log: &Path) {
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "",
+            "automatic discovery executed the repository fsmonitor command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_tree_changes_never_runs_a_command_form_fsmonitor() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let (hook, log) = marker_hook(dir.path());
+        git(&root, &["init", "-q"]);
+        std::fs::write(root.join("tracked.rs"), "fn base() {}\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "base"]);
+        std::fs::write(root.join("tracked.rs"), "fn changed() {}\n").unwrap();
+        std::fs::write(root.join("fresh.rs"), "fn fresh() {}\n").unwrap();
+
+        git(&root, &["config", "core.fsmonitor", "false"]);
+        let disabled = working_tree_changes(&root).unwrap();
+        assert_eq!(disabled, ["fresh.rs", "tracked.rs"]);
+
+        git(&root, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        for args in [
+            &["diff", "--name-only", "HEAD", "--"][..],
+            &["ls-files", "-o", "--exclude-standard"][..],
+        ] {
+            assert_plain_git_runs_hook(&root, &log, args);
+        }
+        assert_eq!(working_tree_changes(&root).unwrap(), disabled);
+        assert_hook_silent(&log);
+
+        assert_eq!(
+            resolve_patch_files(&root, vec!["tracked.rs".to_string()]).unwrap(),
+            ["tracked.rs"]
+        );
+        assert_hook_silent(&log);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_tree_changes_before_first_commit_never_runs_a_command_form_fsmonitor() {
+        if !git_available() {
+            return;
+        }
+        let dir = unborn_fixture();
+        let project = dir.path().join("module");
+        git(dir.path(), &["add", "--", "module/fresh.rs"]);
+        git(dir.path(), &["config", "core.fsmonitor", "false"]);
+        let disabled = working_tree_changes(&project).unwrap();
+        assert_eq!(disabled, [" odd \"é\"\nfile.rs", "fresh.rs"]);
+
+        let hooks = tempfile::tempdir().unwrap();
+        let (hook, log) = marker_hook(hooks.path());
+        git(
+            dir.path(),
+            &["config", "core.fsmonitor", hook.to_str().unwrap()],
+        );
+        assert_plain_git_runs_hook(dir.path(), &log, &["diff", "--cached", "--name-only"]);
+        assert_eq!(working_tree_changes(&project).unwrap(), disabled);
+        assert_hook_silent(&log);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_tree_changes_suppresses_fsmonitor_from_included_config() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let (hook, log) = marker_hook(dir.path());
+        git(&root, &["init", "-q"]);
+        git(&root, &["commit", "--allow-empty", "-qm", "base"]);
+        std::fs::write(root.join("fresh.rs"), "fn fresh() {}\n").unwrap();
+        let included = dir.path().join("fsmonitor.inc");
+        std::fs::write(
+            &included,
+            format!("[core]\n\tfsmonitor = {}\n", hook.display()),
+        )
+        .unwrap();
+        git(
+            &root,
+            &["config", "include.path", included.to_str().unwrap()],
+        );
+
+        assert_plain_git_runs_hook(&root, &log, &["ls-files", "-o", "--exclude-standard"]);
+        assert_eq!(working_tree_changes(&root).unwrap(), ["fresh.rs"]);
+        assert_hook_silent(&log);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_tree_changes_suppresses_fsmonitor_in_a_linked_worktree() {
+        if !git_available() {
+            return;
+        }
+        for per_worktree in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let main = dir.path().join("main");
+            let linked = dir.path().join("linked");
+            std::fs::create_dir(&main).unwrap();
+            let (hook, log) = marker_hook(dir.path());
+            git(&main, &["init", "-q"]);
+            std::fs::write(main.join("tracked.rs"), "fn base() {}\n").unwrap();
+            git(&main, &["add", "."]);
+            git(&main, &["commit", "-qm", "base"]);
+            git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+            std::fs::write(linked.join("tracked.rs"), "fn changed() {}\n").unwrap();
+            std::fs::write(linked.join("fresh.rs"), "fn fresh() {}\n").unwrap();
+            if per_worktree {
+                git(&main, &["config", "extensions.worktreeConfig", "true"]);
+                git(
+                    &linked,
+                    &[
+                        "config",
+                        "--worktree",
+                        "core.fsmonitor",
+                        hook.to_str().unwrap(),
+                    ],
+                );
+            } else {
+                git(&main, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+            }
+
+            assert_plain_git_runs_hook(&linked, &log, &["diff", "--name-only", "HEAD", "--"]);
+            assert_eq!(
+                working_tree_changes(&linked).unwrap(),
+                ["fresh.rs", "tracked.rs"],
+                "per_worktree={per_worktree}"
+            );
+            assert_hook_silent(&log);
+        }
     }
 }
