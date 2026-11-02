@@ -117,7 +117,6 @@ def recall_at(returned: list[str], expected: list[str], k: int) -> float:
 def score_corpus(codesage_bin: str, project_root: Path, records: list[dict],
                  limit: int, env_extra: dict) -> dict:
     """Score a whole corpus under one env. Returns aggregate stats."""
-    n = len(records)
     hits = 0
     rank_sum = 0
     miss = 0
@@ -148,6 +147,7 @@ def score_corpus(codesage_bin: str, project_root: Path, records: list[dict],
             "r5": r5,
             "r10": r10,
         })
+    n = len(rows)
     return {
         "n": n,
         "hits": hits,
