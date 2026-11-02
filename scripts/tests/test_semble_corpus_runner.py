@@ -18,6 +18,56 @@ KNOB = "CODESAGE_QUALIFIED_NAME_BOOST"
 
 
 class SembleCorpusRunnerTests(unittest.TestCase):
+    def test_aggregate_counts_only_queries_with_expected_paths(self):
+        skipped = [{"query": "empty", "relevant": []}, {"query": "missing"}]
+        scored = [{"query": "hit", "relevant": ["target.py"]},
+                  {"query": "failure", "relevant": ["target.py"]}]
+        for records in (scored + skipped, skipped, []):
+            with self.subTest(records=records), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / ".codesage").mkdir()
+                (root / ".codesage/index.db").touch()
+                annotations = root / "annotations.json"
+                annotations.write_text(json.dumps(records))
+                calls = root / "calls.jsonl"
+                calls.write_text("")
+                binary = root / "codesage"
+                binary.write_text(f"#!{sys.executable}\n" + '''import json
+import os
+import sys
+from pathlib import Path
+with Path(os.environ["TEST_CALLS"]).open("a") as log:
+    log.write(json.dumps([os.environ["CODESAGE_QUALIFIED_NAME_BOOST"], sys.argv[-1]]) + "\\n")
+if sys.argv[-1] == "failure":
+    sys.exit(1)
+print(json.dumps({"results": [{"file_path": "target.py"}]}))
+''')
+                binary.chmod(0o755)
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "bench/semble-corpus-runner"),
+                     str(root), str(annotations), "--codesage-bin", str(binary)],
+                    env={**os.environ, "TEST_CALLS": str(calls)},
+                    text=True, capture_output=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                observed = [json.loads(line) for line in calls.read_text().splitlines()]
+                active = [record["query"] for record in records if record.get("relevant")]
+                self.assertEqual(observed, [[arm, query] for arm in ("0", "1")
+                                            for query in active])
+                metrics = json.loads(next(line.removeprefix("METRICS_JSON ")
+                                         for line in result.stdout.splitlines()
+                                         if line.startswith("METRICS_JSON ")))
+                expected = {
+                    "n": len(active), "hits": int(bool(active)), "miss": int(bool(active)),
+                    "miss_rate": 0.5 if active else 0.0,
+                    "mean_first_hit": 1.0 if active else None,
+                    "mean_r5": 0.5 if active else 0.0,
+                    "mean_r10": 0.5 if active else 0.0,
+                }
+                for arm in ("baseline", "cfg2"):
+                    self.assertEqual(metrics[arm], expected)
+                self.assertEqual(metrics["moves"], [])
+
     def test_result_page_validation(self):
         runner = runpy.run_path(str(ROOT / "bench/semble-corpus-runner"))
         bad_rows = [None, [], "row", 7, False, {}, {"file_path": ""}]
