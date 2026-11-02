@@ -13,9 +13,10 @@ Usage:
   semble-corpus-runner <repo_root> <annotations.json> \
       --codesage-bin <path> [--limit 10]
 
-For each query in the annotations file, runs `codesage search --json --limit
-N <query>` twice — once with the gate off (baseline), once with the gate on
-(config 2) — and emits a per-corpus aggregate plus per-query rank deltas.
+Records yielding no expected paths are skipped and excluded from aggregates.
+For each remaining query, runs `codesage search --json --limit N <query>`
+twice — once with the gate off (baseline), once with the gate on (config 2) —
+and emits a per-corpus aggregate plus per-query rank deltas.
 Search failures count as misses; JSON result pages with an invalid shape or
 path are discarded in full with a warning,
 rather than retaining partial hits.
@@ -116,7 +117,7 @@ def recall_at(returned: list[str], expected: list[str], k: int) -> float:
 
 def score_corpus(codesage_bin: str, project_root: Path, records: list[dict],
                  limit: int, env_extra: dict) -> dict:
-    """Score a whole corpus under one env. Returns aggregate stats."""
+    """Score records with expected paths under one env. Returns aggregate stats."""
     hits = 0
     rank_sum = 0
     miss = 0
