@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+### Changed
+
+- CUDA embedding and reranking accumulate FP16 GEMMs in FP16 by default (`ORT_CUDA_GEMM_OPTIONS=1` unless already set), cutting GPU embedding time by 11-18% on an RTX 4080 Laptop.
+- CUDA embedding fingerprints record a nonzero `ORT_CUDA_GEMM_OPTIONS`: the next `codesage index` re-embeds each GPU index once. `ORT_CUDA_GEMM_OPTIONS=0` keeps FP32 accumulation and the existing index.
+
 ## [0.47.1] - 2026-11-01
 
 ### Fixed

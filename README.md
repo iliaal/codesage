@@ -565,6 +565,8 @@ Build with GPU support: `cargo build --release -p codesage --features cuda`. Set
 
 If CUDA is requested but fails to register, the process errors out instead of falling back to CPU.
 
+CUDA sessions accumulate FP16 GEMMs in FP16 (`ORT_CUDA_GEMM_OPTIONS=1`, set at startup unless already set), which runs at full tensor-core rate on GeForce cards. Set `ORT_CUDA_GEMM_OPTIONS=0` to keep FP32 accumulation; changing the value re-embeds GPU indexes on the next `codesage index`.
+
 Required pip packages: `onnxruntime-gpu`, `nvidia-cudnn-cu12`, `nvidia-cublas-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-cufft-cu12`, `nvidia-curand-cu12`, `nvidia-cuda-nvrtc-cu12`.
 
 ## CoreML setup (macOS)

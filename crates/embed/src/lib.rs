@@ -1,5 +1,6 @@
 pub mod chunk;
 pub mod config;
+pub mod cuda_gemm;
 #[cfg(any(feature = "cuda", test))]
 mod cuda_preload;
 pub mod fingerprint;

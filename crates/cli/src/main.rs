@@ -907,6 +907,8 @@ fn print_version_info() {
 }
 
 fn main() {
+    // SAFETY: first statement of main, before tracing or any worker starts a thread.
+    unsafe { codesage_embed::cuda_gemm::apply_default() };
     init_tracing();
 
     // Custom version output includes project-local config; args_os tolerates non-UTF-8 paths.
