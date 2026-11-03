@@ -30,7 +30,7 @@ wait-timeout = "0.2"
 # downloaded ONNX Runtime would never be linked. It stays on the Apple target,
 # which links statically. `load-dynamic` also supplies `std`, which is why the
 # Apple entry names `std` and this one does not.
-ort = { version = "=2.0.0-rc.14", default-features = false, features = ["api-24", "copy-dylibs", "load-dynamic", "ndarray", "preload-dylibs", "tls-native", "tracing"] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["api-24", "copy-dylibs", "load-dynamic", "ndarray", "preload-dylibs", "tls-native", "tracing"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["api-24", "copy-dylibs", "coreml", "download-binaries", "ndarray", "std", "tls-native", "tracing"] }
