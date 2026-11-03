@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.48.0] - 2026-11-03
+
 ### Changed
 
 - CUDA embedding and reranking accumulate FP16 GEMMs in FP16 by default (`ORT_CUDA_GEMM_OPTIONS=1` unless already set), cutting GPU embedding time by 11-18% on an RTX 4080 Laptop.
@@ -1412,5 +1414,7 @@ Initial public release.
 
 [0.47.0]: https://github.com/iliaal/codesage/releases/tag/v0.47.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.47.1...HEAD
 [0.47.1]: https://github.com/iliaal/codesage/releases/tag/v0.47.1
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.48.0...HEAD
+[0.48.0]: https://github.com/iliaal/codesage/releases/tag/v0.48.0
