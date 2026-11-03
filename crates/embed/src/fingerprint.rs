@@ -63,6 +63,7 @@ struct FingerprintInputs {
     execution_provider: String,
     pipeline: PipelineIdentity,
     ort_runtime: String,
+    cuda_gemm: Option<String>,
 }
 
 /// Dynamic builds record the compiled API level and digest the runtime library
@@ -117,7 +118,7 @@ impl SemanticFingerprint {
     }
 
     /// The fingerprint for `config` given an already-computed artifact
-    /// digest. Pure; carries no stat key.
+    /// digest. Reads no artifact; carries no stat key.
     pub fn with_artifact_digest(
         config: &EmbeddingConfig,
         dim: usize,
@@ -133,7 +134,7 @@ impl SemanticFingerprint {
 
     /// The fingerprint for `config` given an artifact digest a persisted
     /// attestation vouches for, together with the stat key it was recorded
-    /// under. Pure; nothing is read.
+    /// under. Reads no artifact.
     pub fn with_attested_digest(
         config: &EmbeddingConfig,
         dim: usize,
@@ -166,6 +167,7 @@ impl SemanticFingerprint {
             execution_provider: configured_execution_provider(&config.device).to_string(),
             pipeline: *pipeline,
             ort_runtime: ort_runtime_tag(),
+            cuda_gemm: crate::cuda_gemm::effective(),
         };
         Self {
             text: render(&inputs, artifact_digest),
@@ -225,10 +227,16 @@ fn render(inputs: &FingerprintInputs, artifact_digest: &str) -> String {
     } else {
         "none"
     };
+    // Only CUDA sessions read the GEMM options, and the provider default adds
+    // nothing, so fingerprints recorded before the option existed stay valid.
+    let cuda_gemm = match (&inputs.cuda_gemm, inputs.execution_provider.as_str()) {
+        (Some(bits), "cuda") => format!(";cudagemm={bits}"),
+        _ => String::new(),
+    };
     format!(
         "v4;model={};artifacts={artifact_digest};dim={};pooling={};\
          device={};ort={};pipeline={};maxseq={};norm={normalized};\
-         chunker={CHUNKER_VERSION};chunk={}/{}/{}",
+         chunker={CHUNKER_VERSION};chunk={}/{}/{}{cuda_gemm}",
         inputs.model,
         inputs.dim,
         inputs.pooling,
@@ -525,6 +533,39 @@ mod tests {
         assert_eq!(fell_back.artifact_digest(), "d");
         assert_eq!(fell_back.artifact_stat_key(), Some("stat"));
         assert_eq!(as_cuda.with_execution_provider("cuda"), as_cuda);
+    }
+
+    #[test]
+    fn cuda_gemm_options_are_part_of_the_cuda_identity_only() {
+        let cuda = EmbeddingConfig {
+            device: "cuda".to_string(),
+            ..EmbeddingConfig::default()
+        };
+        let cpu = EmbeddingConfig {
+            device: "cpu".to_string(),
+            ..EmbeddingConfig::default()
+        };
+        let with_gemm = |config: &EmbeddingConfig, bits: Option<&str>| {
+            let mut fp = SemanticFingerprint::with_attested_digest(config, 768, "d", "stat");
+            fp.inputs.cuda_gemm = bits.map(str::to_string);
+            fp.text = render(&fp.inputs, &fp.artifact_digest);
+            fp
+        };
+
+        let fp32_acc = with_gemm(&cuda, None);
+        let fp16_acc = with_gemm(&cuda, Some("1"));
+        assert!(
+            !fp32_acc.as_str().contains("cudagemm"),
+            "the provider default keeps earlier fingerprints valid: {fp32_acc}"
+        );
+        assert!(fp16_acc.as_str().ends_with(";cudagemm=1"), "{fp16_acc}");
+        assert_ne!(fp16_acc, fp32_acc, "FP16 accumulation changes the vectors");
+        assert_eq!(with_gemm(&cpu, Some("1")), with_gemm(&cpu, None));
+        assert_eq!(
+            fp16_acc.with_execution_provider("cpu"),
+            with_gemm(&cpu, None),
+            "a CPU fallback does not read the CUDA GEMM options"
+        );
     }
 
     #[test]

@@ -95,6 +95,8 @@ If CUDA is requested (`device = "gpu"`) but fails to register, session creation 
 
 `CODESAGE_ALLOW_CPU_FALLBACK=1` allows a failed Linux post-session library check to continue with a warning; it does not bypass missing-build-feature or CUDA registration errors. In that case, the embedder retains `cpu` as its execution provider for embedding fingerprint checks. The reranker uses the same session loader but discards the returned provider metadata, so this is not a reranker fingerprint guarantee. Do not leave the override set on a GPU-configured project.
 
+The binary sets `ORT_CUDA_GEMM_OPTIONS=1` as the first statement of `main` unless the environment already sets it, so FP16 CUDA graphs accumulate their GEMMs in FP16; GeForce RTX 20-40 cards run FP16 tensor math at half rate when it accumulates in FP32. ONNX Runtime reads the variable only through `getenv`, so `crates/embed/src/cuda_gemm.rs` is the one place that writes the process environment. `ORT_CUDA_GEMM_OPTIONS=0` keeps FP32 accumulation. A nonzero value becomes the `cudagemm=` component of CUDA embedding fingerprints, and the provider default adds nothing, so fingerprints recorded before the option existed stay valid under `0`. Changing the value makes semantic search refuse the table as stale until `codesage index` re-embeds it; nothing re-indexes on that refusal by itself.
+
 Required pip packages: `onnxruntime-gpu`, `nvidia-cudnn-cu12`, `nvidia-cublas-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-cufft-cu12`, `nvidia-curand-cu12`, `nvidia-cuda-nvrtc-cu12`.
 
 ## CoreML setup (macOS)
