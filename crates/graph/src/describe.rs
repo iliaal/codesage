@@ -1668,7 +1668,7 @@ mod tests {
     fn describe_deadline_cut_has_executable_recover_and_outer_cancellation_fails() {
         let (root, db, _) = fixture();
         let options = DescribeOptions {
-            risk_budget: Duration::from_secs(3600),
+            risk_budget: Duration::ZERO,
             ..Default::default()
         };
         let result = describe(root.path(), &db, "src/helper.rs", &options).unwrap();
