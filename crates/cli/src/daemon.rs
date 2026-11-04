@@ -751,7 +751,10 @@ mod unix {
         // Zero disables both ceilings.
         let (read, write) = tokio::io::split(tracked);
         let serve_fut = server.serve_with_ct(
-            (crate::mcp::framing::FrameReader::new(read), write),
+            crate::mcp::framing::server_transport(
+                crate::mcp::framing::FrameReader::new(read),
+                write,
+            ),
             cancellation,
         );
         let service = if idle_max.is_zero() {

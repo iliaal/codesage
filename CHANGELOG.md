@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- MCP servers answer a JSON-RPC message whose fields conflict, such as a request that also carries `result` or `error`, with `-32600 Invalid request` instead of handling it (rmcp 3.8.0).
+
 ## [0.48.0] - 2026-11-03
 
 ### Changed

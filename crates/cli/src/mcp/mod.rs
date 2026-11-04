@@ -1226,7 +1226,10 @@ pub async fn run_mcp_server(default_project: Option<String>) -> Result<()> {
         let _ = feed.shutdown().await;
     });
     let server = CodeSageServer::new();
-    let code = match server.serve((server_read, tokio::io::stdout())).await {
+    let code = match server
+        .serve(framing::server_transport(server_read, tokio::io::stdout()))
+        .await
+    {
         Ok(service) => match service.waiting().await {
             Ok(_) => 0,
             Err(e) => {
