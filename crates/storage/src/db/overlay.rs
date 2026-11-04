@@ -782,8 +782,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("index.db");
         seed(&path);
-        let db = Database::open_read_only(&path).unwrap();
-        let _snapshot = db.read_snapshot().unwrap();
+        let mut db = Database::open_read_only(&path).unwrap();
         let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = steps.clone();
         db.conn
@@ -792,10 +791,11 @@ mod tests {
                 Some(move || count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 800),
             )
             .unwrap();
+        let snapshot = db.read_snapshot().unwrap();
+        steps.store(0, std::sync::atomic::Ordering::Relaxed);
         let error = db
             .install_structural_overlay(&["dirty.py".into()], &[])
             .unwrap_err();
-        crate::db::install_work_control(&db.conn).unwrap();
         assert!(
             error.chain().any(|cause| matches!(
                 cause.downcast_ref::<rusqlite::Error>(),
@@ -807,6 +807,8 @@ mod tests {
         assert!(steps.load(std::sync::atomic::Ordering::Relaxed) > 800);
         assert!(!db.has_structural_overlay().unwrap());
         assert!(!db.read_snapshot_active());
+        drop(snapshot);
+        crate::db::install_work_control(&mut db.conn).unwrap();
         let writer = Database::open(&path).unwrap();
         writer
             .conn
