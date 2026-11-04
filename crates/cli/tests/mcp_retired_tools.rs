@@ -139,12 +139,14 @@ fn onboard(root: &Path) {
 }
 
 /// The payload minus what legitimately differs between two identical
-/// questions asked at different instants: the measured cost and, on session
-/// starts, the wall-clock creation stamp.
+/// questions asked at different instants: the measured cost, the wall-clock
+/// creation stamp on session starts, and the elapsed whole seconds on session
+/// ends.
 fn comparable(mut payload: Value) -> Value {
     if let Some(object) = payload.as_object_mut() {
         object.remove("cost");
         object.remove("created_at");
+        object.remove("duration_seconds");
     }
     payload
 }

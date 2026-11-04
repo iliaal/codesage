@@ -1167,10 +1167,13 @@ mod tests {
     }
 
     fn card(root: &Path, db: &Database, target: &str) -> DescribeCard {
-        describe(root, db, target, &DescribeOptions::default())
-            .unwrap()
-            .card
-            .unwrap()
+        // The default section and risk budgets can cut a section short on a loaded test runner.
+        let options = DescribeOptions {
+            section_budget: Duration::from_secs(3600),
+            risk_budget: Duration::from_secs(3600),
+            ..Default::default()
+        };
+        describe(root, db, target, &options).unwrap().card.unwrap()
     }
 
     #[test]

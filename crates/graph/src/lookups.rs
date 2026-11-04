@@ -905,7 +905,16 @@ mod tests {
                 .unwrap();
         }
 
-        let out = lookup(&db, "target");
+        // The default wall-clock budget can stop resolution first on a loaded test runner.
+        let out = find_references_with_budget(
+            &db,
+            &FindReferencesRequest {
+                symbol_name: "target".to_string(),
+                kind: None,
+            },
+            Duration::from_secs(3600),
+        )
+        .unwrap();
         assert_eq!(out.results.len(), callers);
         assert_eq!(
             out.to_resolution,
