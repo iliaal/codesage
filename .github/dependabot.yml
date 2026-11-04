@@ -16,13 +16,15 @@ updates:
           - version-update:semver-major
       # crates/embed/Cargo.toml pins ort exactly in two target tables, and Dependabot rewrites only one, which breaks resolution.
       - dependency-name: ort
-      # rmcp 3.6+ changes the malformed-frame log cause and frame-limit behavior that tests/mcp_daemon.rs and tests/mcp_framing.rs assert.
-      - dependency-name: rmcp
     groups:
       minor-and-patch:
         update-types:
           - minor
           - patch
+        # rmcp gets its own PR: 3.6+ changes the malformed-frame log cause and frame-limit behavior that
+        # crates/cli/tests/mcp_daemon.rs and mcp_framing.rs assert, which would otherwise fail the whole group.
+        exclude-patterns:
+          - rmcp
     cooldown:
       default-days: 7
 
