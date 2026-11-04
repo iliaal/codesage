@@ -1262,7 +1262,7 @@ fn malformed_protocol_request_returns_error_with_logged_frame_and_cause() {
         .find(|line| line.contains("Failed to parse message receive:") && line.contains(&frame))
         .unwrap_or_else(|| panic!("failed frame context was lost: {log}"));
     assert!(
-        diagnostic.contains("data did not match any variant"),
+        diagnostic.contains("| Error: unrecognized JSON-RPC message"),
         "transport parsing cause was lost: {diagnostic}"
     );
     let healthy = session.request(3, r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);

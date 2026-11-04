@@ -4,7 +4,8 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use tokio::io::{AsyncBufRead, AsyncRead, BufReader, ReadBuf};
+use rmcp::{RoleServer, transport::async_rw::AsyncRwTransport};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader, ReadBuf};
 
 // A built-in embedding call has at most 2 MiB of text, even before JSON's 6x escaping.
 pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -14,6 +15,16 @@ pub(crate) fn oversized_frame() -> io::Error {
         io::ErrorKind::InvalidData,
         format!("MCP frame exceeds {MAX_FRAME_BYTES} bytes; closing connection"),
     )
+}
+
+/// rmcp counts the LF against its line cap and silently drops longer lines, so a frame that
+/// `FrameReader` accepts needs one extra byte of headroom to reach the server.
+pub(crate) fn server_transport<R, W>(read: R, write: W) -> AsyncRwTransport<RoleServer, R, W>
+where
+    R: Send + AsyncRead + Unpin,
+    W: Send + AsyncWrite + Unpin + 'static,
+{
+    AsyncRwTransport::new_server(read, write).with_max_line_length(MAX_FRAME_BYTES + 1)
 }
 
 /// Withhold a JSONL frame until its byte limit is checked, before parsing or forwarding it.
