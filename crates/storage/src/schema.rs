@@ -1551,7 +1551,7 @@ mod tests {
     fn migration_stamped_by_a_racing_opener_between_probe_and_lock_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("race.db");
-        let conn = Connection::open(&path).unwrap();
+        let mut conn = Connection::open(&path).unwrap();
         init_db(&conn).unwrap();
 
         let racer = Connection::open(&path).unwrap();

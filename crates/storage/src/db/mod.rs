@@ -165,7 +165,7 @@ pub fn connection_path_still_matches_open_file(
     Ok(false)
 }
 
-fn install_work_control(conn: &Connection) -> Result<()> {
+fn install_work_control(conn: &mut Connection) -> Result<()> {
     let control = codesage_protocol::work::current();
     let controlled = control.is_some();
     let registration = control.as_ref().map(|control| {
@@ -304,7 +304,7 @@ fn open_connection(path: &Path, create: bool) -> Result<Connection> {
         );
     }
     harden_db_path_permissions(path)?;
-    let conn = if create {
+    let mut conn = if create {
         Connection::open(path)?
     } else {
         use rusqlite::OpenFlags;
@@ -326,7 +326,7 @@ fn open_connection(path: &Path, create: bool) -> Result<Connection> {
             other => other.into(),
         })?
     };
-    install_work_control(&conn)?;
+    install_work_control(&mut conn)?;
     init_db(&conn)?;
     Ok(conn)
 }
@@ -344,7 +344,7 @@ fn open_connection_no_migrations(path: &Path) -> Result<Connection> {
     }
     harden_db_path_permissions(path)?;
     use rusqlite::OpenFlags;
-    let conn = Connection::open_with_flags(
+    let mut conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_URI
@@ -361,7 +361,7 @@ fn open_connection_no_migrations(path: &Path) -> Result<Connection> {
         }
         other => other.into(),
     })?;
-    install_work_control(&conn)?;
+    install_work_control(&mut conn)?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     crate::schema::set_busy_timeout(&conn, READ_BUSY_TIMEOUT_MS)?;
     conn.execute_batch("PRAGMA mmap_size=268435456;")?;
@@ -805,8 +805,8 @@ impl Database {
             );
         }
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = Connection::open_with_flags(path, flags)?;
-        install_work_control(&conn)?;
+        let mut conn = Connection::open_with_flags(path, flags)?;
+        install_work_control(&mut conn)?;
         conn.execute_batch("PRAGMA temp_store = MEMORY")?;
         // Opening is lazy: probe before handing back a handle whose first WAL
         // read may fail because it cannot initialize the required sidecars.
@@ -1045,8 +1045,8 @@ impl Database {
 
     pub fn open_in_memory() -> Result<Self> {
         init_vec_extension();
-        let conn = Connection::open_in_memory()?;
-        install_work_control(&conn)?;
+        let mut conn = Connection::open_in_memory()?;
+        install_work_control(&mut conn)?;
         init_db(&conn)?;
         let chunk_table = model_table_name("default", DEFAULT_EMBEDDING_DIM);
         ensure_semantic_model_compatible(
