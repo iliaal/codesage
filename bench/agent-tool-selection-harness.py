@@ -357,7 +357,6 @@ def main() -> int:
     run_ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     conditions = ["with", "without"] if args.condition == "both" else [args.condition]
-    all_reports: list[tuple[str, str]] = []
 
     for cond in conditions:
         rows = []
@@ -398,7 +397,6 @@ def main() -> int:
             append_system_prompt_file=args.append_system_prompt_file,
             label=args.label,
         )
-        all_reports.append((cond, report))
         if args.output_dir:
             args.output_dir.mkdir(parents=True, exist_ok=True)
             suffix = f"-{args.label}" if args.label else ""
