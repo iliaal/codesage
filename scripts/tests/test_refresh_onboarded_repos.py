@@ -11,14 +11,14 @@ SCRIPT = Path(__file__).resolve().parents[1] / "refresh-onboarded-repos.sh"
 
 
 class RefreshOnboardedReposTests(unittest.TestCase):
-    def test_keeps_path_selected_binary_after_changing_directory(self):
-        for entry in ("tools", "./tools", "tools with spaces", ".", "", "absolute"):
+    def test_preserves_selected_binary_and_project_paths(self):
+        for entry in ("tools", "./tools", "tools with spaces", ".", "", "absolute", "newline"):
             with self.subTest(path_entry=entry), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 caller = root / "caller"
                 caller.mkdir()
                 home = root / "home"
-                project = home / "projects" / "target"
+                project = home / "projects" / ("target\nwith newline\n" if entry == "newline" else "target")
                 (project / ".codesage").mkdir(parents=True)
                 (project / ".git").mkdir()
                 copied = root / "checkout" / "scripts" / SCRIPT.name
