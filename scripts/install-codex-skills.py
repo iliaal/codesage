@@ -101,7 +101,8 @@ def install(source_root: Path, skills_dir: Path, repo_skills_dir: Path | None = 
     for name in REPO_COMMANDS:
         legacy = skills_dir / f"codesage-{name}" / "SKILL.md"
         canonical = plugin / "commands" / f"codesage-{name}.md"
-        if (legacy.is_file() and not legacy.is_symlink()
+        if (not any(path.is_symlink() for path in (legacy, *legacy.parents))
+                and legacy.is_file()
                 and legacy.resolve() not in destinations
                 and f"(<{canonical}>)" in legacy.read_text(encoding="utf-8", errors="replace")):
             retired.append(legacy)

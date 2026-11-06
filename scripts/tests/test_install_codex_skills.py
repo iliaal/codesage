@@ -67,6 +67,26 @@ class AdapterInstallTests(unittest.TestCase):
         self.assertEqual(foreign.read_text(), "personal eval skill\n")
         self.assertTrue((self.repo_skills / "codesage-bench" / "SKILL.md").is_file())
 
+    def test_retirement_does_not_follow_symlinked_skill_directory(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        self.skills.mkdir()
+        for name in INSTALLER.REPO_COMMANDS:
+            with self.subTest(name=name):
+                canonical = self.plugin / "commands" / f"codesage-{name}.md"
+                content = INSTALLER.render(canonical, self.plugin)
+                directory = outside / name
+                directory.mkdir()
+                (directory / "SKILL.md").write_text(content)
+                (self.skills / f"codesage-{name}").symlink_to(directory, target_is_directory=True)
+        self.assertEqual(INSTALLER.install(self.source, self.skills), 11)
+        for name in INSTALLER.REPO_COMMANDS:
+            canonical = self.plugin / "commands" / f"codesage-{name}.md"
+            self.assertEqual((outside / name / "SKILL.md").read_text(),
+                             INSTALLER.render(canonical, self.plugin))
+            self.assertTrue((self.skills / f"codesage-{name}").is_symlink())
+            self.assertTrue((self.repo_skills / f"codesage-{name}" / "SKILL.md").is_file())
+
     def test_repository_local_install_is_idempotent(self):
         self.assertEqual(INSTALLER.install(self.source, self.repo_skills), 11)
         first = {p.parent.name: p.read_bytes() for p in self.repo_skills.glob("*/SKILL.md")}

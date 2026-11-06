@@ -4,6 +4,10 @@
 
 - MCP servers answer a JSON-RPC message whose fields conflict, such as a request that also carries `result` or `error`, with `-32600 Invalid request` instead of handling it (rmcp 3.8.0).
 
+### Fixed
+
+- The Codex adapter installer preserves legacy bench and eval skills reached through symlinked directories.
+
 ## [0.48.0] - 2026-11-03
 
 ### Changed
