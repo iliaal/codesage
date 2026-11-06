@@ -78,6 +78,40 @@ class UsageBytesTests(unittest.TestCase):
         self.assertEqual(usage.rule_dedupe_repeated_strings(json.dumps(rows, ensure_ascii=False)),
                          len(json.dumps(expected).encode("utf-8")))
 
+    def test_note_deduplication_preserves_non_string_values(self):
+        note = "A repeated note that is longer than thirty characters."
+        other = [None, True, False, 42, 1.5, {"context": "検索"}, ["nested", {"value": 1}]]
+        rows = [{"notes": [note, *other]} for _ in range(3)]
+        expected = [{"_legend": {"N0": note}},
+                    *[{"notes": ["N0", *other]} for _ in range(3)]]
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                data = {"results": rows, "summary": "unchanged"} if nested else rows
+                compressed = ({"results": expected, "summary": "unchanged"}
+                              if nested else expected)
+                self.assertEqual(usage.rule_dedupe_repeated_strings(json.dumps(data)),
+                                 len(json.dumps(compressed).encode("utf-8")))
+
+    def test_cli_scorecard_handles_mixed_note_values(self):
+        note = "A repeated note that is longer than thirty characters."
+        rows = [{"notes": [note, {"context": "検索"}, ["nested"]]} for _ in range(3)]
+        text = json.dumps(rows)
+        expected = [{"_legend": {"N0": note}},
+                    *[{"notes": ["N0", {"context": "検索"}, ["nested"]]}
+                      for _ in range(3)]]
+        saved = len(text.encode("utf-8")) - len(json.dumps(expected).encode("utf-8"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            self.write_transcript(project / "session.jsonl", text)
+            result = subprocess.run([sys.executable, str(SCRIPT), "--projects-root", str(root)],
+                                    text=True, capture_output=True, check=True)
+            self.assertIn("**Calls observed**: 1", result.stdout)
+            self.assertIn(f"**Total output bytes**: {len(text.encode('utf-8'))} ",
+                          result.stdout)
+            self.assertIn(f"| `dedupe_repeated_strings` |  | {saved} |", result.stdout)
+
     def test_noop_array_rules_preserve_original_bytes(self):
         arrays = [
             ([], True), (["検索"], True), ([{"file": "検索.rs"}], True),
