@@ -241,7 +241,8 @@ def rule_dedupe_repeated_strings(text: str) -> int:
                 continue
             new = dict(it)
             if isinstance(new.get("notes"), list):
-                new["notes"] = [codes.get(n, n) for n in new["notes"]]
+                new["notes"] = [codes.get(n, n) if isinstance(n, str) else n
+                                for n in new["notes"]]
             out.append(new)
         return [{"_legend": {v: k for k, v in codes.items()}}, *out]
 
