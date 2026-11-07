@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.49.0] - 2026-11-07
+
 ### Changed
 
 - MCP servers answer a JSON-RPC message whose fields conflict, such as a request that also carries `result` or `error`, with `-32600 Invalid request` instead of handling it (rmcp 3.8.0).
@@ -1436,5 +1438,7 @@ Initial public release.
 
 [0.47.1]: https://github.com/iliaal/codesage/releases/tag/v0.47.1
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.48.0...HEAD
 [0.48.0]: https://github.com/iliaal/codesage/releases/tag/v0.48.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.49.0...HEAD
+[0.49.0]: https://github.com/iliaal/codesage/releases/tag/v0.49.0
