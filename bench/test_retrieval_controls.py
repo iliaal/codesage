@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _retrieval_controls as controls
+import _reranker_artifacts as reranker_artifacts
 
 
 def load(filename, name):
@@ -201,6 +202,125 @@ class RetrievalControlsTest(unittest.TestCase):
         with self.assertRaises(controls.InvalidRun):
             controls.run_rg(self.root, ["a.py"], "!!!", "rg")
 
+    def test_rg_byte_form_preserves_non_utf8_content_and_byte_budgets(self):
+        content = b"needle \xff\xfe\n"
+        (self.root / "a.py").write_bytes(content)
+        rows, evidence = controls.run_rg(self.root, ["a.py"], "needle", real_rg())
+        self.assertEqual(rows[0][1].encode("utf-8", errors="surrogateescape"), content)
+        self.assertEqual(evidence["returncode"], 0)
+        serialized = b"a.py\n" + content + b"\n"
+        for budget in range(len(serialized) + 2):
+            with self.subTest(budget=budget):
+                _, charge = controls.page(rows, budget)
+                self.assertEqual(charge["bytes"], len(serialized[:budget]))
+                self.assertEqual(charge["page_sha256"], hashlib.sha256(serialized[:budget]).hexdigest())
+
+    def test_rg_byte_form_preserves_non_utf8_paths(self):
+        name = os.fsdecode(b"source-\xff.py")
+        (self.root / name).write_text("needle\n")
+        rows, _ = controls.run_rg(self.root, [name], "needle", real_rg())
+        self.assertEqual(os.fsencode(rows[0][0]), b"source-\xff.py")
+        self.assertEqual(controls.page(rows)[1]["bytes"], len(b"source-\xff.py\nneedle\n\n"))
+
+    def test_rg_malformed_text_or_bytes_remains_invalid(self):
+        for value in ({}, {"bytes": "%%%"}, {"text": 1}, {"bytes": 1},
+                      {"bytes": "bmVlZGxl", "text": "needle"}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                controls.rg_text(value)
+
+    def test_reranker_pins_parse_canonical_loader_and_refuse_uncertain_syntax(self):
+        source = (Path(__file__).resolve().parents[1] / "crates/embed/src/model.rs").read_text()
+        pins = reranker_artifacts.model_pins(source)
+        self.assertEqual(len(pins), 3)
+        pin = next(p for p in pins if p["model"] == "cross-encoder/ms-marco-MiniLM-L6-v2")
+        self.assertEqual(pin["cuda_file"], "onnx/model_cuda_fp16.onnx")
+        for invalid in (source.replace("const MODEL_PINS:", "const OTHER_PINS:"),
+                        source.replace("revision: MS_MARCO_DERIVED_REVISION", "revision: MISSING"),
+                        source.replace("cuda_onnx: None", "cuda_onnx: new_selector()", 1),
+                        source + '\nconst MS_MARCO_DERIVED_REVISION: &str = "' + "0" * 40 + '";'):
+            with self.subTest(invalid=invalid[-80:]), self.assertRaises(controls.InvalidRun):
+                reranker_artifacts.model_pins(invalid)
+
+    def reranker_cache_fixture(self):
+        (self.root / ".codesage").mkdir()
+        config = self.root / ".codesage/config.toml"
+        source = self.root / "model.rs"
+        revision = "a" * 40
+        payloads = {"tokenizer.json": b"tokenizer", "onnx/model.onnx": b"cpu",
+                    "onnx/model_cuda_fp16.onnx": b"cuda"}
+        snapshot = self.root / "hub/models--test--reranker/snapshots" / revision
+        reference = snapshot.parent.parent / "refs" / revision
+        reference.parent.mkdir(parents=True)
+        reference.write_text(revision)
+        for name, data in payloads.items():
+            path = snapshot / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        hashes = {name: hashlib.sha256(data).hexdigest() for name, data in payloads.items()}
+        source.write_text('const MODEL_PINS: &[ModelPin] = &[\n    ModelPin {\n'
+                          f'        model: "test/reranker", repo: "test/reranker", revision: "{revision}",\n'
+                          f'        tokenizer_sha256: "{hashes["tokenizer.json"]}",\n'
+                          f'        onnx_sha256: "{hashes["onnx/model.onnx"]}", onnx_data_sha256: None,\n'
+                          '        cuda_onnx: Some(GraphPin { file: "onnx/model_cuda_fp16.onnx",\n'
+                          f'        sha256: "{hashes["onnx/model_cuda_fp16.onnx"]}", }}),\n'
+                          '        max_seq_length: MAX_SEQ_LENGTH,\n    },\n];\n')
+        return config, source, snapshot, reference
+
+    def test_cached_reranker_selects_exact_cpu_cuda_bytes_and_refuses_missing_or_corrupt(self):
+        config, source, snapshot, _ = self.reranker_cache_fixture()
+        with patch.dict(os.environ, {"HF_HOME": str(self.root), "CODESAGE_ALLOW_ANY_MODEL": "0"}):
+            for device, graph in (("cpu", "onnx/model.onnx"), ("coreml", "onnx/model.onnx"),
+                                  ("GPU", "onnx/model_cuda_fp16.onnx"), (" cuda ", "onnx/model_cuda_fp16.onnx")):
+                config.write_text(f'[embedding]\nreranker = "test/reranker"\ndevice = "{device}"\n')
+                self.assertEqual(reranker_artifacts.cached_reranker_artifacts(self.root, source),
+                                 [snapshot / "tokenizer.json", snapshot / graph])
+            (snapshot / "onnx/model_cuda_fp16.onnx").write_bytes(b"changed")
+            with self.assertRaisesRegex(controls.InvalidRun, "hash differs"):
+                reranker_artifacts.cached_reranker_artifacts(self.root, source)
+            (snapshot / "onnx/model_cuda_fp16.onnx").unlink()
+            with self.assertRaises(FileNotFoundError):
+                reranker_artifacts.cached_reranker_artifacts(self.root, source)
+            config.write_text('[embedding]\nreranker = "unknown/model"\n')
+            with self.assertRaisesRegex(controls.InvalidRun, "no canonical reranker pin"):
+                reranker_artifacts.cached_reranker_artifacts(self.root, source)
+            config.write_text('[embedding]\n')
+            self.assertEqual(reranker_artifacts.cached_reranker_artifacts(self.root, source), [])
+
+    def test_reranker_relative_cache_roots_follow_project_child_cwd(self):
+        config, source, snapshot, _ = self.reranker_cache_fixture()
+        config.write_text('[embedding]\nreranker = "test/reranker"\ndevice = "gpu"\n')
+        self.assertNotEqual(Path.cwd(), self.root)
+        for hf_home in (".", ""):
+            with self.subTest(hf_home=hf_home), patch.dict(os.environ, {"HF_HOME": hf_home}, clear=True):
+                self.assertEqual(reranker_artifacts.cached_reranker_artifacts(self.root, source),
+                                 [snapshot / "tokenizer.json", snapshot / "onnx/model_cuda_fp16.onnx"])
+        home_cache = self.root / "cache-home/.cache/huggingface"
+        shutil.copytree(self.root / "hub", home_cache / "hub")
+        with patch.dict(os.environ, {"HOME": "cache-home"}, clear=True):
+            self.assertEqual(reranker_artifacts.cached_reranker_artifacts(self.root, source),
+                             [home_cache / p.relative_to(self.root) for p in
+                              (snapshot / "tokenizer.json", snapshot / "onnx/model_cuda_fp16.onnx")])
+
+    def test_reranker_cache_reference_selects_snapshot_and_malformed_or_absent_reference_refuses(self):
+        config, source, snapshot, reference = self.reranker_cache_fixture()
+        config.write_text('[embedding]\nreranker = "test/reranker"\ndevice = "cpu"\n')
+        selected = snapshot.with_name("b" * 40)
+        shutil.copytree(snapshot, selected)
+        reference.write_text(selected.name)
+        with patch.dict(os.environ, {"HF_HOME": str(self.root)}, clear=True):
+            self.assertEqual(reranker_artifacts.cached_reranker_artifacts(self.root, source),
+                             [selected / "tokenizer.json", selected / "onnx/model.onnx"])
+            (selected / "tokenizer.json").write_bytes(b"changed")
+            with self.assertRaisesRegex(controls.InvalidRun, "hash differs"):
+                reranker_artifacts.cached_reranker_artifacts(self.root, source)
+            for invalid in ("", "../outside", "/tmp/outside", selected.name + "\n"):
+                reference.write_text(invalid)
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(controls.InvalidRun, "revision pointer"):
+                    reranker_artifacts.cached_reranker_artifacts(self.root, source)
+            reference.unlink()
+            with self.assertRaises(FileNotFoundError):
+                reranker_artifacts.cached_reranker_artifacts(self.root, source)
+
     def test_rg_25_byte_page_ignores_ambient_max_count_configuration(self):
         (self.root / "a.py").write_text("needle\nneedle\n")
         (self.root / "b.py").write_text("needle\n")
@@ -231,6 +351,21 @@ class RetrievalControlsTest(unittest.TestCase):
             (self.root / path).write_text("needle\n")
         rows, evidence = controls.run_rg(self.root, list(reversed(paths)), "needle", "rg")
         self.assertEqual([p for p, _ in rows], paths)
+        self.assertEqual(len(evidence["commands"]), 2)
+
+    def test_rg_batches_keep_byte_path_order_across_non_utf8_boundary(self):
+        (self.root / "batch").mkdir()
+        paths = [f"batch/a-{i:03}.py" for i in range(255)] + [os.fsdecode(b"batch/\xff.py"), "batch/\U0010ffff.py"]
+        for path in paths:
+            (self.root / path).write_text("needle\n")
+        rows, evidence = controls.run_rg(self.root, paths, "needle", real_rg())
+        single = subprocess.run([real_rg(), "--no-config", "--json", "--sort", "path", "--no-ignore",
+                                 "--hidden", "--fixed-strings", "needle", "--", "batch"],
+                                cwd=self.root, capture_output=True, text=True, check=True)
+        expected = [controls.rg_text(event["data"]["path"]) for line in single.stdout.splitlines()
+                    if (event := json.loads(line))["type"] == "match"]
+        self.assertEqual([p for p, _ in rows], expected)
+        self.assertEqual([p for p, _ in rows], paths[:255] + ["batch/\U0010ffff.py", os.fsdecode(b"batch/\xff.py")])
         self.assertEqual(len(evidence["commands"]), 2)
 
     def test_invalid_search_is_not_a_valid_empty_page(self):
@@ -340,6 +475,24 @@ class RetrievalControlsTest(unittest.TestCase):
         saved = json.loads(output.read_text())
         self.assertFalse(saved["complete"])
         self.assertEqual(len(saved["records"]), 1)
+
+    def test_explicit_reranker_artifacts_override_automatic_selection(self):
+        binary = self.fixture_index()
+        corpus = self.root / "corpus.yaml"
+        corpus.write_text(f"project_root: {self.root}\ncases:\n- id: q\n  query: needle\n  expected_files: [a.py]\n")
+        output = self.root / "results.json"
+        with patch.object(runner, "run_codesage_search", return_value=(
+            '[{"file_path":"a.py","content":"alpha"}]', None, fixture_runtime()
+        )), patch.object(runner, "cached_reranker_artifacts", side_effect=AssertionError("automatic selection ran")), patch.object(
+            sys, "argv", ["runner", str(corpus), "--codesage-bin", str(binary), "--results-json", str(output),
+                          "--auto-reranker-artifacts", "--reranker-artifact", str(self.root / "tokenizer"),
+                          "--reranker-artifact", str(self.root / "onnx")]
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(runner.main(), 0)
+        saved = json.loads(output.read_text())
+        self.assertTrue(saved["complete"])
+        self.assertEqual(saved["meta"]["provenance"]["reranker_artifacts"],
+                         [controls.file_pin(self.root / name) for name in ("tokenizer", "onnx")])
 
     def test_main_case_failures_identify_query_and_reason(self):
         binary = self.fixture_index()

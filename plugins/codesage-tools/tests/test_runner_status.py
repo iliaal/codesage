@@ -6,7 +6,8 @@ import unittest
 
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
-METRICS = "<!-- METRICS: cases=2 miss_rate=0.0 median_first=1 r5=1.0 r10=1.0 -->"
+METRICS = ("<!-- METRICS: cases=2 miss_rate=0.0 median_first=1 r5=1.0 r10=1.0 "
+           "placebo_r10=0.2 rg_r10=0.3 rg_matched_r10=0.4 -->")
 
 
 class RunnerStatusTests(unittest.TestCase):
@@ -20,7 +21,7 @@ class RunnerStatusTests(unittest.TestCase):
             source = corpus / "project-session-eval.yaml"
             source.write_text("existing corpus\n")
             runner = root / "runner"
-            runner.write_text(f"#!/bin/bash\nprintf '%s\\n' '{METRICS}'\nprintf 'runner detail\\n' >&2\nexit {status}\n")
+            runner.write_text(f"#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$0.args\"\nprintf '%s\\n' '{METRICS}'\nprintf 'runner detail\\n' >&2\nexit {status}\n")
             runner.chmod(0o755)
             args = ["bash", str(BIN / command)]
             if command == "codesage-eval":
@@ -31,6 +32,10 @@ class RunnerStatusTests(unittest.TestCase):
             result = subprocess.run(args, env={**os.environ, "HOME": str(root / "home")},
                                     capture_output=True, text=True)
             output = result.stdout + result.stderr
+            if command == "codesage-bench":
+                arguments = runner.with_suffix(".args").read_text().splitlines()
+                self.assertIn("--auto-reranker-artifacts", arguments)
+                self.assertEqual("--results-json" in arguments, save)
             self.assertEqual(result.returncode, 1 if status else 0, output)
             if status:
                 diagnostic = (f"RUNNER FAILED rc={status}" if command == "codesage-bench"
@@ -42,6 +47,11 @@ class RunnerStatusTests(unittest.TestCase):
                 self.assertNotIn("FAILED", output)
                 self.assertNotIn("runner failed", output)
                 self.assertIn("miss_rate", result.stdout)
+                if command == "codesage-bench":
+                    self.assertIn("cases=2  miss_rate=0.0  median_first=1  r@5=1.0  r@10=1.0\n", result.stdout)
+                    self.assertNotIn("0.2", result.stdout)
+                    self.assertNotIn("0.3", result.stdout)
+                    self.assertNotIn("0.4", result.stdout)
             history = list((corpus / "history").glob("*.md"))
             self.assertEqual(len(history), int(save))
             if save:

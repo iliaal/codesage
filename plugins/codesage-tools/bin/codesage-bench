@@ -96,11 +96,12 @@ for corpus in "${corpora[@]}"; do
     name="$(basename "$corpus" .yaml)"
     echo "==> $name"
 
-    runner_args=("$corpus")
+    runner_args=("${corpus}" --auto-reranker-artifacts)
     [ -n "$CODESAGE_BIN" ] && runner_args+=(--codesage-bin "$CODESAGE_BIN")
 
     if [ "$SAVE_HISTORY" -eq 1 ]; then
         out_file="$HISTORY_DIR/${TIMESTAMP}__${name}.md"
+        runner_args+=(--results-json "${HISTORY_DIR}/${TIMESTAMP}__${name}.json")
         if "$RUNNER" "${runner_args[@]}" > "$out_file" 2>&1; then
             :
         else
@@ -130,11 +131,11 @@ for corpus in "${corpora[@]}"; do
         continue
     fi
 
-    miss_rate="$(echo "$metrics_line" | grep -oE 'miss_rate=[0-9.]+' | cut -d= -f2)"
-    median="$(echo "$metrics_line"    | grep -oE 'median_first=[^ ]+' | cut -d= -f2)"
-    r5="$(echo "$metrics_line"        | grep -oE 'r5=[0-9.]+' | cut -d= -f2)"
-    r10="$(echo "$metrics_line"       | grep -oE 'r10=[0-9.]+' | cut -d= -f2)"
-    cases="$(echo "$metrics_line"     | grep -oE 'cases=[0-9]+' | cut -d= -f2)"
+    miss_rate="$(echo "$metrics_line" | grep -oE '(^|[[:space:]])miss_rate=[0-9.]+' | cut -d= -f2)"
+    median="$(echo "$metrics_line"    | grep -oE '(^|[[:space:]])median_first=[^ ]+' | cut -d= -f2)"
+    r5="$(echo "$metrics_line"        | grep -oE '(^|[[:space:]])r5=[0-9.]+' | cut -d= -f2)"
+    r10="$(echo "$metrics_line"       | grep -oE '(^|[[:space:]])r10=[0-9.]+' | cut -d= -f2)"
+    cases="$(echo "$metrics_line"     | grep -oE '(^|[[:space:]])cases=[0-9]+' | cut -d= -f2)"
 
     echo "    cases=$cases  miss_rate=$miss_rate  median_first=$median  r@5=$r5  r@10=$r10"
     summary_rows+=("$name|$cases|$miss_rate|$median|$r5|$r10")

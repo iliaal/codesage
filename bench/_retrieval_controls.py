@@ -1,6 +1,8 @@
 """Executable retrieval controls and byte/provenance contracts."""
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -129,14 +131,14 @@ def page(rows: list[tuple[str, str]], budget: int | None = None) -> tuple[list[t
     truncated = False
     digest = hashlib.sha256()
     for path, content in rows:
-        header = (path + "\n").encode("utf-8")
+        header = (path + "\n").encode("utf-8", errors="surrogateescape")
         available = len(header) if budget is None else budget - used
         if available < len(header):
             digest.update(header[:max(0, available)])
             used += max(0, available)
             truncated = True
             break
-        body = (content + "\n").encode("utf-8")
+        body = (content + "\n").encode("utf-8", errors="surrogateescape")
         count = len(body) if budget is None else min(len(body), available - len(header))
         consumed = body[:count]
         digest.update(header)
@@ -179,6 +181,14 @@ def placebo_rows(chunks: dict[str, list[str]], case_id: str, seed: int,
     return rows
 
 
+def rg_text(value: dict) -> str:
+    if isinstance(value, dict) and set(value) == {"text"} and isinstance(value["text"], str):
+        return value["text"]
+    if isinstance(value, dict) and set(value) == {"bytes"} and isinstance(value["bytes"], str):
+        return base64.b64decode(value["bytes"], validate=True).decode("utf-8", errors="surrogateescape")
+    raise InvalidRun("rg match needs one string text or base64 bytes field")
+
+
 def run_rg(project: Path, paths: list[str], query: str, rg_bin: str) -> tuple[list[tuple[str, str]], dict]:
     rg_bin = absolute_executable(rg_bin)
     terms = list(dict.fromkeys(re.findall(r"[A-Za-z0-9_]+", query)))
@@ -188,7 +198,7 @@ def run_rg(project: Path, paths: list[str], query: str, rg_bin: str) -> tuple[li
            "--no-ignore", "--hidden"]
     for term in terms:
         cmd += ["-e", term]
-    paths = sorted(paths)
+    paths = sorted(paths, key=os.fsencode)
     commands = [cmd + ["--", *paths[i:i + 256]] for i in range(0, len(paths), 256)]
     stdout = []
     stderr = []
@@ -210,9 +220,9 @@ def run_rg(project: Path, paths: list[str], query: str, rg_bin: str) -> tuple[li
             event = json.loads(line)
             if event.get("type") == "match":
                 data = event["data"]
-                rows.append((data["path"]["text"].removeprefix("./"), data["lines"]["text"]))
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise InvalidRun("rg emitted invalid JSON or non-UTF8 paths/content") from exc
+                rows.append((rg_text(data["path"]).removeprefix("./"), rg_text(data["lines"])))
+    except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+        raise InvalidRun("rg emitted invalid JSON or text/bytes fields") from exc
     return rows, {"command": commands[0] if len(commands) == 1 else cmd,
                   "commands": commands, "returncode": 0 if 0 in codes else 1,
                   "stdout_sha256": hashlib.sha256(output.encode()).hexdigest(),

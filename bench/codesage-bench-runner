@@ -13,7 +13,10 @@ Executable arguments resolve once against the caller's cwd/PATH; every
 version, status, search, and rg child uses the resulting absolute identity.
 For a configured reranker, repeat --reranker-artifact with the tokenizer
 and the selected ONNX graph; verify selection against the binary's loader
-pins. Each query uses a fresh private runtime directory, observes private
+pins. --auto-reranker-artifacts resolves and verifies cached artifacts from
+this checkout's canonical loader pins when no explicit artifacts are given;
+the checkout must match the selected binary's loader. It never downloads.
+Each query uses a fresh private runtime directory, observes private
 model initialization, and rejects daemon reuse. This instrument does not
 measure indexing pass mode, prospective prediction, or agent completion.
 
@@ -75,6 +78,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent))
 from _codesage_version import codesage_version_info  # noqa: E402
+from _reranker_artifacts import cached_reranker_artifacts  # noqa: E402
 from _retrieval_controls import (  # noqa: E402
     CONTROL_PROTOCOL, QUERY_LOG_FILTER, QUERY_NO_COLOR, QUERY_RUNTIME, InvalidRun,
     absolute_executable, capture_context, distinct, file_pin, git_environment,
@@ -411,6 +415,8 @@ def main() -> int:
     ap.add_argument("--rg-bin", default="rg")
     ap.add_argument("--reranker-artifact", type=Path, action="append", default=[],
                     help="Pin actual reranker tokenizer and selected ONNX graph bytes (repeat).")
+    ap.add_argument("--auto-reranker-artifacts", action="store_true",
+                    help="Resolve cached reranker artifacts from canonical loader pins when no explicit artifacts are given.")
     ap.add_argument(
         "--results-json",
         type=Path,
@@ -506,6 +512,8 @@ def main() -> int:
     cs_info = codesage_version_info(args.codesage_bin, cwd=project_root)
     cs_version = cs_info["version"]
     try:
+        if args.auto_reranker_artifacts and not args.reranker_artifact:
+            args.reranker_artifact = cached_reranker_artifacts(project_root)
         context, chunks = capture_context(project_root, args.codesage_bin, args.rg_bin,
                                           args.reranker_artifact)
         missing_gold = {p for c in cases for p in c["expected_files"] if p not in chunks}
@@ -637,7 +645,8 @@ def main() -> int:
         print(line)
     print(f"- **Executed controls**: seeded uniform-file placebo (seed {args.control_seed}), "
           "`rg --sort path` literal query-token OR, and rg at the CodeSage byte budget.")
-    print("- **Byte unit**: UTF-8 path + LF + content + LF, all emitted chunks charged; "
+    print("- **Byte unit**: path + LF + content + LF, UTF-8 for text and original decoded bytes "
+          "for rg base64 fields; all emitted chunks charged; "
           "duplicate files and refs-mode exclusions consume bytes. Final control row may be cut; "
           "a file counts only after its full path header fits.")
     print(f"- **Actual semantic fingerprint**: `{context['semantic_fingerprint']}`")

@@ -114,7 +114,10 @@ class CommandArgumentTests(unittest.TestCase):
             with self.subTest(command=command):
                 result = self.invoke(command, arguments)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(json.loads(self.record.read_text()), [str(corpus_file)])
+                expected = [str(corpus_file)]
+                if command == "bench":
+                    expected.append("--auto-reranker-artifacts")
+                self.assertEqual(json.loads(self.record.read_text()), expected)
                 self.assertIn("2", result.stdout)
                 self.assertEqual(corpus_file.read_text(), "existing corpus\n")
         result = self.invoke("onboard", [str(project), "--codesage-bin", "/bin/false", "--hint-only"])

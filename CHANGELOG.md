@@ -6,6 +6,7 @@
 
 ### Fixed
 
+- `codesage-bench` resolves cached reranker artifacts, accepts non-UTF-8 `rg` matches, and keeps control recall out of the CodeSage summary.
 - The Codex adapter installer preserves legacy bench and eval skills reached through symlinked directories.
 - Repository refreshes handle onboarded repositories whose paths contain newlines instead of running `codesage index` in an unrelated directory.
 - Repository hint refreshes preserve the configured device and no longer repeat indexing or bypass `--no-index` and `--no-semantic`.
