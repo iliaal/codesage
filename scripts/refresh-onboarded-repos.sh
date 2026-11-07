@@ -148,7 +148,8 @@ for root in "${active[@]:-}"; do
 
 	if [ -n "$onboard_bin" ]; then
 		echo "    [3/3] refresh hint"
-		if ! "$onboard_bin" --refresh-hint --no-mcp --no-hooks "$root" 2>&1 | sed 's/^/        /'; then
+		# Full onboarding would reset the device and index again without our flags.
+		if ! "$onboard_bin" --hint-only --refresh-hint --codesage-bin "$codesage_bin" "$root" 2>&1 | sed 's/^/        /'; then
 			failures+=("$root (hint)")
 			echo "        FAILED"
 		fi
