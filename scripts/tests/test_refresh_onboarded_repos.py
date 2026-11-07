@@ -11,6 +11,58 @@ SCRIPT = Path(__file__).resolve().parents[1] / "refresh-onboarded-repos.sh"
 
 
 class RefreshOnboardedReposTests(unittest.TestCase):
+    def test_hint_refresh_preserves_config_and_index_policy(self):
+        cases = (([], 0), (["--no-index"], 0),
+                 (["--full", "--no-semantic"], 0), ([], 75))
+        for arguments, index_status in cases:
+            with self.subTest(arguments=arguments, index_status=index_status), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                home = root / "home"
+                project = home / "projects" / "target with spaces"
+                subprocess.run(["git", "init", "-q", str(project)], check=True)
+                (project / ".codesage").mkdir()
+                config = project / ".codesage/config.toml"
+                original_config = b'[project]\nname = "target"\n\n[embedding]\ndevice = "cpu"\n'
+                config.write_bytes(original_config)
+                hint = project / ".claude/CLAUDE.md"
+                hint.parent.mkdir()
+                hint.write_text("outdated hint\n")
+                copied = root / "checkout/scripts" / SCRIPT.name
+                copied.parent.mkdir(parents=True)
+                shutil.copyfile(SCRIPT, copied)
+                # Exercise the real helper: a no-op stub hides its init/index
+                # side effects and default GPU configuration rewrite.
+                shutil.copytree(SCRIPT.parents[1] / "plugins/codesage-tools",
+                                root / "checkout/plugins/codesage-tools")
+                tools = root / "tools with spaces"
+                tools.mkdir()
+                binary = tools / "codesage"
+                binary.write_text('''#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["CALL_LOG"], "a") as stream:
+    stream.write(json.dumps([os.getcwd(), sys.argv[1:]]) + "\\n")
+if sys.argv[1] == "index":
+    sys.exit(int(os.environ["INDEX_STATUS"]))
+''')
+                binary.chmod(0o755)
+                log = root / "calls.jsonl"
+                result = subprocess.run(
+                    ["bash", str(copied), *arguments], cwd=root,
+                    capture_output=True, text=True, timeout=30,
+                    env={**os.environ, "HOME": str(home), "CALL_LOG": str(log),
+                         "INDEX_STATUS": str(index_status),
+                         "PATH": "tools with spaces" + os.pathsep + os.environ["PATH"]},
+                )
+                self.assertEqual(config.read_bytes(), original_config)
+                self.assertEqual(result.returncode, index_status, result.stdout + result.stderr)
+                expected = [] if arguments == ["--no-index"] else [["index", *arguments]]
+                expected += [["install-hooks"], ["doctor"]]
+                calls = [json.loads(line) for line in log.read_text().splitlines()]
+                self.assertEqual(calls, [[str(project), command] for command in expected])
+                self.assertNotIn("outdated hint", hint.read_text())
+                self.assertIn("Project argument (JSON string)", hint.read_text())
+
     def test_preserves_selected_binary_and_project_paths(self):
         for entry in ("tools", "./tools", "tools with spaces", ".", "", "absolute", "newline"):
             with self.subTest(path_entry=entry), tempfile.TemporaryDirectory() as directory:
