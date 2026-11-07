@@ -1383,14 +1383,21 @@ fn compute_top_symbols(
     // One batched name-count query seeds the ranking. Refs match by short name
     // (and tail-name fallback for qualified callsites), the same shape as
     // `find_references`, and an upper bound on what resolution can keep.
-    let mut names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
+    let mut constructors = crate::construction::Constructors::default();
+    let reference_names = symbols
+        .iter()
+        .map(|symbol| constructors.reference_names(db, symbol))
+        .collect::<Result<Vec<_>>>()?;
+    let mut names: Vec<String> = reference_names.iter().flatten().cloned().collect();
     names.sort_unstable();
     names.dedup();
     let counts = db
         .reference_counts_for_names(&names)
         .with_context(|| format!("counting refs for top-symbols breakdown of {file_path}"))?;
-    for (s, r) in symbols.iter().zip(ranks.iter_mut()) {
-        r.raw = counts.get(&s.name).copied().unwrap_or(0);
+    for (names, r) in reference_names.iter().zip(ranks.iter_mut()) {
+        r.raw = names.iter().fold(0_u32, |total, name| {
+            total.saturating_add(counts.get(name).copied().unwrap_or(0))
+        });
         // Nothing spells the name, so nothing can resolve to it.
         if r.raw == 0 {
             r.resolved = Some(0);
@@ -1463,6 +1470,9 @@ fn compute_top_symbols(
         for &i in &group {
             resolved_rows.push(cache.references(db, &symbols[i])?);
             resolved_symbols += 1;
+        }
+        if cache.context_capped() {
+            break;
         }
         // One callsite is one (file, line) pair, matching how the name counts
         // collapse an import's module and binding on a single line. Test
@@ -2140,6 +2150,111 @@ mod tests {
     }
 
     const DAY: i64 = 86_400;
+
+    #[test]
+    fn constructor_source_limits_keep_top_symbols_bounded_with_a_warm_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".codesage")).unwrap();
+        std::fs::write(
+            dir.path().join("models.js"),
+            format!(
+                "export class A {{ constructor() {{}} }}\n/*{}*/",
+                "x".repeat(1024 * 1024)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("other.ts"),
+            "export class A { constructor() {} }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("use.js"),
+            "import { A } from './models.js';\nfunction run() { new A(); }\n",
+        )
+        .unwrap();
+        let db = Database::open(&dir.path().join(".codesage/index.db")).unwrap();
+        crate::full_index(dir.path(), &db, &[], false).unwrap();
+        let mut cache = WalkCache::default();
+        for _ in 0..2 {
+            let ranks = compute_top_symbols(&db, "models.js", false, 0, &mut cache, None).unwrap();
+            let constructor = ranks
+                .iter()
+                .find(|symbol| symbol.name == "constructor")
+                .unwrap();
+            assert!(constructor.bounded, "{constructor:?}");
+            assert!(
+                constructor
+                    .why
+                    .contains("2 refs by name (resolution capped, upper bound)"),
+                "{constructor:?}"
+            );
+            assert!(cache.context_capped());
+        }
+        assert!(
+            cache.stats().0 > 0,
+            "second pass must reuse the bounded cache"
+        );
+    }
+
+    #[test]
+    fn constructor_owner_calls_count_and_obey_top_symbol_admission() {
+        for calls in [2, TOP_SYMBOLS_REF_BUDGET + 1] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("models.py"),
+                "class A:\n    def __init__(self): pass\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("use.py"),
+                format!("from models import A\n{}", "A()\n".repeat(calls as usize)),
+            )
+            .unwrap();
+            let db = Database::open_in_memory().unwrap();
+            crate::full_index(dir.path(), &db, &[], false).unwrap();
+            let mut cache = WalkCache::default();
+            let ranked = compute_top_symbols(&db, "models.py", false, 0, &mut cache, None).unwrap();
+            let constructor = ranked
+                .iter()
+                .find(|symbol| symbol.name == "__init__")
+                .unwrap();
+            if calls == 2 {
+                assert!(!constructor.bounded, "{constructor:?}");
+                assert!(constructor.why.contains("2 refs"), "{constructor:?}");
+                let warmed =
+                    compute_top_symbols(&db, "models.py", false, 0, &mut cache, None).unwrap();
+                assert_eq!(
+                    serde_json::to_value(ranked).unwrap(),
+                    serde_json::to_value(warmed).unwrap()
+                );
+                let mut spent = Duration::ZERO;
+                let bounded =
+                    compute_top_symbols(&db, "models.py", false, 0, &mut cache, Some(&mut spent))
+                        .unwrap();
+                assert!(
+                    bounded
+                        .iter()
+                        .find(|symbol| symbol.name == "__init__")
+                        .unwrap()
+                        .bounded
+                );
+            } else {
+                assert!(constructor.bounded, "{constructor:?}");
+                assert!(
+                    constructor
+                        .why
+                        .contains("refs by name (resolution capped, upper bound)"),
+                    "{constructor:?}"
+                );
+                assert_eq!(
+                    cache.stats(),
+                    (0, 0, 0),
+                    "oversized owner population must not be hydrated"
+                );
+            }
+        }
+    }
 
     #[test]
     fn diff_retains_omitted_cluster_assessments_from_the_same_pass() {

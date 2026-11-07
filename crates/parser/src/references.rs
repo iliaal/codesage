@@ -220,14 +220,14 @@ fn java_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
 
 fn rust_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
-        0 | 1 => Some(ReferenceKind::Import),  // use_declaration
-        2 | 3 => Some(ReferenceKind::Call),    // call_expression
-        4 | 5 => Some(ReferenceKind::Call),    // macro_invocation
-        6 => Some(ReferenceKind::Call),        // method call (obj.method())
-        7 => Some(ReferenceKind::Inheritance), // impl Trait for Type
-        8 => Some(ReferenceKind::TypeHint),    // type of an impl block
-        9..=12 => Some(ReferenceKind::Import), // renamed / glob / grouped / braced use
-        13 => Some(ReferenceKind::Import),     // external module declaration
+        0 | 1 => Some(ReferenceKind::Import),    // use_declaration
+        2 | 3 => Some(ReferenceKind::Call),      // call_expression
+        4 | 5 => Some(ReferenceKind::MacroCall), // macro_invocation
+        6 => Some(ReferenceKind::Call),          // method call (obj.method())
+        7 => Some(ReferenceKind::Inheritance),   // impl Trait for Type
+        8 => Some(ReferenceKind::TypeHint),      // type of an impl block
+        9..=12 => Some(ReferenceKind::Import),   // renamed / glob / grouped / braced use
+        13 => Some(ReferenceKind::Import),       // external module declaration
         _ => None,
     }
 }
@@ -1155,6 +1155,59 @@ function later() { (function* () { require('./nested'); })().next(); }
         let bytes = source.as_bytes();
         let tree = crate::parse::parse_file(bytes, language).unwrap();
         super::extract_references(&tree, bytes, language, "inline").unwrap()
+    }
+
+    #[test]
+    fn rust_macro_invocations_keep_a_distinct_reference_kind() {
+        let refs = refs_from_source(
+            "macro_rules! format { () => {} }\nfn format() {}\nfn run() {\n    format!();\n    crate::format!();\n    format();\n    crate::format();\n}\n",
+            Language::Rust,
+        );
+        let rows: Vec<_> = refs
+            .iter()
+            .map(|reference| (reference.to_name.as_str(), reference.kind, reference.line))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("format", ReferenceKind::MacroCall, 4),
+                ("crate::format", ReferenceKind::MacroCall, 5),
+                ("format", ReferenceKind::Call, 6),
+                ("crate::format", ReferenceKind::Call, 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_macro_symbol_pattern_keeps_its_ordinal_and_count() {
+        crate::validate::validate_all_queries().unwrap();
+        let (_, source) = crate::extract::SYMBOL_QUERY_SOURCES
+            .iter()
+            .find(|(language, _)| *language == Language::Rust)
+            .unwrap();
+        let query =
+            tree_sitter::Query::new(&crate::parse::ts_language(Language::Rust), source).unwrap();
+        assert_eq!(query.pattern_count(), 10);
+        assert_eq!(
+            crate::extract::kind_map_for(Language::Rust)(8),
+            Some(codesage_protocol::SymbolKind::Macro)
+        );
+
+        let source = b"macro_rules! format { () => {} }\nfn format() {}\n";
+        let tree = crate::parse::parse_file(source, Language::Rust).unwrap();
+        let symbols =
+            crate::extract::extract_symbols(&tree, source, Language::Rust, "inline.rs").unwrap();
+        let rows: Vec<_> = symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("format", codesage_protocol::SymbolKind::Macro),
+                ("format", codesage_protocol::SymbolKind::Function),
+            ]
+        );
     }
 
     #[test]

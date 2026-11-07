@@ -8,7 +8,7 @@ use anyhow::Result;
 use codesage_storage::Database;
 use codesage_storage::db::ImportPairs;
 
-use crate::bundle::path_import_candidates;
+use crate::bundle::resolved_path_import_candidates;
 
 /// Every cross-file import pair, partitioned by whether any load-time
 /// directive joins it. Pairs are sorted.
@@ -35,14 +35,14 @@ pub fn file_import_pairs(db: &Database) -> Result<ImportPairs> {
 }
 
 /// The one file a directive loads: the first indexed candidate in resolver
-/// order, as Node, TypeScript, and the preprocessor stop at their first hit.
+/// order for JavaScript/TypeScript, or an unambiguous C/C++ include target.
 /// A declaration file (`.d.ts`) loads nothing at runtime, so it is neither an
 /// importer nor a target; the resolver's next candidate stands instead.
 fn loaded_target(spec: &str, from: &str, indexed: &HashSet<String>) -> Option<String> {
     if is_declaration_file(from) {
         return None;
     }
-    path_import_candidates(spec, from)
+    resolved_path_import_candidates(spec, from, indexed)
         .into_iter()
         .find(|candidate| !is_declaration_file(candidate) && indexed.contains(candidate))
 }

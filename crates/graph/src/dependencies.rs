@@ -251,11 +251,11 @@ fn resolve_site(
             }
         }
     } else {
-        files.extend(
-            crate::bundle::path_import_candidates(&row.to_name, &row.from_file)
-                .into_iter()
-                .filter(|file| indexed.paths.contains(file)),
-        );
+        files.extend(crate::bundle::indexed_path_import_candidates(
+            &row.to_name,
+            &row.from_file,
+            indexed.paths,
+        ));
         if files.is_empty()
             && (row.from_file.ends_with(".php") || row.from_file.ends_with(".java"))
             && (row.to_name.contains('\\') || row.to_name.contains('.'))
