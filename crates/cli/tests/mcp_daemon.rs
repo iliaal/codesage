@@ -298,6 +298,265 @@ fn concurrent_shims_share_one_daemon() {
 }
 
 #[test]
+fn completed_shim_session_reconnects_after_daemon_loss() {
+    let runtime = tempfile::tempdir().unwrap();
+    let _cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_owned(),
+    };
+    let project = tempfile::tempdir().unwrap();
+    onboard_fixture_project(project.path());
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+    let args = serde_json::json!({"project": project.path(), "target": "hello_symbol"});
+    let before = call_mcp_tool(&mut session, 2, "find_symbol", args.clone());
+    assert_eq!(before["results"][0]["name"], "hello_symbol");
+    let pid_file = std::fs::read_dir(runtime.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "pid"))
+        .unwrap();
+    let before_pid = read_daemon_pid_file(&pid_file).unwrap();
+    stop_daemon_and_wait(runtime.path());
+    session.send(
+        &serde_json::json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{
+            "name":"find_symbol", "arguments":args
+        }})
+        .to_string(),
+    );
+    let after = next_shim_response(&session, 3);
+    assert_eq!(
+        after["result"]["structuredContent"]["results"][0]["name"],
+        "hello_symbol"
+    );
+    assert_ne!(read_daemon_pid_file(&pid_file).unwrap(), before_pid);
+    assert!(session.child.child.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn completed_shim_session_reconnects_after_client_idle_ceiling() {
+    let runtime = tempfile::tempdir().unwrap();
+    let _cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_owned(),
+    };
+    let mut session =
+        McpSession::start_with_env(runtime.path(), &[("CODESAGE_CLIENT_IDLE_MAX_SECS", "1")]);
+    session.initialize();
+    session.request(2, r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#);
+    thread::sleep(Duration::from_millis(2200));
+    session.send(r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#);
+    let response = next_shim_response(&session, 3);
+    assert!(response.get("result").is_some(), "{response}");
+    assert!(session.child.child.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn shim_reports_written_requests_and_replays_only_handshake() {
+    use std::os::unix::net::UnixListener;
+    let runtime = tempfile::tempdir().unwrap();
+    let _cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_owned(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    let initialize = r#"{"jsonrpc":"2.0","id":41,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"replay-context","version":"7"}}}"#;
+    let initialized = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    let initial_reply = session.request(41, initialize);
+    session.send(initialized);
+    session.request(42, r#"{"jsonrpc":"2.0","id":42,"method":"ping"}"#);
+    let socket = std::fs::read_dir(runtime.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "sock"))
+        .unwrap();
+    stop_daemon_and_wait(runtime.path());
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (observed, written) = mpsc::channel();
+    let peer = thread::spawn(move || {
+        let read = |reader: &mut BufReader<std::os::unix::net::UnixStream>| {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        for connection in 0..2 {
+            let socket = accept_reconnect_peer(&listener);
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(socket);
+            assert_eq!(
+                read(&mut reader),
+                serde_json::from_str::<Value>(initialize).unwrap()
+            );
+            writeln!(reader.get_mut(), "{initial_reply}").unwrap();
+            assert_eq!(
+                read(&mut reader),
+                serde_json::from_str::<Value>(initialized).unwrap()
+            );
+            if connection == 0 {
+                assert_eq!(read(&mut reader)["id"], 10);
+                writeln!(
+                    reader.get_mut(),
+                    r#"{{"jsonrpc":"2.0","id":10,"result":{{}}}}"#
+                )
+                .unwrap();
+                assert_eq!(read(&mut reader)["id"], 11);
+                assert_eq!(read(&mut reader)["id"], 12);
+                assert_eq!(read(&mut reader)["id"], 15);
+                writeln!(
+                    reader.get_mut(),
+                    r#"{{"jsonrpc":"2.0","id":15,"result":{{}}}}"#
+                )
+                .unwrap();
+                reader
+                    .get_mut()
+                    .write_all(br#"{"jsonrpc":"2.0","id":11,"res"#)
+                    .unwrap();
+                observed.send(()).unwrap();
+            } else {
+                assert_eq!(
+                    read(&mut reader)["id"],
+                    13,
+                    "a written request was replayed"
+                );
+                writeln!(
+                    reader.get_mut(),
+                    r#"{{"jsonrpc":"2.0","id":13,"result":{{}}}}"#
+                )
+                .unwrap();
+                assert_eq!(read(&mut reader)["id"], 14);
+                let mut eof = String::new();
+                assert_eq!(reader.read_line(&mut eof).unwrap(), 0);
+            }
+        }
+    });
+    session.send(r#"{"jsonrpc":"2.0","id":10,"method":"ping"}"#);
+    assert!(next_shim_response(&session, 10).get("result").is_some());
+    for id in [11, 12, 15] {
+        session.send(&serde_json::json!({"jsonrpc":"2.0","id":id,"method":"ping"}).to_string());
+    }
+    written.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(next_shim_response(&session, 15).get("result").is_some());
+    for id in [11, 12] {
+        let response = next_shim_response(&session, id);
+        assert_eq!(response["error"]["code"], -32000, "{response}");
+        assert_eq!(response["error"]["data"]["may_have_run"], true);
+        assert_eq!(response["error"]["data"]["replayed"], false);
+    }
+    session.send(r#"{"jsonrpc":"2.0","id":13,"method":"ping"}"#);
+    assert!(next_shim_response(&session, 13).get("result").is_some());
+    session.send(r#"{"jsonrpc":"2.0","id":14,"method":"ping"}"#);
+    drop(session.child.child.stdin.take());
+    let response = next_shim_response(&session, 14);
+    assert_eq!(response["error"]["data"]["may_have_run"], true);
+    assert_eq!(response["error"]["data"]["replayed"], false);
+    peer.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.child.child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "shim reconnected after client EOF"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(
+        session.rx.recv_timeout(Duration::from_secs(1)),
+        Err(mpsc::RecvTimeoutError::Disconnected)
+    ));
+}
+
+#[test]
+fn shim_attempts_reconnect_once_when_initialize_replay_fails() {
+    use std::os::unix::net::UnixListener;
+    let runtime = tempfile::tempdir().unwrap();
+    let _cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_owned(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+    session.request(2, r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#);
+    let socket = std::fs::read_dir(runtime.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "sock"))
+        .unwrap();
+    stop_daemon_and_wait(runtime.path());
+    let listener = UnixListener::bind(&socket).unwrap();
+    session.send(r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#);
+    let peer = accept_reconnect_peer(&listener);
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(peer);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).unwrap()["method"],
+        "initialize"
+    );
+    drop(reader);
+    let response = next_shim_response(&session, 3);
+    assert_eq!(
+        response["error"]["data"]["may_have_run"], false,
+        "{response}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.child.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "shim retried a failed recovery");
+        thread::sleep(Duration::from_millis(10));
+    }
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+fn next_shim_response(session: &McpSession, id: u64) -> Value {
+    let line = session
+        .rx
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap()
+        .unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(
+        response["id"], id,
+        "unexpected replay or duplicate response: {response}"
+    );
+    response
+}
+
+fn accept_reconnect_peer(
+    listener: &std::os::unix::net::UnixListener,
+) -> std::os::unix::net::UnixStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match listener.accept() {
+            Ok((peer, _)) => return peer,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "shim did not reconnect");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("accept failed: {error}"),
+        }
+    }
+}
+
+fn stop_daemon_and_wait(runtime: &std::path::Path) {
+    kill_daemon(runtime);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_dir(runtime)
+        .unwrap()
+        .flatten()
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "sock"))
+    {
+        assert!(Instant::now() < deadline, "daemon did not finish shutdown");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn silent_client_that_never_initializes_is_dropped() {
     // Connection-idle timing starts after initialization; the handshake
     // timeout must release the active-client count for a silent peer.

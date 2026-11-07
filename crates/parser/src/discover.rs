@@ -316,7 +316,31 @@ pub(crate) fn exclude_matches_path(excludes: &GlobSet, rel_path: &str, is_dir: b
 pub struct WatchFilter {
     root: PathBuf,
     excludes: Option<GlobSet>,
+    directories: HashMap<PathBuf, WatchIgnoreDirectory>,
+    global: ignore::gitignore::Gitignore,
+}
+
+struct WatchIgnoreDirectory {
+    ignore: ignore::gitignore::Gitignore,
     gitignore: ignore::gitignore::Gitignore,
+    exclude: ignore::gitignore::Gitignore,
+    repository: bool,
+}
+
+impl WatchIgnoreDirectory {
+    fn load(dir: &Path) -> Result<Self> {
+        let load = |file: PathBuf| -> Result<ignore::gitignore::Gitignore> {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(dir);
+            let _ = builder.add(file);
+            Ok(builder.build()?)
+        };
+        Ok(Self {
+            ignore: load(dir.join(".ignore"))?,
+            gitignore: load(dir.join(".gitignore"))?,
+            exclude: load(dir.join(".git/info/exclude"))?,
+            repository: dir.join(".git").exists() || dir.join(".jj").exists(),
+        })
+    }
 }
 
 impl WatchFilter {
@@ -326,15 +350,35 @@ impl WatchFilter {
         } else {
             Some(build_exclude_set(exclude_patterns)?)
         };
-        let mut gb = ignore::gitignore::GitignoreBuilder::new(root);
-        add_nested_gitignores(&mut gb, root, excludes.as_ref());
-        let _ = gb.add(root.join(".git").join("info").join("exclude"));
-        let gitignore = gb.build()?;
-        Ok(Self {
+        let mut filter = Self {
             root: root.to_path_buf(),
             excludes,
-            gitignore,
-        })
+            directories: HashMap::new(),
+            global: ignore::gitignore::Gitignore::global().0,
+        };
+        for parent in root.ancestors().skip(1) {
+            filter
+                .directories
+                .insert(parent.to_path_buf(), WatchIgnoreDirectory::load(parent)?);
+        }
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            filter
+                .directories
+                .insert(dir.clone(), WatchIgnoreDirectory::load(&dir)?);
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() && !filter.is_ignored(&entry.path(), true) {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        Ok(filter)
     }
 
     /// True if `abs_path` (a descendant of the project root) should be skipped.
@@ -346,62 +390,58 @@ impl WatchFilter {
         if rel.as_os_str().is_empty() {
             return false;
         }
-        // Hidden files/dirs, matching `WalkBuilder::hidden(true)`.
-        if rel
-            .components()
-            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
-        {
-            return true;
-        }
-        let rel_str = rel.to_string_lossy();
-        if let Some(exc) = &self.excludes
-            && exclude_matches_path(exc, &rel_str, is_dir)
-        {
-            return true;
-        }
-        self.gitignore
-            .matched_path_or_any_parents(rel, is_dir)
-            .is_ignore()
-    }
-}
-
-fn add_nested_gitignores(
-    gb: &mut ignore::gitignore::GitignoreBuilder,
-    root: &Path,
-    excludes: Option<&GlobSet>,
-) {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let _ = gb.add(dir.join(".gitignore"));
-
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
-            if !file_type.is_dir() || file_type.is_symlink() {
-                continue;
-            }
-
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with('.') {
-                continue;
-            }
-            let Ok(rel) = path.strip_prefix(root) else {
-                continue;
-            };
-            let rel_str = rel.to_string_lossy();
-            if let Some(excludes) = excludes
-                && exclude_matches_path(excludes, &rel_str, true)
+        let mut path = self.root.clone();
+        let mut components = rel.components().peekable();
+        while let Some(component) = components.next() {
+            path.push(component);
+            let directory = components.peek().is_some() || is_dir;
+            let relative = path.strip_prefix(&self.root).unwrap_or(&path);
+            if let Some(exc) = &self.excludes
+                && exclude_matches_path(exc, &relative.to_string_lossy(), directory)
             {
-                continue;
+                return true;
             }
-            stack.push(path);
+            let matched = self.matched(&path, directory);
+            if matched.is_ignore()
+                || (matched.is_none() && component.as_os_str().to_string_lossy().starts_with('.'))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn matched(&self, path: &Path, is_dir: bool) -> ignore::Match<&ignore::gitignore::Glob> {
+        let (mut ordinary, mut git, mut exclude) = (
+            ignore::Match::None,
+            ignore::Match::None,
+            ignore::Match::None,
+        );
+        let mut repository = false;
+        for parent in path.parent().into_iter().flat_map(Path::ancestors) {
+            if let Some(rules) = self.directories.get(parent) {
+                if ordinary.is_none() {
+                    ordinary = rules.ignore.matched(path, is_dir);
+                }
+                if !repository {
+                    if git.is_none() {
+                        git = rules.gitignore.matched(path, is_dir);
+                    }
+                    if exclude.is_none() {
+                        exclude = rules.exclude.matched(path, is_dir);
+                    }
+                }
+                repository |= rules.repository;
+            }
+        }
+        if !ordinary.is_none() {
+            return ordinary;
+        }
+        let git = git.or(exclude);
+        if git.is_none() && repository {
+            self.global.matched(path, is_dir)
+        } else {
+            git
         }
     }
 }

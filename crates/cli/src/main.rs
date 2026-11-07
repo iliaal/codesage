@@ -906,6 +906,18 @@ fn print_version_info() {
     flush_stdio();
 }
 
+fn configure_cli_sigpipe() -> Result<()> {
+    #[cfg(unix)]
+    {
+        // SAFETY: SIG_DFL is a valid disposition, with no Rust signal handler.
+        // MCP transports retain Rust's ignored SIGPIPE disposition.
+        if unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) } == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error()).context("failed to configure CLI SIGPIPE");
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     // SAFETY: first statement of main, before tracing or any worker starts a thread.
     unsafe { codesage_embed::cuda_gemm::apply_default() };
@@ -916,8 +928,8 @@ fn main() {
         .nth(1)
         .is_some_and(|a| a == "-V" || a == "--version");
     if wants_version {
-        print_version_info();
-        std::process::exit(0);
+        let result = configure_cli_sigpipe().map(|()| print_version_info());
+        std::process::exit(exit_code_for(&result));
     }
 
     // Cache runtime discovery before worker startup without loading native libraries.
@@ -926,7 +938,18 @@ fn main() {
     }
     let cli = Cli::parse();
 
-    let result = run(cli);
+    let result = if matches!(
+        &cli.command,
+        Commands::Mcp { .. }
+            | Commands::Daemon {
+                action: None | Some(DaemonAction::Run),
+                ..
+            }
+    ) {
+        run(cli)
+    } else {
+        configure_cli_sigpipe().and_then(|()| run(cli))
+    };
 
     flush_stdio();
 

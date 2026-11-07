@@ -9,6 +9,10 @@ use anyhow::{Result, bail};
 mod control;
 
 #[cfg(unix)]
+#[path = "daemon_proxy.rs"]
+mod proxy;
+
+#[cfg(unix)]
 mod unix {
     use std::{
         ffi::OsString,
@@ -34,7 +38,7 @@ mod unix {
     use rmcp::model::{CallToolRequestParams, ClientRequest, ServerResult};
     use rmcp::service::PeerRequestOptions;
     use tokio::{
-        io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy},
+        io::{AsyncRead, AsyncWrite, ReadBuf},
         net::{UnixListener, UnixStream},
         signal::unix::{SignalKind, signal},
         task::JoinSet,
@@ -48,7 +52,7 @@ mod unix {
     const RETRY_DELAY: Duration = Duration::from_millis(25);
 
     /// Match the waiter's three-round cap while allowing a live child a slow start.
-    const SPAWNER_WAIT_CAP: Duration = START_TIMEOUT.saturating_mul(3);
+    pub(super) const SPAWNER_WAIT_CAP: Duration = START_TIMEOUT.saturating_mul(3);
 
     /// Leave room within `daemon stop`'s 10-second window for cleanup.
     const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
@@ -130,7 +134,7 @@ mod unix {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct DaemonPaths {
+    pub(super) struct DaemonPaths {
         runtime_dir: PathBuf,
         socket: PathBuf,
         control: PathBuf,
@@ -215,7 +219,7 @@ mod unix {
         let paths = DaemonPaths::for_current_exe(runtime_dir)?;
         prepare_runtime_dir(&paths.runtime_dir)?;
         let stream = ensure_daemon(&paths).await?;
-        proxy_stdio(stream, default_project).await
+        super::proxy::run(&paths, stream, default_project).await
     }
 
     /// `codesage daemon status`: print the running daemon's pid + socket
@@ -811,7 +815,7 @@ mod unix {
         }
     }
 
-    async fn ensure_daemon(paths: &DaemonPaths) -> Result<UnixStream> {
+    pub(super) async fn ensure_daemon(paths: &DaemonPaths) -> Result<UnixStream> {
         if let Ok(stream) = UnixStream::connect(&paths.socket).await {
             return Ok(stream);
         }
@@ -1359,51 +1363,10 @@ mod unix {
     /// Exit status for a finished stdio-proxy direction: a copy error means
     /// the far side died mid-stream, so exiting 0 would let a dead daemon
     /// look like a clean EOF to the client.
-    fn proxy_exit_code<E>(res: &Result<(), E>) -> i32 {
+    pub(super) fn proxy_exit_code<E>(res: &Result<(), E>) -> i32 {
         match res {
             Ok(()) => 0,
             Err(_) => 1,
-        }
-    }
-
-    async fn proxy_stdio(stream: UnixStream, default_project: Option<String>) -> Result<()> {
-        let (mut socket_read, mut socket_write) = tokio::io::split(stream);
-        let mut stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
-
-        let stdin_to_socket = async {
-            let res = crate::mcp::pump_lines(&mut stdin, &mut socket_write, default_project).await;
-            let _ = socket_write.shutdown().await;
-            res
-        };
-        let socket_to_stdout = async {
-            let copy_res = copy(&mut socket_read, &mut stdout).await;
-            let _ = stdout.flush().await;
-            copy_res.map(|_| ())
-        };
-        tokio::pin!(stdin_to_socket);
-        tokio::pin!(socket_to_stdout);
-
-        // `try_join!` would hang on open stdin after the daemon disconnects.
-        // Exit directly: dropping tokio's runtime joins the blocking stdin reader,
-        // whose read syscall cannot be cancelled by dropping its future.
-        tokio::select! {
-            res = &mut socket_to_stdout => {
-                if let Err(e) = &res {
-                    tracing::warn!(error = %e, "MCP daemon connection closed with error");
-                }
-                std::process::exit(proxy_exit_code(&res));
-            }
-            res = &mut stdin_to_socket => {
-                if let Err(e) = &res {
-                    tracing::warn!(error = %e, "MCP client stdin closed with error");
-                    std::process::exit(1);
-                }
-                let code = proxy_exit_code(&res);
-                // Stdin EOF: drain in-flight server response, then exit.
-                let _ = socket_to_stdout.await;
-                std::process::exit(code);
-            }
         }
     }
 
@@ -1676,6 +1639,7 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use tokio::io::AsyncWriteExt;
 
         #[tokio::test]
         async fn transport_eof_cancels_service_without_response_drain() {

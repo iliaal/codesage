@@ -139,6 +139,112 @@ fn watch_filter_respects_nested_gitignore_like_discovery() {
 }
 
 #[test]
+fn watch_filter_anchors_nested_patterns_and_preserves_directory_pruning() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    let cases = [
+        ("app.py", true),
+        ("gen/root.rs", true),
+        ("sub/app.py", false),
+        ("sub/gen/generated.rs", false),
+        ("sub/deep/gen/kept.rs", true),
+        ("sub/deep/hidden.py", false),
+        ("sub/deep/keep.py", true),
+        ("sub/blocked/reopened.rs", false),
+        ("sibling/app.py", true),
+        ("sub/.visible/kept.rs", true),
+        ("sub/.hidden/hidden.rs", false),
+    ];
+    for (path, _) in cases {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "fn item() {}\n").unwrap();
+    }
+    std::fs::write(
+        root.join("sub/.gitignore"),
+        "/gen\n*.py\nblocked/\n!.visible/\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("sub/deep/.gitignore"), "!keep.py\n").unwrap();
+    std::fs::write(root.join("sub/blocked/.gitignore"), "!reopened.rs\n").unwrap();
+    let files = discover_files_with_excludes(root, &[]).unwrap();
+    let filter = WatchFilter::new(root, &[]).unwrap();
+    for (path, admitted) in cases {
+        let walked = files.iter().any(|file| file.path == path);
+        assert_eq!(walked, admitted, "walker: {path}");
+        assert_eq!(
+            !filter.is_ignored(&root.join(path), false),
+            walked,
+            "{path}"
+        );
+    }
+    assert!(!filter.is_ignored(&root.join("gen"), true));
+    assert!(filter.is_ignored(&root.join("sub/gen"), true));
+    assert!(filter.is_ignored(&root.join("sub/blocked"), true));
+}
+
+#[test]
+fn watch_filter_matches_ignore_and_global_excludes() {
+    const CHILD: &str = "CODESAGE_TEST_WATCH_IGNORE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let global = home.path().join("global-ignore");
+        std::fs::write(&global, "global.rs\nrestored.rs\n").unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            format!("[core]\nexcludesFile = {}\n", global.display()),
+        )
+        .unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "watch_filter_matches_ignore_and_global_excludes"])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".git/info")).unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join(".git/info/exclude"), "local.rs\nrestored.rs\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "!restored.rs\n!priority.rs\n").unwrap();
+    std::fs::write(root.join(".ignore"), "priority.rs\n").unwrap();
+    std::fs::write(root.join("sub/.ignore"), "/ignored.rs\n").unwrap();
+    let cases = [
+        ("global.rs", false),
+        ("local.rs", false),
+        ("restored.rs", true),
+        ("priority.rs", false),
+        ("ignored.rs", true),
+        ("sub/ignored.rs", false),
+        ("sub/kept.rs", true),
+    ];
+    for (path, _) in cases {
+        std::fs::write(root.join(path), "fn item() {}\n").unwrap();
+    }
+    let files = discover_files_with_excludes(root, &[]).unwrap();
+    let filter = WatchFilter::new(root, &[]).unwrap();
+    for (path, admitted) in cases {
+        let walked = files.iter().any(|file| file.path == path);
+        assert_eq!(walked, admitted, "walker: {path}");
+        assert_eq!(
+            !filter.is_ignored(&root.join(path), false),
+            walked,
+            "{path}"
+        );
+    }
+}
+
+#[test]
 fn hash_changes_on_content_change() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
