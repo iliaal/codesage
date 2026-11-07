@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Result;
-use codesage_protocol::{CallPathReport, CallPathRequest, CallPathStep, ReferenceKind, Symbol};
+use codesage_protocol::{
+    CallPathReport, CallPathRequest, CallPathStep, ReferenceKind, Symbol, SymbolKind,
+};
 use codesage_storage::Database;
 
 use crate::impact::WalkCache;
@@ -14,7 +16,10 @@ use crate::resolver::{ResolveOptions, TargetError, matched_symbols, resolve_symb
 fn is_call_edge(kind: ReferenceKind) -> bool {
     matches!(
         kind,
-        ReferenceKind::Call | ReferenceKind::Instantiation | ReferenceKind::RouteHandler
+        ReferenceKind::Call
+            | ReferenceKind::MacroCall
+            | ReferenceKind::Instantiation
+            | ReferenceKind::RouteHandler
     )
 }
 
@@ -24,12 +29,17 @@ const MAX_VISITED: usize = 4000;
 /// Bound examined call sites per symbol, including cached duplicate names.
 const MAX_REFS_PER_SYMBOL: usize = 200;
 
-/// A definition's identity. `Symbol` carries no id, so key on the triple that
-/// locates one, matching `impact.rs`'s `symbol_identity_key`.
-type SymbolKey = (String, String, u32);
+/// Match the namespace-aware definition identity used by impact walks.
+type SymbolKey = (String, String, u32, u32, SymbolKind);
 
 fn key_of(s: &Symbol) -> SymbolKey {
-    (s.file_path.clone(), s.qualified_name.clone(), s.line_start)
+    (
+        s.file_path.clone(),
+        s.qualified_name.clone(),
+        s.line_start,
+        s.col_start,
+        s.kind,
+    )
 }
 
 /// Breadth-first over callee edges, so the first path found is a shortest one.
@@ -177,7 +187,7 @@ fn callees_of(
     let mut examined = 0usize;
     for r in refs {
         codesage_protocol::work::checkpoint()?;
-        if !is_call_edge(r.kind) {
+        if !is_call_edge(r.kind) || !crate::impact::reference_within_symbol(&r, sym) {
             continue;
         }
         // Exclude nested functions' calls; retain rows whose owner is unknown.
@@ -196,7 +206,7 @@ fn callees_of(
             );
             break;
         }
-        if codesage_protocol::python::is_python_path(&r.from_file) {
+        if crate::impact::needs_reference_resolution(&r) {
             for def in resolver.resolve_reference(db, &r)? {
                 let k = key_of(&def);
                 if seen.insert(k) {
@@ -215,6 +225,8 @@ fn callees_of(
             if def.file_path == sym.file_path
                 && def.qualified_name == sym.qualified_name
                 && def.line_start == sym.line_start
+                && def.col_start == sym.col_start
+                && def.kind == sym.kind
             {
                 continue;
             }

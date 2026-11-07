@@ -6,6 +6,10 @@
 
 ### Fixed
 
+- Rust macro invocations resolve to indexed macros without binding to same-named functions.
+- Constructor calls reach initializers declared by their own class in Python, PHP, JavaScript, and TypeScript while retaining class references.
+- C statement macros without semicolons retain their call references and following calls.
+- C/C++ quoted includes resolve through conventional include roots and leave ambiguous matches unresolved.
 - `codesage-bench` resolves cached reranker artifacts, accepts non-UTF-8 `rg` matches, and keeps control recall out of the CodeSage summary.
 - The Codex adapter installer preserves legacy bench and eval skills reached through symlinked directories.
 - Repository refreshes handle onboarded repositories whose paths contain newlines instead of running `codesage index` in an unrelated directory.

@@ -506,6 +506,8 @@ pub enum ReferenceKind {
     Import,
     Include,
     Call,
+    /// A Rust macro invocation, resolved in the macro namespace.
+    MacroCall,
     Instantiation,
     Inheritance,
     #[serde(alias = "traituse")]
@@ -532,6 +534,7 @@ str_enum!(ReferenceKind {
     Import => "import",
     Include => "include",
     Call => "call",
+    MacroCall => "macro_call",
     Instantiation => "instantiation",
     Inheritance => "inheritance",
     TraitUse => "trait_use",
@@ -3181,6 +3184,23 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ReferenceKind>("\"routehandler\"").unwrap(),
             ReferenceKind::RouteHandler
+        );
+    }
+
+    #[test]
+    fn macro_call_reference_kind_round_trips_storage_and_json() {
+        assert_eq!(ReferenceKind::MacroCall.as_str(), "macro_call");
+        assert_eq!(
+            ReferenceKind::parse("macro_call"),
+            Some(ReferenceKind::MacroCall)
+        );
+        assert_eq!(
+            serde_json::to_string(&ReferenceKind::MacroCall).unwrap(),
+            "\"macro_call\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ReferenceKind>("\"macro_call\"").unwrap(),
+            ReferenceKind::MacroCall
         );
     }
 

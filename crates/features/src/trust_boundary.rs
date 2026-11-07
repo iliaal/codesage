@@ -17,7 +17,7 @@ use crate::trust_boundary_rules::{TrustBoundaryRule, rule_matches, rules_for};
 /// Derive the set of trust boundaries crossed by a file from its parsed
 /// references. Sorted, deduped, language-aware (C++ inherits C rules).
 ///
-/// Uses `Import`, `Include`, `Call`, `TypeHint`, and Python `ImportBinding`
+/// Uses `Import`, `Include`, `Call`, `MacroCall`, `TypeHint`, and Python `ImportBinding`
 /// references. Excludes inheritance and trait uses to avoid treating ordinary
 /// traits such as Rust's `Debug` as boundary signals.
 pub fn derive_from_refs(refs: &[Reference], language: Language) -> Vec<TrustBoundary> {
@@ -163,6 +163,7 @@ fn ref_kind_signals_boundary(kind: ReferenceKind) -> bool {
         ReferenceKind::Import
             | ReferenceKind::Include
             | ReferenceKind::Call
+            | ReferenceKind::MacroCall
             | ReferenceKind::TypeHint
     )
 }
@@ -260,6 +261,18 @@ mod tests {
             ..imp("socket")
         };
         assert!(derive_from_refs(&[reference], Language::Python).contains(&TrustBoundary::Network));
+    }
+
+    #[test]
+    fn rust_macro_calls_retain_boundary_signals() {
+        let source = b"fn run() { sqlx::query!(\"SELECT 1\"); }";
+        let tree = parse_file(source, Language::Rust).unwrap();
+        let refs = extract_references(&tree, source, Language::Rust, "main.rs").unwrap();
+        assert!(
+            refs.iter()
+                .any(|reference| reference.kind == ReferenceKind::MacroCall)
+        );
+        assert!(derive_from_refs(&refs, Language::Rust).contains(&TrustBoundary::Database));
     }
 
     #[test]

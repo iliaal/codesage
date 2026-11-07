@@ -288,6 +288,13 @@ impl Builder<'_> {
                         recover: expand.clone(),
                     });
                 }
+                if matches!(name, "references" | "callees") && self.cache.context_capped() {
+                    completeness = Some(DescribeIncomplete {
+                        kind: "bounded".into(),
+                        reason: "reference_resolution_limit".into(),
+                        recover: expand.clone(),
+                    });
+                }
                 DescribeSection {
                     data,
                     expand,
@@ -454,11 +461,9 @@ impl Builder<'_> {
                         .into_iter()
                         .map(|s| s.file_path),
                 );
-                targets.extend(
-                    crate::bundle::path_import_candidates(name, path)
-                        .into_iter()
-                        .filter(|p| indexed.contains(p)),
-                );
+                targets.extend(crate::bundle::resolved_path_import_candidates(
+                    name, path, &indexed,
+                ));
             }
             targets.extend(modules.candidates(path, name).unwrap_or_default());
             if let Some((package, rest)) = name.split_once("::")
@@ -605,7 +610,7 @@ impl Builder<'_> {
             let mut callers = BTreeMap::<String, usize>::new();
             for reference in refs.iter() {
                 counts.entry(reference.kind.as_str()).or_default()[usize::from(reference.is_test)] += 1;
-                if reference.kind == ReferenceKind::Call && let Some(caller) = reference.from_handle() { *callers.entry(caller.to_string()).or_default() += 1; }
+                if matches!(reference.kind, ReferenceKind::Call | ReferenceKind::MacroCall | ReferenceKind::Instantiation) && let Some(caller) = reference.from_handle() { *callers.entry(caller.to_string()).or_default() += 1; }
             }
             let mut callers: Vec<_> = callers.into_iter().collect();
             callers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -614,8 +619,8 @@ impl Builder<'_> {
         self.section("callees", self.expansion("bundle", json!({"target": handle, "include_callees": true})), budget, |b| {
             let refs = b.db.references_in_file_range(&symbol.file_path, symbol.line_start, symbol.line_end)?;
             let mut callees = BTreeSet::new();
-            for reference in refs.iter().filter(|r| r.kind == ReferenceKind::Call && r.from_symbol.as_deref() == Some(symbol.qualified_name.as_str())) {
-                for callee in b.cache.resolve_symbols(b.db, &symbol.file_path, &reference.to_name)? { callees.insert(callee.handle().to_string()); }
+            for reference in refs.iter().filter(|r| matches!(r.kind, ReferenceKind::Call | ReferenceKind::MacroCall | ReferenceKind::Instantiation) && r.from_symbol.as_deref() == Some(symbol.qualified_name.as_str()) && crate::impact::reference_within_symbol(r, symbol)) {
+                for callee in b.cache.resolve_reference(b.db, reference)? { callees.insert(callee.handle().to_string()); }
             }
             Ok(json!({"total": callees.len(), "top": callees.into_iter().take(row_limit(b.options.detail)).collect::<Vec<_>>(), "counts_floor": true}))
         })?;

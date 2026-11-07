@@ -262,7 +262,7 @@ pub struct FindReferencesParams {
     #[schemars(description = SYMBOL_TARGET_DESC)]
     pub target: Option<String>,
     #[schemars(
-        description = "Filter by reference kind: import, include, call, instantiation, inheritance, trait_use, type_hint, route_handler"
+        description = "Filter by reference kind: import, include, call, macro_call, instantiation, inheritance, trait_use, type_hint, route_handler"
     )]
     pub kind: Option<ReferenceKind>,
 }
@@ -1017,6 +1017,7 @@ mod tests {
             "import",
             "include",
             "call",
+            "macro_call",
             "instantiation",
             "inheritance",
             "trait_use",

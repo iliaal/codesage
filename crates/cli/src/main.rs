@@ -128,7 +128,7 @@ enum Commands {
     FindReferences {
         /// Symbol name to find references for
         name: String,
-        /// Filter by kind (import, include, call, instantiation, inheritance, trait_use, type_hint)
+        /// Filter by kind (import, include, call, macro_call, instantiation, inheritance, trait_use, type_hint)
         #[arg(long)]
         kind: Option<String>,
         /// Output as JSON

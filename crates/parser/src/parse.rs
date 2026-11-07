@@ -133,6 +133,21 @@ pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTr
     parser.set_language(&ts_language(language))?;
     let prepared = prepare_c_family(source, language)?;
     let input = prepared.as_deref().unwrap_or(source);
+    let mut tree = parse_with_control(&mut parser, input)?;
+    if language == Language::C
+        && tree.root_node().has_error()
+        && let Some(recovered) = recover_c_statement_macros(&mut parser, &tree, input)?
+    {
+        tree = recovered;
+    }
+    if language == Language::Java {
+        validate_java_depth(&tree)?;
+    }
+    let degraded = tree.root_node().has_error();
+    Ok(ParsedTree { tree, degraded })
+}
+
+fn parse_with_control(parser: &mut Parser, input: &[u8]) -> Result<Tree> {
     let control = codesage_protocol::work::current();
     let mut progress = |_: &tree_sitter::ParseState| {
         if control
@@ -150,12 +165,127 @@ pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTr
         Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
     );
     codesage_protocol::work::checkpoint()?;
-    let tree = tree.ok_or_else(|| anyhow::anyhow!("tree-sitter parsing failed"))?;
-    if language == Language::Java {
-        validate_java_depth(&tree)?;
+    tree.ok_or_else(|| anyhow::anyhow!("tree-sitter parsing failed"))
+}
+
+fn recover_c_statement_macros(
+    parser: &mut Parser,
+    tree: &Tree,
+    source: &[u8],
+) -> Result<Option<Tree>> {
+    let mut insertions = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        codesage_protocol::work::checkpoint()?;
+        if let Some(end) = c_statement_macro_end(cursor.node(), source) {
+            insertions.push(end);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return reparse_c_statement_macros(parser, source, &insertions);
+            }
+        }
     }
-    let degraded = tree.root_node().has_error();
-    Ok(ParsedTree { tree, degraded })
+}
+
+fn c_statement_macro_end(
+    declaration: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<(usize, tree_sitter::Point)> {
+    use crate::export_macro::{Kind, Lexer};
+
+    if declaration.kind() != "declaration"
+        || !declaration.has_error()
+        || declaration.parent()?.kind() != "compound_statement"
+    {
+        return None;
+    }
+    let macro_type = declaration.child_by_field_name("type")?;
+    if macro_type.kind() != "macro_type_specifier"
+        || macro_type.has_error()
+        || macro_type.start_byte() != declaration.start_byte()
+    {
+        return None;
+    }
+    let name = macro_type.child_by_field_name("name")?;
+    let name = source.get(name.byte_range())?;
+    if !name.iter().any(u8::is_ascii_uppercase)
+        || !name
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
+        return None;
+    }
+    let before = source.get(..macro_type.start_byte())?;
+    let line_start = before
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |i| i + 1);
+    if !before[line_start..].iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
+    let after = source.get(macro_type.end_byte()..declaration.end_byte())?;
+    let next = Lexer::new(after).next()?;
+    if next.kind != Kind::Ident || !after[..next.start].contains(&b'\n') {
+        return None;
+    }
+    // A following statement keyword rules out a macro-wrapped type declaration.
+    if !matches!(
+        &after[next.start..next.end],
+        b"return"
+            | b"break"
+            | b"continue"
+            | b"goto"
+            | b"if"
+            | b"for"
+            | b"while"
+            | b"switch"
+            | b"do"
+    ) {
+        return None;
+    }
+    Some((macro_type.end_byte(), macro_type.end_position()))
+}
+
+fn reparse_c_statement_macros(
+    parser: &mut Parser,
+    source: &[u8],
+    insertions: &[(usize, tree_sitter::Point)],
+) -> Result<Option<Tree>> {
+    if insertions.is_empty() {
+        return Ok(None);
+    }
+    let mut prepared = Vec::with_capacity(source.len() + insertions.len());
+    let mut copied = 0;
+    for &(offset, _) in insertions {
+        prepared.extend_from_slice(&source[copied..offset]);
+        prepared.push(b';');
+        copied = offset;
+    }
+    prepared.extend_from_slice(&source[copied..]);
+    let mut tree = parse_with_control(parser, &prepared)?;
+    // Extractors always slice the original bytes. Removing the inserted bytes
+    // from the tree restores their offsets, including CRLF and unindented lines.
+    for (delta, &(offset, point)) in insertions.iter().enumerate().rev() {
+        tree.edit(&tree_sitter::InputEdit {
+            start_byte: offset + delta,
+            old_end_byte: offset + delta + 1,
+            new_end_byte: offset + delta,
+            start_position: point,
+            old_end_position: tree_sitter::Point {
+                row: point.row,
+                column: point.column + 1,
+            },
+            new_end_position: point,
+        });
+    }
+    Ok(Some(tree))
 }
 
 fn validate_java_depth(tree: &Tree) -> Result<()> {

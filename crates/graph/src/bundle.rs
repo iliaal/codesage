@@ -797,7 +797,7 @@ fn add_callees_for_symbol(
         if related.len() >= limit {
             break;
         }
-        if !is_callee_reference(r.kind) {
+        if !is_callee_reference(r.kind) || !crate::impact::reference_within_symbol(&r, sym) {
             continue;
         }
         for def in cache.resolve_reference(db, &r)? {
@@ -847,7 +847,7 @@ pub(crate) fn resolve_callee_definitions_with_imports(
     } else {
         crate::rust_modules::RustModules::default()
     };
-    resolve_callee_definitions_with_modules(db, caller_file, to_name, load_imports, &modules)
+    resolve_callee_definitions_with_modules(db, caller_file, to_name, load_imports, &modules, None)
 }
 
 pub(crate) fn resolve_callee_definitions_with_modules(
@@ -856,10 +856,12 @@ pub(crate) fn resolve_callee_definitions_with_modules(
     to_name: &str,
     load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
     modules: &crate::rust_modules::RustModules,
+    kind: Option<ReferenceKind>,
 ) -> Result<Vec<Symbol>> {
     if caller_file.ends_with(".rs")
-        && let Some(resolved) = modules.external_definitions(db, caller_file, to_name)?
+        && let Some(mut resolved) = modules.external_definitions(db, caller_file, to_name)?
     {
+        resolved.retain(|symbol| reference_kind_admits(caller_file, kind, symbol));
         return Ok(resolved);
     }
     if codesage_protocol::python::is_python_path(caller_file) {
@@ -887,12 +889,14 @@ pub(crate) fn resolve_callee_definitions_with_modules(
     // count, so a homonym set the gate thins to one survivor still owes the
     // same import evidence as the full set did.
     let mut all_candidates = db.find_symbols(to_name, None)?;
+    all_candidates.retain(|symbol| reference_kind_admits(caller_file, kind, symbol));
     let mut module_qualified = false;
     if caller_file.ends_with(".rs")
         && all_candidates.is_empty()
         && let Some((_, tail)) = to_name.rsplit_once("::")
     {
-        let tail_candidates = db.find_symbols(tail, None)?;
+        let mut tail_candidates = db.find_symbols(tail, None)?;
+        tail_candidates.retain(|symbol| reference_kind_admits(caller_file, kind, symbol));
         let mut seen = HashSet::new();
         let mut ambiguous = HashSet::new();
         for symbol in &tail_candidates {
@@ -913,7 +917,10 @@ pub(crate) fn resolve_callee_definitions_with_modules(
     }
     let caller_language =
         codesage_parser::detect::detect_language(std::path::Path::new(caller_file));
-    all_candidates.retain(|symbol| language_admits(caller_file, caller_language, symbol));
+    all_candidates.retain(|symbol| {
+        language_admits(caller_file, caller_language, symbol)
+            && reference_kind_admits(caller_file, kind, symbol)
+    });
     let total_candidates = all_candidates.len();
     let candidates: Vec<Symbol> = all_candidates
         .into_iter()
@@ -973,6 +980,21 @@ pub(crate) fn resolve_callee_definitions_with_modules(
         })
         .collect();
     Ok(filtered)
+}
+
+pub(crate) fn reference_kind_admits(
+    caller_file: &str,
+    kind: Option<ReferenceKind>,
+    symbol: &Symbol,
+) -> bool {
+    if !caller_file.ends_with(".rs") {
+        return true;
+    }
+    match kind {
+        Some(ReferenceKind::MacroCall) => symbol.kind == SymbolKind::Macro,
+        Some(ReferenceKind::Call) => symbol.kind != SymbolKind::Macro,
+        _ => true,
+    }
 }
 
 fn language_admits(caller_file: &str, caller: Option<Language>, symbol: &Symbol) -> bool {
@@ -1284,7 +1306,9 @@ pub(crate) fn import_ref_targets_file(
     // A bare JavaScript/TypeScript specifier (`lodash/fp`, `lib/b.js`) names a
     // package or a `baseUrl`/`paths` mapping, neither of which is modelled.
     importer_dialect(importer_file) == ImporterDialect::CFamily
-        && quoted_include_candidates(import_ref, importer_file).any(|c| c == target_file)
+        && quoted_include_candidates(import_ref, importer_file)
+            .iter()
+            .any(|c| c == target_file)
 }
 
 /// How an importer's directives name files, from its extension.
@@ -1307,31 +1331,43 @@ fn importer_dialect(importer_file: &str) -> ImporterDialect {
     }
 }
 
-/// Quoted-include style: `util.h` or `sub/foo.h`. Resolve against the
-/// includer's directory, then the project root, both exact and in that
-/// order. No stem or suffix match: `sub/foo.h` must not claim every
-/// `*/sub/foo.h` in the project. Includes reached through other `-I` paths
-/// stay unresolved, and a system include (`<stdio.h>`, stored with its
-/// brackets) names no project file.
-fn quoted_include_candidates<'a>(
-    import_ref: &'a str,
-    importer_file: &str,
-) -> impl Iterator<Item = String> + 'a {
-    let applies =
-        !import_ref.starts_with('<') && (import_ref.contains('/') || import_ref.contains('.'));
+/// Conventional quoted-include candidates, without assuming compiler flags.
+/// Only the includer's own directory has known precedence; indexed fallback
+/// candidates must be checked for ambiguity before becoming edges.
+fn quoted_include_candidates(import_ref: &str, importer_file: &str) -> Vec<String> {
+    if import_ref.starts_with(['<', '/']) || !(import_ref.contains('/') || import_ref.contains('.'))
+    {
+        return Vec::new();
+    }
     let base = importer_file.rsplit_once('/').map_or("", |(dir, _)| dir);
-    let joined = applies.then(|| lexical_join(base, import_ref)).flatten();
-    joined
-        .into_iter()
-        .chain(applies.then(|| import_ref.to_string()))
+    let mut candidates: Vec<String> = lexical_join(base, import_ref).into_iter().collect();
+    candidates.extend(lexical_join("", import_ref));
+    let mut ancestor = base;
+    loop {
+        let include = if ancestor.is_empty() {
+            "include".to_string()
+        } else {
+            format!("{ancestor}/include")
+        };
+        candidates.extend(lexical_join(&include, import_ref));
+        if ancestor.is_empty() {
+            break;
+        }
+        ancestor = ancestor.rsplit_once('/').map_or("", |(parent, _)| parent);
+    }
+    candidates.extend(lexical_join("src", import_ref));
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
+    candidates
 }
 
 /// The indexed paths a JavaScript/TypeScript module specifier or a C/C++
-/// include may name, in the order the language's resolver tries them. For a
+/// include may name. JavaScript/TypeScript retain resolver order; C/C++
+/// conventional roots after the includer's directory have unknown precedence. For a
 /// JS/TS or C/C++ importer and a specifier without `::`,
 /// `import_ref_targets_file(spec, importer, t)` holds exactly when `t` is in
-/// this list, so `list_dependencies` keeps every candidate while a consumer
-/// that needs the one file actually loaded takes the first indexed entry.
+/// this list. Indexed consumers must use [`indexed_path_import_candidates`]
+/// or [`resolved_path_import_candidates`] to apply C/C++ selection and ambiguity.
 /// Every other importer (Rust, Go, Python, ...) yields nothing. May repeat a path.
 pub(crate) fn path_import_candidates(import_ref: &str, importer_file: &str) -> Vec<String> {
     let dialect = importer_dialect(importer_file);
@@ -1346,9 +1382,58 @@ pub(crate) fn path_import_candidates(import_ref: &str, importer_file: &str) -> V
                 .unwrap_or_default()
         }
         ImporterDialect::CFamily if !import_ref.contains("::") => {
-            quoted_include_candidates(import_ref, importer_file).collect()
+            quoted_include_candidates(import_ref, importer_file)
         }
         _ => Vec::new(),
+    }
+}
+
+pub(crate) fn indexed_path_import_candidates(
+    import_ref: &str,
+    importer_file: &str,
+    indexed: &HashSet<String>,
+) -> Vec<String> {
+    let candidates = path_import_candidates(import_ref, importer_file);
+    let base = importer_file.rsplit_once('/').map_or("", |(dir, _)| dir);
+    if importer_dialect(importer_file) == ImporterDialect::CFamily
+        && let Some(local) = lexical_join(base, import_ref)
+        && candidates.first() == Some(&local)
+        && indexed.contains(&local)
+    {
+        return vec![local];
+    }
+    candidates
+        .into_iter()
+        .filter(|candidate| indexed.contains(candidate))
+        .collect()
+}
+
+pub(crate) fn resolved_path_import_candidates(
+    import_ref: &str,
+    importer_file: &str,
+    indexed: &HashSet<String>,
+) -> Vec<String> {
+    let candidates = indexed_path_import_candidates(import_ref, importer_file, indexed);
+    if importer_dialect(importer_file) == ImporterDialect::CFamily && candidates.len() > 1 {
+        Vec::new()
+    } else {
+        candidates
+    }
+}
+
+pub(crate) fn import_ref_targets_file_with_indexed(
+    import_ref: &str,
+    importer_file: &str,
+    target_file: &str,
+    modules: &crate::rust_modules::RustModules,
+    indexed: &HashSet<String>,
+) -> bool {
+    if importer_dialect(importer_file) == ImporterDialect::CFamily {
+        resolved_path_import_candidates(import_ref, importer_file, indexed)
+            .iter()
+            .any(|candidate| candidate == target_file)
+    } else {
+        import_ref_targets_file_with_modules(import_ref, importer_file, target_file, modules)
     }
 }
 
@@ -1563,6 +1648,7 @@ pub(crate) fn is_callee_reference(kind: ReferenceKind) -> bool {
     matches!(
         kind,
         ReferenceKind::Call
+            | ReferenceKind::MacroCall
             | ReferenceKind::Instantiation
             | ReferenceKind::Import
             | ReferenceKind::ImportBinding
@@ -1679,7 +1765,7 @@ mod import_path_tests {
         assert_eq!(path_import_candidates("./b", "lib/a.js")[1], "lib/b.js");
         assert_eq!(
             path_import_candidates("x.h", "src/main.c"),
-            vec!["src/x.h".to_string(), "x.h".to_string()]
+            vec!["src/x.h", "x.h", "src/include/x.h", "include/x.h"]
         );
     }
 

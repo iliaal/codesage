@@ -10,7 +10,7 @@ use codesage_protocol::{
 use codesage_storage::Database;
 
 use crate::bundle::{
-    import_ref_targets_file_with_modules, import_ref_targets_symbol_with_modules,
+    import_ref_targets_file_with_indexed, import_ref_targets_symbol_with_modules,
     import_refs_for_file, resolve_callee_definitions_with_modules,
 };
 use crate::impact::is_qualified_symbol_name;
@@ -111,7 +111,7 @@ pub fn find_references_with_budget(
         rows
     };
     let definition_count = definitions.len();
-    let to_resolution = attach_handles(db, &mut results, &definitions, to_budget)?;
+    let to_resolution = attach_handles(db, &mut results, &definitions, req.kind, to_budget)?;
     let ambiguous = definition_count > 1;
     // The name the rows are keyed on, which is the spelling itself when the
     // query used it: a qualified input keeps `Foo::run`, while a `sym:`
@@ -224,14 +224,15 @@ const TO_RESOLUTION_BUDGET: Duration = Duration::from_millis(750);
 /// because nothing else shares the name (the rule `impact_analysis` relies
 /// on), so the candidate is accepted only when the spelling is qualified and
 /// equals its qualified name, when it lives in the caller's file, or when the
-/// caller file imports it. Resolution is cached per (caller file, spelling),
+/// caller file imports it. Resolution is cached per (caller file, spelling, kind),
 /// stops after [`MAX_TO_RESOLUTION_PAIRS`] distinct pairs, and stops at
 /// `budget`; either stop is reported through [`ToResolution`] and rows after
 /// it carry no `to`.
 fn attach_handles(
     db: &Database,
-    rows: &mut [Reference],
+    rows: &mut Vec<Reference>,
     definitions: &[Symbol],
+    kind: Option<ReferenceKind>,
     budget: Duration,
 ) -> Result<Option<ToResolution>> {
     let mut caches = EvidenceCaches::new(db);
@@ -261,7 +262,8 @@ fn attach_handles(
         [only] => Some(only),
         _ => None,
     };
-    let mut resolved: HashMap<(String, String), Option<String>> = HashMap::new();
+    let mut resolved: HashMap<(String, String, ReferenceKind), Option<String>> = HashMap::new();
+    let mut resolved_pairs = HashSet::new();
     let mut capped = false;
     for row in rows.iter_mut() {
         codesage_protocol::work::checkpoint()?;
@@ -273,8 +275,8 @@ fn attach_handles(
             if row.kind == ReferenceKind::Import {
                 continue;
             }
-            let key = (row.from_file.clone(), row.to_name.clone());
-            if !resolved.contains_key(&key) && resolved.len() >= MAX_TO_RESOLUTION_PAIRS {
+            let pair = (row.from_file.clone(), row.to_name.clone());
+            if !resolved_pairs.contains(&pair) && resolved_pairs.len() >= MAX_TO_RESOLUTION_PAIRS {
                 capped = true;
                 continue;
             }
@@ -284,7 +286,7 @@ fn attach_handles(
                 [only] => Some(only.handle().to_string()),
                 _ => None,
             };
-            resolved.entry(key).or_insert(None);
+            resolved_pairs.insert(pair);
             continue;
         }
         if crate::bundle::is_package_import(row.kind, &row.from_file, &row.to_name) {
@@ -294,16 +296,18 @@ fn attach_handles(
         if let Some(only) = sole_definition
             && only.file_path == row.from_file
             && spelling_names(&row.to_name, only)
+            && crate::bundle::reference_kind_admits(&row.from_file, Some(row.kind), only)
         {
             row.to = Some(only.handle().to_string());
             continue;
         }
-        let key = (row.from_file.clone(), row.to_name.clone());
+        let pair = (row.from_file.clone(), row.to_name.clone());
+        let key = (row.from_file.clone(), row.to_name.clone(), row.kind);
         if let Some(cached) = resolved.get(&key) {
             row.to = cached.clone();
             continue;
         }
-        if resolved.len() >= MAX_TO_RESOLUTION_PAIRS {
+        if !resolved_pairs.contains(&pair) && resolved_pairs.len() >= MAX_TO_RESOLUTION_PAIRS {
             capped = true;
             continue;
         }
@@ -319,6 +323,7 @@ fn attach_handles(
             &row.to_name,
             &mut || caches.imports(from_file),
             &modules,
+            Some(row.kind),
         )?;
         capped |= modules.capped();
         let handle = match candidates.as_slice() {
@@ -328,10 +333,59 @@ fn attach_handles(
             _ => None,
         };
         row.to = handle.clone();
+        resolved_pairs.insert(pair);
         resolved.insert(key, handle);
     }
+    let mut constructors = crate::construction::Constructors::default();
+    let mut resolver = crate::impact::WalkCache::default();
+    let mut added = HashSet::new();
+    for definition in definitions {
+        if Instant::now() >= deadline {
+            capped = true;
+            break;
+        }
+        let Some(owner) = constructors.owner(db, definition)? else {
+            continue;
+        };
+        for mut row in db.find_references(&owner.name, kind)? {
+            if !matches!(row.kind, ReferenceKind::Call | ReferenceKind::Instantiation) {
+                continue;
+            }
+            codesage_protocol::work::checkpoint()?;
+            if Instant::now() >= deadline {
+                capped = true;
+                break;
+            }
+            let pair = (row.from_file.clone(), row.to_name.clone());
+            if !resolved_pairs.contains(&pair) && resolved_pairs.len() >= MAX_TO_RESOLUTION_PAIRS {
+                capped = true;
+                continue;
+            }
+            resolved_pairs.insert(pair);
+            let candidates = resolver.resolve_reference(db, &row)?;
+            if !candidates
+                .iter()
+                .any(|s| crate::construction::same_symbol(s, definition))
+            {
+                continue;
+            }
+            let handle = definition.handle().to_string();
+            if !added.insert((row.from_file.clone(), row.line, row.col, handle.clone())) {
+                continue;
+            }
+            if let Some(caller) = row.from_symbol.as_deref() {
+                row.from_line =
+                    enclosing_definition(&caches.symbols(&row.from_file)?, caller, row.line)
+                        .filter(|s| s.overloaded)
+                        .map(|s| s.line_start);
+            }
+            row.to = Some(handle);
+            rows.push(row);
+        }
+    }
+    capped |= resolver.context_capped();
     Ok(capped.then_some(ToResolution {
-        resolved_pairs: resolved.len(),
+        resolved_pairs: resolved_pairs.len(),
         capped,
     }))
 }
@@ -522,8 +576,8 @@ fn names_owner(import: &str, owner: &str) -> bool {
 
 fn is_c_family(path: &str) -> bool {
     matches!(
-        path.rsplit_once('.').map(|(_, ext)| ext),
-        Some("c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx")
+        codesage_parser::detect::detect_language(std::path::Path::new(path)),
+        Some(codesage_protocol::Language::C | codesage_protocol::Language::Cpp)
     )
 }
 
@@ -565,8 +619,36 @@ pub fn list_dependencies(db: &Database, file_path: &str) -> Result<DependencyEnt
 
 /// Resolve dependencies in input order, sharing one project-wide import query.
 pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec<DependencyEntry>> {
-    let all_refs = db.import_include_refs_all()?;
-    let modules = crate::rust_modules::RustModules::from_imports(db, &all_refs)?;
+    let all_refs = db.file_import_references()?;
+    let pairs: Vec<_> = all_refs
+        .iter()
+        .map(|row| (row.from_file.clone(), row.to_name.clone()))
+        .collect();
+    let modules = crate::rust_modules::RustModules::from_imports(db, &pairs)?;
+    let mut symbol_imports: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut symbols: HashMap<String, Vec<Symbol>> = HashMap::new();
+    for row in all_refs
+        .iter()
+        .filter(|row| row.kind == ReferenceKind::Import && is_c_family(&row.from_file))
+    {
+        if !symbols.contains_key(&row.to_name) {
+            symbols.insert(row.to_name.clone(), db.find_symbols(&row.to_name, None)?);
+        }
+        let candidates = &symbols[&row.to_name];
+        for candidate in candidates {
+            let exact = candidate.qualified_name == row.to_name;
+            let unique_name = candidate.name == row.to_name
+                && candidates.iter().all(|other| {
+                    other.name != row.to_name || other.file_path == candidate.file_path
+                });
+            if exact || unique_name {
+                symbol_imports
+                    .entry(candidate.file_path.clone())
+                    .or_default()
+                    .insert(row.from_file.clone());
+            }
+        }
+    }
     let indexed: HashSet<String> = db.all_file_paths()?.into_iter().collect();
     let probes = codesage_storage::db::PythonPackageProbes::default();
     let mut out = Vec::with_capacity(file_paths.len());
@@ -574,7 +656,7 @@ pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec
         let mut entry = db.list_file_dependencies(file_path)?;
         if entry.found {
             crate::dependencies::resolve_outgoing(db, &mut entry, &modules, &indexed, &probes)?;
-            resolve_path_imported_by(&mut entry, &all_refs, &modules);
+            resolve_path_imported_by(&mut entry, &pairs, &modules, &indexed, &symbol_imports);
             if let Some(note) = modules.note(&entry.file_path, &entry.imported_by) {
                 entry.note = Some(match entry.note.take() {
                     Some(existing) => format!("{existing} {note}"),
@@ -592,7 +674,18 @@ fn resolve_path_imported_by(
     entry: &mut DependencyEntry,
     all_refs: &[(String, String)],
     modules: &crate::rust_modules::RustModules,
+    indexed: &HashSet<String>,
+    symbol_imports: &HashMap<String, HashSet<String>>,
 ) {
+    entry.imported_by.retain(|path| !is_c_family(path));
+    if let Some(importers) = symbol_imports.get(&entry.file_path) {
+        entry.imported_by.extend(
+            importers
+                .iter()
+                .filter(|path| *path != &entry.file_path)
+                .cloned(),
+        );
+    }
     let mut known: HashSet<String> = entry.imported_by.iter().cloned().collect();
     known.insert(entry.file_path.clone());
     for (from_path, to_name) in all_refs {
@@ -602,7 +695,13 @@ fn resolve_path_imported_by(
         if known.contains(from_path) {
             continue;
         }
-        if import_ref_targets_file_with_modules(to_name, from_path, &entry.file_path, modules) {
+        if import_ref_targets_file_with_indexed(
+            to_name,
+            from_path,
+            &entry.file_path,
+            modules,
+            indexed,
+        ) {
             known.insert(from_path.clone());
             entry.imported_by.push(from_path.clone());
         }

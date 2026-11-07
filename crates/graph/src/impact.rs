@@ -6,12 +6,12 @@ use anyhow::Result;
 use codesage_protocol::{
     CategoryCount, DistanceCount, FileCategory, Handle, ImpactEntry, ImpactOptions, ImpactReason,
     ImpactReport, ImpactRequest, ImpactSummary, ImpactTarget, Reference, ReferenceKind,
-    SiblingSymbol, Symbol, TargetKind, TargetResolution,
+    SiblingSymbol, Symbol, SymbolKind, TargetKind, TargetResolution,
 };
 use codesage_storage::Database;
 
 use crate::bundle::{
-    import_ref_targets_file_with_modules, import_refs_for_file, resolve_callee_definitions,
+    import_ref_targets_file_with_indexed, import_refs_for_file, resolve_callee_definitions,
     resolve_callee_definitions_with_modules,
 };
 use crate::resolver::{ResolveOptions, TargetError, matched_symbols, resolve_symbols};
@@ -99,14 +99,14 @@ pub(crate) struct WalkOutcome {
     pub seed_count: usize,
 }
 
-type DefinitionKey = (String, String, u32);
+type DefinitionKey = (String, String, u32, u32, SymbolKind);
 type ResolvedDefinitions = Arc<Vec<DefinitionKey>>;
 
 /// Request-local resolved edges shared across walks with different frontier
 /// and work limits. Admission is still charged on cache hits.
 #[derive(Default)]
 pub(crate) struct WalkCache {
-    references: HashMap<(String, String, u32), Arc<Vec<Reference>>>,
+    references: HashMap<DefinitionKey, Arc<Vec<Reference>>>,
     resolutions: HashMap<(String, String), ResolvedDefinitions>,
     caller_imports: HashMap<String, Arc<Vec<String>>>,
     reference_bytes: usize,
@@ -116,6 +116,8 @@ pub(crate) struct WalkCache {
     python_imports: HashMap<codesage_protocol::python::PythonImportSite, Arc<Vec<String>>>,
     import_matches: HashMap<String, Arc<Vec<usize>>>,
     rust_modules: Option<Arc<crate::rust_modules::RustModules>>,
+    constructors: crate::construction::Constructors,
+    reference_candidates: Option<((String, String, ReferenceKind), Vec<Symbol>)>,
     #[cfg(test)]
     hits: usize,
     #[cfg(test)]
@@ -158,7 +160,7 @@ impl WalkCache {
             }
             return Ok(Arc::clone(rows));
         }
-        let raw = db.find_references(&sym.name, None)?;
+        let raw = crate::construction::references_for_symbol(db, sym)?;
         let rows = Arc::new(resolve_references_to_symbol(db, sym, raw, Some(self))?);
         let bytes = rows.iter().fold(
             rows.capacity()
@@ -209,23 +211,7 @@ impl WalkCache {
         if let Some(targets) = self.python_imports.get(&key) {
             return Ok(Arc::clone(targets));
         }
-        let indexed = match &self.python_indexed {
-            Some(indexed) => Arc::clone(indexed),
-            None => {
-                let indexed = Arc::new(db.all_file_paths()?.into_iter().collect::<HashSet<_>>());
-                let bytes = indexed.iter().fold(
-                    indexed
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<String>()),
-                    |bytes, path| bytes.saturating_add(path.capacity()),
-                );
-                if bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes) {
-                    self.reference_bytes += bytes;
-                    self.python_indexed = Some(Arc::clone(&indexed));
-                }
-                indexed
-            }
-        };
+        let indexed = self.indexed_files(db)?;
         let targets =
             Arc::new(db.python_import_targets_indexed(row, &indexed, &self.python_probes)?);
         let bytes = targets.iter().fold(
@@ -246,10 +232,31 @@ impl WalkCache {
         Ok(targets)
     }
 
+    fn indexed_files(&mut self, db: &Database) -> Result<Arc<HashSet<String>>> {
+        Ok(match &self.python_indexed {
+            Some(indexed) => Arc::clone(indexed),
+            None => {
+                let indexed = Arc::new(db.all_file_paths()?.into_iter().collect::<HashSet<_>>());
+                let bytes = indexed.iter().fold(
+                    indexed
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                    |bytes, path| bytes.saturating_add(path.capacity()),
+                );
+                if bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes) {
+                    self.reference_bytes += bytes;
+                    self.python_indexed = Some(Arc::clone(&indexed));
+                }
+                indexed
+            }
+        })
+    }
+
     pub(crate) fn context_capped(&self) -> bool {
         self.rust_modules
             .as_ref()
             .is_some_and(|modules| modules.capped())
+            || self.constructors.capped()
     }
 
     pub(crate) fn resolve_symbols(
@@ -257,6 +264,16 @@ impl WalkCache {
         db: &Database,
         caller_file: &str,
         spelling: &str,
+    ) -> Result<Vec<Symbol>> {
+        self.resolve_symbols_for_kind(db, caller_file, spelling, None)
+    }
+
+    fn resolve_symbols_for_kind(
+        &mut self,
+        db: &Database,
+        caller_file: &str,
+        spelling: &str,
+        kind: Option<ReferenceKind>,
     ) -> Result<Vec<Symbol>> {
         let modules = if caller_file.ends_with(".rs") {
             self.rust_modules(db)?
@@ -269,6 +286,7 @@ impl WalkCache {
             spelling,
             &mut || self.caller_imports(db, caller_file),
             &modules,
+            kind,
         )
     }
 
@@ -277,10 +295,32 @@ impl WalkCache {
         db: &Database,
         row: &Reference,
     ) -> Result<Vec<Symbol>> {
-        if let Some(resolved) = crate::python_bindings::resolve_reference(db, row)? {
-            return Ok(resolved);
-        }
-        self.resolve_symbols(db, &row.from_file, &row.to_name)
+        let mut resolved = match crate::python_bindings::resolve_reference(db, row)? {
+            Some(resolved) => resolved,
+            None => {
+                let key = (row.from_file.clone(), row.to_name.clone(), row.kind);
+                if self
+                    .reference_candidates
+                    .as_ref()
+                    .is_none_or(|(cached, _)| cached != &key)
+                {
+                    let candidates = self.resolve_symbols_for_kind(
+                        db,
+                        &row.from_file,
+                        &row.to_name,
+                        Some(row.kind),
+                    )?;
+                    self.reference_candidates = Some((key, candidates));
+                }
+                self.reference_candidates
+                    .as_ref()
+                    .expect("reference candidates initialized")
+                    .1
+                    .clone()
+            }
+        };
+        self.constructors.append_targets(db, row, &mut resolved)?;
+        Ok(resolved)
     }
 
     fn resolve(
@@ -380,6 +420,7 @@ pub(crate) struct WalkBudget {
     pub deadline_hit: bool,
     candidate_counts: HashMap<String, usize>,
     caller_file_counts: HashMap<String, usize>,
+    symbol_reference_names: HashMap<DefinitionKey, Vec<String>>,
     file_imports: Option<Arc<Vec<Reference>>>,
 }
 
@@ -392,6 +433,7 @@ impl WalkBudget {
             deadline_hit: false,
             candidate_counts: HashMap::new(),
             caller_file_counts: HashMap::new(),
+            symbol_reference_names: HashMap::new(),
             file_imports: None,
         }
     }
@@ -426,23 +468,32 @@ impl WalkBudget {
     /// Price resolution as caller files × same-name definitions, not reference rows.
     /// Memoized COUNT queries avoid hydrating candidates just to price them.
     fn cost(&mut self, db: &Database, sym: &Symbol) -> Result<usize> {
-        let files = match self.caller_file_counts.get(&sym.name) {
-            Some(n) => *n,
-            None => {
-                let n = db.count_referencing_files(&sym.name)?;
-                self.caller_file_counts.insert(sym.name.clone(), n);
-                n
-            }
-        };
-        let candidates = match self.candidate_counts.get(&sym.name) {
-            Some(n) => *n,
-            None => {
-                let n = db.count_symbols_named(&sym.name)?.max(1);
-                self.candidate_counts.insert(sym.name.clone(), n);
-                n
-            }
-        };
-        Ok(files.saturating_mul(candidates))
+        let key = symbol_identity_key(sym);
+        if !self.symbol_reference_names.contains_key(&key) {
+            let names = crate::construction::Constructors::default().reference_names(db, sym)?;
+            self.symbol_reference_names.insert(key.clone(), names);
+        }
+        let mut cost = 0usize;
+        for name in &self.symbol_reference_names[&key] {
+            let files = match self.caller_file_counts.get(name) {
+                Some(n) => *n,
+                None => {
+                    let n = db.count_referencing_files(name)?;
+                    self.caller_file_counts.insert(name.clone(), n);
+                    n
+                }
+            };
+            let candidates = match self.candidate_counts.get(name) {
+                Some(n) => *n,
+                None => {
+                    let n = db.count_symbols_named(name)?.max(1);
+                    self.candidate_counts.insert(name.clone(), n);
+                    n
+                }
+            };
+            cost = cost.saturating_add(files.saturating_mul(candidates));
+        }
+        Ok(cost)
     }
 }
 
@@ -546,15 +597,28 @@ pub(crate) fn impact_analysis_walk_shared(
     } else {
         Arc::new(db.file_import_references()?)
     };
+    let indexed = if file_imports.iter().any(|row| {
+        matches!(
+            codesage_parser::detect::detect_language(std::path::Path::new(&row.from_file)),
+            Some(codesage_protocol::Language::C | codesage_protocol::Language::Cpp)
+        )
+    }) {
+        cache
+            .as_deref_mut()
+            .expect("walk cache initialized")
+            .indexed_files(db)?
+    } else {
+        Arc::new(HashSet::new())
+    };
     let mut visited_files = HashSet::new();
     let mut frontier: Vec<Symbol> = seed_symbols;
-    let mut visited_symbols: HashSet<(String, String, u32)> = HashSet::new();
+    let mut visited_symbols: HashSet<DefinitionKey> = HashSet::new();
     let mut frontier_capped = false;
 
     for depth in 1..=req.depth as u32 {
         codesage_protocol::work::checkpoint()?;
         let mut next_files = Vec::new();
-        let mut pending_callers: Vec<(String, Option<String>, u32)> = Vec::new();
+        let mut pending_callers: Vec<(String, Option<String>, u32, u32)> = Vec::new();
         let mut budget_spent = false;
         let mut level: Vec<(&Symbol, Arc<Vec<Reference>>)> = Vec::new();
         if let Some(b) = budget.as_deref_mut() {
@@ -639,7 +703,12 @@ pub(crate) fn impact_analysis_walk_shared(
                     if matches!(req.target, ImpactTarget::File { .. }) {
                         next_files.push(r.from_file.clone());
                     }
-                    pending_callers.push((r.from_file.clone(), r.from_symbol.clone(), r.line));
+                    pending_callers.push((
+                        r.from_file.clone(),
+                        r.from_symbol.clone(),
+                        r.line,
+                        r.col,
+                    ));
                 }
             }
         }
@@ -689,11 +758,12 @@ pub(crate) fn impact_analysis_walk_shared(
                 }
                 if cached_matches.is_none()
                     && !codesage_protocol::python::is_python_path(&r.from_file)
-                    && !import_ref_targets_file_with_modules(
+                    && !import_ref_targets_file_with_indexed(
                         &r.to_name,
                         &r.from_file,
                         file,
                         &rust_modules,
+                        &indexed,
                     )
                 {
                     continue;
@@ -718,7 +788,12 @@ pub(crate) fn impact_analysis_walk_shared(
                 }
                 if depth < req.depth as u32 {
                     next_files.push(r.from_file.clone());
-                    pending_callers.push((r.from_file.clone(), r.from_symbol.clone(), r.line));
+                    pending_callers.push((
+                        r.from_file.clone(),
+                        r.from_symbol.clone(),
+                        r.line,
+                        r.col,
+                    ));
                 }
             }
             if !budget_spent
@@ -739,7 +814,7 @@ pub(crate) fn impact_analysis_walk_shared(
 
         let distinct_files: Vec<String> = {
             let mut set: HashSet<String> = HashSet::new();
-            pending_callers.iter().for_each(|(f, _, _)| {
+            pending_callers.iter().for_each(|(f, _, _, _)| {
                 set.insert(f.clone());
             });
             set.into_iter().collect()
@@ -754,27 +829,32 @@ pub(crate) fn impact_analysis_walk_shared(
         let syms_by_file = db.symbols_for_files(&distinct_files)?;
 
         let mut next_frontier: Vec<Symbol> = Vec::new();
-        for (from_file, from_symbol, line) in &pending_callers {
+        for (from_file, from_symbol, line, col) in &pending_callers {
             codesage_protocol::work::checkpoint()?;
             let Some(syms) = syms_by_file.get(from_file) else {
                 continue;
             };
             // Prefer the recorded owner over enclosing classes or functions.
             if let Some(qn) = from_symbol
-                && let Some(s) = syms.iter().find(|s| &s.qualified_name == qn)
+                && let Some(s) = syms
+                    .iter()
+                    .find(|s| &s.qualified_name == qn && symbol_contains_position(s, *line, *col))
             {
                 next_frontier.push(s.clone());
                 continue;
             }
             // Fallback for references with no recorded enclosing symbol: the
-            // innermost symbol whose range contains the line.
+            // innermost symbol whose range contains the reference position.
             let mut best: Option<&Symbol> = None;
             for s in syms {
                 codesage_protocol::work::checkpoint()?;
-                if s.line_start <= *line && s.line_end >= *line {
-                    let span = s.line_end - s.line_start;
+                if symbol_contains_position(s, *line, *col) {
+                    let start = (s.line_start, s.col_start);
                     match best {
-                        Some(b) if (b.line_end - b.line_start) <= span => {}
+                        Some(b)
+                            if (b.line_start, b.col_start) > start
+                                || ((b.line_start, b.col_start) == start
+                                    && (b.line_end, b.col_end) <= (s.line_end, s.col_end)) => {}
                         _ => best = Some(s),
                     }
                 }
@@ -784,7 +864,7 @@ pub(crate) fn impact_analysis_walk_shared(
             }
         }
 
-        let mut seen_symbols: HashSet<(String, String, u32)> = HashSet::new();
+        let mut seen_symbols: HashSet<DefinitionKey> = HashSet::new();
         next_frontier.retain(|s| seen_symbols.insert(symbol_identity_key(s)));
         if next_frontier.len() > max_frontier {
             tracing::debug!(
@@ -1017,7 +1097,7 @@ fn build_impact_summary(entries: &[ImpactEntry]) -> ImpactSummary {
 pub(crate) fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> {
     // Source references may use a bare spelling even for qualified definitions.
     // Tail lookup admits both; import-aware resolution filters candidates below.
-    let raw = db.find_references(&sym.name, None)?;
+    let raw = crate::construction::references_for_symbol(db, sym)?;
     resolve_references_to_symbol(db, sym, raw, None)
 }
 
@@ -1033,10 +1113,15 @@ fn resolve_references_to_symbol(
     // Cache repeated (caller file, spelling) lookups.
     let mut out = Vec::with_capacity(raw.len());
     let mut cache = HashMap::new();
+    let mut local = WalkCache::default();
     let identity = symbol_identity_key(sym);
     for r in raw {
         codesage_protocol::work::checkpoint()?;
-        if let Some(resolved) = crate::python_bindings::resolve_reference(db, &r)? {
+        if needs_reference_resolution(&r) {
+            let resolved = shared
+                .as_deref_mut()
+                .unwrap_or(&mut local)
+                .resolve_reference(db, &r)?;
             if resolved.iter().any(|s| symbol_identity_key(s) == identity) {
                 out.push(r);
             }
@@ -1060,6 +1145,13 @@ fn resolve_references_to_symbol(
     Ok(out)
 }
 
+pub(crate) fn needs_reference_resolution(row: &Reference) -> bool {
+    codesage_protocol::python::is_python_path(&row.from_file)
+        || row.kind == ReferenceKind::Instantiation
+        || (row.from_file.ends_with(".rs")
+            && matches!(row.kind, ReferenceKind::Call | ReferenceKind::MacroCall))
+}
+
 fn resolved_definition_keys(
     db: &Database,
     caller_file: &str,
@@ -1076,23 +1168,186 @@ fn definition_keys(symbols: Vec<Symbol>) -> ResolvedDefinitions {
     Arc::new(
         symbols
             .into_iter()
-            .map(|sym| (sym.file_path, sym.qualified_name, sym.line_start))
+            .map(|sym| {
+                (
+                    sym.file_path,
+                    sym.qualified_name,
+                    sym.line_start,
+                    sym.col_start,
+                    sym.kind,
+                )
+            })
             .collect(),
     )
 }
 
-/// Symbols have no stable id; this triple identifies one definition.
-fn symbol_identity_key(sym: &Symbol) -> (String, String, u32) {
+/// Source columns separate same-line methods; kind separates macro and value namespaces.
+fn symbol_identity_key(sym: &Symbol) -> DefinitionKey {
     (
         sym.file_path.clone(),
         sym.qualified_name.clone(),
         sym.line_start,
+        sym.col_start,
+        sym.kind,
     )
+}
+
+pub(crate) fn reference_within_symbol(reference: &Reference, symbol: &Symbol) -> bool {
+    reference.from_file == symbol.file_path
+        && symbol_contains_position(symbol, reference.line, reference.col)
+}
+
+fn symbol_contains_position(symbol: &Symbol, line: u32, col: u32) -> bool {
+    let position = (line, col);
+    (symbol.line_start, symbol.col_start) <= position
+        && position < (symbol.line_end, symbol.col_end)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_line_static_constructor_has_no_instance_call_in_either_cache_order() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".codesage")).unwrap();
+        std::fs::write(
+            root.path().join("models.js"),
+            "export class C { constructor() {} static constructor() {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("use.js"),
+            "import { C } from './models.js';\nfunction run() { new C(); }\n",
+        )
+        .unwrap();
+        let db = Database::open(&root.path().join(".codesage/index.db")).unwrap();
+        crate::full_index(root.path(), &db, &[], false).unwrap();
+        let methods = db.find_symbols("constructor", None).unwrap();
+        assert_eq!(methods.len(), 2);
+        assert_ne!(methods[0].col_start, methods[1].col_start);
+        for reverse in [false, true] {
+            let mut methods = methods.clone();
+            if reverse {
+                methods.reverse();
+            }
+            let mut cache = WalkCache::default();
+            for method in methods
+                .iter()
+                .chain(methods.iter().rev())
+                .chain(methods.iter())
+            {
+                let is_static = method
+                    .signature
+                    .as_ref()
+                    .unwrap()
+                    .declaration
+                    .starts_with("static ");
+                let expected = usize::from(!is_static);
+                let cold = references_for_symbol(&db, method).unwrap();
+                let warm = cache.references(&db, method).unwrap();
+                assert_eq!(cold.len(), expected, "{method:?}: {cold:?}");
+                assert_eq!(warm.len(), expected, "{method:?}: {warm:?}");
+                assert!(warm.iter().all(
+                    |row| row.kind == ReferenceKind::Instantiation && row.from_file == "use.js"
+                ));
+            }
+        }
+        let risk = crate::assess_risk(&db, "models.js").unwrap();
+        let methods: Vec<_> = risk
+            .top_symbols
+            .iter()
+            .filter(|symbol| symbol.name == "constructor")
+            .collect();
+        assert_eq!(methods.len(), 2);
+        assert!(
+            methods
+                .iter()
+                .all(|symbol| !symbol.shared && !symbol.bounded)
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|symbol| symbol.why.contains("1 refs"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|symbol| symbol.why.contains("0 refs"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rust_same_line_namespace_candidates_remain_distinct_in_a_warm_cache() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::create_dir(root.path().join(".codesage")).unwrap();
+        for (path, source) in [
+            (
+                "Cargo.toml",
+                "[package]\nname = \"namespaces\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[macro_export] macro_rules! dual { () => {} } pub fn dual() {}\npub mod caller;\n",
+            ),
+            (
+                "src/caller.rs",
+                "pub fn run() { crate::dual!(); crate::dual(); }\n",
+            ),
+        ] {
+            std::fs::write(root.path().join(path), source).unwrap();
+        }
+        let db = Database::open(&root.path().join(".codesage/index.db")).unwrap();
+        crate::full_index(root.path(), &db, &[], false).unwrap();
+        let rows = db.find_references("dual", None).unwrap();
+        assert_eq!(rows.len(), 2);
+        for reverse in [false, true] {
+            let mut rows = rows.clone();
+            if reverse {
+                rows.reverse();
+            }
+            let mut cache = WalkCache::default();
+            for row in rows.iter().chain(rows.iter().rev()).chain(rows.iter()) {
+                let candidates = cache.resolve_reference(&db, row).unwrap();
+                assert_eq!(candidates.len(), 1, "{row:?}: {candidates:?}");
+                assert_eq!(
+                    candidates[0].kind,
+                    match row.kind {
+                        ReferenceKind::MacroCall => codesage_protocol::SymbolKind::Macro,
+                        ReferenceKind::Call => codesage_protocol::SymbolKind::Function,
+                        _ => panic!("unexpected reference: {row:?}"),
+                    }
+                );
+            }
+            let mut symbols = db.find_symbols("dual", None).unwrap();
+            assert_eq!(symbols.len(), 2);
+            if reverse {
+                symbols.reverse();
+            }
+            for symbol in symbols
+                .iter()
+                .chain(symbols.iter().rev())
+                .chain(symbols.iter())
+            {
+                let expected_kind = match symbol.kind {
+                    SymbolKind::Macro => ReferenceKind::MacroCall,
+                    SymbolKind::Function => ReferenceKind::Call,
+                    _ => panic!("unexpected symbol: {symbol:?}"),
+                };
+                let cold = references_for_symbol(&db, symbol).unwrap();
+                let warm = cache.references(&db, symbol).unwrap();
+                assert_eq!(cold.len(), 1, "{symbol:?}: {cold:?}");
+                assert_eq!(warm.len(), 1, "{symbol:?}: {warm:?}");
+                assert_eq!(cold[0].kind, expected_kind);
+                assert_eq!(warm[0].kind, expected_kind);
+            }
+        }
+    }
 
     fn setup_resolution_project() -> (Database, Vec<Symbol>) {
         let db = Database::open_in_memory().unwrap();
@@ -1714,6 +1969,56 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         crate::full_index(root, &db, &[], false).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn constructor_owner_calls_are_priced_even_with_a_warm_resolution_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("models.py"),
+            "class A:\n    def __init__(self): pass\n",
+        )
+        .unwrap();
+        for file in ["one.py", "two.py"] {
+            std::fs::write(dir.path().join(file), "from models import A\nA()\n").unwrap();
+        }
+        let db = Database::open_in_memory().unwrap();
+        crate::full_index(dir.path(), &db, &[], false).unwrap();
+        let constructor = db.find_symbols("__init__", None).unwrap().remove(0);
+        let request = ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: constructor.handle().to_string(),
+            },
+            depth: 1,
+            source_only: false,
+        };
+        let mut budget = WalkBudget::new(2, None);
+        assert_eq!(budget.cost(&db, &constructor).unwrap(), 2);
+        let mut cache = WalkCache::default();
+        let admitted = impact_analysis_walk_shared(
+            &db,
+            &request,
+            MAX_FRONTIER,
+            Some(&mut budget),
+            Some(&mut cache),
+        )
+        .unwrap();
+        assert_eq!(admitted.entries.len(), 2);
+        assert!(!admitted.capped);
+        assert_eq!(budget.remaining, 0);
+        budget.reset(1);
+        assert_eq!(budget.cost(&db, &constructor).unwrap(), 2);
+        let cut = impact_analysis_walk_shared(
+            &db,
+            &request,
+            MAX_FRONTIER,
+            Some(&mut budget),
+            Some(&mut cache),
+        )
+        .unwrap();
+        assert!(cut.capped);
+        assert!(cut.entries.is_empty());
+        assert_eq!(budget.remaining, 1);
     }
 
     #[test]
