@@ -1,6 +1,7 @@
 //! Git-history intelligence commands: `git-index`, `coupling`, `risk`,
 //! `risk-batch`, `risk-diff`, `tests-for`, `rehearse`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -38,6 +39,9 @@ pub(crate) fn cmd_git_index(
             "Git history indexed ({mode:?}): commits_scanned={} files_tracked={} co_change_pairs={}",
             stats.commits_scanned, stats.files_tracked, stats.co_change_pairs
         );
+        for note in &stats.notes {
+            println!("Note: {note}");
+        }
     }
     Ok(())
 }
@@ -56,6 +60,18 @@ fn span_marker(span_known: bool, recurring: bool) -> &'static str {
 /// A score without git history covers structural terms only.
 fn unscored_marker(unscored: bool) -> &'static str {
     if unscored { "  (unscored)" } else { "" }
+}
+
+fn file_risk_notes(file: &str, notes: &[String], legend: &BTreeMap<String, String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut rendered = Vec::new();
+    for note in notes {
+        let full = legend.get(note).unwrap_or(note);
+        if seen.insert(full.as_str()) {
+            rendered.push(format!("{file}: {full}"));
+        }
+    }
+    rendered
 }
 
 pub(crate) fn cmd_coupling(file: &str, limit: usize, json: bool) -> Result<()> {
@@ -221,6 +237,16 @@ pub(crate) fn cmd_risk_diff(files: Vec<String>, json: bool) -> Result<()> {
                 println!("    - {n}");
             }
         }
+        for file in assessment.files.iter().chain(
+            assessment
+                .clustered_directories
+                .iter()
+                .flat_map(|cluster| &cluster.top_files),
+        ) {
+            for note in file_risk_notes(&file.file, &file.notes, &assessment.legend) {
+                println!("  Note: {note}");
+            }
+        }
     }
     Ok(())
 }
@@ -244,6 +270,9 @@ pub(crate) fn cmd_risk_batch(files: Vec<String>, json: bool) -> Result<()> {
                 f.file,
                 unscored_marker(f.unscored)
             );
+            for note in file_risk_notes(&f.file, &f.notes, &assessment.legend) {
+                println!("    {note}");
+            }
         }
         if !assessment.legend.is_empty() {
             println!("  Legend:");
@@ -488,9 +517,28 @@ pub(crate) fn cmd_rehearse(files: Vec<String>, json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_patch_files, working_tree_changes};
+    use super::{file_risk_notes, resolve_patch_files, working_tree_changes};
     use std::path::Path;
     use std::process::Command;
+
+    #[test]
+    fn human_risk_notes_keep_file_context_expand_aliases_and_deduplicate() {
+        let notes = vec![
+            "history is shallow".into(),
+            "N".into(),
+            "churn risk omitted".into(),
+            "N".into(),
+        ];
+        let legend = [("N".into(), "churn risk omitted".into())].into();
+        assert_eq!(
+            file_risk_notes("a.rs", &notes, &legend),
+            ["a.rs: history is shallow", "a.rs: churn risk omitted"]
+        );
+        assert_eq!(
+            file_risk_notes("b.rs", &notes, &legend),
+            ["b.rs: history is shallow", "b.rs: churn risk omitted"]
+        );
+    }
 
     fn git(root: &std::path::Path, args: &[&str]) {
         let out = Command::new("git")

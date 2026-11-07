@@ -9,6 +9,8 @@
 - MCP shims reconnect completed sessions after daemon loss without replaying written requests.
 - CLI output no longer panics when a Unix stdout pipe closes early.
 - Live watcher ignore rules retain their directory scope and honor `.ignore` and global Git excludes.
+- `git-index` avoids lazy blob downloads in partial clones, discloses unavailable churn in risk results, and bounds history walks.
+- Shallow-clone boundary commits add no churn, fixes, authorship, or co-change pairs; risk omits unobserved churn and discloses truncation in human and JSON output.
 - `codesage-bench` resolves cached reranker artifacts, accepts non-UTF-8 `rg` matches, and keeps control recall out of the CodeSage summary.
 - The Codex adapter installer preserves legacy bench and eval skills reached through symlinked directories.
 - Repository refreshes handle onboarded repositories whose paths contain newlines instead of running `codesage index` in an unrelated directory.

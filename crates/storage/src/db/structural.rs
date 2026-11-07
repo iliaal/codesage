@@ -214,6 +214,15 @@ impl Database {
     /// Return the canonical exclusion fingerprint used by the last git-history
     /// pass. `None` means no state or a legacy row without provenance.
     pub fn git_index_exclusion_fingerprint(&self) -> Result<Option<String>> {
+        let (has_table, has_fingerprint): (bool, bool) = self.conn.query_row(
+            "SELECT COUNT(*) > 0, COALESCE(MAX(name = 'exclude_fingerprint'), 0)
+             FROM pragma_table_info('git_index_state')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if has_table && !has_fingerprint {
+            return Ok(None);
+        }
         Ok(self
             .conn
             .query_row(
