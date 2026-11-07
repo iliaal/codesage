@@ -42,10 +42,6 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-repo_root() {
-	dirname "$1"
-}
-
 is_excluded() {
 	case "$1" in
 	*/bench-repos/* | */codesage_ref/* | */.codesage/*) return 0 ;;
@@ -79,9 +75,12 @@ done
 if [ "${#search_roots[@]}" -eq 0 ]; then
 	candidates=()
 else
-	mapfile -t candidates < <(
-		find "${search_roots[@]}" -maxdepth 4 -name ".codesage" -type d 2>/dev/null |
-			sort -u
+	candidates=()
+	while IFS= read -r -d '' candidate; do
+		candidates+=("$candidate")
+	done < <(
+		find "${search_roots[@]}" -maxdepth 4 -name ".codesage" -type d -print0 2>/dev/null |
+			sort -zu
 	)
 fi
 
@@ -89,7 +88,7 @@ active=()
 skipped=()
 for c in "${candidates[@]:-}"; do
 	[ -z "$c" ] && continue
-	root="$(repo_root "$c")"
+	root="${c%/*}"
 	if is_excluded "$root"; then
 		skipped+=("$root")
 	else

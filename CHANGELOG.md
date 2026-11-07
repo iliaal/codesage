@@ -7,6 +7,7 @@
 ### Fixed
 
 - The Codex adapter installer preserves legacy bench and eval skills reached through symlinked directories.
+- Repository refreshes handle onboarded repositories whose paths contain newlines instead of running `codesage index` in an unrelated directory.
 
 ## [0.48.0] - 2026-11-03
 
