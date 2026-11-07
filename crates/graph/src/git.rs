@@ -1,5 +1,8 @@
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, ensure};
 
 const REPOSITORY_ENV: &[&str] = &[
     "GIT_DIR",
@@ -47,4 +50,135 @@ pub fn git_worktree_command(root: &Path) -> Command {
     let mut command = git_command(root);
     command.args(["-c", "core.fsmonitor=false"]);
     command
+}
+
+pub(crate) fn git_history_command(root: &Path) -> Command {
+    let mut command = git_command(root);
+    command
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+pub(crate) fn history_output(mut command: Command, budget: Duration) -> Result<Output> {
+    use std::io::Read;
+
+    const MAX_OUTPUT_BYTES: u64 = 128 << 20;
+    let deadline = Instant::now() + budget;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting git history walk")?;
+    let stdout = child.stdout.take().context("opening git history stdout")?;
+    let stderr = child.stderr.take().context("opening git history stderr")?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+    let readers = [
+        (true, Box::new(stdout) as Box<dyn Read + Send>),
+        (false, Box::new(stderr) as Box<dyn Read + Send>),
+    ]
+    .map(|(is_stdout, stream)| {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stream.take(MAX_OUTPUT_BYTES + 1).read_to_end(&mut bytes);
+            let _ = sender.send((is_stdout, result.map(|_| bytes)));
+        })
+    });
+    drop(sender);
+    let mut reaped = false;
+    let result = (|| {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        for _ in 0..2 {
+            let (is_stdout, bytes) = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .with_context(|| {
+                    format!(
+                        "git history walk truncated by {} ms deadline; index unchanged",
+                        budget.as_millis()
+                    )
+                })?;
+            let bytes = bytes.context("reading git history output")?;
+            ensure!(
+                bytes.len() as u64 <= MAX_OUTPUT_BYTES,
+                "git history walk exceeds 128 MiB output limit; index unchanged"
+            );
+            if is_stdout {
+                stdout = bytes;
+            } else {
+                stderr = bytes;
+            }
+        }
+        loop {
+            if let Some(status) = child.try_wait().context("waiting for git history")? {
+                reaped = true;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "git history walk truncated by {} ms deadline; index unchanged",
+                budget.as_millis()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    })();
+    if !reaped {
+        crate::drift::kill_git(&mut child);
+        let _ = child.wait();
+    }
+    for reader in readers {
+        let _ = reader.join();
+    }
+    result
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_deadline_kills_children_holding_pipes_and_children_without_output() {
+        for script in ["sleep 10 & exit 0", "exec >/dev/null 2>/dev/null; sleep 10"] {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            let start = Instant::now();
+            let error = history_output(command, Duration::from_millis(50)).unwrap_err();
+            assert!(
+                error.to_string().contains("truncated by 50 ms deadline"),
+                "{error:#}"
+            );
+            assert!(start.elapsed() >= Duration::from_millis(50));
+            assert!(start.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn history_children_override_lazy_fetch_without_process_environment_writes() {
+        let before = std::env::vars_os().collect::<Vec<_>>();
+        let mut command = git_history_command(Path::new("."));
+        command.args(["--version"]);
+        let overrides: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            overrides.get(std::ffi::OsStr::new("GIT_NO_LAZY_FETCH")),
+            Some(&Some(std::ffi::OsStr::new("1")))
+        );
+        assert_eq!(
+            overrides.get(std::ffi::OsStr::new("GIT_ALLOW_PROTOCOL")),
+            Some(&Some(std::ffi::OsStr::new("")))
+        );
+        assert!(command.status().unwrap().success());
+        assert_eq!(std::env::vars_os().collect::<Vec<_>>(), before);
+    }
 }

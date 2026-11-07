@@ -3,6 +3,7 @@
 mod bus_factor;
 mod indexer;
 mod risk;
+mod source;
 mod test_commands;
 mod tests_rec;
 

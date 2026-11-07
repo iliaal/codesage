@@ -2168,6 +2168,8 @@ pub struct GitIndexStats {
     pub commits_scanned: usize,
     pub files_tracked: usize,
     pub co_change_pairs: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// The "shape" of a feature slice. Maps to the agent-facing reason the

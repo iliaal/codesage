@@ -58,6 +58,8 @@ use codesage_storage::db::CoChangeWrite;
 use globset::GlobSet;
 
 use super::bus_factor::normalized_author;
+use super::source::HistorySource;
+use crate::git::{git_history_command, history_output};
 
 const DECAY_TAU_DAYS: f64 = 180.0;
 const SECONDS_PER_DAY: f64 = 86_400.0;
@@ -228,6 +230,7 @@ struct PassAnchors<'a> {
     current: HistoryAnchor,
     previous: i64,
     exclusion_fingerprint: &'a str,
+    source: &'a HistorySource,
 }
 
 type CommitEpochKey = (PathBuf, String);
@@ -275,7 +278,7 @@ fn commit_epoch(root: &Path, sha: &str) -> Result<Option<i64>> {
 
 fn read_commit_epoch(root: &Path, sha: &str) -> Result<Option<i64>> {
     // `log.showSignature` would print verification text ahead of the date.
-    let Ok(out) = crate::git_command(root)
+    let Ok(out) = git_history_command(root)
         .args([
             "log",
             "--no-show-signature",
@@ -334,13 +337,15 @@ pub fn git_history_index_with_options(
     mode: IndexMode,
 ) -> Result<GitIndexStats> {
     let (exclude_set, test_like_set) = compile_excludes(extra_excludes)?;
-    let exclusion_fingerprint = effective_exclusion_fingerprint(extra_excludes);
+    let head_sha = resolve_head_sha(root)?;
+    let source = HistorySource::read(root)?;
+    let exclusion_fingerprint =
+        source.fingerprint(&effective_exclusion_fingerprint(extra_excludes));
     // `None` is an index written before 0025 (or by a pre-0025 binary, whose
     // state upsert clears the column): its rows carry no exclusion provenance,
     // so they cannot be trusted to match the current policy either.
     let stored_exclusion = db.git_index_exclusion_fingerprint()?;
     let policy_changed = stored_exclusion.as_deref() != Some(exclusion_fingerprint.as_str());
-    let head_sha = resolve_head_sha(root)?;
     let anchor = anchor_at_commit(root, &head_sha)?;
     log_anchor(root, anchor);
 
@@ -363,6 +368,7 @@ pub fn git_history_index_with_options(
                     commits_scanned: 0,
                     files_tracked: 0,
                     co_change_pairs: 0,
+                    notes: source.notes(),
                 });
             }
             Some((last_sha, _)) => {
@@ -376,15 +382,19 @@ pub fn git_history_index_with_options(
         },
     };
 
-    match effective_mode {
+    let mut stats = match effective_mode {
         IndexMode::Full => run_full(
             db,
             root,
             &exclude_set,
             &test_like_set,
             &head_sha,
-            anchor,
-            &exclusion_fingerprint,
+            PassAnchors {
+                current: anchor,
+                previous: anchor.epoch,
+                exclusion_fingerprint: &exclusion_fingerprint,
+                source: &source,
+            },
         ),
         IndexMode::Incremental => {
             let (last_sha, last_at) = db
@@ -394,6 +404,7 @@ pub fn git_history_index_with_options(
                 current: anchor,
                 previous: previous_anchor(root, &last_sha, last_at, anchor)?,
                 exclusion_fingerprint: &exclusion_fingerprint,
+                source: &source,
             };
             run_incremental(
                 db,
@@ -406,7 +417,9 @@ pub fn git_history_index_with_options(
             )
         }
         IndexMode::Auto => unreachable!("resolved above"),
-    }
+    }?;
+    stats.notes = source.notes();
+    Ok(stats)
 }
 
 /// Make the regime visible: an empty or flat history has to be traceable to its
@@ -475,7 +488,7 @@ fn compile_excludes(extra: &[String]) -> Result<(GlobSet, GlobSet)> {
 /// Bump when repository selection or rules that decide stored history rows
 /// change (commit soft-skips, fix-commit detection, pair accounting), so the next pass
 /// rebuilds instead of composing rows written under two rule sets.
-const HISTORY_POLICY_VERSION: u32 = 2;
+const HISTORY_POLICY_VERSION: u32 = 3;
 
 /// Canonical, order-independent identity for the history and exclusion policy:
 /// repository selection, hard exclusions, the test-like set, and per-commit
@@ -511,11 +524,10 @@ fn run_full(
     exclude_set: &GlobSet,
     test_like_set: &GlobSet,
     head_sha: &str,
-    anchor: HistoryAnchor,
-    exclusion_fingerprint: &str,
+    anchors: PassAnchors<'_>,
 ) -> Result<GitIndexStats> {
-    let raw = run_git_log(root, None, anchor.cutoff())?;
-    let mut commits = parse_log(&raw)?;
+    let anchor = anchors.current;
+    let mut commits = history_commits(root, None, anchor.cutoff(), anchors.source)?;
     let successor = follow_renames(&mut commits, exclude_set);
     remap_dead_paths(root, head_sha, &mut commits, &successor)?;
 
@@ -560,7 +572,7 @@ fn run_full(
             }
         }
         anchor.persist(db, head_sha, true)?;
-        db.set_git_index_exclusion_fingerprint(exclusion_fingerprint)?;
+        db.set_git_index_exclusion_fingerprint(anchors.exclusion_fingerprint)?;
         Ok(())
     })?;
 
@@ -568,6 +580,7 @@ fn run_full(
         commits_scanned,
         files_tracked: files.len(),
         co_change_pairs: co_change_kept,
+        notes: Vec::new(),
     })
 }
 
@@ -582,8 +595,7 @@ fn run_incremental(
 ) -> Result<GitIndexStats> {
     let anchor = anchors.current;
     let range = format!("{last_sha}..{head_sha}");
-    let raw = run_git_log(root, Some(&range), anchor.cutoff())?;
-    let mut commits = parse_log(&raw)?;
+    let mut commits = history_commits(root, Some(&range), anchor.cutoff(), anchors.source)?;
     let successor = follow_renames(&mut commits, exclude_set);
     remap_dead_paths(root, head_sha, &mut commits, &successor)?;
     // Stored rows are keyed by the names files had at `last_sha`; a rename in
@@ -600,15 +612,7 @@ fn run_incremental(
             root = %root.display(),
             "a rename in the incremental range cannot be re-keyed exactly; rescanning in full"
         );
-        return run_full(
-            db,
-            root,
-            exclude_set,
-            test_like_set,
-            head_sha,
-            anchor,
-            anchors.exclusion_fingerprint,
-        );
+        return run_full(db, root, exclude_set, test_like_set, head_sha, anchors);
     }
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
@@ -661,6 +665,7 @@ fn run_incremental(
         commits_scanned,
         files_tracked: files.len(),
         co_change_pairs: co_change_kept,
+        notes: Vec::new(),
     })
 }
 
@@ -672,6 +677,9 @@ fn history_window_cutoff(anchor: i64) -> i64 {
 
 fn write_author_events(db: &Database, commits: &[Commit], excludes: &GlobSet) -> Result<()> {
     for commit in commits {
+        if commit.boundary {
+            continue;
+        }
         let Some(changes) = filter_kept(commit, excludes) else {
             continue;
         };
@@ -819,7 +827,7 @@ fn remap_dead_paths(
 
 /// Every path in `sha`'s tree, repository-relative like `git log` paths.
 fn head_paths(root: &Path, sha: &str) -> Result<std::collections::HashSet<String>> {
-    let out = crate::git_command(root)
+    let out = git_history_command(root)
         .args(["ls-tree", "-r", "-z", "--name-only", "--full-tree", sha])
         .output()
         .with_context(|| format!("git ls-tree {sha} in {}", root.display()))?;
@@ -886,7 +894,7 @@ fn accumulate(
     for change in kept_changes {
         let stats = files.entry(change.path.clone()).or_default();
         stats.total_commits += 1;
-        if is_fix {
+        if is_fix && !commit.boundary {
             stats.fix_count += 1;
         }
         if stats.last_commit_at.is_none_or(|t| t < commit.timestamp) {
@@ -894,11 +902,13 @@ fn accumulate(
         }
         let churn_units = ((change.added + change.deleted) as f64) / CHURN_DIVISOR;
         let weight = decay * churn_units.min(CHURN_CLAMP);
-        stats.churn_score += weight;
+        if !commit.boundary {
+            stats.churn_score += weight;
+        }
     }
 
     // Source-test pairs support test recommendations; test-test pairs add noise.
-    if kept_changes.len() <= MAX_FILES_PER_COMMIT_FOR_COCHANGE {
+    if !commit.boundary && kept_changes.len() <= MAX_FILES_PER_COMMIT_FOR_COCHANGE {
         for i in 0..kept_changes.len() {
             for j in (i + 1)..kept_changes.len() {
                 let a = &kept_changes[i].path;
@@ -923,7 +933,7 @@ fn accumulate(
 }
 
 fn resolve_head_sha(root: &Path) -> Result<String> {
-    let out = crate::git_command(root)
+    let out = git_history_command(root)
         .args(["rev-parse", "HEAD"])
         .output()
         .with_context(|| format!("git rev-parse HEAD in {}", root.display()))?;
@@ -952,7 +962,7 @@ pub fn changed_files_since(
         ));
     }
     let range = format!("{git_ref}...HEAD");
-    let out = crate::git_command(root)
+    let out = git_history_command(root)
         // `--` terminates option parsing so `range` is always read as a
         // revision range, never as flags. A rename touches both paths, so
         // rename detection must not collapse the pair to its destination.
@@ -998,7 +1008,7 @@ pub fn feature_touched_since(
 
 fn is_ancestor(root: &Path, old: &str, new: &str) -> Result<bool> {
     // Missing ancestry or an unavailable SHA requires a full scan; spawn errors propagate.
-    let status = crate::git_command(root)
+    let status = git_history_command(root)
         .args(["merge-base", "--is-ancestor", old, new])
         .status()
         .with_context(|| {
@@ -1026,6 +1036,7 @@ struct Commit {
     /// `(old, new)` for every rename git detected in this commit, binary
     /// files included.
     renames: Vec<(String, String)>,
+    boundary: bool,
 }
 
 #[derive(Debug)]
@@ -1035,7 +1046,45 @@ struct FileChange {
     deleted: u32,
 }
 
-fn run_git_log(root: &Path, range: Option<&str>, since_epoch: i64) -> Result<String> {
+fn history_commits(
+    root: &Path,
+    range: Option<&str>,
+    since_epoch: i64,
+    source: &HistorySource,
+) -> Result<Vec<Commit>> {
+    let raw = run_git_log(root, range, since_epoch, source.tree_only)?;
+    let mut commits = if source.tree_only {
+        parse_name_log(&raw)?
+    } else {
+        parse_log(&raw)?
+    };
+    for commit in &mut commits {
+        commit.boundary = source.shallow.contains(&commit.sha);
+    }
+    Ok(commits)
+}
+
+fn history_walk_budget() -> Result<std::time::Duration> {
+    let millis = match std::env::var("CODESAGE_GIT_HISTORY_TIMEOUT_MS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .context("CODESAGE_GIT_HISTORY_TIMEOUT_MS must be an integer from 1 to 600000")?,
+        Err(std::env::VarError::NotPresent) => 20_000,
+        Err(error) => return Err(error).context("reading CODESAGE_GIT_HISTORY_TIMEOUT_MS"),
+    };
+    anyhow::ensure!(
+        (1..=600_000).contains(&millis),
+        "CODESAGE_GIT_HISTORY_TIMEOUT_MS must be an integer from 1 to 600000"
+    );
+    Ok(std::time::Duration::from_millis(millis))
+}
+
+fn run_git_log(
+    root: &Path,
+    range: Option<&str>,
+    since_epoch: i64,
+    tree_only: bool,
+) -> Result<String> {
     // `@<unix>` is git's epoch-format specifier; locale-independent.
     let since_arg = format!("--since=@{since_epoch}");
     let mut args: Vec<&str> = vec![
@@ -1048,20 +1097,31 @@ fn run_git_log(root: &Path, range: Option<&str>, since_epoch: i64) -> Result<Str
         // Children before parents regardless of committer-date skew, which
         // `follow_renames` needs to apply a rename to everything older.
         "--topo-order",
-        // Renames only, whatever `diff.renames` says: a copy record has the
-        // same numstat shape and would move the source's history onto the copy.
-        "-M",
-        "--numstat",
+        "--no-ext-diff",
+        "--no-textconv",
         "-z",
-        "--pretty=format:commit\x09%H\x09%ct\x09%ae%x1f%an%x1f%s%x00",
         &since_arg,
     ];
+    if tree_only {
+        args.extend([
+            "--no-renames",
+            "--name-only",
+            "--pretty=format:%x00commit\x09%H\x09%ct\x09%ae%x1f%an%x1f%s%x00",
+        ]);
+    } else {
+        args.extend([
+            "-M",
+            "--numstat",
+            "--pretty=format:commit\x09%H\x09%ct\x09%ae%x1f%an%x1f%s%x00",
+        ]);
+    }
     if let Some(r) = range {
         args.push(r);
     }
-    let output = crate::git_command(root)
-        .args(&args)
-        .output()
+    args.push("--");
+    let mut command = git_history_command(root);
+    command.args(&args);
+    let output = history_output(command, history_walk_budget()?)
         .with_context(|| format!("running git log in {}", root.display()))?;
 
     if !output.status.success() {
@@ -1072,6 +1132,58 @@ fn run_git_log(root: &Path, range: Option<&str>, since_epoch: i64) -> Result<Str
         ));
     }
     String::from_utf8(output.stdout).context("git log output not UTF-8")
+}
+
+fn parse_name_log(raw: &str) -> Result<Vec<Commit>> {
+    let mut commits = Vec::new();
+    let mut current: Option<Commit> = None;
+    let mut expect_header = true;
+    let mut first_path = false;
+    for record in raw.split('\0') {
+        if record.is_empty() {
+            expect_header = true;
+            continue;
+        }
+        if expect_header {
+            if let Some(commit) = current.take() {
+                commits.push(commit);
+            }
+            anyhow::ensure!(
+                record.starts_with("commit\t"),
+                "git history tree-only output has no commit header"
+            );
+            let mut parsed = parse_log(record)?;
+            anyhow::ensure!(
+                parsed.len() == 1,
+                "invalid git history tree-only commit header"
+            );
+            current = parsed.pop();
+            expect_header = false;
+            first_path = true;
+        } else {
+            let path = if first_path {
+                record.strip_prefix('\n').unwrap_or(record)
+            } else {
+                record
+            };
+            first_path = false;
+            anyhow::ensure!(
+                !path.is_empty(),
+                "git history tree-only output has an empty path"
+            );
+            if let Some(commit) = &mut current {
+                commit.changes.push(FileChange {
+                    path: path.to_owned(),
+                    added: 0,
+                    deleted: 0,
+                });
+            }
+        }
+    }
+    if let Some(commit) = current {
+        commits.push(commit);
+    }
+    Ok(commits)
 }
 
 /// Parse `run_git_log` output. A record that is neither a commit header nor a
@@ -1121,6 +1233,7 @@ fn parse_log(raw: &str) -> Result<Vec<Commit>> {
                 subject: subject.to_string(),
                 changes: Vec::new(),
                 renames: Vec::new(),
+                boundary: false,
             });
             continue;
         }
@@ -1491,6 +1604,20 @@ mod tests {
         assert_eq!(commits[0].changes.len(), 2);
         assert_eq!(commits[1].changes.len(), 1, "binary file skipped");
         assert_eq!(commits[1].changes[0].path, "src/c.rs");
+    }
+
+    #[test]
+    fn tree_only_paths_preserve_tabs_newlines_and_header_shaped_names() {
+        let raw = "\0commit\tabc\t1700000000\ta@b\u{1f}A\u{1f}change\0\n\nfirst.rs\0commit\tfake\t123\0tab\tpath.rs\0\0\0commit\tdef\t1700000001\ta@b\u{1f}A\u{1f}next\0\nlast.rs\0";
+        let commits = parse_name_log(raw).unwrap();
+        assert_eq!(commits.len(), 2);
+        let paths: Vec<_> = commits[0]
+            .changes
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert_eq!(paths, ["\nfirst.rs", "commit\tfake\t123", "tab\tpath.rs"]);
+        assert_eq!(commits[1].changes[0].path, "last.rs");
     }
 
     fn make_change(path: &str) -> FileChange {

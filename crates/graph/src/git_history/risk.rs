@@ -842,14 +842,20 @@ fn assess_risk_with_context(
         ));
     }
 
+    let history_source = super::source::indexed_history_source(db)?;
     let churn_score = git.as_ref().map(|g| g.churn_score).unwrap_or(0.0);
     let total_commits = git.as_ref().map(|g| g.total_commits).unwrap_or(0);
     let fix_count = git.as_ref().map(|g| g.fix_count).unwrap_or(0);
+    let shallow_without_churn = !history_source.shallow.is_empty() && churn_score == 0.0;
     // A missing map entry means the file has no git_files row, which the
     // per-file query also scores as 0.0.
-    let churn_percentile = match precomputed_percentiles {
-        Some(map) => map.get(file_path).copied().unwrap_or(0.0),
-        None => db.churn_percentile(file_path)?,
+    let churn_percentile = if history_source.tree_only || shallow_without_churn {
+        0.0
+    } else {
+        match precomputed_percentiles {
+            Some(map) => map.get(file_path).copied().unwrap_or(0.0),
+            None => db.churn_percentile(file_path)?,
+        }
     };
     let fix_ratio = if total_commits > 0 {
         (fix_count as f64 / total_commits as f64).clamp(0.0, 1.0)
@@ -987,7 +993,10 @@ fn assess_risk_with_context(
     // measured zero. The flag travels with the score; the notes explain it.
     let unscored = git.is_none();
 
-    let mut notes = Vec::new();
+    let mut notes = history_source.notes();
+    if shallow_without_churn && !history_source.tree_only {
+        notes.push(super::source::SHALLOW_CHURN_OMITTED_NOTE.to_owned());
+    }
     if unscored {
         // This is the note that names the cause, so the window belongs here
         // rather than as a third line beside `UNSCORED_NOTE`. With no row
@@ -1656,7 +1665,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
         .map(|f| f.file.clone())
         .collect();
 
-    let mut summary_notes = Vec::new();
+    let mut summary_notes = super::source::indexed_history_source(db)?.notes();
     if !hotspot_files.is_empty() {
         summary_notes.push(format!(
             "patch touches {} hotspot file(s)",
@@ -1746,6 +1755,19 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
 
     let (mut files, clustered_directories, omitted) =
         cluster_by_directory(files, DIR_CLUSTER_THRESHOLD);
+    for file in &omitted {
+        if file
+            .notes
+            .iter()
+            .any(|note| note == super::source::SHALLOW_CHURN_OMITTED_NOTE)
+        {
+            summary_notes.push(format!(
+                "{}: {}",
+                file.file,
+                super::source::SHALLOW_CHURN_OMITTED_NOTE
+            ));
+        }
+    }
 
     // Omitted cluster members have no notes; alias only the retained detail.
     let mut all_for_alias: Vec<&mut RiskAssessment> = files.iter_mut().collect();
@@ -2000,12 +2022,19 @@ fn import_cycle_components(db: &Database) -> Result<Arc<ImportCycles>> {
     Ok(components)
 }
 
-/// Highest-churn member as a heuristic refactor candidate, or `None` without history.
+/// Highest-churn member as a heuristic refactor candidate, or `None` without measured churn.
 fn pick_max_churn(db: &Database, members: &[String]) -> Result<Option<String>> {
+    let source = super::source::indexed_history_source(db)?;
+    if source.tree_only {
+        return Ok(None);
+    }
     let mut best: Option<(f64, String)> = None;
     for m in members {
         codesage_protocol::work::checkpoint()?;
         if let Some(row) = db.git_file(m)? {
+            if !source.shallow.is_empty() && row.churn_score == 0.0 {
+                continue;
+            }
             match &best {
                 Some((score, _)) if row.churn_score <= *score => {}
                 _ => best = Some((row.churn_score, m.clone())),

@@ -64,7 +64,7 @@ fn git_command(cwd: &Path, args: &[&str]) -> Command {
     command
 }
 
-fn kill_git(child: &mut Child) {
+pub(crate) fn kill_git(child: &mut Child) {
     #[cfg(unix)]
     // SAFETY: the child was placed in its own process group at spawn and has
     // not been reaped yet, so the group id still names it.
