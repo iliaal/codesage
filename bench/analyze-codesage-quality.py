@@ -1119,7 +1119,9 @@ def _window_calls(events: list[dict[str, Any]], start: int, window: int) -> list
     call (which is appended so the scorer can report `chained`).
     """
     calls: list[dict[str, Any]] = []
-    for e in events[start + 1:]:
+    # Avoid copying the whole remaining transcript for a bounded look-ahead.
+    for index in range(start + 1, len(events)):
+        e = events[index]
         kind = e.get("kind")
         if kind == "user":
             # Harness injections also use role=user and must not cut the window.
