@@ -286,7 +286,12 @@ def rule_collapse_adjacent_refs(text: str) -> int:
     def key(item: dict) -> tuple[str, int]:
         return (item.get("file") or item.get("file_path") or "", int(item.get("line") or 0))
 
-    items = sorted(data, key=key)
+    try:
+        items = sorted(data, key=key)
+    except (TypeError, ValueError, OverflowError):
+        # Keys can be present without usable paths or line numbers. Leave the
+        # whole response unchanged rather than aborting the usage scorecard.
+        return _utf8_size(text)
     compressed: list[Any] = []
     touched = False
     i = 0

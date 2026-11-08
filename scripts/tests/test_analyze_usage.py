@@ -144,6 +144,59 @@ class UsageBytesTests(unittest.TestCase):
             self.assertIn("**Shelf item 1.5.**", result.stdout)
             self.assertNotIn("**Promote", result.stdout)
 
+    def malformed_reference_rows(self):
+        for field in ("file", "file_path", "line"):
+            values = (["unknown", "1.5", [1], {"line": 1}, float("nan"),
+                       float("inf"), -float("inf")]
+                      if field == "line" else [42, True, ["src/c.rs"], {"path": "src/c.rs"}])
+            for value in values:
+                path_field = "file_path" if field == "file_path" else "file"
+                rows = [{path_field: "src/検索.rs", "line": n} for n in (1, 2, 3)]
+                # A valid, compressible prefix must not hide the invalid row.
+                rows.append({path_field: "src/検索.rs", "line": 4, field: value})
+                yield field, value, rows
+
+    def test_unusable_reference_keys_preserve_bytes_and_summary(self):
+        for field, value, rows in self.malformed_reference_rows():
+            for indent in (None, 8):
+                with self.subTest(field=field, value=value, indent=indent):
+                    text = json.dumps(rows, ensure_ascii=False, indent=indent)
+                    size = len(text.encode("utf-8"))
+                    self.assertEqual(usage.rule_collapse_adjacent_refs(text), size)
+                    summary = usage.summarize([{"tool": "find_references",
+                                               "output_text": text, "output_bytes": size}])
+                    self.assertEqual(summary["totals"], {"calls": 1, "bytes": size, "errors": 0})
+                    self.assertEqual(summary["per_tool"], {"find_references": [size]})
+                    self.assertEqual(summary["compress_savings"]["collapse_adjacent_refs"], 0)
+
+    def test_reference_key_coercions_and_path_fallbacks_still_compress(self):
+        path = "src/検索.rs"
+        expected = len(json.dumps([{"file": path, "lines": "1-3", "count": 3}]).encode())
+        for paths in ({"file": path}, {"file_path": path},
+                      {"file": "", "file_path": path},
+                      {"file": path, "file_path": 42}):
+            for lines in ((3, 1, 2), ("3", "1", "2"), (3.5, True, 2.5)):
+                with self.subTest(paths=paths, lines=lines):
+                    rows = [{**paths, "line": line} for line in lines]
+                    self.assertEqual(usage.rule_collapse_adjacent_refs(json.dumps(rows)), expected)
+
+    def test_cli_scorecard_handles_unusable_reference_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            total_bytes = 0
+            cases = list(self.malformed_reference_rows())
+            for number, (_, _, rows) in enumerate(cases):
+                text = json.dumps(rows, ensure_ascii=False, indent=8)
+                total_bytes += len(text.encode("utf-8"))
+                self.write_transcript(project / f"session-{number}.jsonl", text)
+            result = subprocess.run([sys.executable, str(SCRIPT), "--projects-root", str(root)],
+                                    text=True, capture_output=True, check=True)
+            self.assertIn(f"**Calls observed**: {len(cases)}", result.stdout)
+            self.assertIn(f"**Total output bytes**: {total_bytes:,} ", result.stdout)
+            self.assertIn("| `collapse_adjacent_refs` |  | 0 | 0.0% |", result.stdout)
+
     def test_invalid_surrogate_does_not_abort_analysis(self):
         text = "bad: " + chr(0xD800)
         self.assertEqual(usage.rule_middle_truncate(text), 6)
