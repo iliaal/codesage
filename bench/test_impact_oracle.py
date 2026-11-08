@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import contextlib
+import gc
 import io
 import json
 import re
@@ -332,6 +333,7 @@ references = []
 
 def tracked_read(path, **kwargs):
     if len(references) >= 4:
+        gc.collect()
         check(references[0]() is None and references[1]() is None,
               "streaming: early raw and stripped source strings are released")
     value = TrackedText("Target();\n")
