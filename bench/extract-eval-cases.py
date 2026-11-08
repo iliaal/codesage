@@ -43,7 +43,8 @@ def parse_session(path: Path) -> list[dict]:
                 continue
             try:
                 msg = json.loads(line)
-                messages.append(msg)
+                if isinstance(msg, dict):
+                    messages.append(msg)
             except json.JSONDecodeError:
                 continue
     return messages
