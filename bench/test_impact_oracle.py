@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import gc
+import io
 import json
 import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import weakref
 from pathlib import Path
 from unittest.mock import patch
 
@@ -270,6 +274,87 @@ for command in ("find-symbol", "impact"):
                 check("TOTAL" not in result.stdout, f"{label}: no completed score summary")
                 check(report.read_text(encoding="utf-8") == "previous report\n" if existing_report
                       else not report.exists(), f"{label}: no JSON creation or overwrite")
+
+# Multi-symbol matching must not mix definitions or raw/code sets. Repeated
+# symbols still produce repeated rows and contribute repeatedly to TOTAL.
+with tempfile.TemporaryDirectory(prefix="impact-oracle-multiple-") as td:
+    repo = Path(td)
+    sources = {
+        "alpha.js": "class Alpha {} Beta();\n",
+        "beta.php": "<?php class Beta {} Alpha();\n",
+        "use.ts": "Alpha(); Alpha(); Beta(); A.B(); AxB(); Alphabet();\n",
+        "noise.js": "// Alpha Beta A.B\nconst label = 'Missing';\n",
+        "near.js": "AxB(); Alphabet();\n",
+    }
+    write_index(repo, sources)
+    definitions = {"Alpha": ["alpha.js"], "Beta": ["beta.php"], "A.B": [], "Missing": []}
+    returned = {"Alpha": ["use.ts", "noise.js"], "Beta": ["alpha.js"], "A.B": [], "Missing": []}
+    calls = []
+
+    def query(binary, project, *args):
+        calls.append((args[0], args[1]))
+        paths = (definitions if args[0] == "find-symbol" else returned)[args[1]]
+        return json.dumps({"results": [{"file_path": p} for p in paths]})
+
+    output = io.StringIO()
+    with patch.object(sys, "argv", ["impact-oracle.py", "--repo", str(repo),
+            "--binary", "fixture", "--symbols", " Beta,Alpha,A.B,Missing,Alpha ",
+            "--no-index", "--show-diff", "--json", str(repo / "report.json")]), \
+            patch.object(oracle, "run", side_effect=query), contextlib.redirect_stdout(output):
+        oracle.main()
+    report = json.loads((repo / "report.json").read_text())
+    check(calls == [(command, symbol) for symbol in ("Beta", "Alpha", "A.B", "Missing", "Alpha")
+                    for command in ("find-symbol", "impact")],
+          "multi-symbol: requested order, duplicates, and query order preserved")
+    for symbol, expected in {
+        "Alpha": ["beta.php", "use.ts"], "Beta": ["alpha.js", "use.ts"],
+        "A.B": ["use.ts"], "Missing": [],
+    }.items():
+        check(report[symbol]["code_truth"] == expected, f"{symbol}: independent code truth and definitions")
+    check(report["Missing"]["raw_truth"] == ["noise.js"], "missing: literal-only match remains raw")
+    check(report["A.B"]["raw_truth"] == ["noise.js", "use.ts"], "regex metacharacters remain literal")
+    check(report["TOTAL"]["code_truth"] == 7 and report["TOTAL"]["code_hit"] == 3
+          and report["TOTAL"]["returned"] == 5, "duplicate symbols contribute to TOTAL each time")
+    rows = [line.split()[0] for line in output.getvalue().splitlines()
+            if line and not line.startswith((" ", "-", "symbol"))]
+    check(rows == ["Beta", "Alpha", "A.B", "Missing", "Alpha", "TOTAL"],
+          "multi-symbol: printed rows retain requested order and duplicates")
+    check("    raw-only noise.js" in output.getvalue() and "    missed  beta.php" in output.getvalue(),
+          "multi-symbol: show-diff retains raw-only and missed classifications")
+
+# Deterministic lifetime check instead of a platform-sensitive memory threshold:
+# by the third file, neither representation of the first source may be retained.
+class TrackedText(str):
+    pass
+
+
+references = []
+
+
+def tracked_read(path, **kwargs):
+    if len(references) >= 4:
+        gc.collect()
+        check(references[0]() is None and references[1]() is None,
+              "streaming: early raw and stripped source strings are released")
+    value = TrackedText("Target();\n")
+    references.append(weakref.ref(value))
+    return value
+
+
+def tracked_strip(path, text):
+    value = TrackedText(oracle.strip_js(text))
+    references.append(weakref.ref(value))
+    return value
+
+
+with patch.object(sys, "argv", ["impact-oracle.py", "--repo", ".", "--binary", "fixture",
+        "--symbols", "Target", "--no-index"]), \
+        patch.object(oracle, "indexed_files", return_value=["first.js", "second.js", "third.js"]), \
+        patch.object(Path, "read_text", new=tracked_read), \
+        patch.object(oracle, "strip_for", new=tracked_strip), \
+        patch.object(oracle, "run", return_value='{"results": []}'), \
+        contextlib.redirect_stdout(io.StringIO()):
+    oracle.main()
 
 if failures:
     print("FAILED:\n" + "\n".join(f"  {failure}" for failure in failures))

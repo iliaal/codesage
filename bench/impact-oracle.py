@@ -320,16 +320,24 @@ def main() -> None:
             "code-only scoring supports only JavaScript/TypeScript and PHP; "
             "unsupported indexed files: " + ", ".join(unsupported)
         )
-    raw_text: dict[str, str] = {}
-    code_text: dict[str, str] = {}
+    # Retain matched paths, not two copies of the entire indexed source corpus.
+    # Definition queries stay after all reads so unreadable sources fail before
+    # any scoring queries or output, just as unsupported languages do.
+    patterns = {sym: re.compile(r"\b" + re.escape(sym) + r"\b") for sym in symbols}
+    raw_matches: dict[str, set[str]] = {sym: set() for sym in patterns}
+    code_matches: dict[str, set[str]] = {sym: set() for sym in patterns}
     for rel in files:
         p = repo / rel
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             ap.error(f"cannot read indexed source file {rel!r}: {exc}")
-        raw_text[rel] = text
-        code_text[rel] = strip_for(rel, text)
+        code = strip_for(rel, text)
+        for sym, pat in patterns.items():
+            if pat.search(text):
+                raw_matches[sym].add(rel)
+            if pat.search(code):
+                code_matches[sym].add(rel)
 
     report: dict[str, dict] = {}
     tot = {"raw_truth": 0, "code_truth": 0, "returned": 0, "raw_hit": 0, "code_hit": 0}
@@ -337,10 +345,9 @@ def main() -> None:
     print(header)
     print("-" * len(header))
     for sym in symbols:
-        pat = re.compile(r"\b" + re.escape(sym) + r"\b")
         defs = definition_files(binary, repo, sym)
-        raw_truth = {f for f, t in raw_text.items() if f not in defs and pat.search(t)}
-        code_truth = {f for f, t in code_text.items() if f not in defs and pat.search(t)}
+        raw_truth = raw_matches[sym] - defs
+        code_truth = code_matches[sym] - defs
         returned = set(impact_files(binary, repo, sym, args.depth))
         raw_hit = returned & raw_truth
         code_hit = returned & code_truth
