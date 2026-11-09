@@ -32,13 +32,17 @@ The comparator does not implicitly upgrade earlier control protocols.
 
 Search failures (records carrying `error`, or `meta.search_failures > 0`) are
 scored as misses by the runner, so a flaky arm manufactures lift for the other
-one. Failed ids are counted per arm and listed under the Arms table. The
-comparison is refused unless `--allow-failures` (compare anyway, failures
+one. Failures are counted per input before pooling; failed ids are listed
+under the Arms table. The comparison is refused unless `--allow-failures`
+(compare anyway, failures
 stay in) or `--exclude-failed` (drop every id that failed in EITHER arm from
 BOTH arms before pairing, keeping the comparison symmetric). The two flags
 combine. Exclusion only clears failures it can attribute to records: if
-`meta.search_failures` exceeds the records carrying `error` in that arm, the
-remainder still refuses without `--allow-failures`.
+`meta.search_failures` exceeds the records carrying `error` in that input,
+the remainder still refuses without `--allow-failures`. An error in another
+input cannot account for it. Merged metadata reports the sum of each input's
+larger metadata/record count; the Arms table reports failures left after
+exclusion, including any whose case ids are unknown.
 
 Per arm: miss rate, recall@5, recall@10, MRR, median first-hit rank (hits only,
 upper median, as the runner prints it). Recall@k is |top-k ∩ expected| /
@@ -434,7 +438,8 @@ def load_records(paths: list[Path], *, allow_partial: bool) -> tuple[dict, dict[
     Meta values from several files are merged; a key that differs across the
     files of one arm is recorded as a `MultiValue` (sorted by canonical JSON,
     originals kept) for display. Controlled records retain the originating
-    metadata independently of the merged display metadata.
+    metadata independently of the merged display metadata. Search failures
+    are reconciled against each file's records before their counts are summed.
     """
     out: dict[str, dict] = {}
     meta: dict = {}
@@ -492,12 +497,19 @@ def load_records(paths: list[Path], *, allow_partial: bool) -> tuple[dict, dict[
                 **{key: file_meta[key] for key in PROVENANCE_KEYS},
                 "provenance": dict(file_meta["provenance"]),
             }, "_input_path": str(path)} if controlled else rec
+        # Count known and unknown failures within their own input. Pooling
+        # first would let a record error from another file hide an unknown
+        # metadata failure, especially when --exclude-failed drops that record.
+        file_failures = max(
+            parse_failure_count(file_meta.get("search_failures"), str(path)),
+            sum(rec.get("error") is not None for rec in data),
+        )
+        if "search_failures" in file_meta or file_failures:
+            meta["search_failures"] = meta.get("search_failures", 0) + file_failures
         for k, v in file_meta.items():
             if k == "search_failures":
-                # Validate each input before aggregation, including the first,
-                # so invalid counts cannot cancel another file's failures.
-                meta[k] = meta.get(k, 0) + parse_failure_count(v, str(path))
-            elif k not in meta:
+                continue
+            if k not in meta:
                 meta[k] = v
             elif meta[k] != v:
                 prior = list(meta[k]) if isinstance(meta[k], MultiValue) else [meta[k]]
@@ -514,9 +526,9 @@ def search_failure_counts(
     base_meta: dict, cand_meta: dict, baseline: dict[str, dict], candidate: dict[str, dict],
     *, attributed: dict[str, int] | None = None,
 ) -> dict[str, int]:
-    """Per-arm failure count: the larger of meta.search_failures (minus the
+    """Per-arm failure count: the larger of the reconciled input counts (minus the
     failures already attributed to dropped records, floor 0) and the records
-    still carrying `error` (a legacy list has no meta)."""
+    still carrying `error` (also supports callers without metadata)."""
     attributed = attributed or {}
     counts = {}
     for arm, meta, recs in (("baseline", base_meta, baseline), ("candidate", cand_meta, candidate)):
@@ -806,6 +818,7 @@ def compare(
     cand_meta: dict | None = None,
     excluded: list[str] | None = None,
     mismatch_overrides: list[str] | None = None,
+    failure_counts: dict[str, int] | None = None,
 ) -> tuple[list[str], bool]:
     """Return (report lines, accept); raise Refused when no honest verdict exists."""
     ids = sorted(set(baseline) & set(candidate))
@@ -835,6 +848,8 @@ def compare(
                      "placebo advantage and source/index/model provenance are unverified.")
     base_failed = failed_ids(baseline)
     cand_failed = failed_ids(candidate)
+    if failure_counts is None:
+        failure_counts = search_failure_counts(base_meta or {}, cand_meta or {}, baseline, candidate)
     if excluded:
         lines.append(f"- Excluded failed ids (both arms): {len(excluded)} ({', '.join(excluded)})")
     else:
@@ -904,7 +919,7 @@ def compare(
         f"| {fmt_median(cand['median_first_hit'])} | |"
     )
     lines.append(
-        f"| search failures | {len(base_failed)} | {len(cand_failed)} | |"
+        f"| search failures | {failure_counts['baseline']} | {failure_counts['candidate']} | |"
     )
     lines.append("")
     if base_failed or cand_failed:
@@ -913,6 +928,14 @@ def compare(
             lines.append(f"- baseline: {', '.join(base_failed)}")
         if cand_failed:
             lines.append(f"- candidate: {', '.join(cand_failed)}")
+        lines.append("")
+    for arm, known in (("baseline", base_failed), ("candidate", cand_failed)):
+        unknown = failure_counts[arm] - len(known)
+        if unknown:
+            lines.append(f"- {arm}: {unknown} search failure(s) without an identifiable case id; "
+                         "retained under `--allow-failures`.")
+    if any(failure_counts[arm] > len(known)
+           for arm, known in (("baseline", base_failed), ("candidate", cand_failed))):
         lines.append("")
     lines.append("## Paired deltas (candidate - baseline)")
     lines.append("")
@@ -1074,6 +1097,7 @@ def main(argv: list[str] | None = None) -> int:
             cand_meta=cand_meta,
             excluded=excluded,
             mismatch_overrides=diffs if args.allow_mismatch else None,
+            failure_counts=failures,
         )
     except Refused as e:
         print(f"REFUSED: {e}", file=sys.stderr)
