@@ -8,8 +8,11 @@ mod test_commands;
 mod tests_rec;
 
 pub use indexer::{
-    IndexMode, changed_files_since, feature_touched_since, git_history_index,
-    git_history_index_with_options,
+    CAUSE_DIVERGED, CAUSE_FIRST_BUILD, CAUSE_FULL, CAUSE_RANGE_TOO_LONG,
+    DISCARD_ENVIRONMENT_CHANGED, DISCARD_RECHECK_TIMEOUT, IndexMode, OUTCOME_FAILED,
+    OUTCOME_NO_PROGRESS, OUTCOME_PARKED, OUTCOME_PROGRESSING, changed_files_since,
+    feature_touched_since, git_history_index, git_history_index_with_options, history_rebuild,
+    history_rebuild_at,
 };
 pub(crate) use risk::CompletePolicy;
 pub(crate) use risk::ImportCycles;

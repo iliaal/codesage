@@ -3022,6 +3022,89 @@ pub struct FreshnessInfo {
     /// rebuilds the semantic state.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub semantic_unavailable: Option<String>,
+    /// A full Git history rebuild saved across bounded `codesage git-index`
+    /// runs. Absent when none is saved.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub history_rebuild: Option<HistoryRebuild>,
+}
+
+/// A full Git history rebuild that reads its commits in slices across
+/// bounded `git-index` runs. Until it completes, history facts (churn, fixes,
+/// coupling, authorship) describe the previously indexed head, or are absent
+/// when history was never indexed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct HistoryRebuild {
+    /// `progressing`: the last run that worked on it saved commits or shrank
+    /// its slice, and the next hook run continues it. A run that reached the
+    /// rebuild but discarded what it read, because the numstat environment
+    /// moved or its re-check exceeded its allowance, leaves the state as it
+    /// was and records `note`, `last_discard_unix`, `discarding_since_unix`, and
+    /// `discard_cause`; a re-check that ran out of time also halves the next
+    /// slice. `no_progress`: that run
+    /// saved nothing; `stalled` says why and a larger
+    /// `CODESAGE_GIT_HISTORY_TIMEOUT_MS` is needed. `failed`: that run stopped
+    /// on an error other than its deadline, which `stalled` holds. `parked`: a later pass
+    /// brought history up to date without it, or `target_sha` is neither HEAD
+    /// nor an ancestor of HEAD (or no longer exists), so no pass from HEAD
+    /// resumes it; it is kept so a rebuild toward `target_sha` reuses the
+    /// saved commits.
+    pub state: String,
+    /// `first_build` (no history indexed yet), `diverged` (the stored history
+    /// head is not an ancestor of HEAD), `range_too_long` (reading the commits
+    /// after the stored head exceeded the budget), or `full` (`git-index
+    /// --full`, a changed history policy, or a rename an incremental pass
+    /// cannot re-key).
+    pub cause: String,
+    /// Commit the rebuild indexes history at.
+    pub target_sha: String,
+    /// Stored history head when the rebuild started; absent on a first build.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stored_sha: Option<String>,
+    pub commits_saved: usize,
+    pub commits_total: usize,
+    /// Commits the next run reads in its first slice.
+    pub next_slice_commits: usize,
+    /// Commits the last run that worked on it saved.
+    pub last_run_saved: usize,
+    /// Unix seconds of the last run that saved progress on it or changed its
+    /// state; a run that only discarded what it read does not move it.
+    pub updated_at_unix: i64,
+    /// Why the last run saved nothing (`no_progress`) or the error it stopped
+    /// on (`failed`). On a `parked` rebuild, the last such reason, kept for
+    /// information.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stalled: Option<String>,
+    /// Why a run stopped without changing this rebuild's state: one toward
+    /// another commit that did not reach it, or one that discarded a plan or
+    /// slice because the numstat environment changed while it was read or its
+    /// re-check exceeded the re-check allowance. Informational.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
+    /// Unix seconds of the last run that reached this rebuild but discarded
+    /// what it read, when no run has saved progress on it since.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_discard_unix: Option<i64>,
+    /// Unix seconds of the first such run since the last that saved progress.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub discarding_since_unix: Option<i64>,
+    /// Why the last discarding run discarded what it read:
+    /// `environment_changed` or `recheck_timeout`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub discard_cause: Option<String>,
+    /// Consecutive re-plans that found no commits saved under their numstat
+    /// environment while output was saved under another environment; a
+    /// branch switch under an unchanged environment does not count. Saved
+    /// output is kept for at most four environments, so a count of four or
+    /// more means the environment changes between runs, or more environments
+    /// alternate than are kept, and saved progress does not grow. Reset when
+    /// a run resumes the rebuild under its environment and saves progress, and
+    /// by any re-plan that is not a restart.
+    #[serde(skip_serializing_if = "is_zero_usize", default)]
+    pub restarts: usize,
+}
+
+fn is_zero_usize(count: &usize) -> bool {
+    *count == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]

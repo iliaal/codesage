@@ -26,6 +26,9 @@ struct Check {
     /// Carried only by the `hook_health` check.
     #[serde(skip_serializing_if = "Option::is_none")]
     hook_health: Option<codesage_protocol::HookHealth>,
+    /// Carried only by the `git_history` check, while a rebuild is staged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_rebuild: Option<codesage_protocol::HistoryRebuild>,
 }
 
 impl Check {
@@ -35,6 +38,7 @@ impl Check {
             status,
             message,
             hook_health: None,
+            history_rebuild: None,
         }
     }
 }
@@ -54,7 +58,11 @@ pub fn run(json: bool) -> Result<()> {
         checks.push(check_db(root));
         checks.push(check_disk(root));
         checks.push(check_hooks(root));
-        checks.push(check_hook_health(root));
+        let mut hook_health = check_hook_health(root);
+        let git_history = check_git_history(root);
+        explain_hook_exit(&mut hook_health, git_history.history_rebuild.as_ref());
+        checks.push(hook_health);
+        checks.push(git_history);
         checks.push(check_index_drift(root));
         checks.push(check_semantic_freshness(root));
     } else {
@@ -589,8 +597,228 @@ fn check_hook_health(root: &Path) -> Check {
         status,
         message: parts.join("; "),
         hook_health: Some(health),
+        history_rebuild: None,
     }
 }
+
+/// A hook run exits nonzero on every run of a history rebuild that is still
+/// saving progress, so its exit status alone reads as a failure.
+fn explain_hook_exit(hook_health: &mut Check, rebuild: Option<&codesage_protocol::HistoryRebuild>) {
+    use codesage_graph::history_rebuild_terms::OUTCOME_PROGRESSING;
+    let failed = hook_health
+        .hook_health
+        .as_ref()
+        .is_some_and(|health| health.last_exit.is_some_and(|code| code != 0));
+    if failed && rebuild.is_some_and(|rebuild| rebuild.state == OUTCOME_PROGRESSING) {
+        hook_health.message.push_str(
+            "; a nonzero exit is expected while the git history rebuild is in progress \
+             (see git_history)",
+        );
+    }
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+/// Stored git history head and any staged rebuild. A rebuild that saves
+/// progress passes; one whose last run saved nothing warns with the recovery.
+fn check_git_history(root: &Path) -> Check {
+    use codesage_graph::history_rebuild_terms::{
+        CAUSE_DIVERGED, CAUSE_FIRST_BUILD, CAUSE_FULL, CAUSE_RANGE_TOO_LONG,
+        DISCARD_RECHECK_TIMEOUT, OUTCOME_FAILED, OUTCOME_NO_PROGRESS, OUTCOME_PARKED,
+        OUTCOME_PROGRESSING,
+    };
+    const NAME: &str = "git_history";
+    let db_path = root.join(PROJECT_DIR).join(DB_FILE);
+    if !db_path.exists() {
+        return Check::new(
+            NAME,
+            Status::Skip,
+            "no index.db yet (run `codesage index`)".to_string(),
+        );
+    }
+    if codesage_graph::hook_health::inspect(root).is_none() {
+        return Check::new(NAME, Status::Skip, "not a git repository".to_string());
+    }
+    let db = match Database::open_existing_read(&db_path) {
+        Ok(db) => db,
+        Err(e) => return Check::new(NAME, Status::Fail, format!("failed to open index: {e}")),
+    };
+    let stored = match db.get_git_index_state() {
+        Ok(state) => state.map(|(sha, _)| sha),
+        Err(e) => {
+            return Check::new(
+                NAME,
+                Status::Fail,
+                format!("failed to read git history state: {e:#}"),
+            );
+        }
+    };
+    let rebuild = match codesage_graph::history_rebuild_at(root, &db) {
+        Ok(rebuild) => rebuild,
+        Err(e) => {
+            return Check::new(
+                NAME,
+                Status::Fail,
+                format!("failed to read the staged git history rebuild: {e:#}"),
+            );
+        }
+    };
+    let indexed = match &stored {
+        Some(sha) => format!("indexed at {}", short_sha(sha)),
+        None => "not indexed".to_string(),
+    };
+    let Some(rebuild) = rebuild else {
+        return match stored {
+            Some(_) => Check::new(NAME, Status::Pass, indexed),
+            None => Check::new(
+                NAME,
+                Status::Warn,
+                "not indexed (run `codesage git-index`)".to_string(),
+            ),
+        };
+    };
+    let saved = format!(
+        "{} of {} commits saved toward {}",
+        rebuild.commits_saved,
+        rebuild.commits_total,
+        short_sha(&rebuild.target_sha)
+    );
+    let stored_head = rebuild.stored_sha.as_deref().map_or("", short_sha);
+    let cause = match rebuild.cause.as_str() {
+        CAUSE_FIRST_BUILD => "first build".to_string(),
+        CAUSE_DIVERGED => format!("stored head {stored_head} is not an ancestor of HEAD"),
+        CAUSE_RANGE_TOO_LONG => {
+            format!("the commits after stored head {stored_head} exceeded the budget")
+        }
+        CAUSE_FULL => format!(
+            "full rebuild against stored head {stored_head} (`--full`, a changed history \
+             policy, or a rename an incremental pass cannot re-key)"
+        ),
+        other => other.to_string(),
+    };
+    let age = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|now| {
+            u64::try_from(rebuild.updated_at_unix)
+                .ok()
+                .map(|at| (now, at))
+        })
+        .map(|(now, at)| format_age(now.as_secs().saturating_sub(at)))
+        .unwrap_or_default();
+    let (status, message) = match rebuild.state.as_str() {
+        OUTCOME_PARKED => (
+            Status::Pass,
+            format!(
+                "{indexed}; a rebuild toward {} ({saved}, cause: {cause}) is kept so a later \
+                 rebuild reuses its commits",
+                short_sha(&rebuild.target_sha)
+            ),
+        ),
+        OUTCOME_NO_PROGRESS => (
+            Status::Warn,
+            format!(
+                "{indexed}; rebuild made no progress on its last run{age}: {}; {saved}, cause: \
+                 {cause}. Rerun with a larger budget: \
+                 `CODESAGE_GIT_HISTORY_TIMEOUT_MS=<ms> codesage git-index --full` (at most 600000)",
+                rebuild.stalled.as_deref().unwrap_or("no slice was read")
+            ),
+        ),
+        OUTCOME_FAILED => (
+            Status::Warn,
+            format!(
+                "{indexed}; rebuild failed on its last run{age}: {}; {saved}, cause: {cause}. \
+                 Fix the cause, then rerun `codesage git-index --full`, which retries it",
+                rebuild
+                    .stalled
+                    .as_deref()
+                    .unwrap_or("no error was recorded")
+            ),
+        ),
+        OUTCOME_PROGRESSING => (
+            Status::Pass,
+            format!(
+                "{indexed}; rebuild in progress: {saved}, next slice {} commits, last run{age} \
+                 saved {}, cause: {cause}; each `git-index` run continues it and exits 1 until \
+                 it completes",
+                rebuild.next_slice_commits, rebuild.last_run_saved
+            ),
+        ),
+        other => (
+            Status::Warn,
+            format!("{indexed}; rebuild in unrecognized state {other:?}: {saved}, cause: {cause}"),
+        ),
+    };
+    let message = match &rebuild.note {
+        Some(note) => format!(
+            "{message}; note: a run stopped without changing this rebuild's state (see hook_health for whether runs keep failing): {note}"
+        ),
+        None => message,
+    };
+    // From the first discard since the last saved progress to the latest
+    // one, so a single discard does not warn however long it sits.
+    let discarding_for = rebuild
+        .discarding_since_unix
+        .zip(rebuild.last_discard_unix)
+        .and_then(|(since, last)| u64::try_from(last - since).ok())
+        .filter(|&secs| secs >= DISCARD_WARN_SECS);
+    // A parked rebuild is reported without a warning; no run is working on
+    // it, so neither discards nor restarts describe current runs.
+    let parked = rebuild.state == OUTCOME_PARKED;
+    let discarding_for = discarding_for.filter(|_| !parked);
+    let (status, message) = match discarding_for {
+        Some(secs) => {
+            let cause = if rebuild.discard_cause.as_deref() == Some(DISCARD_RECHECK_TIMEOUT) {
+                "re-checking the numstat environment keeps taking longer than it may, so \
+                 fingerprinting is slow here; raise `CODESAGE_GIT_HISTORY_TIMEOUT_MS`"
+            } else {
+                "something changes the git configuration, attributes, or checkout while \
+                 `git-index` runs"
+            };
+            (
+                Status::Warn,
+                format!(
+                    "{message}; runs have reached this rebuild and discarded what they read, \
+                     without saving progress, for {}d{:02}h: {cause}",
+                    secs / 86_400,
+                    (secs % 86_400) / 3600
+                ),
+            )
+        }
+        None => (status, message),
+    };
+    // Each re-plan that keeps nothing under its environment starts that
+    // environment over; past the number of environments kept, that repeats.
+    let (status, message) = if !parked && rebuild.restarts >= STAGED_ENVIRONMENTS_KEPT {
+        (
+            Status::Warn,
+            format!(
+                "{message}; the last {} re-plans each found no commits saved under their numstat \
+                 environment, so saved progress does not grow: the attributes, configuration, \
+                 or git version differ between runs in more than {STAGED_ENVIRONMENTS_KEPT} \
+                 ways, or change on every run",
+                rebuild.restarts
+            ),
+        )
+    } else {
+        (status, message)
+    };
+    Check {
+        name: NAME,
+        status,
+        message,
+        hook_health: None,
+        history_rebuild: Some(rebuild),
+    }
+}
+
+/// Doctor warns when runs have kept discarding what they read from a saved
+/// rebuild for this long without any run saving progress on it.
+const DISCARD_WARN_SECS: u64 = 86_400;
+
+use codesage_storage::db::STAGED_ENVIRONMENTS_KEPT;
 
 fn format_age(secs: u64) -> String {
     if secs < 60 {
@@ -1117,6 +1345,337 @@ mod tests {
         assert!(
             !lockdir.exists(),
             "a live `sleep` is no hook run: the lock is reaped"
+        );
+    }
+
+    #[test]
+    fn check_git_history_reports_a_staged_rebuild_and_whether_it_progresses() {
+        use codesage_graph::history_rebuild_terms::{
+            CAUSE_DIVERGED, OUTCOME_FAILED, OUTCOME_NO_PROGRESS, OUTCOME_PARKED,
+            OUTCOME_PROGRESSING,
+        };
+        let dir = init_git_repo();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(PROJECT_DIR)).unwrap();
+        let db_path = root.join(PROJECT_DIR).join(DB_FILE);
+        let stored = "feedfacefeedfacefeedfacefeedfacefeedface";
+        let target = "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff";
+        let commits: Vec<String> = (0..4).map(|i| format!("{i:040x}")).collect();
+        let stage = |outcome: &str, stalled: Option<&str>| {
+            let db = Database::open(&db_path).unwrap();
+            db.set_git_index_state(stored).unwrap();
+            let progress = codesage_storage::db::GitHistoryProgress {
+                slice_len: 2,
+                cause: CAUSE_DIVERGED,
+                stored_sha: Some(stored),
+                outcome,
+                stalled,
+                run_saved: 2,
+            };
+            db.execute_batch(|db| {
+                db.start_git_history_build(target, "policy", 0, &commits, &progress)?;
+                db.stage_git_history_commits(
+                    &[(&commits[0], "out"), (&commits[1], "out")],
+                    &progress,
+                )
+            })
+            .unwrap();
+        };
+
+        assert_eq!(check_git_history(root).status, Status::Skip);
+        drop(Database::open(&db_path).unwrap());
+        let check = check_git_history(root);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("run `codesage git-index`"),
+            "{}",
+            check.message
+        );
+        assert!(check.history_rebuild.is_none());
+
+        stage(OUTCOME_PROGRESSING, None);
+        let check = check_git_history(root);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        for part in [
+            "indexed at feedfacefeed",
+            "rebuild in progress: 2 of 4 commits saved toward c0ffeec0ffee",
+            "next slice 2 commits",
+            "saved 2",
+            "cause: stored head feedfacefeed is not an ancestor of HEAD",
+        ] {
+            assert!(check.message.contains(part), "{part}: {}", check.message);
+        }
+        let rebuild = check
+            .history_rebuild
+            .clone()
+            .expect("rebuild carried in JSON");
+        assert_eq!(rebuild.state, OUTCOME_PROGRESSING);
+
+        // Discards kept up for two days on a rebuild runs work on warn.
+        let db = Database::open(&db_path).unwrap();
+        db.execute_raw_for_tests(
+            "UPDATE git_history_build_v2_progress SET discarding_since = unixepoch() - 2 * 86400",
+        )
+        .unwrap();
+        db.record_git_history_discard(
+            "the numstat environment changed",
+            "environment_changed",
+            None,
+        )
+        .unwrap();
+        let check = check_git_history(root);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains(
+                "runs have reached this rebuild and discarded what they read, without saving \
+                 progress, for 2d00h: something changes the git configuration"
+            ),
+            "{}",
+            check.message
+        );
+        db.record_git_history_discard("re-checking took longer", "recheck_timeout", None)
+            .unwrap();
+        let check = check_git_history(root);
+        assert!(
+            check
+                .message
+                .contains("re-checking the numstat environment keeps taking longer than it may"),
+            "{}",
+            check.message
+        );
+
+        // Re-plans that keep starting over warn too.
+        db.execute_raw_for_tests(
+            "UPDATE git_history_build_v2_progress SET discarding_since = NULL;
+             UPDATE git_history_build_v2_progress SET restarts = 4",
+        )
+        .unwrap();
+        drop(db);
+        let check = check_git_history(root);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains(
+                "the last 4 re-plans each found no commits saved under their numstat environment"
+            ),
+            "{}",
+            check.message
+        );
+        stage(OUTCOME_PROGRESSING, None);
+        assert_eq!(check_git_history(root).status, Status::Pass);
+
+        let mut hook = Check {
+            hook_health: Some(codesage_protocol::HookHealth {
+                last_exit: Some(1),
+                ..Default::default()
+            }),
+            ..Check::new("hook_health", Status::Warn, "last run x exit=1".into())
+        };
+        explain_hook_exit(&mut hook, Some(&rebuild));
+        assert!(
+            hook.message
+                .ends_with("a nonzero exit is expected while the git history rebuild is in progress (see git_history)"),
+            "{}",
+            hook.message
+        );
+
+        stage(
+            OUTCOME_NO_PROGRESS,
+            Some("commit 000000000000 alone takes longer than the budget"),
+        );
+        let check = check_git_history(root);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        for part in [
+            "rebuild made no progress on its last run",
+            "commit 000000000000 alone takes longer than the budget",
+            "`CODESAGE_GIT_HISTORY_TIMEOUT_MS=<ms> codesage git-index --full`",
+        ] {
+            assert!(check.message.contains(part), "{part}: {}", check.message);
+        }
+        let mut hook = Check {
+            hook_health: Some(codesage_protocol::HookHealth {
+                last_exit: Some(1),
+                ..Default::default()
+            }),
+            ..Check::new("hook_health", Status::Warn, "last run x exit=1".into())
+        };
+        explain_hook_exit(&mut hook, check.history_rebuild.as_ref());
+        assert_eq!(
+            hook.message, "last run x exit=1",
+            "a stalled rebuild is a failure"
+        );
+
+        stage(
+            OUTCOME_FAILED,
+            Some("git log failed in /repo: fatal: unable to read 0123"),
+        );
+        let check = check_git_history(root);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        for part in [
+            "rebuild failed on its last run",
+            "git log failed in /repo: fatal: unable to read 0123",
+            "Fix the cause, then rerun `codesage git-index --full`, which retries it",
+        ] {
+            assert!(check.message.contains(part), "{part}: {}", check.message);
+        }
+        assert!(
+            !check.message.contains("larger budget"),
+            "{}",
+            check.message
+        );
+        let mut hook = Check {
+            hook_health: Some(codesage_protocol::HookHealth {
+                last_exit: Some(1),
+                ..Default::default()
+            }),
+            ..Check::new("hook_health", Status::Warn, "last run x exit=1".into())
+        };
+        explain_hook_exit(&mut hook, check.history_rebuild.as_ref());
+        assert_eq!(
+            hook.message, "last run x exit=1",
+            "a failed rebuild is a failure"
+        );
+
+        Database::open(&db_path)
+            .unwrap()
+            .set_git_history_build_outcome(OUTCOME_PARKED)
+            .unwrap();
+        let check = check_git_history(root);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check
+                .message
+                .contains("is kept so a later rebuild reuses its commits"),
+            "{}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn check_git_history_parks_a_stalled_rebuild_unreachable_from_head() {
+        use codesage_graph::history_rebuild_terms::{CAUSE_DIVERGED, OUTCOME_NO_PROGRESS};
+        let dir = init_git_repo();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&["checkout", "-qb", "side"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "side"]);
+        let side = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "-"]);
+        let main = git(&["rev-parse", "HEAD"]);
+        std::fs::create_dir_all(root.join(PROJECT_DIR)).unwrap();
+        let db_path = root.join(PROJECT_DIR).join(DB_FILE);
+
+        // The user returned to main, and then a target git no longer has.
+        for target in [side, "d".repeat(40)] {
+            let db = Database::open(&db_path).unwrap();
+            db.set_git_index_state(&main).unwrap();
+            let commits = vec![target.clone()];
+            let progress = codesage_storage::db::GitHistoryProgress {
+                slice_len: 1,
+                cause: CAUSE_DIVERGED,
+                stored_sha: Some(&main),
+                outcome: OUTCOME_NO_PROGRESS,
+                stalled: Some("commit 000000000000 alone takes longer than the budget"),
+                run_saved: 0,
+            };
+            db.execute_batch(|db| {
+                db.start_git_history_build(&target, "policy", 0, &commits, &progress)
+                    .map(|_| ())
+            })
+            .unwrap();
+            drop(db);
+            let check = check_git_history(root);
+            assert_eq!(check.status, Status::Pass, "{target}: {}", check.message);
+            assert!(
+                check
+                    .message
+                    .contains("is kept so a later rebuild reuses its commits"),
+                "{target}: {}",
+                check.message
+            );
+            assert!(
+                !check.message.contains("git-index --full"),
+                "{target}: {}",
+                check.message
+            );
+        }
+
+        // A note from a run that left the rebuild's state alone is shown
+        // without a warning.
+        Database::open(&db_path)
+            .unwrap()
+            .set_git_history_build_note("listing the commits toward abc ran out of time")
+            .unwrap();
+        let check = check_git_history(root);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check.message.ends_with(
+                "note: a run stopped without changing this rebuild's state (see hook_health for \
+                 whether runs keep failing): listing the commits toward abc ran out of time"
+            ),
+            "{}",
+            check.message
+        );
+
+        // One discard is not a warning, however long ago it was or how long
+        // before it progress was last saved.
+        let db = Database::open(&db_path).unwrap();
+        db.execute_raw_for_tests(
+            "UPDATE git_history_build_v2_progress SET updated_at = unixepoch() - 3 * 86400",
+        )
+        .unwrap();
+        db.record_git_history_discard(
+            "the numstat environment changed",
+            "environment_changed",
+            None,
+        )
+        .unwrap();
+        let check = check_git_history(root);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        db.execute_raw_for_tests(
+            "UPDATE git_history_build_v2_progress
+             SET discarding_since = unixepoch() - 25 * 3600,
+                 discarded_at = unixepoch() - 25 * 3600",
+        )
+        .unwrap();
+        let check = check_git_history(root);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+
+        // A parked rebuild warns neither for discards kept up for two days
+        // nor for restarts: no run is working on it.
+        db.execute_raw_for_tests(
+            "UPDATE git_history_build_v2_progress SET discarding_since = unixepoch() - 2 * 86400;
+             UPDATE git_history_build_v2_progress SET restarts = 4",
+        )
+        .unwrap();
+        db.record_git_history_discard(
+            "the numstat environment changed",
+            "environment_changed",
+            None,
+        )
+        .unwrap();
+        let check = check_git_history(root);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check
+                .message
+                .contains("is kept so a later rebuild reuses its commits")
+                && !check.message.contains("runs have reached this rebuild")
+                && !check.message.contains("re-plans each found"),
+            "{}",
+            check.message
         );
     }
 

@@ -42,9 +42,17 @@ pub use git::{git_command, git_worktree_command};
 pub use git_history::{
     IndexMode, ReachabilityOptions, abbreviate_paths, assess_risk, assess_risk_batch,
     assess_risk_diff, changed_files_since, feature_touched_since, find_coupling,
-    find_coupling_ranked, git_history_index, git_history_index_with_options, recommend_tests,
-    recommend_tests_with_reachability,
+    find_coupling_ranked, git_history_index, git_history_index_with_options, history_rebuild,
+    history_rebuild_at, recommend_tests, recommend_tests_with_reachability,
 };
+/// Vocabulary of [`codesage_protocol::HistoryRebuild`] `cause` and `state`.
+pub mod history_rebuild_terms {
+    pub use crate::git_history::{
+        CAUSE_DIVERGED, CAUSE_FIRST_BUILD, CAUSE_FULL, CAUSE_RANGE_TOO_LONG,
+        DISCARD_ENVIRONMENT_CHANGED, DISCARD_RECHECK_TIMEOUT, OUTCOME_FAILED, OUTCOME_NO_PROGRESS,
+        OUTCOME_PARKED, OUTCOME_PROGRESSING,
+    };
+}
 pub use impact::{impact_analysis, impact_analysis_report};
 pub use import_graph::file_import_pairs;
 pub use index::{

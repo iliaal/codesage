@@ -61,6 +61,42 @@ pub(crate) fn git_history_command(root: &Path) -> Command {
     command
 }
 
+/// Caller variables a history walk does not inherit. The pathspec variables
+/// change how git reads pathspecs without being configuration, and a hook
+/// inherits whatever its triggering command exported, so one run would list
+/// attribute files or read commits differently from the next. `GIT_CONFIG`
+/// makes `git config --list` read only the named file while `git log` ignores
+/// it, so the numstat fingerprint would hash a configuration the walk never
+/// sees. Configuration (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`,
+/// `GIT_CONFIG_GLOBAL`, ...) still reaches the walk, as it reaches every other
+/// git child, and the numstat fingerprint hashes its effect.
+const HISTORY_WALK_STRIPPED_ENV: &[&str] = &[
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+    "GIT_CONFIG",
+];
+
+/// [`git_history_command`] for the history walk itself and for the numstat
+/// environment fingerprint that decides whether saved walk output is
+/// reusable: the variables in [`HISTORY_WALK_STRIPPED_ENV`] and every
+/// `GIT_TRACE*` variable are removed. Other callers keep
+/// [`git_history_command`] unchanged.
+pub(crate) fn git_history_walk_command(root: &Path) -> Command {
+    let mut command = git_history_command(root);
+    for (name, _) in std::env::vars_os() {
+        let name_text = name.to_string_lossy();
+        if name_text.starts_with("GIT_TRACE")
+            || HISTORY_WALK_STRIPPED_ENV.contains(&name_text.as_ref())
+        {
+            command.env_remove(&name);
+        }
+    }
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command
+}
+
 /// A history walk that ran past its deadline. Its child was killed and no
 /// output was used, so callers can tell a budget overrun from a git failure.
 #[derive(Debug)]

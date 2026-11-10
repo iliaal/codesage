@@ -29,8 +29,9 @@ mod sidecar_verdicts;
 mod structural;
 
 pub use git_hist::{
-    CoChangeRow, CoChangeWrite, GitFileRow, GitHistoryBuild, ONE_OFF_RANK_MULTIPLIER,
-    RECURRING_SPAN_SECS,
+    CoChangeRow, CoChangeWrite, GitFileRow, GitHistoryBuild, GitHistoryBuildStatus,
+    GitHistoryProgress, ONE_OFF_RANK_MULTIPLIER, RECURRING_SPAN_SECS, STAGED_ENVIRONMENT_TTL_SECS,
+    STAGED_ENVIRONMENTS_KEPT,
 };
 pub use overlay::StructuralOverlayFile;
 pub use semantic::{RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes};

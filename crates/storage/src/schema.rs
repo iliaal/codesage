@@ -783,6 +783,10 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ("0027_symbol_signatures", migrate_0027_symbol_signatures),
     ("0029_feature_entrypoints", migrate_0029_feature_entrypoints),
     ("0030_git_history_build", migrate_0030_git_history_build),
+    (
+        "0031_git_history_build_v2",
+        migrate_0031_git_history_build_v2,
+    ),
 ];
 
 fn migrate_0027_symbol_signatures(conn: &Connection) -> rusqlite::Result<()> {
@@ -822,6 +826,71 @@ fn migrate_0030_git_history_build(conn: &Connection) -> rusqlite::Result<()> {
             len INTEGER NOT NULL,
             output TEXT NOT NULL
         );",
+    )
+}
+
+/// Supersedes 0030's position-keyed staging with tables of its own, so a
+/// binary that knows only 0030 keeps working on the same index: each binary
+/// reads and writes only its own staging, and both are a resumable cache.
+/// Each commit's `git log` output is keyed by SHA and by the environment it
+/// was read under (`git_history_build_v2_keys`, one row per numstat
+/// environment and clone mode), because it depends on the commit and that
+/// environment but not on the planned target: a re-plan keeps the commits it
+/// still lists under every environment, so branches whose attributes or
+/// configuration differ each keep their own saved output. The
+/// planned commit list is written once per plan, after the small columns so a
+/// status read stops before its overflow pages; per-run progress lives in its
+/// own row, since updating a column rewrites the whole record.
+///
+/// 0030's tables are kept (and recreated if missing) because the older
+/// binary deletes from them on every pass. Their rows are cleared once: the
+/// older binary prefers a saved rebuild whose target is an ancestor of HEAD
+/// over an incremental pass, so after a rollback it would redo a full
+/// rebuild of a stale target and replace the history this binary built
+/// before catching up incrementally. The result would still be a valid
+/// history, but every run of that work would be wasted.
+fn migrate_0031_git_history_build_v2(conn: &Connection) -> rusqlite::Result<()> {
+    migrate_0030_git_history_build(conn)?;
+    conn.execute_batch(
+        "DELETE FROM git_history_build_slices;
+        DELETE FROM git_history_build_progress;
+        DELETE FROM git_history_build;
+        CREATE TABLE IF NOT EXISTS git_history_build_v2 (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            target_sha TEXT NOT NULL,
+            policy TEXT NOT NULL,
+            cutoff INTEGER NOT NULL,
+            commit_count INTEGER NOT NULL,
+            commits TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS git_history_build_v2_progress (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            slice_len INTEGER NOT NULL,
+            cause TEXT NOT NULL,
+            stored_sha TEXT,
+            outcome TEXT NOT NULL,
+            stalled TEXT,
+            run_saved INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            note TEXT,
+            discarded_at INTEGER,
+            discarding_since INTEGER,
+            discard_cause TEXT,
+            restarts INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS git_history_build_v2_keys (
+            id INTEGER PRIMARY KEY,
+            env_key TEXT NOT NULL UNIQUE,
+            used_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS git_history_build_v2_commits (
+            sha TEXT NOT NULL,
+            key_id INTEGER NOT NULL,
+            output TEXT NOT NULL,
+            PRIMARY KEY (sha, key_id)
+        );
+        CREATE INDEX IF NOT EXISTS git_history_build_v2_commits_key
+            ON git_history_build_v2_commits (key_id);",
     )
 }
 

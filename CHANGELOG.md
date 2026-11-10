@@ -1,13 +1,19 @@
 ## [Unreleased]
 
+### Added
+
+- `codesage doctor` `git_history` check and `project_overview` `freshness.history_rebuild` report a saved `git-index` rebuild: target, commits saved and total, next slice size, cause, and whether its last run progressed, saved nothing, or failed.
+
 ### Changed
 
 - MCP transport dependency rmcp requires 3.9.0 or newer, clearing RUSTSEC-2026-0462 from dependency audits.
+- `git-index` history walks ignore inherited pathspec variables (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`, `GIT_NOGLOB_PATHSPECS`, `GIT_ICASE_PATHSPECS`), `GIT_CONFIG`, and `GIT_TRACE*`.
 - Git hooks record `.codesage/hook-state` after every successful `index` pass and track `git-index` separately in `.codesage/hook-git-state`; an unchanged tree reruns only a failed `git-index` pass. Rerun `codesage install-hooks` to update existing hooks.
 
 ### Fixed
 
-- `git-index` full rebuilds and incremental ranges that exceed `CODESAGE_GIT_HISTORY_TIMEOUT_MS` save progress (schema migration `0030_git_history_build`) and resume on the next run instead of failing identically forever; the previous history stays in place until the rebuild completes. A rebuild forced by a stored head that is not an ancestor of HEAD names that cause and the recovery.
+- `git-index` full rebuilds and incremental ranges that exceed `CODESAGE_GIT_HISTORY_TIMEOUT_MS` save progress (schema migration `0031_git_history_build_v2`) and resume, reusing saved commits across branch switches, kept separately for each set of diff-relevant settings; history is unchanged until the rebuild completes. A rebuild forced by an off-branch stored head names that cause and the recovery.
+- A `git-index` rebuild saves its plan and each slice as soon as they are read, discards a slice read while diff-relevant git settings changed, and stays in progress; `codesage doctor` warns when runs keep discarding.
 - Deleting a file's chunks no longer removes another file's vectors when the path sidecar matches the chunk table's ids but not its paths, the state an older binary leaves after dropping and repopulating the table; the write path rebuilds the sidecar first.
 - `codesage edit-check`, `codesage rehearse`, the brief hook, MCP `edit_check` and `review_rehearsal`, and the MCP `index` block skip a stray `.git` such as an empty directory: a nearer `.codesage` still wins, Git's worktree root containing the start is used, and Git failures fall back to the nearest structurally valid `.git`.
 

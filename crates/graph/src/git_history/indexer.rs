@@ -55,12 +55,12 @@ use codesage_parser::discover::{
 };
 use codesage_protocol::GitIndexStats;
 use codesage_storage::Database;
-use codesage_storage::db::{CoChangeWrite, GitHistoryBuild};
+use codesage_storage::db::{CoChangeWrite, GitHistoryBuild, GitHistoryProgress};
 use globset::GlobSet;
 
 use super::bus_factor::normalized_author;
 use super::source::HistorySource;
-use crate::git::{HistoryDeadline, git_history_command, history_output};
+use crate::git::{HistoryDeadline, git_history_command, git_history_walk_command, history_output};
 
 const DECAY_TAU_DAYS: f64 = 180.0;
 const SECONDS_PER_DAY: f64 = 86_400.0;
@@ -354,11 +354,43 @@ struct WalkLimits {
     /// Walks reported as past their deadline without running git, so tests
     /// can exhaust a budget deterministically.
     forced_deadline: Option<fn(HistoryWalk) -> bool>,
+    /// Whether an incremental range that exceeds the budget falls back to a
+    /// staged rebuild in the same run. Off for the pass that carries a
+    /// just-completed rebuild to HEAD, so one run spends at most three
+    /// budgets: an incremental walk, a staged rebuild, and that follow-up.
+    may_stage: bool,
+    /// Whether a saved rebuild may take precedence over the same-HEAD or
+    /// incremental pass. Off for the pass a run falls back to when the
+    /// rebuild it preferred could not fingerprint its environment.
+    may_preempt: bool,
+    /// Upper bound on the time a re-check may run past the deadline.
+    max_recheck_allowance: Duration,
+    /// Time the numstat environment fingerprint takes on top of its git
+    /// children, so tests can make it slow.
+    #[cfg(test)]
+    environment_delay: Duration,
+    /// Called with the repository root after each slice a rebuild saves, so
+    /// tests can change the numstat environment between slices.
+    #[cfg(test)]
+    after_slice: Option<fn(&Path)>,
+    /// Called with the repository root after a slice is read and before its
+    /// re-check, so tests can change the environment during a slice or make
+    /// the slice slow to finish.
+    #[cfg(test)]
+    before_recheck: Option<fn(&Path)>,
+    /// Called with the repository root after the commits are listed and
+    /// before the plan's re-check.
+    #[cfg(test)]
+    before_plan_recheck: Option<fn(&Path)>,
 }
 
 /// One budgeted git child of a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoryWalk {
+    /// Fingerprinting what numstat output depends on besides the commit.
+    Environment,
+    /// Fingerprinting it again after a plan or slice is read, before it is saved.
+    Recheck,
     /// Listing the commits a full rebuild reads.
     Plan,
     /// Reading one slice of that many commits.
@@ -374,6 +406,17 @@ impl WalkLimits {
             first_slice: FIRST_SLICE_COMMITS,
             max_slices: None,
             forced_deadline: None,
+            may_stage: true,
+            may_preempt: true,
+            max_recheck_allowance: MAX_RECHECK_ALLOWANCE,
+            #[cfg(test)]
+            environment_delay: Duration::ZERO,
+            #[cfg(test)]
+            after_slice: None,
+            #[cfg(test)]
+            before_recheck: None,
+            #[cfg(test)]
+            before_plan_recheck: None,
         })
     }
 
@@ -396,6 +439,9 @@ fn is_deadline(error: &anyhow::Error) -> bool {
 #[derive(Debug, Clone, Copy)]
 enum FullReason<'a> {
     Rebuild,
+    /// `git-index --full`. The rebuild it starts or resumes is recorded as
+    /// requested against the stored head, so later passes continue it.
+    Requested,
     /// The stored head is not an ancestor of HEAD, so its rows cannot be
     /// composed with the commits HEAD added.
     Diverged {
@@ -405,6 +451,166 @@ enum FullReason<'a> {
     RangeTooLong {
         stored: &'a str,
     },
+}
+
+/// Recorded cause of a staged rebuild: no history was indexed yet.
+pub const CAUSE_FIRST_BUILD: &str = "first_build";
+/// The stored history head is not an ancestor of HEAD.
+pub const CAUSE_DIVERGED: &str = "diverged";
+/// Reading the commits after the stored head took longer than the budget.
+pub const CAUSE_RANGE_TOO_LONG: &str = "range_too_long";
+/// `git-index --full`, a changed history policy, or a rename an incremental
+/// pass cannot re-key.
+pub const CAUSE_FULL: &str = "full";
+
+/// The last run that worked on a staged rebuild saved commits, or shrank the
+/// slice that ran out of time.
+pub const OUTCOME_PROGRESSING: &str = "progressing";
+/// The last run that worked on a staged rebuild saved nothing.
+pub const OUTCOME_NO_PROGRESS: &str = "no_progress";
+/// A later pass brought history up to date without the staged rebuild, which
+/// is kept so a rebuild for its target reuses the saved commits.
+pub const OUTCOME_PARKED: &str = "parked";
+/// The last run that worked on a staged rebuild failed with an error other
+/// than running out of time; `stalled` holds the error.
+pub const OUTCOME_FAILED: &str = "failed";
+/// A run discarded a plan or slice because the numstat environment changed
+/// while it was read.
+pub const DISCARD_ENVIRONMENT_CHANGED: &str = "environment_changed";
+/// A run discarded a plan or slice because re-checking the numstat
+/// environment took longer than the time it had.
+pub const DISCARD_RECHECK_TIMEOUT: &str = "recheck_timeout";
+
+/// The staged full history rebuild, for status readers; `None` when nothing
+/// is staged or the index predates the staging tables.
+pub fn history_rebuild(db: &Database) -> Result<Option<codesage_protocol::HistoryRebuild>> {
+    Ok(db
+        .git_history_build_status()?
+        .map(|status| codesage_protocol::HistoryRebuild {
+            state: status.outcome,
+            cause: status.cause,
+            target_sha: status.target_sha,
+            stored_sha: status.stored_sha,
+            commits_saved: status.staged,
+            commits_total: status.total,
+            next_slice_commits: status.slice_len,
+            last_run_saved: status.run_saved,
+            updated_at_unix: status.updated_at,
+            stalled: status.stalled,
+            note: status.note,
+            last_discard_unix: status.discarded_at,
+            discarding_since_unix: status.discarding_since,
+            discard_cause: status.discard_cause,
+            restarts: status.restarts,
+        }))
+}
+
+/// A saved rebuild no run has touched for this long is deleted.
+const STALE_BUILD_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// Delete a saved rebuild that no run will finish: one untouched for
+/// [`STALE_BUILD_SECS`], or one whose target commit git no longer has. A run
+/// that reached the rebuild but discarded what it read counts as touching
+/// it, so a rebuild whose environment keeps moving is kept and reported by
+/// doctor rather than deleted. A
+/// target that only stopped being an ancestor of HEAD is kept, since
+/// switching back to its branch resumes it. A lookup that cannot answer keeps
+/// the rebuild.
+fn prune_stale_build(db: &Database, root: &Path) -> Result<()> {
+    let Some(status) = db.git_history_build_status()? else {
+        return Ok(());
+    };
+    let touched = status
+        .updated_at
+        .max(status.discarded_at.unwrap_or(i64::MIN));
+    let expired = unix_now() - touched > STALE_BUILD_SECS;
+    let missing = !expired && {
+        let mut exists = git_history_command(root);
+        exists.args([
+            "cat-file",
+            "-e",
+            "--end-of-options",
+            &format!("{}^{{commit}}", status.target_sha),
+        ]);
+        history_output(exists, STATUS_LOOKUP_BUDGET)
+            .is_ok_and(|out| out.status.code() == Some(1) || out.status.code() == Some(128))
+    };
+    if expired || missing {
+        tracing::info!(
+            root = %root.display(),
+            target = %status.target_sha,
+            expired,
+            "deleting a saved git history rebuild no run will finish"
+        );
+        db.execute_batch(|db| db.clear_git_history_build())?;
+    }
+    Ok(())
+}
+
+/// Ancestry lookups for status readers stop after this long; an answer they
+/// cannot get leaves the recorded state alone.
+const STATUS_LOOKUP_BUDGET: Duration = Duration::from_secs(2);
+
+/// [`history_rebuild`] as seen from the checkout at `root`. A rebuild whose
+/// target is neither HEAD nor an ancestor of HEAD, including a target git no
+/// longer has, is reported as `parked` whatever its last run did: no pass from
+/// this HEAD resumes it, so its stall is not something to act on here, and
+/// `git-index --full` would discard its commits.
+pub fn history_rebuild_at(
+    root: &Path,
+    db: &Database,
+) -> Result<Option<codesage_protocol::HistoryRebuild>> {
+    let Some(mut rebuild) = history_rebuild(db)? else {
+        return Ok(None);
+    };
+    if rebuild.state == OUTCOME_PARKED {
+        return Ok(Some(rebuild));
+    }
+    let reachable = (|| -> Result<Option<bool>> {
+        let mut head = git_history_command(root);
+        head.args(["rev-parse", "--verify", "--quiet", "HEAD"]);
+        let head = history_output(head, STATUS_LOOKUP_BUDGET)?;
+        if !head.status.success() {
+            return Ok(None);
+        }
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+        if head == rebuild.target_sha {
+            return Ok(Some(true));
+        }
+        let mut ancestry = git_history_command(root);
+        ancestry.args(["merge-base", "--is-ancestor", &rebuild.target_sha, &head]);
+        let ancestry = history_output(ancestry, STATUS_LOOKUP_BUDGET)?;
+        Ok(match ancestry.status.code() {
+            Some(0) => Some(true),
+            // 1: not an ancestor; 128: git cannot read the target.
+            Some(1 | 128) => Some(false),
+            _ => None,
+        })
+    })();
+    match reachable {
+        Ok(Some(false)) => rebuild.state = OUTCOME_PARKED.to_owned(),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            root = %root.display(),
+            error = %format!("{error:#}"),
+            "checking whether the saved git history rebuild is reachable from HEAD"
+        ),
+    }
+    Ok(Some(rebuild))
+}
+
+impl<'a> FullReason<'a> {
+    /// The recorded cause, and the stored head the rebuild started against.
+    fn cause(self, stored_head: Option<&'a str>) -> (&'static str, Option<&'a str>) {
+        match (self, stored_head) {
+            (FullReason::Diverged { stored }, _) => (CAUSE_DIVERGED, Some(stored)),
+            (FullReason::RangeTooLong { stored }, _) => (CAUSE_RANGE_TOO_LONG, Some(stored)),
+            (FullReason::Rebuild | FullReason::Requested, Some(stored)) => {
+                (CAUSE_FULL, Some(stored))
+            }
+            (FullReason::Rebuild | FullReason::Requested, None) => (CAUSE_FIRST_BUILD, None),
+        }
+    }
 }
 
 fn index_history(
@@ -426,8 +632,12 @@ fn index_history(
     let policy_changed = stored_exclusion.as_deref() != Some(exclusion_fingerprint.as_str());
     let anchor = anchor_at_commit(root, &head_sha)?;
     log_anchor(root, anchor);
+    if limits.may_stage {
+        prune_stale_build(db, root)?;
+    }
 
     let mut diverged_from = None;
+    let mut preempted = false;
     let effective_mode = match mode {
         IndexMode::Full => IndexMode::Full,
         IndexMode::Incremental | IndexMode::Auto => match db.get_git_index_state()? {
@@ -436,6 +646,20 @@ fn index_history(
                 if last_sha != head_sha && !is_ancestor(root, &last_sha, &head_sha)? {
                     diverged_from = Some(last_sha);
                 }
+                IndexMode::Full
+            }
+            Some((last_sha, _))
+                if last_sha == head_sha
+                    && limits.may_preempt
+                    && continues_saved_rebuild(
+                        db,
+                        root,
+                        &head_sha,
+                        &last_sha,
+                        &exclusion_fingerprint,
+                    )? =>
+            {
+                preempted = true;
                 IndexMode::Full
             }
             Some((last_sha, last_indexed_at)) if last_sha == head_sha => {
@@ -447,7 +671,11 @@ fn index_history(
                     db.prune_git_author_events(anchor.cutoff())?;
                     anchor.persist(db, &head_sha, false)?;
                     db.set_git_index_exclusion_fingerprint(&exclusion_fingerprint)?;
-                    db.clear_git_history_build()
+                    db.park_git_history_build(
+                        OUTCOME_PARKED,
+                        OUTCOME_PROGRESSING,
+                        &[CAUSE_RANGE_TOO_LONG, CAUSE_DIVERGED],
+                    )
                 })?;
                 return Ok(GitIndexStats {
                     commits_scanned: 0,
@@ -460,9 +688,16 @@ fn index_history(
                 if !is_ancestor(root, &last_sha, &head_sha)? {
                     diverged_from = Some(last_sha);
                     IndexMode::Full
-                } else if resumable_build(db, root, &head_sha, &exclusion_fingerprint)?.is_some() {
-                    // Only a failed pass leaves a rebuild behind, so the
-                    // incremental range would fail the same way again.
+                } else if limits.may_preempt
+                    && continues_saved_rebuild(
+                        db,
+                        root,
+                        &head_sha,
+                        &last_sha,
+                        &exclusion_fingerprint,
+                    )?
+                {
+                    preempted = true;
                     IndexMode::Full
                 } else {
                     IndexMode::Incremental
@@ -471,8 +706,21 @@ fn index_history(
             None => IndexMode::Full,
         },
     };
+    // A pass that may not stage (the follow-up to a completed rebuild, or the
+    // fallback from one that could not fingerprint) must not start another
+    // rebuild, even if HEAD moved off its line meanwhile: that would spend a
+    // further budget in the same run.
+    if !limits.may_stage && effective_mode == IndexMode::Full {
+        let indexed = db.get_git_index_state()?.map(|(sha, _)| sha);
+        return Err(anyhow!(
+            "git history is indexed at {}, and HEAD {} needs a full rebuild from there; the \
+             next `codesage git-index` run starts it",
+            indexed.as_deref().map_or("nothing", short_sha),
+            short_sha(&head_sha)
+        ));
+    }
 
-    let mut stats = match effective_mode {
+    let ran = match effective_mode {
         IndexMode::Full => run_full(
             db,
             root,
@@ -488,6 +736,7 @@ fn index_history(
             },
             match &diverged_from {
                 Some(stored) => FullReason::Diverged { stored },
+                None if mode == IndexMode::Full => FullReason::Requested,
                 None => FullReason::Rebuild,
             },
         ),
@@ -513,14 +762,54 @@ fn index_history(
             )
         }
         IndexMode::Auto => unreachable!("resolved above"),
-    }?;
+    };
+    let mut stats = match ran {
+        // The saved rebuild was preferred over a pass that does not need it,
+        // but its saved output cannot be trusted this run. Record that on the
+        // rebuild, which then no longer takes precedence, and run that pass.
+        Err(error) if preempted && error.downcast_ref::<FingerprintFailed>().is_some() => {
+            let outcome = if is_deadline(&error) {
+                OUTCOME_NO_PROGRESS
+            } else {
+                OUTCOME_FAILED
+            };
+            record_unfinished(db, None, outcome, Some(&one_line(&format!("{error:#}"))), 0)?;
+            tracing::warn!(
+                root = %root.display(),
+                error = %format!("{error:#}"),
+                "the saved git history rebuild could not fingerprint its environment; \
+                 indexing without it"
+            );
+            return index_history(
+                db,
+                root,
+                extra_excludes,
+                mode,
+                WalkLimits {
+                    may_preempt: false,
+                    may_stage: false,
+                    ..limits
+                },
+            );
+        }
+        ran => ran?,
+    };
     // A resumed rebuild completes at the commit it was planned for; HEAD may
     // have moved on since, along a range an incremental pass composes onto it.
     if db
         .get_git_index_state()?
         .is_some_and(|(indexed, _)| indexed != head_sha)
     {
-        let follow_up = index_history(db, root, extra_excludes, IndexMode::Incremental, limits)?;
+        let follow_up = index_history(
+            db,
+            root,
+            extra_excludes,
+            IndexMode::Incremental,
+            WalkLimits {
+                may_stage: false,
+                ..limits
+            },
+        )?;
         stats = GitIndexStats {
             commits_scanned: stats.commits_scanned + follow_up.commits_scanned,
             ..follow_up
@@ -635,7 +924,7 @@ fn run_full(
     anchors: PassAnchors<'_>,
     reason: FullReason<'_>,
 ) -> Result<GitIndexStats> {
-    let (target, mut commits) = match stage_history(db, root, head_sha, &anchors)? {
+    let (target, mut commits) = match stage_history(db, root, head_sha, &anchors, reason)? {
         Staged::Complete { target, commits } => (target, commits),
         Staged::Incomplete(progress) => {
             return Err(rebuild_incomplete(
@@ -723,6 +1012,10 @@ struct BuildProgress {
     slice_len: usize,
     /// Why this run saved nothing, when it saved nothing.
     stalled: Option<String>,
+    /// Why the plan or slice this run read last was not saved, when its
+    /// environment re-check did not confirm it; the rebuild is still in
+    /// progress.
+    discarded: Option<String>,
 }
 
 enum Staged {
@@ -744,44 +1037,901 @@ fn resumable_build(
     let Some(build) = db.git_history_build()? else {
         return Ok(None);
     };
-    if build.policy != policy {
-        return Ok(None);
-    }
-    if build.target_sha != head_sha && !is_ancestor(root, &build.target_sha, head_sha)? {
-        return Ok(None);
-    }
-    if anchor_at_commit(root, &build.target_sha)?.cutoff() != build.cutoff {
-        return Ok(None);
-    }
-    Ok(Some(build))
+    let resumable = resumable_target(
+        root,
+        head_sha,
+        policy,
+        &build.policy,
+        &build.target_sha,
+        build.cutoff,
+    )?;
+    Ok(resumable.then_some(build))
 }
 
 /// Read the full history in slices that each fit in what remains of the
-/// run's budget, saving each one, so a history whose single walk exceeds the
-/// budget completes over several runs. The commits are planned once, in the
-/// order and window a single walk would list them, and each slice reads the
-/// same per-commit output, so the assembled commits equal that walk's.
+/// run's budget, saving each commit's output by SHA, so a history whose
+/// single walk exceeds the budget completes over several runs. The commits
+/// are planned once, in the order and window a single walk would list them;
+/// a re-plan for another target keeps the output of every commit it still
+/// lists. Each slice reads the same per-commit output a single walk does, and
+/// the commits are assembled in planned order, so they equal that walk's.
 fn stage_history(
     db: &Database,
     root: &Path,
     head_sha: &str,
     anchors: &PassAnchors<'_>,
+    reason: FullReason<'_>,
+) -> Result<Staged> {
+    let stored_head = db.get_git_index_state()?.map(|(sha, _)| sha);
+    let (run_cause, run_stored) = reason.cause(stored_head.as_deref());
+    // A run without a cause of its own leaves the recorded one in place.
+    let relabel = (!matches!(reason, FullReason::Rebuild)).then_some((run_cause, run_stored));
+    let run = RunTrace::default();
+    let staged = stage_history_slices(db, root, head_sha, anchors, reason, &run);
+    if let Err(error) = &staged {
+        let outcome = if is_deadline(error) {
+            OUTCOME_NO_PROGRESS
+        } else {
+            OUTCOME_FAILED
+        };
+        let error = format!("{error:#}");
+        let recorded = (|| -> Result<()> {
+            let Some(status) = db.git_history_build_status()? else {
+                return Ok(());
+            };
+            // Only the rebuild this run resumed or started takes its outcome,
+            // cause, and error. One saved for another target is unaffected,
+            // so a failure elsewhere cannot stop a healthy rebuild from being
+            // continued; it carries the failure as a note.
+            if run.working_on.take().as_deref() == Some(status.target_sha.as_str()) {
+                return record_unfinished(
+                    db,
+                    relabel,
+                    outcome,
+                    Some(&one_line(&error)),
+                    run.saved.get(),
+                );
+            }
+            let what = match run.planning.take() {
+                Some(target) => format!("planning a rebuild toward {}", short_sha(&target)),
+                None => format!(
+                    "a `git-index` run at HEAD {} before reaching this rebuild",
+                    short_sha(head_sha)
+                ),
+            };
+            db.set_git_history_build_note(&one_line(&format!("{what} failed: {error}")))
+        })();
+        if let Err(record) = recorded {
+            tracing::warn!(
+                error = %format!("{record:#}"),
+                "recording the failed git history rebuild run"
+            );
+        }
+    }
+    staged
+}
+
+/// `text` on one line of at most 500 characters, for a stored reason.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .take(500)
+        .collect()
+}
+
+/// What a staging run did before it stopped, for recording a failure.
+#[derive(Default)]
+struct RunTrace {
+    /// Commits saved.
+    saved: std::cell::Cell<usize>,
+    /// The target being planned, while no rebuild for it is saved yet.
+    planning: std::cell::Cell<Option<String>>,
+    /// Target of the saved rebuild this run resumed or started.
+    working_on: std::cell::Cell<Option<String>>,
+}
+
+/// Record how a run left a staged rebuild it did not finish; a no-op when
+/// nothing is staged. `relabel` replaces the recorded cause and stored head.
+fn record_unfinished(
+    db: &Database,
+    relabel: Option<(&str, Option<&str>)>,
+    outcome: &str,
+    stalled: Option<&str>,
+    run_saved: usize,
+) -> Result<()> {
+    let Some(status) = db.git_history_build_status()? else {
+        return Ok(());
+    };
+    let (cause, stored_sha) =
+        relabel.unwrap_or((status.cause.as_str(), status.stored_sha.as_deref()));
+    db.set_git_history_progress(&GitHistoryProgress {
+        slice_len: status.slice_len,
+        cause,
+        stored_sha,
+        outcome,
+        stalled,
+        run_saved,
+    })
+}
+
+/// Git prints paths as the bytes the filesystem holds, which need not be UTF-8.
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static NUMSTAT_FINGERPRINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Identity of what `git log --numstat` output depends on besides the commit
+/// itself, read from the repository, its configuration, and the worktree
+/// rather than from each commit. An attribute such as `-diff`, or a
+/// `core.bigFileThreshold` the file exceeds, turns its counts into `-`, so
+/// output read under one setting is not the output a walk under another
+/// reads. Covered: the git version; the effective configuration as
+/// `git config --list` prints it for the walk, less the keys
+/// [`numstat_config_ignored`] names, so a key nobody listed costs a re-read
+/// rather than wrong history; `$GIT_DIR/info/attributes`, the global and
+/// system attributes files (the system file only where `git var` names it,
+/// from git 2.42); the `.gitattributes` entries of the trees `attr.tree` and
+/// `GIT_ATTR_SOURCE` name (and of HEAD in a bare repository without
+/// `attr.tree`); the `refs/replace/` refs, `GIT_NO_REPLACE_OBJECTS`, and
+/// `info/grafts`; and, with a worktree, the index blob of every tracked
+/// `.gitattributes`, the worktree `.gitattributes`, tracked or not, of every
+/// directory that holds a tracked path, and the worktree and index
+/// `.gitmodules`. A `.gitattributes` in a directory with no tracked path,
+/// such as an ignored directory, a nested repository, or a submodule
+/// worktree, is not read.
+/// Every git child stops at `deadline`; `budget` names it in the error.
+fn numstat_environment_fingerprint(
+    root: &Path,
+    deadline: Instant,
+    budget: Duration,
+) -> Result<String> {
+    #[cfg(test)]
+    NUMSTAT_FINGERPRINTS.with(|count| count.set(count.get() + 1));
+    let mut encoded = Vec::new();
+    for (label, bytes) in &numstat_environment_parts(root, deadline, budget)? {
+        for part in [label, bytes] {
+            encoded.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            encoded.extend_from_slice(part);
+        }
+    }
+    Ok(codesage_parser::discover::content_hash(&encoded))
+}
+
+/// The first 1 MiB of a file the numstat environment depends on, or a marker
+/// for one that is absent or unreadable.
+fn read_environment_file(path: &Path) -> Vec<u8> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    match std::fs::File::open(path) {
+        Ok(file) => match file.take(1 << 20).read_to_end(&mut bytes) {
+            Ok(_) => bytes,
+            Err(_) => b"<unreadable>".to_vec(),
+        },
+        Err(_) => b"<absent>".to_vec(),
+    }
+}
+
+/// The worktree `.gitattributes` of each directory in `dirs` (relative to
+/// `toplevel`, root as the empty path) that has one, labelled by path. The
+/// deadline is checked every 256 directories, so a tree with many
+/// directories cannot run the fingerprint past it.
+fn directory_attributes(
+    toplevel: &Path,
+    dirs: BTreeSet<&[u8]>,
+    deadline: Instant,
+    budget: Duration,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut found = Vec::new();
+    for (checked, dir) in dirs.into_iter().enumerate() {
+        if checked % 256 == 255 && Instant::now() >= deadline {
+            return Err(HistoryDeadline { budget }.into());
+        }
+        let file = toplevel.join(path_from_bytes(dir)).join(".gitattributes");
+        if file.exists() {
+            let mut label = dir.to_vec();
+            label.extend_from_slice(b"/.gitattributes");
+            found.push((label, read_environment_file(&file)));
+        }
+    }
+    Ok(found)
+}
+
+/// The labelled parts [`numstat_environment_fingerprint`] hashes, in order.
+fn numstat_environment_parts(
+    root: &Path,
+    deadline: Instant,
+    budget: Duration,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let git = |dir: &Path, args: &[&str]| -> Result<Option<Vec<u8>>> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(HistoryDeadline { budget }.into());
+        }
+        let mut command = git_history_walk_command(dir);
+        command.args(args);
+        let output = history_output(command, left)
+            .with_context(|| format!("running git {} in {}", args.join(" "), dir.display()))?;
+        Ok(output.status.success().then_some(output.stdout))
+    };
+    let read = read_environment_file;
+    let trimmed = |bytes: Vec<u8>| -> Option<PathBuf> {
+        let end = bytes
+            .iter()
+            .rposition(|&b| b != b'\n' && b != b'\r')
+            .map_or(0, |last| last + 1);
+        (end > 0).then(|| path_from_bytes(&bytes[..end]))
+    };
+    // The `.gitattributes` entries of a tree, as path and blob ID: the only
+    // part of an attribute source tree that matters, so `attr.tree=HEAD`
+    // survives commits that leave the attributes alone.
+    let tree_attributes = |tree_ish: &[u8]| -> Result<Vec<u8>> {
+        let spec = format!("{}^{{tree}}", String::from_utf8_lossy(tree_ish));
+        let tree = git(
+            root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &spec,
+            ],
+        )?
+        .map(|tree| String::from_utf8_lossy(&tree).trim().to_owned())
+        .filter(|tree| !tree.is_empty());
+        let Some(tree) = tree else {
+            return Ok(b"<unresolved>".to_vec());
+        };
+        let entries = git(root, &["ls-tree", "-r", "-z", "--full-tree", &tree])?
+            .context("listing an attribute source tree")?;
+        let mut kept = Vec::new();
+        for entry in entries.split(|&b| b == 0) {
+            let path = entry
+                .iter()
+                .position(|&b| b == b'\t')
+                .map_or(&b""[..], |tab| &entry[tab + 1..]);
+            let name = path
+                .iter()
+                .rposition(|&b| b == b'/')
+                .map_or(path, |slash| &path[slash + 1..]);
+            if name == b".gitattributes" {
+                kept.extend_from_slice(entry);
+                kept.push(0);
+            }
+        }
+        Ok(kept)
+    };
+
+    let mut parts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut push = |label: &[u8], bytes: &[u8]| parts.push((label.to_vec(), bytes.to_vec()));
+    // Diff and rename heuristics change between git releases.
+    let version = git(root, &["--version"])?.context("reading the git version")?;
+    push(b"git-version", &version);
+    let located = git(
+        root,
+        &[
+            "rev-parse",
+            "--is-bare-repository",
+            "--git-path",
+            "info/attributes",
+            "--git-path",
+            "info/grafts",
+        ],
+    )?
+    .context("locating the repository's info/attributes and grafts")?;
+    let mut lines = located.split(|&b| b == b'\n');
+    let bare = lines.next() == Some(&b"true"[..]);
+    let mut git_path = || {
+        lines
+            .next()
+            .filter(|line| !line.is_empty())
+            .map(path_from_bytes)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                }
+            })
+    };
+    let info = git_path();
+    let grafts = git_path();
+    push(b"info", &info.as_deref().map(read).unwrap_or_default());
+    // Grafts and replace refs rewrite parents, so a commit's diff changes.
+    push(b"grafts", &grafts.as_deref().map(read).unwrap_or_default());
+    let replaced = git(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/replace/",
+        ],
+    )?
+    .context("listing replace refs")?;
+    push(b"replace-refs", &replaced);
+    push(
+        b"GIT_NO_REPLACE_OBJECTS",
+        &env_bytes("GIT_NO_REPLACE_OBJECTS").unwrap_or_else(|| b"<unset>".to_vec()),
+    );
+
+    // A bare repository has no worktree attributes or `.gitmodules` to read.
+    if !bare {
+        let toplevel = git(root, &["rev-parse", "--show-toplevel"])?
+            .and_then(trimmed)
+            .context("locating the git worktree")?;
+        // The walk command removes `GIT_LITERAL_PATHSPECS` and the other
+        // pathspec variables, so this magic is read as written.
+        let pathspec = ":(top,glob)**/.gitattributes";
+        let ls_files = |args: &[&str]| {
+            let mut full = vec!["-c", "core.fsmonitor=false"];
+            full.extend_from_slice(args);
+            git(&toplevel, &full)
+        };
+        let staged = ls_files(&["ls-files", "-z", "--stage", "--", pathspec])?
+            .context("listing tracked .gitattributes files")?;
+        push(b"index", &staged);
+        // Git reads `<dir>/.gitattributes` from the worktree, tracked or not,
+        // for every directory holding a path it diffs. Each directory with a
+        // tracked path is checked directly, root included, so an untracked
+        // file there is seen without a worktree scan; only a directory with
+        // no tracked path at all goes unchecked. A directory without the
+        // file adds nothing, so new directories leave the fingerprint alone.
+        let tracked = ls_files(&["ls-files", "-z", "--"])?.context("listing tracked paths")?;
+        let mut dirs = BTreeSet::from([&b""[..]]);
+        for path in tracked.split(|&b| b == 0) {
+            let mut rest = path;
+            while let Some(slash) = rest.iter().rposition(|&b| b == b'/') {
+                rest = &rest[..slash];
+                if !dirs.insert(rest) {
+                    break;
+                }
+            }
+        }
+        for (label, bytes) in directory_attributes(&toplevel, dirs, deadline, budget)? {
+            push(&label, &bytes);
+        }
+        // A submodule's `ignore` setting hides its gitlink changes from numstat.
+        let modules = ls_files(&[
+            "ls-files",
+            "-z",
+            "--stage",
+            "--",
+            ":(top,literal).gitmodules",
+        ])?
+        .context("listing .gitmodules")?;
+        push(b"gitmodules-index", &modules);
+        push(b"gitmodules", &read(&toplevel.join(".gitmodules")));
+    }
+
+    let global = match git(root, &["var", "GIT_ATTR_GLOBAL"])? {
+        Some(path) => trimmed(path),
+        // `git var` gained the attribute paths in 2.42.
+        None => match git(root, &["config", "--path", "--get", "core.attributesFile"])? {
+            Some(path) => trimmed(path),
+            None => std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                })
+                .map(|config| config.join("git/attributes")),
+        },
+    };
+    push(b"global", &global.as_deref().map(read).unwrap_or_default());
+    // Before 2.42, and under `GIT_ATTR_NOSYSTEM`, `git var` names no system
+    // file. Its prefix-relative default is not derivable from `--exec-path`
+    // (a `/usr` build reads `/etc/gitattributes`), so the file is recorded as
+    // unknown rather than guessed.
+    let system = match git(root, &["var", "GIT_ATTR_SYSTEM"])? {
+        Some(path) => trimmed(path).as_deref().map(read).unwrap_or_default(),
+        None => b"<unknown>".to_vec(),
+    };
+    push(b"system", &system);
+    push(
+        b"GIT_ATTR_NOSYSTEM",
+        &env_bytes("GIT_ATTR_NOSYSTEM").unwrap_or_else(|| b"<unset>".to_vec()),
+    );
+
+    let listed =
+        git(root, &["config", "--list", "-z"])?.context("listing the git configuration")?;
+    let mut attr_tree = None;
+    for entry in listed.split(|&b| b == 0).filter(|entry| !entry.is_empty()) {
+        let (key, value) = match entry.iter().position(|&b| b == b'\n') {
+            Some(newline) => (&entry[..newline], &entry[newline + 1..]),
+            None => (entry, &b""[..]),
+        };
+        if key.eq_ignore_ascii_case(b"attr.tree") {
+            attr_tree = Some(value.to_vec());
+        }
+        if !numstat_config_ignored(key) {
+            push(key, value);
+        }
+    }
+    // A bare repository reads attributes from HEAD when `attr.tree` is unset.
+    let attr_tree = attr_tree.or_else(|| bare.then(|| b"HEAD".to_vec()));
+    for (label, tree_ish) in [
+        (&b"attr.tree"[..], attr_tree),
+        (b"GIT_ATTR_SOURCE", env_bytes("GIT_ATTR_SOURCE")),
+    ] {
+        if let Some(tree_ish) = tree_ish {
+            push(label, &tree_ish);
+            push(label, &tree_attributes(&tree_ish)?);
+        }
+    }
+
+    Ok(parts)
+}
+
+/// The process environment's value for `name`, as the history walk inherits it.
+fn env_bytes(name: &str) -> Option<Vec<u8>> {
+    let value = std::env::var_os(name)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(value.as_bytes().to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        Some(value.to_string_lossy().into_owned().into_bytes())
+    }
+}
+
+/// Whether configuration key `key` (as `git config --list` prints it: section
+/// and variable name lowercased, subsection as written) is left out of the
+/// numstat fingerprint. Every other key is hashed, so a key nobody listed
+/// here costs a re-read of saved output rather than wrong history. Two kinds
+/// are left out: keys that never reach the slice reader's output, and keys
+/// its command line (`log --no-show-signature --no-walk=unsorted --no-merges
+/// --root --no-ext-diff --no-textconv -z -M --numstat --pretty=format:` with
+/// `%H`, `%ct`, `%ae`, `%an`, and `%s`) overrides.
+fn numstat_config_ignored(key: &[u8]) -> bool {
+    let key = String::from_utf8_lossy(key);
+    let Some((section, rest)) = key.split_once('.') else {
+        return false;
+    };
+    let section = section.to_ascii_lowercase();
+    let (subsection, name) = match rest.rsplit_once('.') {
+        Some((subsection, name)) => (Some(subsection), name.to_ascii_lowercase()),
+        None => (None, rest.to_ascii_lowercase()),
+    };
+    // Sections that only tools, transports, the worktree, or other commands
+    // read: what `git switch`, `push -u`, editors, and maintenance write.
+    const VOLATILE_SECTIONS: &[&str] = &[
+        "advice",
+        "alias",
+        "am",
+        "author",
+        "blame",
+        "branch",
+        "checkout",
+        "clone",
+        "color",
+        "commit",
+        "committer",
+        "credential",
+        "difftool",
+        "fetch",
+        "filter",
+        "format",
+        "fsmonitor",
+        "gc",
+        "gpg",
+        "grep",
+        "gui",
+        "guitool",
+        "help",
+        "http",
+        "imap",
+        "include",
+        "includeif",
+        "index",
+        "init",
+        "instaweb",
+        "interactive",
+        "lfs",
+        "maintenance",
+        "man",
+        "merge",
+        "mergetool",
+        "notes",
+        "pack",
+        "pager",
+        "protocol",
+        "pull",
+        "push",
+        "rebase",
+        "receive",
+        "remote",
+        "repack",
+        "rerere",
+        "safe",
+        "sendemail",
+        "sequence",
+        "stash",
+        "status",
+        "tag",
+        "trace2",
+        "transfer",
+        "uploadarchive",
+        "uploadpack",
+        "url",
+        "user",
+        "web",
+        "worktree",
+    ];
+    if VOLATILE_SECTIONS.contains(&section.as_str()) {
+        return true;
+    }
+    match (section.as_str(), subsection, name.as_str()) {
+        // Editors, credentials, hooks, and worktree bookkeeping; the
+        // worktree `.gitattributes` listing these affect is hashed directly.
+        (
+            "core",
+            None,
+            "editor" | "pager" | "askpass" | "sshcommand" | "hookspath" | "excludesfile"
+            | "untrackedcache" | "preloadindex" | "fscache" | "logallrefupdates"
+            | "sharedrepository" | "autocrlf" | "eol" | "safecrlf" | "filemode" | "symlinks"
+            | "commentchar" | "commentstring" | "splitindex" | "multipackindex" | "commitgraph",
+        ) => true,
+        ("core", None, name) if name.starts_with("fsmonitor") => true,
+        // `-z` prints paths verbatim.
+        ("core", None, "quotepath") => true,
+        // `%H` prints the full object name.
+        ("core", None, "abbrev") => true,
+        // `--no-show-signature`.
+        ("log", None, "showsignature") => true,
+        // `--root`.
+        ("log", None, "showroot") => true,
+        // The format prints no date but `%ct`.
+        ("log", None, "date") => true,
+        // The format has no `%d`.
+        ("log", None, "decorate" | "excludedecoration" | "initialdecorationset") => true,
+        // `%H`.
+        ("log", None, "abbrevcommit") => true,
+        // `%ae` and `%an` ignore the mailmap; `%aE`/`%aN` would not.
+        ("log", None, "mailmap") => true,
+        // Needs a single pathspec, and the walk passes none.
+        ("log", None, "follow") => true,
+        // `--no-merges` lists no merge to diff.
+        ("log", None, "diffmerges") => true,
+        // No graph is drawn.
+        ("log", None, "graphcolors") => true,
+        // `-M` turns rename detection on whatever `diff.renames` says.
+        ("diff", None, "renames") => true,
+        // `--no-ext-diff`.
+        ("diff", None, "external") => true,
+        // Tools `git difftool` runs, not `git log`.
+        ("diff", None, "tool" | "guitool") => true,
+        // Numstat prints paths without `a/` and `b/` prefixes.
+        ("diff", None, "mnemonicprefix" | "noprefix" | "srcprefix" | "dstprefix") => true,
+        // Patch, stat, dirstat, and color rendering, none of which numstat prints.
+        (
+            "diff",
+            None,
+            "statgraphwidth" | "statnamewidth" | "dirstat" | "colormoved" | "colormovedws"
+            | "wserrorhighlight" | "suppressblankempty",
+        ) => true,
+        // `--no-textconv` and `--no-ext-diff` turn these driver settings off;
+        // hunk headers and word diffs are not part of numstat.
+        (
+            "diff",
+            Some(_),
+            "textconv" | "cachetextconv" | "command" | "trustexitcode" | "xfuncname" | "funcname"
+            | "wordregex",
+        ) => true,
+        // How `git submodule` clones and updates, not whether numstat shows a
+        // gitlink change; `submodule.<name>.ignore` is still hashed.
+        (
+            "submodule",
+            _,
+            "url"
+            | "branch"
+            | "update"
+            | "active"
+            | "fetchrecursesubmodules"
+            | "shallow"
+            | "recurse"
+            | "fetchjobs"
+            | "propagatebranches"
+            | "alternatelocation"
+            | "alternateerrorstrategy",
+        ) => true,
+        _ => false,
+    }
+}
+
+const NUMSTAT_ENVIRONMENT: &str = "\0numstat-environment:";
+
+/// What staged output must share to be reused or resumed: the history policy
+/// and the environment the output was read under. Its git children stop at
+/// `deadline`.
+fn staging_key(root: &Path, policy: &str, deadline: Instant, limits: WalkLimits) -> Result<String> {
+    environment_key(root, policy, deadline, limits, HistoryWalk::Environment).map_err(|error| {
+        let budget = is_deadline(&error).then_some(limits.budget);
+        error.context(FingerprintFailed { budget })
+    })
+}
+
+fn environment_key(
+    root: &Path,
+    policy: &str,
+    deadline: Instant,
+    limits: WalkLimits,
+    walk: HistoryWalk,
+) -> Result<String> {
+    let fingerprint = limits.run(walk, || {
+        #[cfg(test)]
+        std::thread::sleep(limits.environment_delay);
+        numstat_environment_fingerprint(root, deadline, limits.budget)
+    })?;
+    Ok(format!("{policy}{NUMSTAT_ENVIRONMENT}{fingerprint}"))
+}
+
+/// Time a re-check of the numstat environment may run past the run's
+/// deadline, given how long the last fingerprint took: twice that, at least
+/// 250 ms, at most `cap` ([`MAX_RECHECK_ALLOWANCE`] outside tests). Killing
+/// and reaping a slice the deadline stopped cannot starve a re-check, which
+/// has this allowance of its own; a staged rebuild therefore runs at most one
+/// allowance past its budget.
+fn recheck_allowance(last: Duration, cap: Duration) -> Duration {
+    last.saturating_mul(2)
+        .max(Duration::from_millis(250))
+        .min(cap)
+}
+
+const MAX_RECHECK_ALLOWANCE: Duration = Duration::from_secs(5);
+
+/// A plan or slice whose re-check of the numstat environment did not confirm
+/// the key it was read under, so it was not saved.
+#[derive(Debug)]
+struct ReadNotSaved {
+    target: String,
+    /// Commits in the slice; zero for the plan.
+    slice: usize,
+    why: NotSavedWhy,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NotSavedWhy {
+    /// The environment changed while it was read.
+    Changed,
+    /// The re-check took longer than the time it was given: the rest of the
+    /// run's budget or its re-check allowance, whichever ended later.
+    OutOfTime {
+        given: Duration,
+        allowance: Duration,
+    },
+    /// The re-check failed; the error it wraps says why.
+    Failed,
+}
+
+impl NotSavedWhy {
+    /// The discard cause recorded on the rebuild.
+    fn cause(self) -> &'static str {
+        match self {
+            NotSavedWhy::Changed => DISCARD_ENVIRONMENT_CHANGED,
+            NotSavedWhy::OutOfTime { .. } => DISCARD_RECHECK_TIMEOUT,
+            NotSavedWhy::Failed => "recheck_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for ReadNotSaved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let target = short_sha(&self.target);
+        let what = match self.slice {
+            0 => format!("the commit list toward {target}"),
+            1 => format!("a slice of 1 commit toward {target}"),
+            slice => format!("a slice of {slice} commits toward {target}"),
+        };
+        match self.why {
+            NotSavedWhy::Changed => write!(
+                f,
+                "the numstat environment (git version, configuration, attributes, replace refs, \
+                 grafts, submodules) changed while this run read {what}, so it was not saved; \
+                 the next run reads it again under the current environment"
+            ),
+            NotSavedWhy::OutOfTime { given, allowance } => write!(
+                f,
+                "re-checking the numstat environment after this run read {what} took longer \
+                 than the {} ms it had (its {} ms re-check allowance or the rest of the run's \
+                 budget, whichever ended later), so it was not saved",
+                given.as_millis(),
+                allowance.as_millis()
+            ),
+            NotSavedWhy::Failed => write!(
+                f,
+                "re-checking the numstat environment after this run read {what} failed, so it \
+                 was not saved"
+            ),
+        }
+    }
+}
+
+/// The numstat environment could not be fingerprinted, so no saved output
+/// can be trusted this run. `budget` is set when it ran out of time.
+#[derive(Debug)]
+struct FingerprintFailed {
+    budget: Option<Duration>,
+}
+
+impl std::fmt::Display for FingerprintFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "fingerprinting the numstat environment (configuration, attributes, replace refs, \
+             grafts, submodules) for the staged rebuild"
+        )?;
+        if let Some(budget) = self.budget {
+            write!(f, " within the {} ms budget", budget.as_millis())?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether the saved rebuild's target, policy, and window let a pass at
+/// `head_sha` finish it.
+fn resumable_target(
+    root: &Path,
+    head_sha: &str,
+    key: &str,
+    policy: &str,
+    target: &str,
+    cutoff: i64,
+) -> Result<bool> {
+    Ok(policy == key
+        && (target == head_sha || is_ancestor(root, target, head_sha)?)
+        && anchor_at_commit(root, target)?.cutoff() == cutoff)
+}
+
+/// Whether a pass whose stored head is `last_sha` continues the saved rebuild
+/// instead of taking the same-HEAD or incremental path. Only a rebuild
+/// started against this stored head for a reason other than divergence
+/// qualifies: one left by an incremental range or rename re-key that failed,
+/// which would fail the same way again, or by `git-index --full`. A rebuild
+/// started because the stored head had diverged is kept for its commits, but
+/// HEAD has since returned to the stored head's line. A rebuild whose last
+/// run saved nothing or failed does not qualify either, so it cannot hold
+/// history at the stored head on every run; it stays saved and reported, and
+/// `git-index --full`, or a run that makes progress on it, resumes it.
+///
+/// The numstat environment is not compared: the run that continues the
+/// rebuild re-plans it when the environment changed, and the reason to
+/// prefer it over the shortcut does not depend on that environment. The
+/// status row and the ancestry of its target decide.
+fn continues_saved_rebuild(
+    db: &Database,
+    root: &Path,
+    head_sha: &str,
+    last_sha: &str,
+    policy: &str,
+) -> Result<bool> {
+    let Some(status) = db.git_history_build_status()? else {
+        return Ok(false);
+    };
+    if status.cause == CAUSE_DIVERGED
+        || status.stored_sha.as_deref() != Some(last_sha)
+        || status.outcome == OUTCOME_NO_PROGRESS
+        || status.outcome == OUTCOME_FAILED
+        || !status
+            .policy
+            .strip_prefix(policy)
+            .is_some_and(|rest| rest.starts_with(NUMSTAT_ENVIRONMENT))
+    {
+        return Ok(false);
+    }
+    Ok(
+        (status.target_sha == head_sha || is_ancestor(root, &status.target_sha, head_sha)?)
+            && anchor_at_commit(root, &status.target_sha)?.cutoff() == status.cutoff,
+    )
+}
+
+fn stage_history_slices(
+    db: &Database,
+    root: &Path,
+    head_sha: &str,
+    anchors: &PassAnchors<'_>,
+    reason: FullReason<'_>,
+    run: &RunTrace,
 ) -> Result<Staged> {
     let limits = anchors.limits;
     let source = anchors.source;
-    let mut planned_at = None;
-    let build = match resumable_build(db, root, head_sha, anchors.exclusion_fingerprint)? {
-        Some(build) => build,
+    let stored_head = db.get_git_index_state()?.map(|(sha, _)| sha);
+    let (run_cause, run_stored) = reason.cause(stored_head.as_deref());
+    // The environment fingerprint, the commit listing, and every slice share
+    // this one deadline; each re-check may run a bounded allowance past it.
+    let deadline = Instant::now() + limits.budget;
+    let fingerprinted = Instant::now();
+    let key = staging_key(root, anchors.exclusion_fingerprint, deadline, limits)?;
+    let fingerprint_took = fingerprinted.elapsed();
+    if fingerprint_took > limits.budget / 2 {
+        return stage_without_slices(
+            db,
+            root,
+            head_sha,
+            anchors,
+            reason,
+            run,
+            &key,
+            deadline,
+            fingerprint_took,
+        );
+    }
+    let mut last_fingerprint = fingerprint_took;
+    // Fingerprints the environment again after a plan or slice was read and
+    // before it is saved, so output read under an environment that moved
+    // since the run's first fingerprint never reaches the staging tables.
+    let mut recheck = |target: &str, slice: usize| -> Result<Option<ReadNotSaved>> {
+        let started = Instant::now();
+        let allowance = recheck_allowance(last_fingerprint, limits.max_recheck_allowance);
+        let until = deadline.max(started + allowance);
+        let rechecked = environment_key(
+            root,
+            anchors.exclusion_fingerprint,
+            until,
+            limits,
+            HistoryWalk::Recheck,
+        );
+        last_fingerprint = started.elapsed();
+        let not_saved = |why| ReadNotSaved {
+            target: target.to_owned(),
+            slice,
+            why,
+        };
+        match rechecked {
+            Ok(now) if now == key => Ok(None),
+            Ok(_) => Ok(Some(not_saved(NotSavedWhy::Changed))),
+            Err(error) if is_deadline(&error) => Ok(Some(not_saved(NotSavedWhy::OutOfTime {
+                given: until.saturating_duration_since(started),
+                allowance,
+            }))),
+            Err(error) => Err(error.context(not_saved(NotSavedWhy::Failed))),
+        }
+    };
+    let resumed = resumable_build(db, root, head_sha, &key)?;
+    if let Some(build) = &resumed {
+        run.working_on.set(Some(build.target_sha.clone()));
+    }
+    let planned = resumed.is_none();
+    let (build, cause, stored_sha) = match resumed {
+        // A rebuild resumed without a cause of its own keeps the one it
+        // was started for.
+        Some(build) if matches!(reason, FullReason::Rebuild) => {
+            let (cause, stored) = (build.cause.clone(), build.stored_sha.clone());
+            (build, cause, stored)
+        }
+        Some(build) => (build, run_cause.to_owned(), run_stored.map(str::to_owned)),
         None => {
-            let started = Instant::now();
-            planned_at = Some(started);
+            run.planning.set(Some(head_sha.to_owned()));
             let cutoff = anchors.current.cutoff();
-            let planned = limits.run(HistoryWalk::Plan, || {
-                plan_history(root, head_sha, cutoff, limits.budget)
+            let listed = limits.run(HistoryWalk::Plan, || {
+                plan_history(
+                    root,
+                    head_sha,
+                    cutoff,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
             });
-            let commits = match planned {
+            let commits = match listed {
                 Ok(commits) => commits,
                 Err(error) if is_deadline(&error) => {
+                    // A rebuild saved for another target keeps its state and
+                    // commits; the failed listing is only noted on it.
+                    db.set_git_history_build_note(&format!(
+                        "listing the commits toward {} ran out of time",
+                        short_sha(head_sha)
+                    ))?;
                     return Ok(Staged::Incomplete(BuildProgress {
                         target: head_sha.to_owned(),
                         staged: 0,
@@ -790,80 +1940,181 @@ fn stage_history(
                         stalled: Some(
                             "listing the commits in the history window ran out of time".into(),
                         ),
+                        discarded: None,
                     }));
                 }
                 Err(error) => return Err(error),
             };
             let slice_len = limits.first_slice.clamp(1, MAX_SLICE_COMMITS);
+            #[cfg(test)]
+            if let Some(before_plan_recheck) = limits.before_plan_recheck {
+                before_plan_recheck(root);
+            }
+            // Grafts and replace refs decide which commits the plan lists.
+            if let Some(not_saved) = recheck(head_sha, 0)? {
+                let why = not_saved.to_string();
+                db.record_git_history_discard(&one_line(&why), not_saved.why.cause(), None)?;
+                return Ok(Staged::Incomplete(BuildProgress {
+                    target: head_sha.to_owned(),
+                    staged: 0,
+                    total: commits.len(),
+                    slice_len,
+                    stalled: None,
+                    discarded: Some(why),
+                }));
+            }
+            let mut staged = 0;
             db.execute_batch(|db| {
-                db.start_git_history_build(
+                staged = db.start_git_history_build(
                     head_sha,
-                    anchors.exclusion_fingerprint,
+                    &key,
                     cutoff,
                     &commits,
-                    slice_len,
-                )
+                    &GitHistoryProgress {
+                        slice_len,
+                        cause: run_cause,
+                        stored_sha: run_stored,
+                        outcome: OUTCOME_PROGRESSING,
+                        stalled: None,
+                        run_saved: 0,
+                    },
+                )?;
+                Ok(())
             })?;
-            GitHistoryBuild {
+            run.planning.set(None);
+            run.working_on.set(Some(head_sha.to_owned()));
+            if staged > 0 {
+                tracing::info!(
+                    root = %root.display(),
+                    staged,
+                    total = commits.len(),
+                    "reusing staged git history commits for a new rebuild target"
+                );
+            }
+            let build = GitHistoryBuild {
                 target_sha: head_sha.to_owned(),
-                policy: anchors.exclusion_fingerprint.to_owned(),
+                policy: key.clone(),
                 cutoff,
                 commits,
                 slice_len,
-                staged: 0,
-            }
+                staged,
+                cause: run_cause.to_owned(),
+                stored_sha: run_stored.map(str::to_owned),
+            };
+            (build, run_cause.to_owned(), run_stored.map(str::to_owned))
         }
     };
 
-    // A run that planned shares the budget with planning; one that resumes
-    // gives its first slice the whole budget, so a timeout there measures
-    // the slice rather than the overhead before it.
-    let deadline = planned_at.unwrap_or_else(Instant::now) + limits.budget;
+    let saved = db.git_history_build_staged_shas()?;
+    let pending: Vec<String> = build
+        .commits
+        .iter()
+        .filter(|sha| !saved.contains(*sha))
+        .cloned()
+        .collect();
+    drop(saved);
+    let base = GitHistoryProgress {
+        slice_len: build.slice_len,
+        cause: &cause,
+        stored_sha: stored_sha.as_deref(),
+        outcome: OUTCOME_PROGRESSING,
+        stalled: None,
+        run_saved: 0,
+    };
+
     let total = build.commits.len();
-    let mut staged = build.staged;
+    let mut read = 0usize;
     let mut slice_len = build.slice_len.clamp(1, MAX_SLICE_COMMITS);
     let mut slices = 0usize;
-    let mut advanced = planned_at.is_some();
+    let mut advanced = planned;
     let mut stalled = None;
-    while staged < total {
+    while read < pending.len() {
         if limits.max_slices.is_some_and(|max| slices >= max) {
             break;
         }
         let started = Instant::now();
         let given = deadline.saturating_duration_since(started);
-        if (slices > 0 || planned_at.is_some()) && given.is_zero() {
+        if given.is_zero() {
             break;
         }
-        let shas = &build.commits[staged..(staged + slice_len).min(total)];
-        let read = limits.run(HistoryWalk::Slice(shas.len()), || {
+        let shas = &pending[read..(read + slice_len).min(pending.len())];
+        let output = limits.run(HistoryWalk::Slice(shas.len()), || {
             read_history_slice(root, shas, source.tree_only, given)
         });
-        match read {
+        match output {
             Ok(output) => {
                 // Headers, not parsed commits: a single walk also drops a
                 // commit whose date does not parse, and so must the slice.
-                let (_, headers) = parse_history_with_headers(&output, source)?;
+                let commits = split_history(&output, source)?;
                 anyhow::ensure!(
-                    headers.iter().eq(shas.iter()),
+                    commits.iter().map(|(sha, _)| sha).eq(shas.iter()),
                     "git log returned other commits than the {} requested from {}",
                     shas.len(),
                     shas[0]
                 );
                 let next = next_slice_len(shas.len(), started.elapsed(), limits.budget);
+                #[cfg(test)]
+                if let Some(before_recheck) = limits.before_recheck {
+                    before_recheck(root);
+                }
+                if let Some(not_saved) = recheck(&build.target_sha, shas.len())? {
+                    // The rebuild keeps the state its last saved slice or run
+                    // left; only the reason is recorded. A smaller slice ends
+                    // earlier, leaving its re-check more of the budget.
+                    let why = not_saved.to_string();
+                    let shrunk = matches!(not_saved.why, NotSavedWhy::OutOfTime { .. })
+                        .then(|| (shas.len() / 2).max(1));
+                    db.record_git_history_discard(&one_line(&why), not_saved.why.cause(), shrunk)?;
+                    return Ok(Staged::Incomplete(BuildProgress {
+                        target: build.target_sha,
+                        staged: total - (pending.len() - read),
+                        total,
+                        slice_len: shrunk.unwrap_or(slice_len),
+                        stalled: None,
+                        discarded: Some(why),
+                    }));
+                }
+                let outputs: Vec<(&str, &str)> = commits
+                    .iter()
+                    .map(|(sha, output)| (sha.as_str(), *output))
+                    .collect();
                 db.execute_batch(|db| {
-                    db.stage_git_history_slice(staged, shas.len(), &output, next)
+                    db.stage_git_history_commits(
+                        &outputs,
+                        &GitHistoryProgress {
+                            slice_len: next,
+                            run_saved: read + shas.len(),
+                            ..base
+                        },
+                    )?;
+                    // Resumed means planned under this same environment, so
+                    // the re-plans that kept starting over have stopped.
+                    if !planned {
+                        db.clear_git_history_restarts()?;
+                    }
+                    Ok(())
                 })?;
-                staged += shas.len();
+                read += shas.len();
+                run.saved.set(read);
                 slice_len = next;
                 slices += 1;
                 advanced = true;
+                #[cfg(test)]
+                if let Some(after_slice) = limits.after_slice {
+                    after_slice(root);
+                }
             }
             Err(error) if is_deadline(&error) => {
                 // Only a slice that had most of the budget says the slice is too large.
-                if slices == 0 && given >= limits.budget / 2 {
+                // Time the fingerprint took before the slice is not the slice's.
+                if slices == 0 && given + fingerprint_took >= limits.budget / 2 {
                     if shas.len() > 1 {
                         slice_len = shas.len() / 2;
-                        db.set_git_history_slice_len(slice_len)?;
+                        db.set_git_history_progress(&GitHistoryProgress {
+                            slice_len,
+                            run_saved: read,
+                            ..base
+                        })?;
                         advanced = true;
                     } else {
                         stalled = Some(format!(
@@ -877,41 +2128,48 @@ fn stage_history(
             Err(error) => return Err(error),
         }
     }
-    if staged < total {
+    if read < pending.len() {
+        let stalled = (!advanced).then(|| stalled.unwrap_or_else(|| "no slice was read".into()));
+        if stalled.is_some() {
+            db.set_git_history_progress(&GitHistoryProgress {
+                slice_len,
+                outcome: OUTCOME_NO_PROGRESS,
+                stalled: stalled.as_deref(),
+                run_saved: read,
+                ..base
+            })?;
+        }
         return Ok(Staged::Incomplete(BuildProgress {
             target: build.target_sha,
-            staged,
+            staged: total - (pending.len() - read),
             total,
             slice_len,
-            stalled: if advanced {
-                None
-            } else {
-                Some(stalled.unwrap_or_else(|| "no slice was read".into()))
-            },
+            stalled,
+            discarded: None,
         }));
     }
 
     let assembled = (|| -> Result<Vec<Commit>> {
+        let outputs = db.git_history_build_outputs()?;
+        anyhow::ensure!(
+            outputs.len() == total,
+            "staged git history holds {} of {total} planned commits",
+            outputs.len()
+        );
         let mut commits = Vec::with_capacity(total);
-        let mut expected = 0usize;
-        for (start, len, output) in db.git_history_build_slices()? {
+        for sha in &build.commits {
+            let output = outputs
+                .get(sha)
+                .with_context(|| format!("staged git history lacks planned commit {sha}"))?;
+            let (parsed, headers) = parse_history_with_headers(output, source)?;
             anyhow::ensure!(
-                start == expected,
-                "staged git history skips from commit {expected} to {start}"
-            );
-            let (parsed, headers) = parse_history_with_headers(&output, source)?;
-            anyhow::ensure!(
-                headers.len() == len,
-                "staged git history slice at commit {start} holds {} of {len} commits",
+                headers.len() == 1 && headers[0].sha == *sha,
+                "staged git history for commit {} holds {} commit headers",
+                short_sha(sha),
                 headers.len()
             );
             commits.extend(parsed);
-            expected += len;
         }
-        anyhow::ensure!(
-            expected == total,
-            "staged git history holds {expected} of {total} planned commits"
-        );
         Ok(commits)
     })();
     match assembled {
@@ -925,6 +2183,171 @@ fn stage_history(
             Err(error)
         }
     }
+}
+
+/// A staged rebuild run whose environment fingerprint took more than half the
+/// budget: every slice's re-check would take as long again, so no slice is
+/// read. The rebuild this run resumes, or a new plan for `head_sha`, records
+/// `no_progress` with the budget that would fit, so doctor and the error
+/// name the recovery instead of each run discarding what it read.
+#[allow(clippy::too_many_arguments)]
+fn stage_without_slices(
+    db: &Database,
+    root: &Path,
+    head_sha: &str,
+    anchors: &PassAnchors<'_>,
+    reason: FullReason<'_>,
+    run: &RunTrace,
+    key: &str,
+    deadline: Instant,
+    took: Duration,
+) -> Result<Staged> {
+    let limits = anchors.limits;
+    let needed = (took.as_millis() * 4).div_ceil(1000) * 1000;
+    let stalled = format!(
+        "fingerprinting the numstat environment took {} ms, more than half the {} ms budget, \
+         so no slice's re-check fits in it; set CODESAGE_GIT_HISTORY_TIMEOUT_MS to at least {}",
+        took.as_millis(),
+        limits.budget.as_millis(),
+        needed.min(600_000)
+    );
+    let stored_head = db.get_git_index_state()?.map(|(sha, _)| sha);
+    let (run_cause, run_stored) = reason.cause(stored_head.as_deref());
+    let progress = |slice_len, cause, stored_sha| GitHistoryProgress {
+        slice_len,
+        cause,
+        stored_sha,
+        outcome: OUTCOME_NO_PROGRESS,
+        stalled: Some(&stalled),
+        run_saved: 0,
+    };
+    if let Some(build) = resumable_build(db, root, head_sha, key)? {
+        run.working_on.set(Some(build.target_sha.clone()));
+        let (cause, stored) = if matches!(reason, FullReason::Rebuild) {
+            (build.cause.as_str(), build.stored_sha.as_deref())
+        } else {
+            (run_cause, run_stored)
+        };
+        db.set_git_history_progress(&progress(build.slice_len, cause, stored))?;
+        return Ok(Staged::Incomplete(BuildProgress {
+            target: build.target_sha,
+            staged: build.staged,
+            total: build.commits.len(),
+            slice_len: build.slice_len,
+            stalled: Some(stalled),
+            discarded: None,
+        }));
+    }
+    // Only grafts and replace refs decide which commits the plan lists, and
+    // they are read quickly, so the plan is checked against them rather than
+    // against a second slow fingerprint.
+    run.planning.set(Some(head_sha.to_owned()));
+    let before = plan_dependencies(root, deadline, limits.budget)?;
+    let cutoff = anchors.current.cutoff();
+    let listed = limits.run(HistoryWalk::Plan, || {
+        plan_history(
+            root,
+            head_sha,
+            cutoff,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+    });
+    let commits = match listed {
+        Ok(commits) => commits,
+        Err(error) if is_deadline(&error) => {
+            db.set_git_history_build_note(&format!(
+                "listing the commits toward {} ran out of time",
+                short_sha(head_sha)
+            ))?;
+            return Ok(Staged::Incomplete(BuildProgress {
+                target: head_sha.to_owned(),
+                staged: 0,
+                total: 0,
+                slice_len: 0,
+                stalled: Some(stalled),
+                discarded: None,
+            }));
+        }
+        Err(error) => return Err(error),
+    };
+    if plan_dependencies(root, deadline, limits.budget)? != before {
+        let why = ReadNotSaved {
+            target: head_sha.to_owned(),
+            slice: 0,
+            why: NotSavedWhy::Changed,
+        }
+        .to_string();
+        db.record_git_history_discard(&one_line(&why), DISCARD_ENVIRONMENT_CHANGED, None)?;
+        return Ok(Staged::Incomplete(BuildProgress {
+            target: head_sha.to_owned(),
+            staged: 0,
+            total: commits.len(),
+            slice_len: 0,
+            stalled: None,
+            discarded: Some(why),
+        }));
+    }
+    let slice_len = limits.first_slice.clamp(1, MAX_SLICE_COMMITS);
+    let mut staged = 0;
+    db.execute_batch(|db| {
+        staged = db.start_git_history_build(
+            head_sha,
+            key,
+            cutoff,
+            &commits,
+            &progress(slice_len, run_cause, run_stored),
+        )?;
+        Ok(())
+    })?;
+    run.planning.set(None);
+    run.working_on.set(Some(head_sha.to_owned()));
+    Ok(Staged::Incomplete(BuildProgress {
+        target: head_sha.to_owned(),
+        staged,
+        total: commits.len(),
+        slice_len,
+        stalled: Some(stalled),
+        discarded: None,
+    }))
+}
+
+/// What decides the commits a plan lists besides HEAD and the window:
+/// `info/grafts`, the `refs/replace/` refs, and `GIT_NO_REPLACE_OBJECTS`.
+fn plan_dependencies(root: &Path, deadline: Instant, budget: Duration) -> Result<Vec<u8>> {
+    let git = |args: &[&str]| -> Result<Vec<u8>> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(HistoryDeadline { budget }.into());
+        }
+        let mut command = git_history_walk_command(root);
+        command.args(args);
+        let output = history_output(command, left)
+            .with_context(|| format!("running git {} in {}", args.join(" "), root.display()))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "git {} failed in {}",
+            args.join(" "),
+            root.display()
+        );
+        Ok(output.stdout)
+    };
+    let grafts = git(&["rev-parse", "--git-path", "info/grafts"])?;
+    let grafts = path_from_bytes(grafts.trim_ascii_end());
+    let grafts = if grafts.is_absolute() {
+        grafts
+    } else {
+        root.join(grafts)
+    };
+    let mut parts = std::fs::read(&grafts).unwrap_or_else(|_| b"<absent>".to_vec());
+    parts.push(0);
+    parts.extend(git(&[
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/replace/",
+    ])?);
+    parts.push(0);
+    parts.extend(env_bytes("GIT_NO_REPLACE_OBJECTS").unwrap_or_else(|| b"<unset>".to_vec()));
+    Ok(parts)
 }
 
 /// Size the next slice so it takes about a quarter of the budget, growing at
@@ -962,7 +2385,7 @@ fn rebuild_incomplete(
             short_sha(stored),
             short_sha(head_sha)
         ),
-        FullReason::Rebuild => String::new(),
+        FullReason::Rebuild | FullReason::Requested => String::new(),
     };
     match &progress.stalled {
         Some(stall) => anyhow!(
@@ -972,15 +2395,36 @@ fn rebuild_incomplete(
         ),
         None => anyhow!(
             "{cause}git history rebuild in progress: {} of {} commits saved toward {} within \
-             the {budget_ms} ms budget, next slice {} commits; the previous history index is \
+             the {budget_ms} ms budget, next slice {} commits{}; the previous history index is \
              unchanged until the rebuild completes. Rerun `codesage git-index` to continue; \
              `CODESAGE_GIT_HISTORY_TIMEOUT_MS=600000 codesage git-index --full` finishes in one \
              run when the remaining slices fit in that budget",
             progress.staged,
             progress.total,
             short_sha(&progress.target),
-            progress.slice_len
+            progress.slice_len,
+            progress
+                .discarded
+                .as_deref()
+                .map(|why| format!("; {why}"))
+                .unwrap_or_default()
         ),
+    }
+}
+
+/// What a pass that may not stage says about the indexed head it starts
+/// from: either a rebuild this run just completed there, or the history it
+/// fell back to after the saved rebuild could not fingerprint its
+/// environment.
+fn no_stage_context(limits: WalkLimits, last_sha: &str) -> String {
+    if limits.may_preempt {
+        format!("git history rebuilt at {}", short_sha(last_sha))
+    } else {
+        format!(
+            "the saved rebuild could not fingerprint its environment, so this run indexed \
+             incrementally from {}",
+            short_sha(last_sha)
+        )
     }
 }
 
@@ -1008,6 +2452,15 @@ fn run_incremental(
         Ok(commits) => commits,
         // Retrying the same range would fail the same way every run; a staged
         // rebuild saves progress and leaves the current rows in place meanwhile.
+        Err(error) if is_deadline(&error) && !anchors.limits.may_stage => {
+            return Err(anyhow!(
+                "{}; reading the commits from there to HEAD {} took longer than the {} ms \
+                 budget, so the next `codesage git-index` run rebuilds them",
+                no_stage_context(anchors.limits, last_sha),
+                short_sha(head_sha),
+                anchors.limits.budget.as_millis()
+            ));
+        }
         Err(error) if is_deadline(&error) => {
             tracing::info!(
                 root = %root.display(),
@@ -1037,6 +2490,13 @@ fn run_incremental(
         })
         .collect();
     if rekey_diverges_from_full_scan(db, &moves, test_like_set)? {
+        anyhow::ensure!(
+            anchors.limits.may_stage,
+            "{}; a rename between there and HEAD {} needs a full rescan, which the next \
+             `codesage git-index` run performs",
+            no_stage_context(anchors.limits, last_sha),
+            short_sha(head_sha)
+        );
         tracing::info!(
             root = %root.display(),
             "a rename in the incremental range cannot be re-keyed exactly; rescanning in full"
@@ -1095,7 +2555,11 @@ fn run_incremental(
         }
         anchor.persist(db, head_sha, false)?;
         db.set_git_index_exclusion_fingerprint(anchors.exclusion_fingerprint)?;
-        db.clear_git_history_build()
+        db.park_git_history_build(
+            OUTCOME_PARKED,
+            OUTCOME_PROGRESSING,
+            &[CAUSE_RANGE_TOO_LONG, CAUSE_DIVERGED],
+        )
     })?;
 
     Ok(GitIndexStats {
@@ -1498,17 +2962,33 @@ fn parse_history(raw: &str, source: &HistorySource) -> Result<Vec<Commit>> {
     Ok(parse_history_with_headers(raw, source)?.0)
 }
 
-/// [`parse_history`] plus the SHA of every commit header in `raw`, in order,
-/// including headers whose commit the parse dropped.
+/// A commit header record in raw `git log -z` output.
+#[derive(Debug, PartialEq, Eq)]
+struct Header {
+    sha: String,
+    /// Byte offset of the header record.
+    offset: usize,
+}
+
+/// `raw.split('\0')` with each record's byte offset.
+fn nul_records(raw: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut offset = 0;
+    raw.split('\0').map(move |record| {
+        let start = offset;
+        offset += record.len() + 1;
+        (start, record)
+    })
+}
+
+/// [`parse_history`] plus every commit header in `raw`, in order, including
+/// headers whose commit the parse dropped.
 fn parse_history_with_headers(
     raw: &str,
     source: &HistorySource,
-) -> Result<(Vec<Commit>, Vec<String>)> {
+) -> Result<(Vec<Commit>, Vec<Header>)> {
     let (mut commits, headers) = if source.tree_only {
         // The tree-only parse fails on a header it cannot read, so it drops none.
-        let commits = parse_name_log(raw)?;
-        let headers = commits.iter().map(|commit| commit.sha.clone()).collect();
-        (commits, headers)
+        parse_name_log_with_headers(raw)?
     } else {
         parse_log_with_headers(raw)?
     };
@@ -1516,6 +2996,30 @@ fn parse_history_with_headers(
         commit.boundary = source.shallow.contains(&commit.sha);
     }
     Ok((commits, headers))
+}
+
+/// Split slice output into `(sha, output)` per commit header. Each part runs
+/// from its header record to the next one, so it parses alone exactly as it
+/// does inside `raw`: both parsers reset at a header they recognize, and the
+/// parsers themselves locate the headers, so a path shaped like a header does
+/// not split a commit. Only record separators may precede the first header.
+fn split_history<'a>(raw: &'a str, source: &HistorySource) -> Result<Vec<(String, &'a str)>> {
+    let (_, headers) = parse_history_with_headers(raw, source)?;
+    let first = headers.first().map_or(raw.len(), |header| header.offset);
+    anyhow::ensure!(
+        raw[..first].bytes().all(|b| b == b'\0' || b == b'\n'),
+        "git log printed output ahead of its first commit header"
+    );
+    let ends = headers
+        .iter()
+        .skip(1)
+        .map(|header| header.offset)
+        .chain([raw.len()]);
+    Ok(headers
+        .iter()
+        .zip(ends)
+        .map(|(header, end)| (header.sha.clone(), &raw[header.offset..end]))
+        .collect())
 }
 
 /// The commits a full walk of `target` lists, in its order, without reading
@@ -1527,7 +3031,7 @@ fn plan_history(
     budget: Duration,
 ) -> Result<Vec<String>> {
     let since_arg = format!("--since=@{since_epoch}");
-    let mut command = git_history_command(root);
+    let mut command = git_history_walk_command(root);
     command.args([
         "log",
         "--no-show-signature",
@@ -1566,7 +3070,7 @@ fn read_history_slice(
     tree_only: bool,
     budget: Duration,
 ) -> Result<String> {
-    let mut command = git_history_command(root);
+    let mut command = git_history_walk_command(root);
     command
         .args([
             "log",
@@ -1653,7 +3157,7 @@ fn run_git_log(
         args.push(r);
     }
     args.push("--");
-    let mut command = git_history_command(root);
+    let mut command = git_history_walk_command(root);
     command.args(&args);
     let output = history_output(command, budget)
         .with_context(|| format!("running git log in {}", root.display()))?;
@@ -1668,12 +3172,18 @@ fn run_git_log(
     String::from_utf8(output.stdout).context("git log output not UTF-8")
 }
 
+#[cfg(test)]
 fn parse_name_log(raw: &str) -> Result<Vec<Commit>> {
+    Ok(parse_name_log_with_headers(raw)?.0)
+}
+
+fn parse_name_log_with_headers(raw: &str) -> Result<(Vec<Commit>, Vec<Header>)> {
     let mut commits = Vec::new();
+    let mut headers = Vec::new();
     let mut current: Option<Commit> = None;
     let mut expect_header = true;
     let mut first_path = false;
-    for record in raw.split('\0') {
+    for (offset, record) in nul_records(raw) {
         if record.is_empty() {
             expect_header = true;
             continue;
@@ -1692,6 +3202,12 @@ fn parse_name_log(raw: &str) -> Result<Vec<Commit>> {
                 "invalid git history tree-only commit header"
             );
             current = parsed.pop();
+            if let Some(commit) = &current {
+                headers.push(Header {
+                    sha: commit.sha.clone(),
+                    offset,
+                });
+            }
             expect_header = false;
             first_path = true;
         } else {
@@ -1717,7 +3233,7 @@ fn parse_name_log(raw: &str) -> Result<Vec<Commit>> {
     if let Some(commit) = current {
         commits.push(commit);
     }
-    Ok(commits)
+    Ok((commits, headers))
 }
 
 /// Parse `run_git_log` output. A record that is neither a commit header nor a
@@ -1727,8 +3243,8 @@ fn parse_log(raw: &str) -> Result<Vec<Commit>> {
     Ok(parse_log_with_headers(raw)?.0)
 }
 
-/// [`parse_log`] plus the SHA of every commit header, kept or skipped.
-fn parse_log_with_headers(raw: &str) -> Result<(Vec<Commit>, Vec<String>)> {
+/// [`parse_log`] plus every commit header, kept or skipped.
+fn parse_log_with_headers(raw: &str) -> Result<(Vec<Commit>, Vec<Header>)> {
     let mut commits = Vec::new();
     let mut headers = Vec::new();
     let mut current: Option<Commit> = None;
@@ -1738,8 +3254,8 @@ fn parse_log_with_headers(raw: &str) -> Result<(Vec<Commit>, Vec<String>)> {
     // which commits were skipped, not just how many.
     let mut skipped_shas: Vec<String> = Vec::new();
 
-    let mut records = raw.split('\0');
-    while let Some(record) = records.next() {
+    let mut records = nul_records(raw);
+    while let Some((offset, record)) = records.next() {
         // Git inserts newlines before numstat records and between commits. Strip
         // them only at record boundaries, never from the filename field itself.
         let line = record.trim_start_matches('\n');
@@ -1749,7 +3265,10 @@ fn parse_log_with_headers(raw: &str) -> Result<(Vec<Commit>, Vec<String>)> {
             }
             let mut parts = rest.splitn(3, '\t');
             let _sha = parts.next().unwrap_or("");
-            headers.push(_sha.to_owned());
+            headers.push(Header {
+                sha: _sha.to_owned(),
+                offset,
+            });
             // A fabricated timestamp of zero would still affect fix counts despite zero churn.
             let ts: Option<i64> = parts.next().and_then(|s| s.parse().ok());
             let Some(ts) = ts else {
@@ -1797,10 +3316,10 @@ fn parse_log_with_headers(raw: &str) -> Result<(Vec<Commit>, Vec<String>)> {
             continue;
         };
         let (path, renamed_from) = if path.is_empty() {
-            let Some(old_path) = records.next() else {
+            let Some((_, old_path)) = records.next() else {
                 break;
             };
-            let Some(new_path) = records.next() else {
+            let Some((_, new_path)) = records.next() else {
                 break;
             };
             (new_path, Some(old_path))
@@ -2737,6 +4256,13 @@ mod tests {
             first_slice,
             max_slices,
             forced_deadline: None,
+            may_stage: true,
+            may_preempt: true,
+            max_recheck_allowance: MAX_RECHECK_ALLOWANCE,
+            environment_delay: Duration::ZERO,
+            after_slice: None,
+            before_recheck: None,
+            before_plan_recheck: None,
         }
     }
 
@@ -2866,7 +4392,7 @@ mod tests {
         let staged = loop {
             runs += 1;
             assert!(runs <= 4 * walk.len(), "staging never completed");
-            match stage_history(&db, root, &head_sha, &anchors).unwrap() {
+            match stage_history(&db, root, &head_sha, &anchors, FullReason::Rebuild).unwrap() {
                 Staged::Complete { target, commits } => {
                     assert_eq!(target, head_sha);
                     break commits;
@@ -2876,6 +4402,2461 @@ mod tests {
         };
         assert!(runs > 2);
         assert_eq!(project(&staged), project(&walk));
+    }
+
+    type CommitView = (
+        String,
+        i64,
+        String,
+        String,
+        Vec<(String, u32, u32)>,
+        Vec<(String, String)>,
+        bool,
+    );
+
+    fn commit_view(commits: &[Commit]) -> Vec<CommitView> {
+        commits
+            .iter()
+            .map(|commit| {
+                (
+                    commit.sha.clone(),
+                    commit.timestamp,
+                    commit.author.clone(),
+                    commit.subject.clone(),
+                    commit
+                        .changes
+                        .iter()
+                        .map(|change| (change.path.clone(), change.added, change.deleted))
+                        .collect(),
+                    commit.renames.clone(),
+                    commit.boundary,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retargeted_rebuild_reuses_the_commits_both_targets_list() {
+        for tree_only in [false, true] {
+            let dir = diverging_repo();
+            let root = dir.path();
+            advance_main(root);
+            let main_head = head(root);
+            // `other` forks from main below its newest commit, so main's head
+            // is not an ancestor of it, and shares the rename commit.
+            policy_git(root, &["checkout", "-qb", "other", "HEAD~1"]);
+            commit_all(root, &[("o.rs", "o\n")], "other work");
+            let other_head = head(root);
+            assert!(!is_ancestor(root, &main_head, &other_head).unwrap());
+
+            let source = HistorySource {
+                tree_only,
+                shallow: BTreeSet::new(),
+            };
+            let fingerprint = source.fingerprint(&effective_exclusion_fingerprint(&[]));
+            let db = Database::open_in_memory().unwrap();
+            let stage = |sha: &str, limits: WalkLimits| {
+                let current = anchor_at_commit(root, sha).unwrap();
+                let anchors = PassAnchors {
+                    current,
+                    previous: current.epoch,
+                    exclusion_fingerprint: &fingerprint,
+                    source: &source,
+                    limits,
+                };
+                stage_history(&db, root, sha, &anchors, FullReason::Rebuild).unwrap()
+            };
+
+            // A one-commit first slice, then a four-commit one: main 7, then
+            // the rename through main 3.
+            for expected in [1, 5] {
+                match stage(&main_head, sliced(1, Some(1))) {
+                    Staged::Incomplete(progress) => {
+                        assert_eq!((progress.staged, progress.total), (expected, 8));
+                    }
+                    Staged::Complete { .. } => panic!("main staged in full"),
+                }
+            }
+            match stage(&other_head, sliced(1, Some(0))) {
+                Staged::Incomplete(progress) => {
+                    assert_eq!(progress.target, other_head);
+                    assert_eq!(
+                        (progress.staged, progress.total),
+                        (4, 8),
+                        "tree_only={tree_only}: the commits main and other share were read again"
+                    );
+                    assert!(progress.stalled.is_none());
+                }
+                Staged::Complete { .. } => panic!("other staged without reading its own commit"),
+            }
+            let saved = db.git_history_build_staged_shas().unwrap();
+            assert_eq!(saved.len(), 4);
+            assert!(
+                !saved.contains(&main_head),
+                "a commit the new plan does not list stays staged"
+            );
+
+            let staged = match stage(&other_head, sliced(1, None)) {
+                Staged::Complete { target, commits } => {
+                    assert_eq!(target, other_head);
+                    commits
+                }
+                Staged::Incomplete(progress) => panic!("staging stopped: {progress:?}"),
+            };
+            let walk = history_commits(
+                root,
+                None,
+                anchor_at_commit(root, &other_head).unwrap().cutoff(),
+                &source,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            assert!(tree_only || walk.iter().any(|commit| !commit.renames.is_empty()));
+            assert_eq!(
+                commit_view(&staged),
+                commit_view(&walk),
+                "tree_only={tree_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_switches_between_runs_keep_the_staged_rebuild() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        advance_main(root);
+        let main_head = head(root);
+        let run = || index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1)));
+        let message = format!("{:#}", run().unwrap_err());
+        assert!(message.contains("1 of 8 commits saved"), "{message}");
+
+        // Back on the stored head, then one commit along its line: neither
+        // pass needs the rebuild, and neither discards it.
+        policy_git(root, &["checkout", "-q", "side"]);
+        run().unwrap();
+        let status = db.git_history_build_status().unwrap().unwrap();
+        assert_eq!(
+            (
+                status.staged,
+                status.outcome.as_str(),
+                status.target_sha.as_str()
+            ),
+            (1, OUTCOME_PARKED, main_head.as_str())
+        );
+        commit_all(root, &[("side.rs", "s1\n")], "side more");
+        run().unwrap();
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+        assert_eq!(db.git_history_build().unwrap().unwrap().staged, 1);
+
+        policy_git(root, &["checkout", "-q", "main"]);
+        let message = format!("{:#}", run().unwrap_err());
+        assert!(message.contains("5 of 8 commits saved"), "{message}");
+        let status = db.git_history_build_status().unwrap().unwrap();
+        assert_eq!(
+            (status.outcome.as_str(), status.cause.as_str()),
+            (OUTCOME_PROGRESSING, CAUSE_DIVERGED)
+        );
+        let mut runs = 0;
+        while let Err(error) = run() {
+            runs += 1;
+            assert!(runs <= 4, "the rebuild never completed: {error:#}");
+        }
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, main_head);
+        assert!(db.git_history_build().unwrap().is_none());
+        let fresh = Database::open_in_memory().unwrap();
+        git_history_index(&fresh, root).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&fresh));
+    }
+
+    #[test]
+    fn a_rebuild_kept_for_another_branch_does_not_preempt_an_incremental_pass() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        advance_main(root);
+        let run = || index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1)));
+        assert!(run().is_err());
+        // HEAD returns to the stored head's line and merges main, so both the
+        // stored head and the staged target are ancestors of HEAD.
+        policy_git(root, &["checkout", "-q", "side"]);
+        policy_git(root, &["merge", "-q", "--no-edit", "-X", "ours", "main"]);
+        run().unwrap();
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+        assert_eq!(
+            db.git_history_build_status().unwrap().unwrap().outcome,
+            OUTCOME_PARKED
+        );
+    }
+
+    #[test]
+    fn rebuild_status_tells_progress_from_a_run_that_saved_nothing() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        let stored = head(root);
+        advance_main(root);
+        let message = format!(
+            "{:#}",
+            index_history(&db, root, &[], IndexMode::Auto, sliced(4, Some(1))).unwrap_err()
+        );
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(
+            (
+                rebuild.state.as_str(),
+                rebuild.cause.as_str(),
+                rebuild.stored_sha.as_deref(),
+                rebuild.target_sha.as_str()
+            ),
+            (
+                OUTCOME_PROGRESSING,
+                CAUSE_DIVERGED,
+                Some(stored.as_str()),
+                head(root).as_str()
+            )
+        );
+        assert_eq!(
+            (
+                rebuild.commits_saved,
+                rebuild.commits_total,
+                rebuild.last_run_saved
+            ),
+            (4, 8, 4)
+        );
+        assert!(
+            message.contains(&format!(
+                "next slice {} commits",
+                rebuild.next_slice_commits
+            )),
+            "{message}"
+        );
+        assert!(rebuild.stalled.is_none());
+
+        let slices_time_out = forcing(sliced(4, None), |walk| {
+            matches!(walk, HistoryWalk::Slice(_))
+        });
+        let mut runs = 0;
+        let stalled = loop {
+            runs += 1;
+            assert!(runs <= 6, "the slice never shrank to one commit");
+            assert!(index_history(&db, root, &[], IndexMode::Auto, slices_time_out).is_err());
+            let rebuild = history_rebuild(&db).unwrap().unwrap();
+            assert_eq!(rebuild.commits_saved, 4);
+            assert_eq!(rebuild.last_run_saved, 0);
+            if rebuild.state == OUTCOME_NO_PROGRESS {
+                break rebuild;
+            }
+            assert_eq!(rebuild.state, OUTCOME_PROGRESSING);
+        };
+        assert!(runs >= 2, "halving the slice is progress");
+        assert_eq!(stalled.next_slice_commits, 1);
+        assert!(
+            stalled
+                .stalled
+                .as_deref()
+                .is_some_and(|why| why.contains("alone takes longer than the budget")),
+            "{stalled:?}"
+        );
+    }
+
+    fn rev(root: &Path, spec: &str) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", spec])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "rev-parse {spec}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// Main and two branches off its tip: `attrs` marks `*.foo` `-diff`,
+    /// `plain` does not. Every shared commit changes `data.foo`.
+    fn attributes_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        policy_git(root, &["init", "-q", "-b", "main"]);
+        policy_git(root, &["config", "user.email", "test@example.com"]);
+        policy_git(root, &["config", "user.name", "Test"]);
+        for round in 0..3 {
+            commit_all(
+                root,
+                &[
+                    ("data.foo", &format!("d{round}\n")),
+                    ("a.rs", &format!("a{round}\n")),
+                ],
+                &format!("base {round}"),
+            );
+        }
+        policy_git(root, &["checkout", "-qb", "plain"]);
+        commit_all(root, &[("a.rs", "plain\n")], "plain work");
+        policy_git(root, &["checkout", "-qb", "attrs", "main"]);
+        commit_all(
+            root,
+            &[(".gitattributes", "*.foo -diff\n"), ("a.rs", "attrs\n")],
+            "attrs work",
+        );
+        dir
+    }
+
+    fn fingerprint_now(root: &Path) -> String {
+        let budget = Duration::from_secs(60);
+        numstat_environment_fingerprint(root, Instant::now() + budget, budget).unwrap()
+    }
+
+    fn foo_counted(commits: &[Commit]) -> bool {
+        commits
+            .iter()
+            .flat_map(|commit| &commit.changes)
+            .any(|change| change.path == "data.foo")
+    }
+
+    #[test]
+    fn staged_output_is_not_reused_under_other_attributes() {
+        let dir = attributes_repo();
+        let root = dir.path();
+        let source = HistorySource {
+            tree_only: false,
+            shallow: BTreeSet::new(),
+        };
+        let fingerprint = source.fingerprint(&effective_exclusion_fingerprint(&[]));
+        let db = Database::open_in_memory().unwrap();
+        let stage = |sha: &str, limits: WalkLimits| {
+            let current = anchor_at_commit(root, sha).unwrap();
+            let anchors = PassAnchors {
+                current,
+                previous: current.epoch,
+                exclusion_fingerprint: &fingerprint,
+                source: &source,
+                limits,
+            };
+            stage_history(&db, root, sha, &anchors, FullReason::Rebuild).unwrap()
+        };
+        let walk = |sha: &str| {
+            history_commits(
+                root,
+                None,
+                anchor_at_commit(root, sha).unwrap().cutoff(),
+                &source,
+                Duration::from_secs(60),
+            )
+            .unwrap()
+        };
+        let finish = |sha: &str| match stage(sha, sliced(1, None)) {
+            Staged::Complete { commits, .. } => commits,
+            Staged::Incomplete(progress) => panic!("staging stopped: {progress:?}"),
+        };
+
+        // Stage every shared commit under `-diff`, then retarget to `plain`.
+        let attrs_head = head(root);
+        for _ in 0..2 {
+            stage(&attrs_head, sliced(1, Some(1)));
+        }
+        assert_eq!(db.git_history_build_staged_shas().unwrap().len(), 4);
+        assert!(!foo_counted(&walk(&attrs_head)), "-diff hides the counts");
+        policy_git(root, &["checkout", "-q", "plain"]);
+        let plain_head = head(root);
+        let single = walk(&plain_head);
+        assert!(foo_counted(&single));
+        assert_eq!(commit_view(&finish(&plain_head)), commit_view(&single));
+
+        // Back on `attrs`, every commit keeps the output saved under `-diff`:
+        // the `plain` plan dropped only output saved under its own attributes.
+        policy_git(root, &["checkout", "-q", "attrs"]);
+        match stage(&attrs_head, sliced(1, Some(0))) {
+            Staged::Complete { commits, .. } => {
+                assert_eq!(commit_view(&commits), commit_view(&walk(&attrs_head)));
+            }
+            Staged::Incomplete(progress) => panic!("saved output was dropped: {progress:?}"),
+        }
+        // Resuming the same target after the attributes change re-reads.
+        // Git falls back to the index copy of a deleted file, so empty it.
+        std::fs::write(root.join(".gitattributes"), "").unwrap();
+        let single = walk(&attrs_head);
+        assert!(foo_counted(&single));
+        assert_eq!(commit_view(&finish(&attrs_head)), commit_view(&single));
+    }
+
+    #[test]
+    fn attributes_fingerprint_covers_every_attribute_file_git_reads() {
+        let dir = attributes_repo();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        commit_all(root, &[("sub/lib.rs", "lib\n")], "a tracked directory");
+        let mut seen = vec![fingerprint_now(root)];
+        // A directory with no tracked path is not checked; it is documented
+        // as not fingerprinted.
+        std::fs::create_dir_all(root.join("untracked")).unwrap();
+        std::fs::write(root.join("untracked/.gitattributes"), "*.rs -diff\n").unwrap();
+        assert_eq!(
+            fingerprint_now(root),
+            seen[0],
+            "a directory without tracked paths was read"
+        );
+        let mut changed = |what: &str| {
+            let next = fingerprint_now(root);
+            assert!(
+                !seen.contains(&next),
+                "{what} left the fingerprint unchanged"
+            );
+            seen.push(next);
+        };
+        std::fs::write(root.join("sub/.gitattributes"), "*.rs -diff\n").unwrap();
+        changed("an untracked .gitattributes in a directory with a tracked path");
+        policy_git(root, &["add", "sub/.gitattributes"]);
+        changed("tracking that .gitattributes");
+        std::fs::write(root.join("sub/.gitattributes"), "*.md -diff\n").unwrap();
+        changed("the worktree content of a tracked .gitattributes");
+        policy_git(root, &["checkout", "-q", "plain"]);
+        changed("checking out a branch without the root .gitattributes");
+        std::fs::write(root.join(".gitattributes"), "*.foo -diff\n").unwrap();
+        changed("an untracked root .gitattributes");
+        std::fs::remove_file(root.join(".gitattributes")).unwrap();
+        policy_git(root, &["checkout", "-q", "attrs"]);
+        std::fs::write(root.join(".git/info/attributes"), "*.rs -diff\n").unwrap();
+        changed("info/attributes");
+        let global = root.join("global-attributes");
+        std::fs::write(&global, "*.txt -diff\n").unwrap();
+        policy_git(
+            root,
+            &["config", "core.attributesFile", global.to_str().unwrap()],
+        );
+        changed("core.attributesFile");
+        std::fs::write(&global, "*.md -diff\n").unwrap();
+        changed("the core.attributesFile content");
+        let base = rev(root, "main");
+        std::fs::write(root.join(".git/info/grafts"), format!("{base}\n")).unwrap();
+        changed("info/grafts");
+        policy_git(root, &["config", "core.useReplaceRefs", "false"]);
+        changed("core.useReplaceRefs");
+        policy_git(root, &["config", "branch.main.remote", "origin"]);
+        assert_eq!(
+            fingerprint_now(root),
+            seen[seen.len() - 1],
+            "branch tracking config is not numstat input"
+        );
+    }
+
+    #[test]
+    fn a_graft_added_mid_rebuild_rereads_saved_commits() {
+        let (dir, db) = half_staged_main();
+        let root = dir.path();
+        // `main 5` now sits directly on the root commit, so its diff and the
+        // commits a walk lists both change.
+        let grafted = rev(root, "main~2");
+        let root_commit = rev(root, "main~7");
+        policy_git(root, &["replace", "--graft", &grafted, &root_commit]);
+        let source = HistorySource::read(root).unwrap();
+        let walk = history_commits(
+            root,
+            None,
+            anchor_at_commit(root, &head(root)).unwrap().cutoff(),
+            &source,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let staged = match stage_main(&db, root, sliced(1, None)) {
+            Staged::Complete { commits, .. } => commits,
+            Staged::Incomplete(progress) => panic!("staging stopped: {progress:?}"),
+        };
+        assert_eq!(commit_view(&staged), commit_view(&walk));
+    }
+
+    #[test]
+    fn attr_tree_head_keeps_saved_commits_until_the_attributes_change() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        policy_git(root, &["config", "attr.tree", "HEAD"]);
+        advance_main(root);
+        let db = Database::open_in_memory().unwrap();
+        for _ in 0..2 {
+            stage_main(&db, root, sliced(1, Some(1)));
+        }
+        commit_all(root, &[("unrelated.txt", "u\n")], "unrelated");
+        assert_eq!(
+            kept_after_a_resume(&db, root),
+            5,
+            "a commit that leaves .gitattributes alone discarded saved output"
+        );
+        commit_all(root, &[(".gitattributes", "*.rs -diff\n")], "attributes");
+        assert_eq!(kept_after_a_resume(&db, root), 0);
+    }
+
+    #[test]
+    fn a_config_change_rereads_saved_output() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let source = HistorySource {
+            tree_only: false,
+            shallow: BTreeSet::new(),
+        };
+        let fingerprint = source.fingerprint(&effective_exclusion_fingerprint(&[]));
+        let db = Database::open_in_memory().unwrap();
+        let head_sha = head(root);
+        let stage = |limits: WalkLimits| {
+            let current = anchor_at_commit(root, &head_sha).unwrap();
+            let anchors = PassAnchors {
+                current,
+                previous: current.epoch,
+                exclusion_fingerprint: &fingerprint,
+                source: &source,
+                limits,
+            };
+            stage_history(&db, root, &head_sha, &anchors, FullReason::Rebuild).unwrap()
+        };
+        for _ in 0..2 {
+            assert!(matches!(stage(sliced(1, Some(1))), Staged::Incomplete(_)));
+        }
+        assert_eq!(db.git_history_build_staged_shas().unwrap().len(), 5);
+
+        // Every file now exceeds the threshold, so numstat prints `-` counts.
+        policy_git(root, &["config", "core.bigFileThreshold", "1"]);
+        let walk = history_commits(
+            root,
+            None,
+            anchor_at_commit(root, &head_sha).unwrap().cutoff(),
+            &source,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(
+            walk.iter().all(|commit| commit.changes.is_empty()),
+            "the threshold must hide every count"
+        );
+        let staged = match stage(sliced(1, None)) {
+            Staged::Complete { commits, .. } => commits,
+            Staged::Incomplete(progress) => panic!("staging stopped: {progress:?}"),
+        };
+        assert_eq!(commit_view(&staged), commit_view(&walk));
+    }
+
+    #[test]
+    fn a_non_utf8_attributes_path_is_fingerprinted() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let dir = attributes_repo();
+            let root = dir.path();
+            let odd = root.join(std::ffi::OsStr::from_bytes(b"odd-\xff-dir"));
+            if let Err(error) = std::fs::create_dir(&odd) {
+                eprintln!("skipped: the filesystem rejects a non-UTF-8 name: {error}");
+                return;
+            }
+            std::fs::write(odd.join(".gitattributes"), "*.rs -diff\n").unwrap();
+            policy_git(root, &["add", "-A"]);
+            let first = fingerprint_now(root);
+            std::fs::write(odd.join(".gitattributes"), "*.md -diff\n").unwrap();
+            assert_ne!(
+                fingerprint_now(root),
+                first,
+                "the file under the non-UTF-8 directory was not read"
+            );
+        }
+        #[cfg(not(unix))]
+        eprintln!("skipped: non-UTF-8 paths are a Unix filesystem property");
+    }
+
+    #[test]
+    fn passes_beside_a_rebuild_parked_for_another_branch_read_no_numstat_environment() {
+        let fingerprints = || NUMSTAT_FINGERPRINTS.with(std::cell::Cell::get);
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        advance_main(root);
+        let run = || index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1)));
+        assert!(run().is_err());
+        policy_git(root, &["checkout", "-q", "side"]);
+
+        let before = fingerprints();
+        run().unwrap();
+        commit_all(root, &[("side.rs", "s1\n")], "side more");
+        run().unwrap();
+        assert_eq!(
+            fingerprints(),
+            before,
+            "a same-HEAD or incremental pass fingerprinted for a diverged rebuild"
+        );
+        assert_eq!(history_rebuild(&db).unwrap().unwrap().state, OUTCOME_PARKED);
+    }
+
+    /// A rebuild of `main` with five of its eight commits saved, and a
+    /// function that runs one resume that reads no slice and returns how many
+    /// saved commits it kept.
+    fn half_staged_main() -> (tempfile::TempDir, Database) {
+        let dir = diverging_repo();
+        advance_main(dir.path());
+        let db = Database::open_in_memory().unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                stage_main(&db, dir.path(), sliced(1, Some(1))),
+                Staged::Incomplete(_)
+            ));
+        }
+        assert_eq!(db.git_history_build_staged_shas().unwrap().len(), 5);
+        (dir, db)
+    }
+
+    fn stage_main(db: &Database, root: &Path, limits: WalkLimits) -> Staged {
+        try_stage_main(db, root, limits).unwrap()
+    }
+
+    fn try_stage_main(db: &Database, root: &Path, limits: WalkLimits) -> Result<Staged> {
+        let source = HistorySource::read(root).unwrap();
+        let fingerprint = source.fingerprint(&effective_exclusion_fingerprint(&[]));
+        let head_sha = head(root);
+        let current = anchor_at_commit(root, &head_sha).unwrap();
+        let anchors = PassAnchors {
+            current,
+            previous: current.epoch,
+            exclusion_fingerprint: &fingerprint,
+            source: &source,
+            limits,
+        };
+        stage_history(db, root, &head_sha, &anchors, FullReason::Rebuild)
+    }
+
+    fn kept_after_a_resume(db: &Database, root: &Path) -> usize {
+        match stage_main(db, root, sliced(1, Some(0))) {
+            Staged::Incomplete(progress) => progress.staged,
+            Staged::Complete { .. } => panic!("a run that reads no slice completed"),
+        }
+    }
+
+    #[test]
+    fn branch_tracking_config_keeps_saved_commits() {
+        let (dir, db) = half_staged_main();
+        let root = dir.path();
+        // What `git switch <remote branch>`, `push -u`, and editors write.
+        for (key, value) in [
+            ("branch.main.remote", "origin"),
+            ("branch.main.merge", "refs/heads/main"),
+            ("branch.main.vscode-merge-base", "origin/main"),
+            ("remote.origin.url", "https://example.invalid/repo.git"),
+        ] {
+            policy_git(root, &["config", key, value]);
+        }
+        assert_eq!(kept_after_a_resume(&db, root), 5);
+    }
+
+    #[test]
+    fn a_diff_algorithm_change_rereads_saved_commits() {
+        let (dir, db) = half_staged_main();
+        let root = dir.path();
+        policy_git(root, &["config", "diff.algorithm", "patience"]);
+        assert_eq!(kept_after_a_resume(&db, root), 0);
+    }
+
+    fn git_stdin(root: &Path, args: &[&str], input: &str) -> String {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// Point `refs/heads/attrsrc` at a root commit whose only file is a
+    /// `.gitattributes` holding `body`.
+    fn set_attribute_source(root: &Path, body: &str) {
+        let blob = git_stdin(root, &["hash-object", "-w", "--stdin"], body);
+        let tree = git_stdin(
+            root,
+            &["mktree"],
+            &format!("100644 blob {blob}\t.gitattributes\n"),
+        );
+        let commit = git_stdin(root, &["commit-tree", &tree], "attributes\n");
+        policy_git(root, &["update-ref", "refs/heads/attrsrc", &commit]);
+    }
+
+    #[test]
+    fn a_change_to_the_attr_tree_branch_rereads_saved_commits() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        set_attribute_source(root, "*.rs -diff\n");
+        policy_git(root, &["config", "attr.tree", "attrsrc"]);
+        advance_main(root);
+        let db = Database::open_in_memory().unwrap();
+        for _ in 0..2 {
+            stage_main(&db, root, sliced(1, Some(1)));
+        }
+        assert_eq!(kept_after_a_resume(&db, root), 5, "nothing changed yet");
+        // The configured value is still `attrsrc`; the tree it names is not.
+        set_attribute_source(root, "*.md -diff\n");
+        assert_eq!(kept_after_a_resume(&db, root), 0);
+    }
+
+    #[test]
+    fn a_rebuild_that_saves_nothing_does_not_hold_history_at_the_stored_head() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        let slices_time_out = forcing(sliced(4, None), |walk| {
+            matches!(walk, HistoryWalk::Slice(_))
+        });
+        let mut runs = 0;
+        while history_rebuild(&db)
+            .unwrap()
+            .is_none_or(|rebuild| rebuild.state != OUTCOME_NO_PROGRESS)
+        {
+            runs += 1;
+            assert!(runs <= 6, "the slice never shrank to one commit");
+            assert!(index_history(&db, root, &[], IndexMode::Full, slices_time_out).is_err());
+        }
+        assert_eq!(history_rebuild(&db).unwrap().unwrap().cause, CAUSE_FULL);
+
+        // The same-HEAD pass and an incremental pass still run, under the
+        // same budget, and the stalled rebuild stays reported.
+        index_history(&db, root, &[], IndexMode::Auto, slices_time_out).unwrap();
+        commit_all(root, &[("side.rs", "s1\n")], "side more");
+        index_history(&db, root, &[], IndexMode::Auto, slices_time_out).unwrap();
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(rebuild.state, OUTCOME_NO_PROGRESS, "{rebuild:?}");
+
+        // An explicit `--full` resumes it.
+        index_history(&db, root, &[], IndexMode::Full, sliced(4, None)).unwrap();
+        assert!(db.git_history_build().unwrap().is_none());
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+    }
+
+    #[test]
+    fn a_resumed_run_fingerprints_the_numstat_environment_once_before_and_once_after_reading() {
+        let fingerprints = || NUMSTAT_FINGERPRINTS.with(std::cell::Cell::get);
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        assert!(index_history(&db, root, &[], IndexMode::Full, sliced(1, Some(1))).is_err());
+        let before = fingerprints();
+        // The same-HEAD pass is preempted, and the resumed rebuild finishes.
+        index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).unwrap();
+        assert!(db.git_history_build().unwrap().is_none());
+        assert_eq!(fingerprints() - before, 2);
+    }
+
+    #[test]
+    fn a_failure_before_reaching_a_saved_rebuild_keeps_its_cause() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        let stored = head(root);
+        advance_main(root);
+        let main_head = head(root);
+        assert!(index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).is_err());
+
+        policy_git(root, &["checkout", "-qb", "other", "HEAD~1"]);
+        commit_all(root, &[("o.rs", "o\n")], "other work");
+        let environment_times_out =
+            forcing(sliced(1, Some(1)), |walk| walk == HistoryWalk::Environment);
+        assert!(index_history(&db, root, &[], IndexMode::Full, environment_times_out).is_err());
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(rebuild.target_sha, main_head);
+        assert_eq!(
+            (rebuild.cause.as_str(), rebuild.stored_sha.as_deref()),
+            (CAUSE_DIVERGED, Some(stored.as_str())),
+            "another target's run relabelled this rebuild"
+        );
+        assert_eq!(
+            (rebuild.state.as_str(), rebuild.stalled.as_deref()),
+            (OUTCOME_PROGRESSING, None),
+            "another target's run changed this rebuild's outcome"
+        );
+        assert!(
+            rebuild.note.as_deref().is_some_and(|why| {
+                why.contains(&format!(
+                "run at HEAD {} before reaching this rebuild failed: fingerprinting the numstat \
+                 environment",
+                short_sha(&head(root))
+            ))
+            }),
+            "{rebuild:?}"
+        );
+    }
+
+    #[test]
+    fn a_completed_rebuild_whose_follow_up_runs_out_of_time_stops_there() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        advance_main(root);
+        let main_head = head(root);
+        assert!(index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).is_err());
+        commit_all(root, &[("a.rs", "a8\n")], "main 8");
+
+        let range_times_out = forcing(sliced(512, None), |walk| walk == HistoryWalk::Incremental);
+        let message = format!(
+            "{:#}",
+            index_history(&db, root, &[], IndexMode::Auto, range_times_out).unwrap_err()
+        );
+        assert!(
+            message.contains(&format!(
+                "git history rebuilt at {}; reading the commits from there to HEAD",
+                short_sha(&main_head)
+            )),
+            "{message}"
+        );
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, main_head);
+        assert!(
+            db.git_history_build().unwrap().is_none(),
+            "the follow-up started another staged rebuild in the same run"
+        );
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+    }
+
+    #[test]
+    fn another_targets_failure_does_not_stop_a_requested_rebuild_being_continued() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        let stored = head(root);
+        assert!(index_history(&db, root, &[], IndexMode::Full, sliced(1, Some(1))).is_err());
+        assert_eq!(history_rebuild(&db).unwrap().unwrap().cause, CAUSE_FULL);
+
+        // A branch the stored head is not on; listing its commits times out.
+        policy_git(root, &["checkout", "-qb", "elsewhere", "HEAD~1"]);
+        commit_all(root, &[("x.rs", "x\n")], "elsewhere");
+        let plan_times_out = forcing(sliced(1, Some(1)), |walk| walk == HistoryWalk::Plan);
+        assert!(index_history(&db, root, &[], IndexMode::Auto, plan_times_out).is_err());
+        assert_eq!(
+            history_rebuild(&db).unwrap().unwrap().state,
+            OUTCOME_PROGRESSING
+        );
+
+        policy_git(root, &["checkout", "-q", "side"]);
+        index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).unwrap();
+        assert!(
+            db.git_history_build().unwrap().is_none(),
+            "the requested rebuild was not continued: {:?}",
+            history_rebuild(&db).unwrap()
+        );
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, stored);
+    }
+
+    #[test]
+    fn a_fingerprint_over_half_the_budget_reports_no_progress_with_the_budget_that_fits() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let db = Database::open_in_memory().unwrap();
+        // 11 s of a 20 s budget, scaled down.
+        let slow = WalkLimits {
+            budget: Duration::from_millis(2_000),
+            environment_delay: Duration::from_millis(1_100),
+            max_recheck_allowance: Duration::from_millis(500),
+            ..sliced(512, None)
+        };
+        for _ in 0..2 {
+            let message = format!(
+                "{:#}",
+                index_history(&db, root, &[], IndexMode::Auto, slow).unwrap_err()
+            );
+            assert!(
+                message.contains("made no progress")
+                    && message.contains("set CODESAGE_GIT_HISTORY_TIMEOUT_MS to at least")
+                    && !message.contains("Rerun `codesage git-index` to continue"),
+                "{message}"
+            );
+            let rebuild = history_rebuild(&db).unwrap().unwrap();
+            assert_eq!(
+                (rebuild.state.as_str(), rebuild.commits_total),
+                (OUTCOME_NO_PROGRESS, 8),
+                "{rebuild:?}"
+            );
+        }
+        // The budget it names finishes the rebuild.
+        let named = WalkLimits {
+            budget: Duration::from_millis(5_000),
+            ..slow
+        };
+        index_history(&db, root, &[], IndexMode::Auto, named).unwrap();
+        let single = Database::open_in_memory().unwrap();
+        index_history(&single, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&single));
+    }
+
+    #[test]
+    fn a_fingerprint_near_the_allowance_cap_still_saves_progress_every_run() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let db = Database::open_in_memory().unwrap();
+        // About 7 s of a 20 s budget with the 5 s cap, scaled down, leaving
+        // the fingerprint's own git children room under a loaded test run.
+        let slow = WalkLimits {
+            budget: Duration::from_millis(4_000),
+            environment_delay: Duration::from_millis(1_400),
+            max_recheck_allowance: Duration::from_millis(1_000),
+            ..sliced(1, None)
+        };
+        let mut saved = 0;
+        for run in 0..12 {
+            match index_history(&db, root, &[], IndexMode::Auto, slow) {
+                Ok(_) => {
+                    let single = Database::open_in_memory().unwrap();
+                    index_history(&single, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+                    assert_eq!(history_rows(&db), history_rows(&single));
+                    return;
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    assert!(message.contains("rebuild in progress"), "{message}");
+                    let now = history_rebuild(&db).unwrap().unwrap().commits_saved;
+                    assert!(
+                        now > saved || run == 0,
+                        "run {run} saved nothing: {message}"
+                    );
+                    saved = now;
+                }
+            }
+        }
+        panic!("the rebuild did not finish in 12 runs");
+    }
+
+    #[test]
+    fn the_recheck_allowance_is_capped() {
+        assert_eq!(
+            recheck_allowance(Duration::from_secs(10), MAX_RECHECK_ALLOWANCE),
+            MAX_RECHECK_ALLOWANCE
+        );
+        assert_eq!(
+            recheck_allowance(Duration::from_millis(10), MAX_RECHECK_ALLOWANCE),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            recheck_allowance(Duration::from_secs(1), MAX_RECHECK_ALLOWANCE),
+            Duration::from_secs(2)
+        );
+    }
+
+    /// A threshold every file exceeds turns the counts later slices read
+    /// into `-`.
+    fn hide_counts(root: &Path) {
+        policy_git(root, &["config", "core.bigFileThreshold", "1"]);
+    }
+
+    fn show_counts(root: &Path) {
+        policy_git(root, &["config", "--unset", "core.bigFileThreshold"]);
+    }
+
+    fn single_walk(root: &Path) -> Vec<Commit> {
+        let source = HistorySource::read(root).unwrap();
+        history_commits(
+            root,
+            None,
+            anchor_at_commit(root, &head(root)).unwrap().cutoff(),
+            &source,
+            Duration::from_secs(60),
+        )
+        .unwrap()
+    }
+
+    /// [`half_staged_main`] with one commit per slice, so slices follow a
+    /// change between them.
+    fn half_staged_main_in_single_commits() -> (tempfile::TempDir, Database) {
+        let (dir, db) = half_staged_main();
+        let status = db.git_history_build_status().unwrap().unwrap();
+        db.set_git_history_progress(&GitHistoryProgress {
+            slice_len: 1,
+            cause: &status.cause,
+            stored_sha: status.stored_sha.as_deref(),
+            outcome: OUTCOME_PROGRESSING,
+            stalled: None,
+            run_saved: 0,
+        })
+        .unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn a_config_change_between_slices_discards_the_slice_read_after_it() {
+        let (dir, db) = half_staged_main_in_single_commits();
+        let root = dir.path();
+        let before = db.git_history_build_staged_shas().unwrap();
+        let changing = WalkLimits {
+            after_slice: Some(hide_counts),
+            ..sliced(1, None)
+        };
+        let progress = match stage_main(&db, root, changing) {
+            Staged::Incomplete(progress) => progress,
+            Staged::Complete { .. } => panic!("the run saved a slice read across the change"),
+        };
+        let discarded = progress.discarded.unwrap_or_default();
+        assert!(
+            discarded.contains("changed while this run read a slice of 2 commits toward"),
+            "{discarded}"
+        );
+        assert_eq!((progress.staged, progress.stalled), (6, None));
+        let after = db.git_history_build_staged_shas().unwrap();
+        assert!(
+            after.len() == 6 && before.is_subset(&after),
+            "the slice read before the change is kept, the one after it is not"
+        );
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(rebuild.state, OUTCOME_PROGRESSING, "{rebuild:?}");
+        assert_eq!(rebuild.note.as_deref(), Some(discarded.as_str()));
+        assert!(rebuild.last_discard_unix.is_some(), "{rebuild:?}");
+
+        let walk = single_walk(root);
+        assert!(walk.iter().all(|commit| commit.changes.is_empty()));
+        let staged = match stage_main(&db, root, sliced(1, None)) {
+            Staged::Complete { commits, .. } => commits,
+            Staged::Incomplete(progress) => panic!("staging stopped: {progress:?}"),
+        };
+        assert_eq!(commit_view(&staged), commit_view(&walk));
+    }
+
+    #[test]
+    fn a_config_change_during_one_uninterrupted_rebuild_leaves_the_rows_of_a_single_walk() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let db = Database::open_in_memory().unwrap();
+        let changing = WalkLimits {
+            after_slice: Some(hide_counts),
+            ..sliced(1, None)
+        };
+        let message = format!(
+            "{:#}",
+            index_history(&db, root, &[], IndexMode::Auto, changing).unwrap_err()
+        );
+        assert!(
+            message.contains("git history rebuild in progress: 1 of 8 commits saved")
+                && message.contains("changed while this run read a slice of"),
+            "{message}"
+        );
+        assert!(db.get_git_index_state().unwrap().is_none());
+
+        index_history(&db, root, &[], IndexMode::Auto, sliced(1, None)).unwrap();
+        let single = Database::open_in_memory().unwrap();
+        index_history(&single, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&single));
+    }
+
+    thread_local! {
+        static SLICES_SAVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Hides counts after the first slice and shows them again after the
+    /// second, so only the second is read under the changed setting.
+    fn hide_counts_for_one_slice(root: &Path) {
+        let saved = SLICES_SAVED.with(|count| {
+            count.set(count.get() + 1);
+            count.get()
+        });
+        match saved {
+            1 => hide_counts(root),
+            2 => show_counts(root),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn a_config_change_reverted_before_the_next_slice_is_still_caught() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let db = Database::open_in_memory().unwrap();
+        let flickering = WalkLimits {
+            after_slice: Some(hide_counts_for_one_slice),
+            ..sliced(1, None)
+        };
+        let ran = index_history(&db, root, &[], IndexMode::Auto, flickering);
+        assert!(
+            ran.as_ref().is_err_and(
+                |error| format!("{error:#}").contains("changed while this run read a slice of")
+            ),
+            "{:?}",
+            ran.map(|_| ())
+        );
+        // The revert the run did not reach.
+        if SLICES_SAVED.with(std::cell::Cell::get) == 1 {
+            show_counts(root);
+        }
+        index_history(&db, root, &[], IndexMode::Auto, sliced(1, None)).unwrap();
+        let single = Database::open_in_memory().unwrap();
+        index_history(&single, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&single));
+    }
+
+    #[test]
+    fn a_hook_run_whose_environment_moves_leaves_the_rebuild_for_the_next_plain_run() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        // A requested rebuild at the stored head, which plain runs continue
+        // only while it takes precedence over the same-HEAD pass.
+        assert!(index_history(&db, root, &[], IndexMode::Full, sliced(1, Some(1))).is_err());
+        assert_eq!(
+            history_rebuild(&db).unwrap().unwrap().state,
+            OUTCOME_PROGRESSING
+        );
+
+        let changing = WalkLimits {
+            before_recheck: Some(hide_counts),
+            ..sliced(1, None)
+        };
+        let message = format!(
+            "{:#}",
+            index_history(&db, root, &[], IndexMode::Auto, changing).unwrap_err()
+        );
+        assert!(
+            message.contains("git history rebuild in progress")
+                && message.contains("changed while this run read"),
+            "{message}"
+        );
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(rebuild.state, OUTCOME_PROGRESSING, "{rebuild:?}");
+        assert!(
+            rebuild
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("changed while this run read")),
+            "{rebuild:?}"
+        );
+
+        index_history(&db, root, &[], IndexMode::Auto, sliced(1, None)).unwrap();
+        assert!(
+            db.git_history_build().unwrap().is_none(),
+            "the next plain run did not finish the rebuild: {:?}",
+            history_rebuild(&db).unwrap()
+        );
+        let single = Database::open_in_memory().unwrap();
+        index_history(&single, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&single));
+    }
+
+    #[test]
+    fn branches_whose_attributes_differ_each_keep_their_saved_commits_across_switches() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        // A line that matches no file: the same output, another environment.
+        policy_git(root, &["checkout", "-q", "side"]);
+        commit_all(
+            root,
+            &[(".gitattributes", "*.nomatch -diff\n")],
+            "side attributes",
+        );
+        let db = Database::open_in_memory().unwrap();
+        let mut saved = HashMap::new();
+        let mut counts = Vec::new();
+        for run in 0..24 {
+            let branch = if run % 2 == 0 { "main" } else { "side" };
+            policy_git(root, &["checkout", "-q", branch]);
+            match index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))) {
+                Ok(_) => {
+                    let single = Database::open_in_memory().unwrap();
+                    index_history(&single, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+                    assert_eq!(history_rows(&db), history_rows(&single), "{counts:?}");
+                    assert!(run >= 7, "{counts:?}");
+                    return;
+                }
+                Err(error) => {
+                    let rebuild = history_rebuild(&db).unwrap().unwrap();
+                    let before = saved.insert(branch, rebuild.commits_saved).unwrap_or(0);
+                    counts.push((branch, rebuild.commits_saved));
+                    assert!(
+                        rebuild.commits_saved > before,
+                        "run {run} on {branch} did not grow its saved count: {counts:?}: \
+                         {error:#}"
+                    );
+                    assert_eq!(rebuild.restarts, usize::from(run == 1), "{rebuild:?}");
+                }
+            }
+        }
+        panic!("neither branch finished: {counts:?}");
+    }
+
+    /// Writes an untracked root `.gitattributes` that hides `.foo` counts.
+    fn hide_foo_counts(root: &Path) {
+        std::fs::write(root.join(".gitattributes"), "*.foo -diff\n").unwrap();
+    }
+
+    #[test]
+    fn an_untracked_root_attributes_file_added_mid_rebuild_is_caught() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        policy_git(root, &["init", "-q", "-b", "main"]);
+        policy_git(root, &["config", "user.email", "test@example.com"]);
+        policy_git(root, &["config", "user.name", "Test"]);
+        for round in 0..11 {
+            commit_all(
+                root,
+                &[
+                    ("data.foo", &format!("d{round}\n")),
+                    ("a.rs", &format!("a{round}\n")),
+                ],
+                &format!("round {round}"),
+            );
+        }
+        let db = Database::open_in_memory().unwrap();
+        let adding = WalkLimits {
+            after_slice: Some(hide_foo_counts),
+            ..sliced(1, None)
+        };
+        let message = format!(
+            "{:#}",
+            index_history(&db, root, &[], IndexMode::Auto, adding).unwrap_err()
+        );
+        assert!(
+            message.contains("changed while this run read a slice of"),
+            "{message}"
+        );
+        std::fs::remove_file(root.join(".gitattributes")).unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(1, None)).unwrap();
+        assert_eq!(db.git_file("data.foo").unwrap().unwrap().total_commits, 11);
+        let single = Database::open_in_memory().unwrap();
+        index_history(&single, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&single));
+    }
+
+    #[test]
+    fn restarts_reset_once_a_resumed_run_saves_under_a_stable_environment() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let db = Database::open_in_memory().unwrap();
+        let mut restarts = Vec::new();
+        // A threshold no file reaches: other environments, the same counts.
+        for threshold in ["11m", "12m", "13m", "14m", "15m", "15m"] {
+            policy_git(root, &["config", "core.bigFileThreshold", threshold]);
+            assert!(index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).is_err());
+            restarts.push(history_rebuild(&db).unwrap().unwrap().restarts);
+        }
+        assert_eq!(restarts, [0, 1, 2, 3, 4, 0]);
+    }
+
+    #[test]
+    fn an_untracked_attributes_file_in_an_intermediate_directory_is_fingerprinted() {
+        let dir = attributes_repo();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("deep/mid")).unwrap();
+        commit_all(
+            root,
+            &[("deep/mid/file.rs", "x\n")],
+            "a path two levels deep",
+        );
+        let before = fingerprint_now(root);
+        std::fs::write(root.join("deep/.gitattributes"), "*.rs -diff\n").unwrap();
+        assert_ne!(fingerprint_now(root), before);
+    }
+
+    #[test]
+    fn the_directory_attributes_check_stops_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..300).map(|i| format!("d{i:03}")).collect();
+        let dirs = |count: usize| -> BTreeSet<&[u8]> {
+            names[..count].iter().map(String::as_bytes).collect()
+        };
+        let budget = Duration::from_millis(1);
+        let past = Instant::now();
+        let stopped = directory_attributes(dir.path(), dirs(300), past, budget).unwrap_err();
+        assert!(is_deadline(&stopped), "{stopped:#}");
+        // Fewer than 256 directories finish before the first check.
+        assert!(directory_attributes(dir.path(), dirs(255), past, budget).is_ok());
+    }
+
+    #[test]
+    fn far_diverged_branches_under_one_environment_are_not_restarts() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let db = Database::open_in_memory().unwrap();
+        let mut restarts = Vec::new();
+        for run in 0..6 {
+            let branch = if run % 2 == 0 { "main" } else { "side" };
+            policy_git(root, &["checkout", "-q", branch]);
+            assert!(index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).is_err());
+            restarts.push(history_rebuild(&db).unwrap().unwrap().restarts);
+        }
+        assert_eq!(restarts, [0; 6]);
+    }
+
+    #[test]
+    fn a_discarded_plan_is_recorded_on_the_saved_rebuild() {
+        let (dir, db) = half_staged_main();
+        let root = dir.path();
+        policy_git(root, &["checkout", "-q", "side"]);
+        let changing = WalkLimits {
+            before_plan_recheck: Some(hide_counts),
+            ..sliced(1, None)
+        };
+        let message = format!(
+            "{:#}",
+            index_history(&db, root, &[], IndexMode::Auto, changing).unwrap_err()
+        );
+        assert!(message.contains("the commit list toward"), "{message}");
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(
+            (
+                rebuild.state.as_str(),
+                rebuild.commits_saved,
+                rebuild.discard_cause.as_deref()
+            ),
+            (OUTCOME_PROGRESSING, 5, Some(DISCARD_ENVIRONMENT_CHANGED)),
+            "{rebuild:?}"
+        );
+        assert!(
+            rebuild
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("the commit list toward"))
+                && rebuild.last_discard_unix.is_some()
+                && rebuild.discarding_since_unix.is_some(),
+            "{rebuild:?}"
+        );
+    }
+
+    #[test]
+    fn a_discarded_slice_leaves_a_parked_rebuild_parked() {
+        let (dir, db) = half_staged_main();
+        let root = dir.path();
+        db.park_git_history_build(OUTCOME_PARKED, OUTCOME_PROGRESSING, &[])
+            .unwrap();
+        let parked_at = db.git_history_build_status().unwrap().unwrap().updated_at;
+        let changing = WalkLimits {
+            before_recheck: Some(hide_counts),
+            ..sliced(1, None)
+        };
+        let progress = match stage_main(&db, root, changing) {
+            Staged::Incomplete(progress) => progress,
+            Staged::Complete { .. } => panic!("the run saved a slice read across the change"),
+        };
+        assert!(progress.discarded.is_some(), "{progress:?}");
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(rebuild.state, OUTCOME_PARKED, "{rebuild:?}");
+        assert_eq!(rebuild.commits_saved, 5);
+        assert_eq!(rebuild.updated_at_unix, parked_at);
+        assert!(rebuild.note.is_some() && rebuild.last_discard_unix.is_some());
+    }
+
+    /// A slice whose process takes past the run's deadline to finish.
+    fn finish_past_the_deadline(_: &Path) {
+        std::thread::sleep(Duration::from_millis(1_100));
+    }
+
+    #[test]
+    fn a_slice_finished_past_the_deadline_is_rechecked_within_its_own_allowance() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let db = Database::open_in_memory().unwrap();
+        let late = WalkLimits {
+            budget: Duration::from_millis(1_000),
+            before_recheck: Some(finish_past_the_deadline),
+            ..sliced(1, None)
+        };
+        let progress = match stage_main(&db, root, late) {
+            Staged::Incomplete(progress) => progress,
+            Staged::Complete { .. } => panic!("one slice finished the rebuild"),
+        };
+        assert_eq!(
+            (progress.staged, progress.discarded.as_deref()),
+            (1, None),
+            "{progress:?}"
+        );
+        assert_eq!(db.git_history_build_staged_shas().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_recheck_that_runs_out_of_time_discards_only_its_slice() {
+        let (dir, db) = half_staged_main();
+        let root = dir.path();
+        let before = db.git_history_build_staged_shas().unwrap();
+        let recheck_times_out = forcing(sliced(1, None), |walk| walk == HistoryWalk::Recheck);
+        let progress = match stage_main(&db, root, recheck_times_out) {
+            Staged::Incomplete(progress) => progress,
+            Staged::Complete { .. } => panic!("the run saved a slice it could not re-check"),
+        };
+        let discarded = progress.discarded.unwrap_or_default();
+        assert!(
+            discarded.contains(
+                "re-checking the numstat environment after this run read a slice of 3 commits"
+            ) && discarded.contains("ms re-check allowance"),
+            "{discarded}"
+        );
+        assert_eq!(db.git_history_build_staged_shas().unwrap(), before);
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(rebuild.state, OUTCOME_PROGRESSING, "{rebuild:?}");
+        assert_eq!(rebuild.note.as_deref(), Some(discarded.as_str()));
+        assert_eq!(
+            (
+                rebuild.discard_cause.as_deref(),
+                rebuild.next_slice_commits,
+                progress.slice_len
+            ),
+            (Some(DISCARD_RECHECK_TIMEOUT), 1, 1),
+            "a slice of 3 whose re-check timed out is halved"
+        );
+        assert!(rebuild.discarding_since_unix.is_some());
+
+        let staged = match stage_main(&db, root, sliced(1, None)) {
+            Staged::Complete { commits, .. } => commits,
+            Staged::Incomplete(progress) => panic!("staging stopped: {progress:?}"),
+        };
+        assert_eq!(commit_view(&staged), commit_view(&single_walk(root)));
+    }
+
+    #[test]
+    fn a_fingerprint_that_runs_out_of_time_is_named() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        let slow = WalkLimits {
+            budget: Duration::from_millis(200),
+            environment_delay: Duration::from_millis(300),
+            ..sliced(4, None)
+        };
+        let message = format!(
+            "{:#}",
+            index_history(&db, root, &[], IndexMode::Auto, slow).unwrap_err()
+        );
+        assert!(
+            message.contains("fingerprinting the numstat environment"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_follow_up_that_needs_a_rename_rescan_stops_there() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        advance_main(root);
+        let main_head = head(root);
+        assert!(index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).is_err());
+        // Across the test-like boundary, which a re-key cannot reproduce.
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        policy_git(root, &["mv", "a.rs", "tests/a.rs"]);
+        policy_git(root, &["commit", "-qm", "move a into tests"]);
+
+        let message = format!(
+            "{:#}",
+            index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap_err()
+        );
+        assert!(
+            message.contains(&format!(
+                "git history rebuilt at {}; a rename between there and HEAD",
+                short_sha(&main_head)
+            )),
+            "{message}"
+        );
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, main_head);
+        assert!(db.git_history_build().unwrap().is_none());
+
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+        let fresh = Database::open_in_memory().unwrap();
+        git_history_index(&fresh, root).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&fresh));
+    }
+
+    #[test]
+    fn a_rebuild_unreachable_from_head_is_reported_parked() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        advance_main(root);
+        let slices_time_out = forcing(sliced(1, None), |walk| {
+            matches!(walk, HistoryWalk::Slice(_))
+        });
+        for _ in 0..2 {
+            assert!(index_history(&db, root, &[], IndexMode::Auto, slices_time_out).is_err());
+        }
+        assert_eq!(
+            history_rebuild_at(root, &db).unwrap().unwrap().state,
+            OUTCOME_NO_PROGRESS,
+            "a stall resumable from HEAD keeps its diagnosis"
+        );
+        // Back on the stored head: main's rebuild is not reachable from here.
+        policy_git(root, &["checkout", "-q", "side"]);
+        let parked = history_rebuild_at(root, &db).unwrap().unwrap();
+        assert_eq!(parked.state, OUTCOME_PARKED);
+        assert!(
+            parked.stalled.is_some(),
+            "the last reason stays for information"
+        );
+        // A target git no longer has.
+        db.execute_raw_for_tests(&format!(
+            "UPDATE git_history_build_v2 SET target_sha = '{}'",
+            "d".repeat(40)
+        ))
+        .unwrap();
+        policy_git(root, &["checkout", "-q", "main"]);
+        assert_eq!(
+            history_rebuild_at(root, &db).unwrap().unwrap().state,
+            OUTCOME_PARKED
+        );
+    }
+
+    /// Child-process entry for tests that need the real process environment:
+    /// a parent test sets `GIT_*` variables on this test binary, so every git
+    /// child inherits them exactly as a hook's children would. It runs the
+    /// action named in `CODESAGE_TEST_CHILD` against `CODESAGE_TEST_ROOT` and
+    /// the index at `CODESAGE_TEST_DB`, and writes the result to
+    /// `CODESAGE_TEST_OUT`.
+    #[test]
+    #[ignore = "entry point for child-process tests"]
+    fn child_process_entry() {
+        let Ok(action) = std::env::var("CODESAGE_TEST_CHILD") else {
+            return;
+        };
+        let var = |name: &str| PathBuf::from(std::env::var(name).unwrap());
+        let root = var("CODESAGE_TEST_ROOT");
+        let db = Database::open(&var("CODESAGE_TEST_DB")).unwrap();
+        let result = match action.as_str() {
+            "stage-one" => match stage_main(&db, &root, sliced(1, Some(1))) {
+                Staged::Complete { .. } => "complete".to_owned(),
+                Staged::Incomplete(progress) => progress.staged.to_string(),
+            },
+            "kept" => kept_after_a_resume(&db, &root).to_string(),
+            "finish" => match stage_main(&db, &root, sliced(1, None)) {
+                Staged::Complete { commits, .. } => format!("{:?}", commit_view(&commits)),
+                Staged::Incomplete(progress) => format!("incomplete: {progress:?}"),
+            },
+            "index" => match index_history(&db, &root, &[], IndexMode::Auto, sliced(512, None)) {
+                Ok(_) => "ok".to_owned(),
+                Err(error) => format!("error: {error:#}"),
+            },
+            "stage-killed" => {
+                let killed = WalkLimits {
+                    before_recheck: Some(kill_at_the_second_slice),
+                    ..sliced(1, None)
+                };
+                stage_main(&db, &root, killed);
+                "the child was not killed".to_owned()
+            }
+            "system-part" => {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                numstat_environment_parts(&root, deadline, Duration::from_secs(60))
+                    .unwrap()
+                    .into_iter()
+                    .find(|(label, _)| label == b"system")
+                    .map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap()
+            }
+            other => panic!("unknown child action {other}"),
+        };
+        std::fs::write(var("CODESAGE_TEST_OUT"), result).unwrap();
+    }
+
+    static SLICES_READ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// SIGKILL this process once the second slice has been read and before it
+    /// is saved.
+    fn kill_at_the_second_slice(_: &Path) {
+        if SLICES_READ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            Command::new("kill")
+                .args(["-KILL", &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+
+    /// Run `action` in a child copy of this test binary whose process
+    /// environment adds `env`.
+    fn in_child(action: &str, root: &Path, db: &Path, env: &[(&str, &str)]) -> String {
+        let out = tempfile::tempdir().unwrap();
+        let out_file = out.path().join("result");
+        let status = child_status(action, root, db, env, &out_file);
+        assert!(status.success(), "child {action} failed");
+        std::fs::read_to_string(out_file).unwrap()
+    }
+
+    fn child_status(
+        action: &str,
+        root: &Path,
+        db: &Path,
+        env: &[(&str, &str)],
+        out_file: &Path,
+    ) -> std::process::ExitStatus {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "git_history::indexer::tests::child_process_entry",
+                "--ignored",
+                "--test-threads=1",
+                "-q",
+            ])
+            .env("CODESAGE_TEST_CHILD", action)
+            .env("CODESAGE_TEST_ROOT", root)
+            .env("CODESAGE_TEST_DB", db)
+            .env("CODESAGE_TEST_OUT", out_file)
+            .envs(env.iter().copied())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_run_killed_mid_slice_keeps_its_plan_and_the_slices_it_saved() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("index.db");
+        drop(Database::open(&db).unwrap());
+        let out = tempfile::tempdir().unwrap();
+        let status = child_status("stage-killed", root, &db, &[], &out.path().join("result"));
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(9), "{status:?}");
+        }
+        let db = Database::open(&db).unwrap();
+        let build = db.git_history_build().unwrap().expect("the plan was lost");
+        assert_eq!((build.commits.len(), build.staged), (8, 1), "{build:?}");
+    }
+
+    /// A directory holding a `git` that runs the real one except when its
+    /// first two arguments are `first second`, which it fails.
+    #[cfg(unix)]
+    fn git_failing(first: &str, second: &str) -> (tempfile::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let search = std::env::var_os("PATH").unwrap();
+        let real = std::env::split_paths(&search)
+            .map(|dir| dir.join("git"))
+            .find(|path| path.is_file())
+            .unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let wrapper = bin.path().join("git");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = {first} ] && [ \"$2\" = {second} ]; then exit 1; fi\n\
+                 exec '{}' \"$@\"\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&search)),
+        )
+        .unwrap();
+        (bin, path.into_string().unwrap())
+    }
+
+    #[test]
+    fn a_failing_configuration_listing_is_a_fingerprint_error() {
+        #[cfg(unix)]
+        {
+            let dir = diverging_repo();
+            let root = dir.path();
+            let db_dir = tempfile::tempdir().unwrap();
+            let db = db_dir.path().join("index.db");
+            drop(Database::open(&db).unwrap());
+            let (_bin, path) = git_failing("config", "--list");
+            let failed = in_child("index", root, &db, &[("PATH", &path)]);
+            assert!(
+                failed.starts_with("error: ") && failed.contains("listing the git configuration"),
+                "{failed}"
+            );
+        }
+        #[cfg(not(unix))]
+        eprintln!("skipped: the git wrapper is a shell script");
+    }
+
+    #[test]
+    fn a_system_attributes_file_git_cannot_name_is_recorded_as_unknown() {
+        #[cfg(unix)]
+        {
+            let dir = diverging_repo();
+            let root = dir.path();
+            let db_dir = tempfile::tempdir().unwrap();
+            let db = db_dir.path().join("index.db");
+            drop(Database::open(&db).unwrap());
+            // What git before 2.42 does: `git var` knows no attribute paths.
+            let (_bin, path) = git_failing("var", "GIT_ATTR_SYSTEM");
+            assert_eq!(
+                in_child("system-part", root, &db, &[("PATH", &path)]),
+                "<unknown>"
+            );
+            assert_ne!(in_child("system-part", root, &db, &[]), "<unknown>");
+        }
+        #[cfg(not(unix))]
+        eprintln!("skipped: the git wrapper is a shell script");
+    }
+
+    /// [`half_staged_main`] with the index in a file, for child processes.
+    fn half_staged_main_on_disk() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let (dir, staged) = half_staged_main();
+        let db_dir = tempfile::tempdir().unwrap();
+        let path = db_dir.path().join("index.db");
+        let db = Database::open(&path).unwrap();
+        let build = staged.git_history_build().unwrap().unwrap();
+        let outputs = staged.git_history_build_outputs().unwrap();
+        let progress = GitHistoryProgress {
+            slice_len: build.slice_len,
+            cause: &build.cause,
+            stored_sha: build.stored_sha.as_deref(),
+            outcome: OUTCOME_PROGRESSING,
+            stalled: None,
+            run_saved: 0,
+        };
+        let pairs: Vec<(&str, &str)> = outputs
+            .iter()
+            .map(|(sha, output)| (sha.as_str(), output.as_str()))
+            .collect();
+        db.execute_batch(|db| {
+            db.start_git_history_build(
+                &build.target_sha,
+                &build.policy,
+                build.cutoff,
+                &build.commits,
+                &progress,
+            )?;
+            db.stage_git_history_commits(&pairs, &progress)
+        })
+        .unwrap();
+        (dir, db_dir, path)
+    }
+
+    #[test]
+    fn inherited_command_line_config_of_ignored_keys_keeps_saved_commits() {
+        let (dir, _db_dir, db) = half_staged_main_on_disk();
+        let root = dir.path();
+        // What `git -c ... commit` exports to the hooks it runs.
+        let ide = [(
+            "GIT_CONFIG_PARAMETERS",
+            "'core.quotepath'='false' 'log.showsignature'='false' 'branch.x.remote'='origin'",
+        )];
+        for round in 0..2 {
+            assert_eq!(
+                in_child("kept", root, &db, &ide),
+                "5",
+                "round {round}, with -c"
+            );
+            assert_eq!(
+                in_child("kept", root, &db, &[]),
+                "5",
+                "round {round}, without"
+            );
+        }
+        // A hashed key passed the same way does change the fingerprint.
+        let algorithm = [("GIT_CONFIG_PARAMETERS", "'diff.algorithm'='patience'")];
+        assert_eq!(in_child("kept", root, &db, &algorithm), "0");
+    }
+
+    #[test]
+    fn inherited_literal_pathspecs_do_not_hide_an_attributes_change() {
+        let dir = attributes_repo();
+        let root = dir.path();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("index.db");
+        drop(Database::open(&db).unwrap());
+        let literal = [("GIT_LITERAL_PATHSPECS", "1")];
+        assert_eq!(in_child("stage-one", root, &db, &literal), "1");
+        assert_eq!(in_child("stage-one", root, &db, &literal), "complete");
+        // Git falls back to the index copy of a deleted file, so empty it.
+        std::fs::write(root.join(".gitattributes"), "").unwrap();
+        let source = HistorySource::read(root).unwrap();
+        let walk = history_commits(
+            root,
+            None,
+            anchor_at_commit(root, &head(root)).unwrap().cutoff(),
+            &source,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(foo_counted(&walk));
+        assert_eq!(
+            in_child("finish", root, &db, &literal),
+            format!("{:?}", commit_view(&walk))
+        );
+    }
+
+    #[test]
+    fn safe_directory_from_command_line_config_reaches_the_history_children() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("index.db");
+        drop(Database::open(&db).unwrap());
+        // Git's own switch for a repository owned by someone else; real
+        // foreign ownership needs a second user.
+        let foreign = [("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")];
+        let refused = in_child("index", root, &db, &foreign);
+        assert!(refused.contains("dubious ownership"), "{refused}");
+        let trusted = [
+            ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "safe.directory"),
+            ("GIT_CONFIG_VALUE_0", "*"),
+        ];
+        assert_eq!(in_child("index", root, &db, &trusted), "ok");
+    }
+
+    #[test]
+    fn an_exported_git_config_file_does_not_hide_the_configuration_the_walk_reads() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = db_dir.path().join("index.db");
+        drop(Database::open(&db).unwrap());
+        // `git config --list` would read only this file; `git log` ignores it.
+        let exported = [("GIT_CONFIG", "/dev/null")];
+        assert_eq!(in_child("stage-one", root, &db, &exported), "1");
+        assert_eq!(
+            in_child("kept", root, &db, &[]),
+            "1",
+            "the walk reads the same configuration with and without GIT_CONFIG"
+        );
+        policy_git(root, &["config", "core.bigFileThreshold", "1"]);
+        assert_eq!(in_child("kept", root, &db, &exported), "0");
+    }
+
+    #[test]
+    fn a_git_version_change_rereads_saved_commits() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let (dir, _db_dir, db) = half_staged_main_on_disk();
+            let root = dir.path();
+            let search = std::env::var_os("PATH").unwrap();
+            let real = std::env::split_paths(&search)
+                .map(|dir| dir.join("git"))
+                .find(|path| path.is_file())
+                .unwrap();
+            let bin = tempfile::tempdir().unwrap();
+            let wrapper = bin.path().join("git");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 0.0.0.test'; \
+                     exit 0; fi\nexec '{}' \"$@\"\n",
+                    real.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = std::env::join_paths(
+                std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&search)),
+            )
+            .unwrap();
+            assert_eq!(in_child("kept", root, &db, &[]), "5");
+            let other_git = [("PATH", path.to_str().unwrap())];
+            assert_eq!(in_child("kept", root, &db, &other_git), "0");
+        }
+        #[cfg(not(unix))]
+        eprintln!("skipped: the git wrapper is a shell script");
+    }
+
+    #[test]
+    fn a_driver_diff_algorithm_change_rereads_saved_commits() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        std::fs::write(root.join(".gitattributes"), "*.rs diff=cdrv\n").unwrap();
+        advance_main(root);
+        let db = Database::open_in_memory().unwrap();
+        for _ in 0..2 {
+            stage_main(&db, root, sliced(1, Some(1)));
+        }
+        assert_eq!(kept_after_a_resume(&db, root), 5);
+        policy_git(root, &["config", "diff.cdrv.algorithm", "histogram"]);
+        assert_eq!(kept_after_a_resume(&db, root), 0);
+        let source = HistorySource::read(root).unwrap();
+        let walk = history_commits(
+            root,
+            None,
+            anchor_at_commit(root, &head(root)).unwrap().cutoff(),
+            &source,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let staged = match stage_main(&db, root, sliced(1, None)) {
+            Staged::Complete { commits, .. } => commits,
+            Staged::Incomplete(progress) => panic!("staging stopped: {progress:?}"),
+        };
+        assert_eq!(commit_view(&staged), commit_view(&walk));
+    }
+
+    #[test]
+    fn a_bare_repository_rebuilds_across_bounded_runs() {
+        let dir = diverging_repo();
+        advance_main(dir.path());
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare = bare_dir.path().join("repo.git");
+        policy_git(
+            dir.path(),
+            &["clone", "-q", "--bare", ".", bare.to_str().unwrap()],
+        );
+        let db = Database::open_in_memory().unwrap();
+        let mut runs = 0;
+        while let Err(error) = index_history(&db, &bare, &[], IndexMode::Auto, sliced(1, Some(1))) {
+            runs += 1;
+            assert!(runs <= 6, "{error:#}");
+            assert!(
+                format!("{error:#}").contains("rebuild in progress"),
+                "{error:#}"
+            );
+        }
+        assert!(runs >= 1, "a one-commit slice finished in one run");
+        let fresh = Database::open_in_memory().unwrap();
+        git_history_index(&fresh, &bare).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&fresh));
+    }
+
+    #[test]
+    fn a_stalled_range_rebuild_is_parked_once_an_incremental_pass_catches_up() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        for round in 0..4 {
+            commit_all(root, &[("e.rs", &format!("e{round}\n"))], "side more");
+        }
+        let stuck = forcing(sliced(1, None), |walk| {
+            matches!(walk, HistoryWalk::Incremental | HistoryWalk::Slice(_))
+        });
+        for _ in 0..2 {
+            assert!(index_history(&db, root, &[], IndexMode::Auto, stuck).is_err());
+        }
+        let rebuild = history_rebuild_at(root, &db).unwrap().unwrap();
+        assert_eq!(
+            (rebuild.cause.as_str(), rebuild.state.as_str()),
+            (CAUSE_RANGE_TOO_LONG, OUTCOME_NO_PROGRESS)
+        );
+
+        index_history(&db, root, &[], IndexMode::Auto, sliced(1, None)).unwrap();
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+        assert_eq!(
+            history_rebuild_at(root, &db).unwrap().unwrap().state,
+            OUTCOME_PARKED,
+            "a range rebuild the incremental pass made unnecessary still warns"
+        );
+    }
+
+    #[test]
+    fn fingerprint_and_fallback_messages_name_only_what_happened() {
+        let timed_out = FingerprintFailed {
+            budget: Some(Duration::from_millis(250)),
+        }
+        .to_string();
+        assert!(
+            timed_out.ends_with("within the 250 ms budget"),
+            "{timed_out}"
+        );
+        let failed = FingerprintFailed { budget: None }.to_string();
+        assert!(!failed.contains("budget"), "{failed}");
+
+        let follow_up = WalkLimits {
+            may_stage: false,
+            ..sliced(1, None)
+        };
+        let sha = "a".repeat(40);
+        assert!(no_stage_context(follow_up, &sha).starts_with("git history rebuilt at"));
+        let fallback = WalkLimits {
+            may_preempt: false,
+            ..follow_up
+        };
+        let message = no_stage_context(fallback, &sha);
+        assert!(!message.contains("rebuilt"), "{message}");
+        assert!(message.contains("could not fingerprint"), "{message}");
+    }
+
+    /// Commits on `main` that move gitlink `sub`, with `.gitmodules` setting
+    /// `ignore = all` for it.
+    fn submodule_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        policy_git(root, &["init", "-q", "-b", "main"]);
+        policy_git(root, &["config", "user.email", "test@example.com"]);
+        policy_git(root, &["config", "user.name", "Test"]);
+        commit_all(
+            root,
+            &[(
+                ".gitmodules",
+                "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n\tignore = all\n",
+            )],
+            "modules",
+        );
+        for round in 0..4 {
+            let pointed = rev(root, "HEAD");
+            policy_git(
+                root,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{pointed},sub"),
+                ],
+            );
+            // Not `add -A`: with no `sub` directory it would stage the
+            // gitlink's deletion.
+            std::fs::write(root.join("a.rs"), format!("a{round}\n")).unwrap();
+            policy_git(root, &["add", "a.rs"]);
+            policy_git(root, &["commit", "-qm", &format!("move {round}")]);
+        }
+        dir
+    }
+
+    #[test]
+    fn removing_a_submodule_ignore_rereads_saved_commits() {
+        let dir = submodule_repo();
+        let root = dir.path();
+        let source = HistorySource::read(root).unwrap();
+        let walk = || {
+            history_commits(
+                root,
+                None,
+                anchor_at_commit(root, &head(root)).unwrap().cutoff(),
+                &source,
+                Duration::from_secs(60),
+            )
+            .unwrap()
+        };
+        let sub_counted = |commits: &[Commit]| {
+            commits
+                .iter()
+                .flat_map(|commit| &commit.changes)
+                .any(|change| change.path == "sub")
+        };
+        assert!(!sub_counted(&walk()), "ignore = all hides the gitlink");
+        let db = Database::open_in_memory().unwrap();
+        for _ in 0..2 {
+            stage_main(&db, root, sliced(1, Some(1)));
+        }
+        assert_eq!(db.git_history_build_staged_shas().unwrap().len(), 5);
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+        )
+        .unwrap();
+        let single = walk();
+        assert!(sub_counted(&single));
+        let staged = match stage_main(&db, root, sliced(1, None)) {
+            Staged::Complete { commits, .. } => commits,
+            Staged::Incomplete(progress) => panic!("staging stopped: {progress:?}"),
+        };
+        assert_eq!(commit_view(&staged), commit_view(&single));
+    }
+
+    #[test]
+    fn a_fingerprint_failure_falls_back_to_the_pass_the_rebuild_preempted() {
+        let fingerprints = || NUMSTAT_FINGERPRINTS.with(std::cell::Cell::get);
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        assert!(index_history(&db, root, &[], IndexMode::Full, sliced(1, Some(1))).is_err());
+
+        let environment_times_out =
+            forcing(sliced(1, Some(1)), |walk| walk == HistoryWalk::Environment);
+        index_history(&db, root, &[], IndexMode::Auto, environment_times_out).unwrap();
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(rebuild.state, OUTCOME_NO_PROGRESS, "{rebuild:?}");
+        assert!(
+            rebuild
+                .stalled
+                .as_deref()
+                .is_some_and(|why| why.contains("fingerprinting the numstat environment")),
+            "{rebuild:?}"
+        );
+        // It no longer takes precedence, so later passes do not retry it.
+        let before = fingerprints();
+        commit_all(root, &[("side.rs", "s1\n")], "side more");
+        index_history(&db, root, &[], IndexMode::Auto, environment_times_out).unwrap();
+        assert_eq!(fingerprints(), before);
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+    }
+
+    #[test]
+    fn a_saved_rebuild_no_run_will_finish_is_pruned() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        advance_main(root);
+        let run = || index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1)));
+        assert!(run().is_err());
+        policy_git(root, &["checkout", "-q", "side"]);
+        run().unwrap();
+        assert!(
+            db.git_history_build().unwrap().is_some(),
+            "a rebuild for a branch that still exists is kept"
+        );
+
+        db.execute_raw_for_tests(&format!(
+            "UPDATE git_history_build_v2_progress SET updated_at = unixepoch() - {}",
+            STALE_BUILD_SECS + 60
+        ))
+        .unwrap();
+        run().unwrap();
+        assert!(
+            db.git_history_build().unwrap().is_none(),
+            "an expired rebuild was kept"
+        );
+
+        policy_git(root, &["checkout", "-q", "main"]);
+        assert!(run().is_err());
+        policy_git(root, &["checkout", "-q", "side"]);
+        db.execute_raw_for_tests(&format!(
+            "UPDATE git_history_build_v2 SET target_sha = '{}'",
+            "d".repeat(40)
+        ))
+        .unwrap();
+        run().unwrap();
+        assert!(
+            db.git_history_build().unwrap().is_none(),
+            "a rebuild of a commit git no longer has was kept"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_runs_keep_discarding_is_kept_while_one_with_no_runs_is_pruned() {
+        let (dir, db) = half_staged_main();
+        let root = dir.path();
+        let age_progress = || {
+            db.execute_raw_for_tests(&format!(
+                "UPDATE git_history_build_v2_progress SET updated_at = unixepoch() - {}",
+                STALE_BUILD_SECS + 60
+            ))
+            .unwrap();
+        };
+        age_progress();
+        db.record_git_history_discard("the environment moved", DISCARD_ENVIRONMENT_CHANGED, None)
+            .unwrap();
+        prune_stale_build(&db, root).unwrap();
+        let kept = db.git_history_build_status().unwrap().unwrap();
+        assert!(
+            unix_now() - kept.updated_at > STALE_BUILD_SECS,
+            "a discard moved updated_at"
+        );
+
+        db.execute_raw_for_tests(&format!(
+            "UPDATE git_history_build_v2_progress SET discarded_at = unixepoch() - {}",
+            STALE_BUILD_SECS + 60
+        ))
+        .unwrap();
+        prune_stale_build(&db, root).unwrap();
+        assert!(db.git_history_build().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_pass_that_may_not_stage_does_not_start_a_rebuild() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        let stored = head(root);
+        advance_main(root);
+        let follow_up = WalkLimits {
+            may_stage: false,
+            ..sliced(512, None)
+        };
+        let message = format!(
+            "{:#}",
+            index_history(&db, root, &[], IndexMode::Incremental, follow_up).unwrap_err()
+        );
+        assert!(
+            message.contains(&format!(
+                "git history is indexed at {}, and HEAD {} needs a full rebuild",
+                short_sha(&stored),
+                short_sha(&head(root))
+            )),
+            "{message}"
+        );
+        assert!(db.git_history_build().unwrap().is_none());
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, stored);
+    }
+
+    #[test]
+    fn a_failed_slice_records_its_error_instead_of_progress() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        advance_main(root);
+        let run = || index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1)));
+        assert!(run().is_err());
+        policy_git(root, &["checkout", "-q", "side"]);
+        run().unwrap();
+        assert_eq!(history_rebuild(&db).unwrap().unwrap().state, OUTCOME_PARKED);
+
+        // Main's next slice reads `main 5`, whose parent's `a.rs` blob is gone.
+        let blob = rev(root, "main~3:a.rs");
+        std::fs::remove_file(root.join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
+        policy_git(root, &["checkout", "-q", "main"]);
+        let message = format!("{:#}", run().unwrap_err());
+        assert!(!message.contains("rebuild in progress"), "{message}");
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(rebuild.state, OUTCOME_FAILED, "{rebuild:?}");
+        assert_eq!(rebuild.commits_saved, 1);
+        assert!(
+            rebuild
+                .stalled
+                .as_deref()
+                .is_some_and(|why| why.contains("git log failed")),
+            "{rebuild:?}"
+        );
+    }
+
+    #[test]
+    fn a_plan_that_runs_out_of_time_for_another_target_only_notes_the_saved_rebuild() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        advance_main(root);
+        let main_head = head(root);
+        assert!(index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).is_err());
+        assert_eq!(
+            history_rebuild(&db).unwrap().unwrap().state,
+            OUTCOME_PROGRESSING
+        );
+
+        policy_git(root, &["checkout", "-qb", "other", "HEAD~1"]);
+        commit_all(root, &[("o.rs", "o\n")], "other work");
+        let plan_times_out = forcing(sliced(1, Some(1)), |walk| walk == HistoryWalk::Plan);
+        assert!(index_history(&db, root, &[], IndexMode::Auto, plan_times_out).is_err());
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(rebuild.target_sha, main_head, "the saved commits are kept");
+        assert_eq!(
+            (rebuild.state.as_str(), rebuild.stalled.as_deref()),
+            (OUTCOME_PROGRESSING, None),
+            "another target's listing changed this rebuild's outcome"
+        );
+        assert!(
+            rebuild
+                .note
+                .as_deref()
+                .is_some_and(|why| why.contains(&format!(
+                    "listing the commits toward {} ran out of time",
+                    short_sha(&head(root))
+                ))),
+            "{rebuild:?}"
+        );
+        // The next run that works on the rebuild clears the note.
+        policy_git(root, &["checkout", "-q", "main"]);
+        assert!(index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).is_err());
+        assert_eq!(history_rebuild(&db).unwrap().unwrap().note, None);
+    }
+
+    #[test]
+    fn an_explicit_full_rebuild_is_continued_by_later_passes() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        let stored = head(root);
+
+        // HEAD is the stored head: the next pass would otherwise take the
+        // same-HEAD path and park the rebuild.
+        let message = format!(
+            "{:#}",
+            index_history(&db, root, &[], IndexMode::Full, sliced(1, Some(1))).unwrap_err()
+        );
+        assert!(message.contains("rebuild in progress"), "{message}");
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(
+            (rebuild.cause.as_str(), rebuild.stored_sha.as_deref()),
+            (CAUSE_FULL, Some(stored.as_str()))
+        );
+        index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).unwrap();
+        assert!(
+            db.git_history_build().unwrap().is_none(),
+            "{:?}",
+            history_rebuild(&db).unwrap()
+        );
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, stored);
+        let fresh = Database::open_in_memory().unwrap();
+        git_history_index(&fresh, root).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&fresh));
+
+        // HEAD has moved past the stored head.
+        advance_main(root);
+        assert!(index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).is_err());
+        // Back on the stored line with main merged: the diverged rebuild is
+        // parked, and its target is an ancestor of HEAD.
+        policy_git(root, &["checkout", "-q", "side"]);
+        policy_git(root, &["merge", "-q", "--no-edit", "-X", "ours", "main"]);
+
+        assert!(index_history(&db, root, &[], IndexMode::Full, sliced(1, Some(1))).is_err());
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(
+            (rebuild.cause.as_str(), rebuild.stored_sha.as_deref()),
+            (CAUSE_FULL, Some(stored.as_str()))
+        );
+
+        // The next hook pass finishes it rather than going incremental and
+        // parking it again.
+        index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1))).unwrap();
+        assert!(
+            db.git_history_build().unwrap().is_none(),
+            "{:?}",
+            history_rebuild(&db).unwrap()
+        );
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+    }
+
+    #[test]
+    fn a_rebuild_left_against_the_stored_head_preempts_an_incremental_pass_that_would_succeed() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        let stored = head(root);
+        for round in 0..4 {
+            commit_all(root, &[("e.rs", &format!("e{round}\n"))], "side more");
+        }
+        let range_times_out = forcing(sliced(2, Some(1)), |walk| walk == HistoryWalk::Incremental);
+        assert!(index_history(&db, root, &[], IndexMode::Auto, range_times_out).is_err());
+        let rebuild = history_rebuild(&db).unwrap().unwrap();
+        assert_eq!(
+            (rebuild.cause.as_str(), rebuild.stored_sha.as_deref()),
+            (CAUSE_RANGE_TOO_LONG, Some(stored.as_str()))
+        );
+
+        // The incremental walk would now succeed; the rebuild is finished
+        // instead, so nothing is left parked.
+        index_history(&db, root, &[], IndexMode::Auto, sliced(2, Some(1))).unwrap();
+        assert!(
+            db.git_history_build().unwrap().is_none(),
+            "{:?}",
+            history_rebuild(&db).unwrap()
+        );
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+        let fresh = Database::open_in_memory().unwrap();
+        git_history_index(&fresh, root).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&fresh));
+    }
+
+    #[test]
+    fn git_index_rebuilds_in_slices_on_every_migrated_starting_state() {
+        for state in ["fresh", "562c496", "0.49.0"] {
+            let dir = diverging_repo();
+            let root = dir.path();
+            let db_dir = tempfile::tempdir().unwrap();
+            let path = db_dir.path().join("index.db");
+            if state != "fresh" {
+                let db = Database::open(&path).unwrap();
+                let mut rewind = String::from(
+                    "DROP TABLE git_history_build_v2_commits;
+                     DROP TABLE git_history_build_v2_keys;
+                     DROP TABLE git_history_build_v2_progress;
+                     DROP TABLE git_history_build_v2;
+                     DELETE FROM schema_migrations WHERE name = '0031_git_history_build_v2';",
+                );
+                rewind.push_str(if state == "562c496" {
+                    "INSERT INTO git_history_build VALUES (1, 'head', 'policy', 0, 'a');
+                     INSERT INTO git_history_build_progress VALUES (1, 4);
+                     INSERT INTO git_history_build_slices VALUES (0, 1, 'out');"
+                } else {
+                    "DROP TABLE git_history_build_slices;
+                     DROP TABLE git_history_build_progress;
+                     DROP TABLE git_history_build;
+                     DELETE FROM schema_migrations WHERE name = '0030_git_history_build';"
+                });
+                db.execute_raw_for_tests(&rewind).unwrap();
+            }
+            let db = Database::open(&path).unwrap();
+            let mut runs = 0;
+            while let Err(error) =
+                index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1)))
+            {
+                runs += 1;
+                assert!(runs <= 6, "{state}: {error:#}");
+                assert!(
+                    format!("{error:#}").contains("rebuild in progress"),
+                    "{state}: {error:#}"
+                );
+            }
+            assert!(runs >= 1, "{state}: a one-commit slice finished in one run");
+            assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+            let fresh = Database::open_in_memory().unwrap();
+            git_history_index(&fresh, root).unwrap();
+            assert_eq!(history_rows(&db), history_rows(&fresh), "{state}");
+        }
+    }
+
+    #[test]
+    fn split_history_cuts_at_the_headers_each_parser_recognizes() {
+        let numstat = "commit\tabc\t1700000000\ta@b\u{1f}A\u{1f}one\0\n1\t0\t\0commit\tfake\0new.rs\0\
+                       \0commit\tbad\tnot-a-date\ta@b\u{1f}A\u{1f}bad\0\n2\t0\tx.rs\0\
+                       \0commit\tdef\t1700000001\ta@b\u{1f}A\u{1f}two\0\n3\t1\ty.rs\0";
+        let tree_only = "\0commit\tabc\t1700000000\ta@b\u{1f}A\u{1f}change\0\n\nfirst.rs\0commit\tfake\t123\0tab\tpath.rs\0\0\0commit\tdef\t1700000001\ta@b\u{1f}A\u{1f}next\0\nlast.rs\0";
+        for (raw, tree_only, shas) in [
+            (numstat, false, &["abc", "bad", "def"][..]),
+            (tree_only, true, &["abc", "def"][..]),
+        ] {
+            let source = HistorySource {
+                tree_only,
+                shallow: BTreeSet::new(),
+            };
+            let parts = split_history(raw, &source).unwrap();
+            assert_eq!(
+                parts
+                    .iter()
+                    .map(|(sha, _)| sha.as_str())
+                    .collect::<Vec<_>>(),
+                shas
+            );
+            let mut alone = Vec::new();
+            for (sha, part) in &parts {
+                let (commits, headers) = parse_history_with_headers(part, &source).unwrap();
+                assert_eq!(
+                    headers.iter().map(|h| h.sha.as_str()).collect::<Vec<_>>(),
+                    [sha.as_str()]
+                );
+                alone.extend(commits);
+            }
+            assert_eq!(
+                commit_view(&alone),
+                commit_view(&parse_history(raw, &source).unwrap()),
+                "tree_only={tree_only}"
+            );
+        }
+        let numstat_source = HistorySource {
+            tree_only: false,
+            shallow: BTreeSet::new(),
+        };
+        let parts = split_history(numstat, &numstat_source).unwrap();
+        let (renamed, _) = parse_history_with_headers(parts[0].1, &numstat_source).unwrap();
+        assert_eq!(
+            renamed[0].renames,
+            [("commit\tfake".to_owned(), "new.rs".to_owned())]
+        );
+        let (dropped, _) = parse_history_with_headers(parts[1].1, &numstat_source).unwrap();
+        assert!(
+            dropped.is_empty(),
+            "a commit whose date does not parse is dropped"
+        );
+        assert!(
+            split_history(&format!("1\t2\tstray.rs\0{numstat}"), &numstat_source).is_err(),
+            "a record ahead of the first header must not be dropped silently"
+        );
     }
 
     #[test]
@@ -3074,7 +7055,7 @@ mod tests {
             source: &source,
             limits: sliced(2, None),
         };
-        match stage_history(&db, root, &head(root), &anchors).unwrap() {
+        match stage_history(&db, root, &head(root), &anchors, FullReason::Rebuild).unwrap() {
             Staged::Complete { commits, .. } => assert_eq!(shas(&commits), shas(&walk)),
             Staged::Incomplete(progress) => panic!("staging stopped: {progress:?}"),
         }

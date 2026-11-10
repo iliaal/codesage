@@ -44,8 +44,8 @@ pub struct CoChangeWrite {
 }
 
 /// A full history rebuild staged across bounded `git-index` runs. Rows in
-/// `git_history_build_slices` hold raw `git log` output for consecutive
-/// ranges of `commits`; readers of `git_files` and `git_co_changes` never see
+/// `git_history_build_v2_commits` hold each planned commit's raw `git log`
+/// output, keyed by SHA; readers of `git_files` and `git_co_changes` never see
 /// them, so the previous history stays in place until the rebuild completes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitHistoryBuild {
@@ -56,13 +56,76 @@ pub struct GitHistoryBuild {
     pub commits: Vec<String>,
     /// Commits the next slice reads.
     pub slice_len: usize,
-    /// Leading commits whose output is staged.
+    /// Planned commits whose output is staged, in any position.
     pub staged: usize,
+    pub cause: String,
+    /// The stored history head the rebuild was started against, if any.
+    pub stored_sha: Option<String>,
+}
+
+/// Mutable state of a staged rebuild, rewritten by every run that touches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GitHistoryProgress<'a> {
+    /// Commits the next slice reads.
+    pub slice_len: usize,
+    pub cause: &'a str,
+    pub stored_sha: Option<&'a str>,
+    pub outcome: &'a str,
+    /// Why the last run saved nothing, when it saved nothing.
+    pub stalled: Option<&'a str>,
+    /// Commits the last run saved.
+    pub run_saved: usize,
+}
+
+/// A staged rebuild as status readers see it, without its planned commit list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHistoryBuildStatus {
+    pub target_sha: String,
+    pub policy: String,
+    pub cutoff: i64,
+    pub total: usize,
+    pub staged: usize,
+    pub slice_len: usize,
+    pub cause: String,
+    pub stored_sha: Option<String>,
+    pub outcome: String,
+    pub stalled: Option<String>,
+    pub run_saved: usize,
+    /// Unix seconds of the last run that changed the rebuild's progress or
+    /// state. A run that only discarded what it read does not move it.
+    pub updated_at: i64,
+    /// Why the last run that touched this rebuild without changing its state
+    /// stopped: one toward another target that did not reach it, or one whose
+    /// environment moved before it could save what it read. Reported for
+    /// information only; cleared by the next run that saves progress on it.
+    pub note: Option<String>,
+    /// Unix seconds of the last run that reached this rebuild but discarded
+    /// what it read, since the last run that saved progress on it.
+    pub discarded_at: Option<i64>,
+    /// Unix seconds of the first such run since the last that saved progress.
+    pub discarding_since: Option<i64>,
+    /// Why that run discarded what it read.
+    pub discard_cause: Option<String>,
+    /// Consecutive re-plans that found no output saved under their
+    /// environment while output was saved under another, since a run last
+    /// resumed the rebuild under its environment and saved progress.
+    pub restarts: usize,
 }
 
 fn windows_of(mask: u64) -> u32 {
     mask.count_ones().max(1)
 }
+
+/// The staged rebuild's environment key, as the id staged output rows carry.
+const CURRENT_KEY: &str = "(SELECT k.id FROM git_history_build_v2_keys k
+     JOIN git_history_build_v2 b ON k.env_key = b.policy WHERE b.id = 1)";
+
+/// Environments whose staged output a re-plan keeps, most recently used first.
+pub const STAGED_ENVIRONMENTS_KEPT: usize = 4;
+
+/// Staged output of an environment no plan or slice has used for this long is
+/// deleted at the next re-plan.
+pub const STAGED_ENVIRONMENT_TTL_SECS: i64 = 30 * 86_400;
 
 /// Rank multiplier applied to a pair's weight when its shared commits span
 /// less than [`RECURRING_SPAN_SECS`] (or the span is unknown on a legacy
@@ -874,7 +937,7 @@ impl Database {
         let Some((target_sha, policy, cutoff, commits)) = self
             .conn
             .query_row(
-                "SELECT target_sha, policy, cutoff, commits FROM git_history_build WHERE id = 1",
+                "SELECT target_sha, policy, cutoff, commits FROM git_history_build_v2 WHERE id = 1",
                 [],
                 |row| {
                     Ok((
@@ -889,20 +952,21 @@ impl Database {
         else {
             return Ok(None);
         };
-        let slice_len: i64 = self
+        let (slice_len, cause, stored_sha) = self
             .conn
             .query_row(
-                "SELECT slice_len FROM git_history_build_progress WHERE id = 1",
+                "SELECT slice_len, cause, stored_sha FROM git_history_build_v2_progress WHERE id = 1",
                 [],
-                |row| row.get(0),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?
-            .unwrap_or(1);
-        let staged: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(len), 0) FROM git_history_build_slices",
-            [],
-            |row| row.get(0),
-        )?;
+            .unwrap_or((1, String::new(), None));
         Ok(Some(GitHistoryBuild {
             target_sha,
             policy,
@@ -913,85 +977,456 @@ impl Database {
                 .map(str::to_owned)
                 .collect(),
             slice_len: usize::try_from(slice_len).unwrap_or(1).max(1),
-            staged: usize::try_from(staged).unwrap_or(0),
+            staged: self.git_history_build_staged_count()?,
+            cause,
+            stored_sha,
         }))
     }
 
-    /// Replace any staged rebuild with an empty one for `commits`.
+    fn git_history_build_staged_count(&self) -> Result<usize> {
+        let staged: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM git_history_build_v2_commits WHERE key_id = {CURRENT_KEY}"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(staged).unwrap_or(0))
+    }
+
+    /// The staged rebuild without its planned commit list. `None` also for an
+    /// index whose schema predates the staging tables, so read-only status
+    /// readers work on it.
+    pub fn git_history_build_status(&self) -> Result<Option<GitHistoryBuildStatus>> {
+        for table in [
+            "git_history_build_v2",
+            "git_history_build_v2_progress",
+            "git_history_build_v2_commits",
+            "git_history_build_v2_keys",
+        ] {
+            if !self.table_exists(table)? {
+                return Ok(None);
+            }
+        }
+        let Some((target_sha, policy, cutoff, total)) = self
+            .conn
+            .query_row(
+                "SELECT target_sha, policy, cutoff, commit_count FROM git_history_build_v2 WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let progress = self
+            .conn
+            .query_row(
+                "SELECT slice_len, cause, stored_sha, outcome, stalled, run_saved, updated_at, note,
+                        discarded_at, discarding_since, discard_cause, restarts
+                 FROM git_history_build_v2_progress WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, i64>(11)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            slice_len,
+            cause,
+            stored_sha,
+            outcome,
+            stalled,
+            run_saved,
+            updated_at,
+            note,
+            discarded_at,
+            discarding_since,
+            discard_cause,
+            restarts,
+        )) = progress
+        else {
+            return Ok(None);
+        };
+        Ok(Some(GitHistoryBuildStatus {
+            target_sha,
+            policy,
+            cutoff,
+            total: usize::try_from(total).unwrap_or(0),
+            staged: self.git_history_build_staged_count()?,
+            slice_len: usize::try_from(slice_len).unwrap_or(1).max(1),
+            cause,
+            stored_sha,
+            outcome,
+            stalled,
+            run_saved: usize::try_from(run_saved).unwrap_or(0),
+            updated_at,
+            note,
+            discarded_at,
+            discarding_since,
+            discard_cause,
+            restarts: usize::try_from(restarts).unwrap_or(0),
+        }))
+    }
+
+    /// The policy the staged rebuild was planned under, if one is staged.
+    pub fn git_history_build_policy(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT policy FROM git_history_build_v2 WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Replace any staged rebuild with one for `commits`, planned under
+    /// `policy`, the clone mode and numstat environment its commits' output is
+    /// read under. Staged output is kept per environment, so branches whose
+    /// environments differ each keep their own commits: under `policy`, the
+    /// output of commits `commits` does not list is deleted; under other
+    /// environments, whose branches may still list them, it is kept. An
+    /// environment no plan or slice has used for
+    /// [`STAGED_ENVIRONMENT_TTL_SECS`], or beyond the
+    /// [`STAGED_ENVIRONMENTS_KEPT`] most recently used, is deleted with its
+    /// output. Returns how many listed commits are saved under `policy`, and
+    /// counts a re-plan that keeps none while another environment had output
+    /// as a restart. Deletes row by row, so run it inside
+    /// [`Database::execute_batch`].
     pub fn start_git_history_build(
         &self,
         target_sha: &str,
         policy: &str,
         cutoff: i64,
         commits: &[String],
-        slice_len: usize,
-    ) -> Result<()> {
-        self.clear_git_history_build()?;
-        self.conn.execute(
-            "INSERT INTO git_history_build (id, target_sha, policy, cutoff, commits)
-             VALUES (1, ?1, ?2, ?3, ?4)",
-            rusqlite::params![target_sha, policy, cutoff, commits.join("\n")],
+        progress: &GitHistoryProgress<'_>,
+    ) -> Result<usize> {
+        // Output under another environment, as opposed to none for this
+        // target under the same one, which a far-diverged branch also gives.
+        let had_other_output: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM git_history_build_v2_commits c
+                           JOIN git_history_build_v2_keys k ON c.key_id = k.id
+                           WHERE k.env_key != ?1)",
+            [policy],
+            |row| row.get(0),
         )?;
-        self.set_git_history_slice_len(slice_len)
+        let previous_restarts: i64 = self
+            .conn
+            .query_row(
+                "SELECT restarts FROM git_history_build_v2_progress WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        self.conn
+            .execute("DELETE FROM git_history_build_v2_progress", [])?;
+        self.conn.execute("DELETE FROM git_history_build_v2", [])?;
+        // An environment unused for the TTL loses its output even when it is
+        // the one re-planning: that output was read before any recent run
+        // confirmed the environment, so the TTL bounds how old reused output
+        // can be.
+        let mut evicted: Vec<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM git_history_build_v2_keys WHERE used_at < unixepoch() - ?1",
+            )?;
+            stmt.query_map([STAGED_ENVIRONMENT_TTL_SECS], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for id in &evicted {
+            self.conn.execute(
+                "DELETE FROM git_history_build_v2_commits WHERE key_id = ?1",
+                [id],
+            )?;
+            self.conn
+                .execute("DELETE FROM git_history_build_v2_keys WHERE id = ?1", [id])?;
+        }
+        self.conn.execute(
+            "INSERT INTO git_history_build_v2_keys (env_key, used_at) VALUES (?1, unixepoch())
+             ON CONFLICT(env_key) DO UPDATE SET used_at = excluded.used_at",
+            [policy],
+        )?;
+        evicted = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM git_history_build_v2_keys
+                 WHERE env_key != ?1
+                   AND id NOT IN (SELECT id FROM git_history_build_v2_keys
+                                  WHERE env_key != ?1
+                                  ORDER BY used_at DESC, id DESC LIMIT ?2)",
+            )?;
+            stmt.query_map(
+                rusqlite::params![policy, STAGED_ENVIRONMENTS_KEPT as i64 - 1],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        for id in evicted {
+            self.conn.execute(
+                "DELETE FROM git_history_build_v2_commits WHERE key_id = ?1",
+                [id],
+            )?;
+            self.conn
+                .execute("DELETE FROM git_history_build_v2_keys WHERE id = ?1", [id])?;
+        }
+        let planned: std::collections::HashSet<&str> = commits.iter().map(String::as_str).collect();
+        let key_id: i64 = self.conn.query_row(
+            "SELECT id FROM git_history_build_v2_keys WHERE env_key = ?1",
+            [policy],
+            |row| row.get(0),
+        )?;
+        let saved: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT sha FROM git_history_build_v2_commits WHERE key_id = ?1")?;
+            stmt.query_map([key_id], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut delete = self.conn.prepare_cached(
+            "DELETE FROM git_history_build_v2_commits WHERE sha = ?1 AND key_id = ?2",
+        )?;
+        let mut kept = 0i64;
+        for sha in &saved {
+            if planned.contains(sha.as_str()) {
+                kept += 1;
+            } else {
+                delete.execute(rusqlite::params![sha, key_id])?;
+            }
+        }
+        let restarts = if kept == 0 && had_other_output {
+            previous_restarts + 1
+        } else {
+            0
+        };
+        self.conn.execute(
+            "INSERT INTO git_history_build_v2 (id, target_sha, policy, cutoff, commit_count, commits)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                target_sha,
+                policy,
+                cutoff,
+                commits.len() as i64,
+                commits.join("\n")
+            ],
+        )?;
+        self.set_git_history_progress(progress)?;
+        self.conn.execute(
+            "UPDATE git_history_build_v2_progress SET restarts = ?1 WHERE id = 1",
+            [restarts],
+        )?;
+        Ok(usize::try_from(kept).unwrap_or(0))
     }
 
-    /// Stage the output for `len` commits starting at `start`, and size the next slice.
-    pub fn stage_git_history_slice(
+    /// Stage each `(sha, output)` under the staged rebuild's environment and
+    /// record the run's progress. Inserts row by row, so run it inside
+    /// [`Database::execute_batch`].
+    pub fn stage_git_history_commits(
         &self,
-        start: usize,
-        len: usize,
-        output: &str,
-        next_slice_len: usize,
+        outputs: &[(&str, &str)],
+        progress: &GitHistoryProgress<'_>,
     ) -> Result<()> {
+        let mut insert = self.conn.prepare_cached(&format!(
+            "INSERT INTO git_history_build_v2_commits (sha, key_id, output)
+             VALUES (?1, {CURRENT_KEY}, ?2)
+             ON CONFLICT(sha, key_id) DO UPDATE SET output = excluded.output"
+        ))?;
+        for (sha, output) in outputs {
+            insert.execute(rusqlite::params![sha, output])?;
+        }
         self.conn.execute(
-            "INSERT INTO git_history_build_slices (start, len, output) VALUES (?1, ?2, ?3)",
-            rusqlite::params![start as i64, len as i64, output],
+            &format!(
+                "UPDATE git_history_build_v2_keys SET used_at = unixepoch() WHERE id = {CURRENT_KEY}"
+            ),
+            [],
         )?;
-        self.set_git_history_slice_len(next_slice_len)
+        self.set_git_history_progress(progress)
     }
 
-    pub fn set_git_history_slice_len(&self, slice_len: usize) -> Result<()> {
+    pub fn set_git_history_progress(&self, progress: &GitHistoryProgress<'_>) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO git_history_build_progress (id, slice_len) VALUES (1, ?1)
-             ON CONFLICT(id) DO UPDATE SET slice_len = excluded.slice_len",
-            [slice_len as i64],
+            "INSERT INTO git_history_build_v2_progress
+                 (id, slice_len, cause, stored_sha, outcome, stalled, run_saved, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, unixepoch())
+             ON CONFLICT(id) DO UPDATE SET
+                 slice_len = excluded.slice_len,
+                 cause = excluded.cause,
+                 stored_sha = excluded.stored_sha,
+                 outcome = excluded.outcome,
+                 stalled = excluded.stalled,
+                 run_saved = excluded.run_saved,
+                 updated_at = excluded.updated_at,
+                 note = NULL,
+                 discarded_at = NULL,
+                 discarding_since = NULL,
+                 discard_cause = NULL",
+            rusqlite::params![
+                progress.slice_len as i64,
+                progress.cause,
+                progress.stored_sha,
+                progress.outcome,
+                progress.stalled,
+                progress.run_saved as i64
+            ],
         )?;
         Ok(())
     }
 
-    /// Staged slices as `(start, len, output)`, in commit order.
-    pub fn git_history_build_slices(&self) -> Result<Vec<(usize, usize, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT start, len, output FROM git_history_build_slices ORDER BY start")?;
-        let rows = stmt
+    /// Record `outcome` on a staged rebuild a pass left untouched; a no-op
+    /// when nothing is staged.
+    pub fn set_git_history_build_outcome(&self, outcome: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE git_history_build_v2_progress
+             SET outcome = ?1, stalled = NULL, run_saved = 0, updated_at = unixepoch()
+             WHERE id = 1",
+            [outcome],
+        )?;
+        Ok(())
+    }
+
+    /// Attach `note` to a staged rebuild without changing its outcome; a no-op
+    /// when nothing is staged.
+    pub fn set_git_history_build_note(&self, note: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE git_history_build_v2_progress SET note = ?1 WHERE id = 1",
+            [note],
+        )?;
+        Ok(())
+    }
+
+    /// Reset the restart count of a staged rebuild a run resumed under an
+    /// unchanged environment and saved progress on.
+    pub fn clear_git_history_restarts(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE git_history_build_v2_progress SET restarts = 0 WHERE id = 1",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Record that a run reached the staged rebuild but discarded what it
+    /// read because of `cause`, keeping its outcome and `updated_at`, and,
+    /// when given, shrinking the next slice to `slice_len`; a no-op when
+    /// nothing is staged. `discarding_since` keeps the first such run since
+    /// the last that saved progress.
+    pub fn record_git_history_discard(
+        &self,
+        note: &str,
+        cause: &str,
+        slice_len: Option<usize>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE git_history_build_v2_progress
+             SET note = ?1, discard_cause = ?2, discarded_at = unixepoch(),
+                 discarding_since = COALESCE(discarding_since, unixepoch()),
+                 slice_len = COALESCE(?3, slice_len)
+             WHERE id = 1",
+            rusqlite::params![note, cause, slice_len.map(|len| len as i64)],
+        )?;
+        Ok(())
+    }
+
+    /// Replace the outcome `from` with `to` on a staged rebuild a pass left
+    /// untouched, keeping any other outcome and its reason.
+    pub fn replace_git_history_build_outcome(&self, from: &str, to: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE git_history_build_v2_progress
+             SET outcome = ?2, stalled = NULL, run_saved = 0, updated_at = unixepoch()
+             WHERE id = 1 AND outcome = ?1",
+            [from, to],
+        )?;
+        Ok(())
+    }
+
+    /// Set a staged rebuild a pass left untouched to `parked` when its
+    /// outcome is `active` or its cause is one of `settled_causes`, keeping
+    /// its last reason. A rebuild already `parked` is left alone, so its
+    /// `updated_at` keeps aging.
+    pub fn park_git_history_build(
+        &self,
+        parked: &str,
+        active: &str,
+        settled_causes: &[&str],
+    ) -> Result<()> {
+        let placeholders = (0..settled_causes.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let causes = if settled_causes.is_empty() {
+            String::new()
+        } else {
+            format!(" OR cause IN ({placeholders})")
+        };
+        let sql = format!(
+            "UPDATE git_history_build_v2_progress
+             SET outcome = ?1, run_saved = 0, updated_at = unixepoch()
+             WHERE id = 1 AND outcome != ?1 AND (outcome = ?2{causes})"
+        );
+        let mut params: Vec<&str> = vec![parked, active];
+        params.extend_from_slice(settled_causes);
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params))?;
+        Ok(())
+    }
+
+    /// SHAs whose output is staged under the staged rebuild's environment.
+    pub fn git_history_build_staged_shas(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT sha FROM git_history_build_v2_commits WHERE key_id = {CURRENT_KEY}"
+        ))?;
+        let shas = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(shas)
+    }
+
+    /// Output staged under the staged rebuild's environment, by SHA.
+    pub fn git_history_build_outputs(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT sha, output FROM git_history_build_v2_commits WHERE key_id = {CURRENT_KEY}"
+        ))?;
+        let outputs = stmt
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .into_iter()
-            .map(|(start, len, output)| (start.max(0) as usize, len.max(0) as usize, output))
-            .collect())
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(outputs)
     }
 
     pub fn clear_git_history_build(&self) -> Result<()> {
         self.conn
-            .execute("DELETE FROM git_history_build_slices", [])?;
+            .execute("DELETE FROM git_history_build_v2_commits", [])?;
         self.conn
-            .execute("DELETE FROM git_history_build_progress", [])?;
-        self.conn.execute("DELETE FROM git_history_build", [])?;
+            .execute("DELETE FROM git_history_build_v2_keys", [])?;
+        self.conn
+            .execute("DELETE FROM git_history_build_v2_progress", [])?;
+        self.conn.execute("DELETE FROM git_history_build_v2", [])?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CoChangeWrite, Database, RECURRING_SPAN_SECS};
+    use super::{CoChangeWrite, Database, GitHistoryProgress, RECURRING_SPAN_SECS};
 
     #[test]
     fn selected_churn_candidates_merge_batches_and_ignore_hotter_other_paths() {
@@ -1634,32 +2069,225 @@ mod tests {
         assert_eq!(db.co_change_weight("a.rs", "b.rs").unwrap(), 4.0);
     }
 
+    fn progress(slice_len: usize) -> GitHistoryProgress<'static> {
+        GitHistoryProgress {
+            slice_len,
+            cause: "first_build",
+            stored_sha: None,
+            outcome: "progressing",
+            stalled: None,
+            run_saved: 0,
+        }
+    }
+
     #[test]
     fn staging_slices_never_rewrites_the_planned_commit_list() {
         let db = Database::open_in_memory().unwrap();
         let commits: Vec<String> = (0..6).map(|i| format!("{i:040x}")).collect();
-        db.start_git_history_build("head", "policy", 7, &commits, 2)
+        db.start_git_history_build("head", "policy", 7, &commits, &progress(2))
             .unwrap();
         db.execute_raw_for_tests(
-            "CREATE TRIGGER keep_commits BEFORE UPDATE ON git_history_build
+            "CREATE TRIGGER keep_commits BEFORE UPDATE ON git_history_build_v2
              BEGIN SELECT RAISE(ABORT, 'planned commit list rewritten'); END;",
         )
         .unwrap();
-        db.stage_git_history_slice(0, 2, "out-0", 4).unwrap();
-        db.set_git_history_slice_len(1).unwrap();
-        db.stage_git_history_slice(2, 1, "out-2", 3).unwrap();
+        db.stage_git_history_commits(
+            &[(&commits[0], "out-0"), (&commits[1], "out-1")],
+            &progress(4),
+        )
+        .unwrap();
+        db.set_git_history_progress(&progress(1)).unwrap();
+        db.stage_git_history_commits(&[(&commits[2], "out-2")], &progress(3))
+            .unwrap();
 
         let build = db.git_history_build().unwrap().unwrap();
         assert_eq!(build.commits, commits);
         assert_eq!((build.staged, build.slice_len, build.cutoff), (3, 3, 7));
-        assert_eq!(
-            db.git_history_build_slices().unwrap(),
-            vec![(0, 2, "out-0".to_owned()), (2, 1, "out-2".to_owned())]
-        );
+        let outputs = db.git_history_build_outputs().unwrap();
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[&commits[0]], "out-0");
+        assert_eq!(outputs[&commits[2]], "out-2");
         db.clear_git_history_build().unwrap();
         assert!(db.git_history_build().unwrap().is_none());
-        db.start_git_history_build("next", "policy", 7, &commits, 5)
+        assert!(db.git_history_build_outputs().unwrap().is_empty());
+        db.execute_raw_for_tests("DROP TRIGGER keep_commits")
+            .unwrap();
+        db.start_git_history_build("next", "policy", 7, &commits, &progress(5))
             .unwrap();
         assert_eq!(db.git_history_build().unwrap().unwrap().slice_len, 5);
+    }
+
+    #[test]
+    fn replanning_keeps_listed_commits_and_prunes_the_rest() {
+        let db = Database::open_in_memory().unwrap();
+        let sha = |i: u32| format!("{i:040x}");
+        let first: Vec<String> = (0..4).map(sha).collect();
+        db.start_git_history_build("one", "policy", 7, &first, &progress(2))
+            .unwrap();
+        let outputs: Vec<(String, String)> = first
+            .iter()
+            .map(|s| (s.clone(), format!("out-{s}")))
+            .collect();
+        let pairs: Vec<(&str, &str)> = outputs
+            .iter()
+            .map(|(s, o)| (s.as_str(), o.as_str()))
+            .collect();
+        db.stage_git_history_commits(&pairs, &progress(2)).unwrap();
+
+        // The second plan shares commits 2 and 3 and adds 4 and 5.
+        let second: Vec<String> = (2..6).map(sha).collect();
+        let retarget = GitHistoryProgress {
+            cause: "diverged",
+            stored_sha: Some("stored"),
+            ..progress(8)
+        };
+        let kept = db
+            .start_git_history_build("two", "policy", 9, &second, &retarget)
+            .unwrap();
+        assert_eq!(kept, 2);
+        let build = db.git_history_build().unwrap().unwrap();
+        assert_eq!((build.target_sha.as_str(), build.staged), ("two", 2));
+        assert_eq!(build.commits, second);
+        assert_eq!(
+            (build.cause.as_str(), build.stored_sha.as_deref()),
+            ("diverged", Some("stored"))
+        );
+        let staged = db.git_history_build_staged_shas().unwrap();
+        assert_eq!(staged, [sha(2), sha(3)].into_iter().collect());
+        assert_eq!(
+            db.git_history_build_outputs().unwrap()[&sha(3)],
+            format!("out-{}", sha(3))
+        );
+
+        let status = db.git_history_build_status().unwrap().unwrap();
+        assert_eq!(
+            (
+                status.total,
+                status.staged,
+                status.slice_len,
+                status.outcome.as_str()
+            ),
+            (4, 2, 8, "progressing")
+        );
+        db.set_git_history_build_outcome("parked").unwrap();
+        assert_eq!(
+            db.git_history_build_status().unwrap().unwrap().outcome,
+            "parked"
+        );
+
+        // Another policy reads other output for the same commits.
+        let kept = db
+            .start_git_history_build("two", "other", 9, &second, &progress(8))
+            .unwrap();
+        assert_eq!(kept, 0);
+        assert!(db.git_history_build_staged_shas().unwrap().is_empty());
+        let other: Vec<(String, String)> = second
+            .iter()
+            .map(|s| (s.clone(), format!("other-{s}")))
+            .collect();
+        let pairs: Vec<(&str, &str)> = other
+            .iter()
+            .map(|(s, o)| (s.as_str(), o.as_str()))
+            .collect();
+        db.stage_git_history_commits(&pairs, &progress(8)).unwrap();
+
+        // Back under the first policy, its own output is still there, apart
+        // from what the plan no longer lists.
+        let third: Vec<String> = (3..6).map(sha).collect();
+        let kept = db
+            .start_git_history_build("three", "policy", 9, &third, &progress(8))
+            .unwrap();
+        assert_eq!(kept, 1);
+        assert_eq!(
+            db.git_history_build_outputs().unwrap(),
+            [(sha(3), format!("out-{}", sha(3)))].into_iter().collect()
+        );
+        let status = db.git_history_build_status().unwrap().unwrap();
+        assert_eq!((status.staged, status.restarts), (1, 0));
+        let kept = db
+            .start_git_history_build("two", "other", 9, &second, &progress(8))
+            .unwrap();
+        assert_eq!(
+            kept, 4,
+            "the other policy's output for listed commits was kept"
+        );
+    }
+
+    #[test]
+    fn replanning_keeps_at_most_four_environments_and_counts_restarts() {
+        let db = Database::open_in_memory().unwrap();
+        let plan: Vec<String> = vec![format!("{:040x}", 1)];
+        let mut restarts = Vec::new();
+        for env in ["a", "b", "c", "d", "e", "a"] {
+            db.start_git_history_build("t", env, 0, &plan, &progress(1))
+                .unwrap();
+            restarts.push(db.git_history_build_status().unwrap().unwrap().restarts);
+            db.stage_git_history_commits(&[(&plan[0], env)], &progress(1))
+                .unwrap();
+        }
+        // `a` was evicted when `e` became the fifth environment.
+        assert_eq!(restarts, [0, 1, 2, 3, 4, 5]);
+        db.start_git_history_build("t", "e", 0, &plan, &progress(1))
+            .unwrap();
+        let status = db.git_history_build_status().unwrap().unwrap();
+        assert_eq!((status.staged, status.restarts), (1, 0));
+    }
+
+    #[test]
+    fn replanning_under_any_of_the_last_four_environments_keeps_its_output() {
+        let db = Database::open_in_memory().unwrap();
+        let plan: Vec<String> = vec![format!("{:040x}", 1)];
+        for env in ["a", "b", "c", "d"] {
+            db.start_git_history_build("t", env, 0, &plan, &progress(1))
+                .unwrap();
+            db.stage_git_history_commits(&[(&plan[0], env)], &progress(1))
+                .unwrap();
+        }
+        for env in ["a", "b", "c", "d"] {
+            let kept = db
+                .start_git_history_build("t", env, 0, &plan, &progress(1))
+                .unwrap();
+            assert_eq!(kept, 1, "{env} lost its output");
+            assert_eq!(db.git_history_build_outputs().unwrap()[&plan[0]], env);
+        }
+    }
+
+    #[test]
+    fn an_environment_unused_for_thirty_days_loses_its_output_even_when_it_replans() {
+        let db = Database::open_in_memory().unwrap();
+        let plan: Vec<String> = vec![format!("{:040x}", 1)];
+        for env in ["old", "recent"] {
+            db.start_git_history_build("t", env, 0, &plan, &progress(1))
+                .unwrap();
+            db.stage_git_history_commits(&[(&plan[0], env)], &progress(1))
+                .unwrap();
+        }
+        db.execute_raw_for_tests(&format!(
+            "UPDATE git_history_build_v2_keys SET used_at = unixepoch() - {}
+             WHERE env_key = 'old'",
+            super::STAGED_ENVIRONMENT_TTL_SECS + 60
+        ))
+        .unwrap();
+        let kept = db
+            .start_git_history_build("t", "old", 0, &plan, &progress(1))
+            .unwrap();
+        assert_eq!(kept, 0, "output older than the TTL was reused");
+        let kept = db
+            .start_git_history_build("t", "recent", 0, &plan, &progress(1))
+            .unwrap();
+        assert_eq!(kept, 1);
+    }
+
+    #[test]
+    fn build_status_is_absent_on_a_schema_without_staging_tables() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.git_history_build_status().unwrap().is_none());
+        db.execute_raw_for_tests(
+            "DROP TABLE git_history_build_v2_commits;
+             DROP TABLE git_history_build_v2_progress;
+             DROP TABLE git_history_build_v2;",
+        )
+        .unwrap();
+        assert!(db.git_history_build_status().unwrap().is_none());
     }
 }

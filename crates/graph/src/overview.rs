@@ -398,6 +398,10 @@ fn build_freshness(root: &Path, db: &Database) -> FreshnessInfo {
     let semantic = db.semantic_file_count();
     let semantic_indexed_files = *semantic.as_ref().unwrap_or(&0);
     let semantic_unavailable = semantic.err().map(|error| format!("{error:#}"));
+    let history_rebuild = crate::history_rebuild_at(root, db).unwrap_or_else(|error| {
+        tracing::warn!(error = %format!("{error:#}"), "reading the staged git history rebuild");
+        None
+    });
     FreshnessInfo {
         structural_kind,
         structural_summary: report.summary(),
@@ -409,6 +413,7 @@ fn build_freshness(root: &Path, db: &Database) -> FreshnessInfo {
         semantic_indexed_files,
         semantic_indexed: semantic_indexed_files > 0,
         semantic_unavailable,
+        history_rebuild,
     }
 }
 
@@ -467,13 +472,56 @@ fn recovery(freshness: &FreshnessInfo, has_history: bool) -> Vec<OverviewRecover
             why: format!("semantic coverage could not be measured: {reason}"),
         });
     }
-    if !has_history && freshness.structural_kind != "not_git" {
-        calls.push(OverviewRecovery {
+    use crate::history_rebuild_terms::{OUTCOME_FAILED, OUTCOME_NO_PROGRESS, OUTCOME_PROGRESSING};
+    let rebuild = freshness.history_rebuild.as_ref();
+    match rebuild {
+        Some(rebuild) if rebuild.state == OUTCOME_FAILED => calls.push(OverviewRecovery {
+            command: "codesage git-index --full".to_string(),
+            why: format!(
+                "Git history rebuild toward {} failed on its last run ({}); {} of {} commits saved; once the cause is fixed, `--full` retries it",
+                short(&rebuild.target_sha),
+                rebuild.stalled.as_deref().unwrap_or("no error was recorded"),
+                rebuild.commits_saved,
+                rebuild.commits_total
+            ),
+        }),
+        Some(rebuild) if rebuild.state == OUTCOME_NO_PROGRESS => calls.push(OverviewRecovery {
+            command: "CODESAGE_GIT_HISTORY_TIMEOUT_MS=600000 codesage git-index --full".to_string(),
+            why: format!(
+                "Git history rebuild toward {} made no progress ({}); {} of {} commits saved",
+                short(&rebuild.target_sha),
+                rebuild.stalled.as_deref().unwrap_or("no slice was read"),
+                rebuild.commits_saved,
+                rebuild.commits_total
+            ),
+        }),
+        Some(rebuild) if rebuild.state == OUTCOME_PROGRESSING => calls.push(OverviewRecovery {
             command: "codesage git-index".to_string(),
-            why: "Git history has not been indexed".to_string(),
-        });
+            why: format!(
+                "Git history rebuild toward {} in progress: {} of {} commits saved; {} until it completes",
+                short(&rebuild.target_sha),
+                rebuild.commits_saved,
+                rebuild.commits_total,
+                if has_history {
+                    "history facts describe the previously indexed head"
+                } else {
+                    "history facts are unavailable"
+                }
+            ),
+        }),
+        _ if !has_history && freshness.structural_kind != "not_git" => {
+            calls.push(OverviewRecovery {
+                command: "codesage git-index".to_string(),
+                why: "Git history has not been indexed".to_string(),
+            });
+        }
+        _ => {}
     }
     calls
+}
+
+fn short(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
 }
 
 #[cfg(test)]
@@ -708,6 +756,7 @@ mod tests {
             semantic_indexed_files: 0,
             semantic_indexed: false,
             semantic_unavailable: None,
+            history_rebuild: None,
         }
     }
 
@@ -884,6 +933,184 @@ mod tests {
             lockdir.is_dir(),
             "overview is read-only: the dead lock stays"
         );
+    }
+
+    fn stage_rebuild(db: &Database, outcome: &str, stalled: Option<&str>) {
+        let commits: Vec<String> = (0..4).map(|i| format!("{i:040x}")).collect();
+        let progress = codesage_storage::db::GitHistoryProgress {
+            slice_len: 2,
+            cause: crate::history_rebuild_terms::CAUSE_DIVERGED,
+            stored_sha: Some("feedfacefeedfacefeedfacefeedfacefeedface"),
+            outcome,
+            stalled,
+            run_saved: 1,
+        };
+        db.execute_batch(|db| {
+            db.start_git_history_build(
+                "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff",
+                "policy",
+                0,
+                &commits,
+                &progress,
+            )?;
+            db.stage_git_history_commits(&[(&commits[0], "out")], &progress)
+        })
+        .unwrap();
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A repository on `main` and a commit on `side` that main does not hold.
+    fn branched_repo() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
+        write(root, "a.rs", "a\n");
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "base"]);
+        git(root, &["checkout", "-qb", "side"]);
+        write(root, "b.rs", "b\n");
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", "side"]);
+        let side = git(root, &["rev-parse", "HEAD"]);
+        git(root, &["checkout", "-q", "main"]);
+        (dir, side)
+    }
+
+    #[test]
+    fn a_stalled_rebuild_unreachable_from_head_is_parked_without_recovery() {
+        use crate::history_rebuild_terms::{OUTCOME_NO_PROGRESS, OUTCOME_PARKED};
+        let (dir, side) = branched_repo();
+        let root = dir.path();
+        let main = git(root, &["rev-parse", "HEAD"]);
+        for target in [side, "d".repeat(40)] {
+            let db = Database::open_in_memory().unwrap();
+            db.set_git_index_state(&main).unwrap();
+            let commits = vec![target.clone()];
+            let progress = codesage_storage::db::GitHistoryProgress {
+                slice_len: 1,
+                cause: crate::history_rebuild_terms::CAUSE_DIVERGED,
+                stored_sha: Some(&main),
+                outcome: OUTCOME_NO_PROGRESS,
+                stalled: Some("commit 000000000000 alone takes longer than the budget"),
+                run_saved: 0,
+            };
+            db.execute_batch(|db| {
+                db.start_git_history_build(&target, "policy", 0, &commits, &progress)
+                    .map(|_| ())
+            })
+            .unwrap();
+            let freshness = build_project_overview(root, &db).unwrap().freshness;
+            assert_eq!(
+                freshness.history_rebuild.as_ref().map(|r| r.state.as_str()),
+                Some(OUTCOME_PARKED),
+                "target {target}"
+            );
+            let calls = recovery(&freshness, true);
+            assert!(
+                calls.iter().all(|call| !call.command.contains("git-index")),
+                "target {target}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_history_rebuild_is_reported_with_progress_and_recovery() {
+        use crate::history_rebuild_terms::{
+            OUTCOME_FAILED, OUTCOME_NO_PROGRESS, OUTCOME_PARKED, OUTCOME_PROGRESSING,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        db.set_git_index_state("feedfacefeedfacefeedfacefeedfacefeedface")
+            .unwrap();
+        stage_rebuild(&db, OUTCOME_PROGRESSING, None);
+        let overview = build_project_overview(dir.path(), &db).unwrap();
+        let rebuild = overview
+            .freshness
+            .history_rebuild
+            .clone()
+            .expect("a staged rebuild is reported");
+        assert_eq!(
+            (
+                rebuild.state.as_str(),
+                rebuild.cause.as_str(),
+                rebuild.commits_saved,
+                rebuild.commits_total,
+                rebuild.next_slice_commits,
+                rebuild.last_run_saved
+            ),
+            (OUTCOME_PROGRESSING, "diverged", 1, 4, 2, 1)
+        );
+        assert_eq!(
+            rebuild.stored_sha.as_deref(),
+            Some("feedfacefeedfacefeedfacefeedfacefeedface")
+        );
+        let value = serde_json::to_value(&overview).unwrap();
+        assert_eq!(
+            value["freshness"]["history_rebuild"]["target_sha"],
+            "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff"
+        );
+        let progressing = recovery(&overview.freshness, true);
+        assert_eq!(progressing.len(), 1);
+        assert_eq!(progressing[0].command, "codesage git-index");
+        assert!(
+            progressing[0]
+                .why
+                .contains("rebuild toward c0ffeec0ffee in progress: 1 of 4 commits saved"),
+            "{}",
+            progressing[0].why
+        );
+
+        stage_rebuild(
+            &db,
+            OUTCOME_NO_PROGRESS,
+            Some("commit 000000000000 alone takes longer than the budget"),
+        );
+        let freshness = build_project_overview(dir.path(), &db).unwrap().freshness;
+        let stalled = recovery(&freshness, true);
+        assert_eq!(
+            stalled[0].command,
+            "CODESAGE_GIT_HISTORY_TIMEOUT_MS=600000 codesage git-index --full"
+        );
+        assert!(
+            stalled[0].why.contains(
+                "made no progress (commit 000000000000 alone takes longer than the budget)"
+            ),
+            "{}",
+            stalled[0].why
+        );
+
+        stage_rebuild(&db, OUTCOME_FAILED, Some("git log failed in /repo: fatal"));
+        let freshness = build_project_overview(dir.path(), &db).unwrap().freshness;
+        let failed = recovery(&freshness, true);
+        assert_eq!(failed[0].command, "codesage git-index --full");
+        assert!(
+            failed[0]
+                .why
+                .contains("failed on its last run (git log failed in /repo: fatal)"),
+            "{}",
+            failed[0].why
+        );
+
+        db.set_git_history_build_outcome(OUTCOME_PARKED).unwrap();
+        let freshness = build_project_overview(dir.path(), &db).unwrap().freshness;
+        assert_eq!(
+            freshness.history_rebuild.as_ref().map(|r| r.state.as_str()),
+            Some(OUTCOME_PARKED)
+        );
+        assert!(recovery(&freshness, true).is_empty());
     }
 
     #[test]

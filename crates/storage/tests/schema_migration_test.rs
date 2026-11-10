@@ -206,6 +206,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0027_symbol_signatures",
         "0029_feature_entrypoints",
         "0030_git_history_build",
+        "0031_git_history_build_v2",
     ];
     for migration in expected_migrations {
         let count: i64 = conn
@@ -523,6 +524,237 @@ impl tracing::Subscriber for WarnCapture {
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+    conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+        .unwrap()
+        .query_map([table], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn row_count(conn: &Connection, table: &str) -> i64 {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+/// The staging statements of the 562c496 binary, which knows migration 0030
+/// only: `clear_git_history_build`, `start_git_history_build`,
+/// `stage_git_history_slice`, `set_git_history_slice_len`, and the reads of
+/// `git_history_build` and `git_history_build_slices`.
+fn run_562c496_staging(conn: &Connection) {
+    conn.execute_batch(
+        "DELETE FROM git_history_build_slices;
+         DELETE FROM git_history_build_progress;
+         DELETE FROM git_history_build;
+         INSERT INTO git_history_build (id, target_sha, policy, cutoff, commits)
+             VALUES (1, 'old-head', 'policy', 7, 'a');
+         INSERT INTO git_history_build_progress (id, slice_len) VALUES (1, 2)
+             ON CONFLICT(id) DO UPDATE SET slice_len = excluded.slice_len;
+         INSERT INTO git_history_build_slices (start, len, output) VALUES (0, 1, 'out');",
+    )
+    .unwrap();
+    conn.query_row(
+        "SELECT target_sha, policy, cutoff, commits FROM git_history_build WHERE id = 1",
+        [],
+        |_| Ok(()),
+    )
+    .unwrap();
+    conn.query_row(
+        "SELECT slice_len FROM git_history_build_progress WHERE id = 1",
+        [],
+        |_| Ok(()),
+    )
+    .unwrap();
+    conn.query_row(
+        "SELECT COALESCE(SUM(len), 0) FROM git_history_build_slices",
+        [],
+        |_| Ok(()),
+    )
+    .unwrap();
+    conn.prepare("SELECT start, len, output FROM git_history_build_slices ORDER BY start")
+        .unwrap()
+        .query_map([], |_| Ok(()))
+        .unwrap()
+        .for_each(|row| row.unwrap());
+    conn.execute_batch(
+        "DELETE FROM git_history_build_slices;
+         DELETE FROM git_history_build_progress;
+         DELETE FROM git_history_build;",
+    )
+    .unwrap();
+}
+
+/// A fresh index, one migrated by the 562c496 binary (0030 applied, with a
+/// rebuild it saved), and a 0.49.0 index (neither migration recorded) all end
+/// with 0031's tables, 0030's tables intact and emptied, and staging that
+/// works for this binary and, after a rollback, for the 562c496 one.
+#[test]
+fn every_starting_state_reaches_0031_and_keeps_0030_usable() {
+    use codesage_storage::Database;
+    use codesage_storage::db::GitHistoryProgress;
+
+    for state in ["fresh", "562c496", "0.49.0"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            if state != "fresh" {
+                init_db(&conn).unwrap();
+                conn.execute_batch(
+                    "DROP TABLE git_history_build_v2_commits;
+                     DROP TABLE git_history_build_v2_keys;
+                     DROP TABLE git_history_build_v2_progress;
+                     DROP TABLE git_history_build_v2;
+                     DELETE FROM schema_migrations WHERE name = '0031_git_history_build_v2';",
+                )
+                .unwrap();
+            }
+            match state {
+                "562c496" => conn
+                    .execute_batch(
+                        "INSERT INTO git_history_build VALUES (1, 'head', 'policy', 0, 'a');
+                         INSERT INTO git_history_build_progress VALUES (1, 4);
+                         INSERT INTO git_history_build_slices VALUES (0, 1, 'out');",
+                    )
+                    .unwrap(),
+                "0.49.0" => conn
+                    .execute_batch(
+                        "DROP TABLE git_history_build_slices;
+                         DROP TABLE git_history_build_progress;
+                         DROP TABLE git_history_build;
+                         DELETE FROM schema_migrations WHERE name = '0030_git_history_build';",
+                    )
+                    .unwrap(),
+                _ => {}
+            }
+            init_db(&conn).unwrap();
+            assert_eq!(
+                table_columns(&conn, "git_history_build_v2"),
+                [
+                    "id",
+                    "target_sha",
+                    "policy",
+                    "cutoff",
+                    "commit_count",
+                    "commits"
+                ],
+                "{state}"
+            );
+            assert_eq!(
+                table_columns(&conn, "git_history_build_v2_progress"),
+                [
+                    "id",
+                    "slice_len",
+                    "cause",
+                    "stored_sha",
+                    "outcome",
+                    "stalled",
+                    "run_saved",
+                    "updated_at",
+                    "note",
+                    "discarded_at",
+                    "discarding_since",
+                    "discard_cause",
+                    "restarts"
+                ],
+                "{state}"
+            );
+            assert_eq!(
+                table_columns(&conn, "git_history_build_v2_keys"),
+                ["id", "env_key", "used_at"],
+                "{state}"
+            );
+            assert_eq!(
+                table_columns(&conn, "git_history_build_v2_commits"),
+                ["sha", "key_id", "output"],
+                "{state}"
+            );
+            assert_eq!(
+                table_columns(&conn, "git_history_build"),
+                ["id", "target_sha", "policy", "cutoff", "commits"],
+                "{state}"
+            );
+            assert_eq!(
+                table_columns(&conn, "git_history_build_progress"),
+                ["id", "slice_len"],
+                "{state}"
+            );
+            assert_eq!(
+                table_columns(&conn, "git_history_build_slices"),
+                ["start", "len", "output"],
+                "{state}"
+            );
+            for table in [
+                "git_history_build",
+                "git_history_build_progress",
+                "git_history_build_slices",
+            ] {
+                assert_eq!(
+                    row_count(&conn, table),
+                    0,
+                    "{state}: {table} kept a stale rebuild"
+                );
+            }
+            for name in ["0030_git_history_build", "0031_git_history_build_v2"] {
+                let recorded: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+                        [name],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(recorded, 1, "{state}: {name}");
+            }
+        }
+
+        let db = Database::open(&path).unwrap();
+        assert!(db.git_history_build().unwrap().is_none(), "{state}");
+        let commits = vec!["a".repeat(40), "b".repeat(40)];
+        let progress = GitHistoryProgress {
+            slice_len: 1,
+            cause: "first_build",
+            stored_sha: None,
+            outcome: "progressing",
+            stalled: None,
+            run_saved: 1,
+        };
+        db.execute_batch(|db| {
+            db.start_git_history_build("head", "policy", 0, &commits, &progress)?;
+            db.stage_git_history_commits(&[(&commits[0], "out")], &progress)
+        })
+        .unwrap();
+        drop(db);
+
+        // Roll back to the 562c496 binary: its staging still works, and the
+        // two binaries never see each other's rows.
+        let conn = Connection::open(&path).unwrap();
+        run_562c496_staging(&conn);
+        conn.execute_batch(
+            "INSERT INTO git_history_build VALUES (1, 'old-head', 'policy', 7, 'c');",
+        )
+        .unwrap();
+        drop(conn);
+        let db = Database::open(&path).unwrap();
+        let status = db.git_history_build_status().unwrap().unwrap();
+        assert_eq!(
+            (status.target_sha.as_str(), status.staged, status.total),
+            ("head", 1, 2),
+            "{state}"
+        );
+        db.clear_git_history_build().unwrap();
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            row_count(&conn, "git_history_build"),
+            1,
+            "{state}: this binary cleared the older binary's staging"
+        );
+    }
 }
 
 #[test]
