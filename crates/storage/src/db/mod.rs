@@ -25,6 +25,7 @@ mod git_hist;
 mod hash_cache;
 mod overlay;
 mod semantic;
+mod sidecar_verdicts;
 mod structural;
 
 pub use git_hist::{
@@ -33,6 +34,7 @@ pub use git_hist::{
 };
 pub use overlay::StructuralOverlayFile;
 pub use semantic::{RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes};
+pub use sidecar_verdicts::PathSidecarVerdicts;
 pub use structural::{FingerprintInput, ImportPairs, PythonPackageProbes, StoredFingerprint};
 
 /// Reject unknown stored enums as typed conversion errors; never relabel schema skew.
@@ -918,7 +920,14 @@ impl Database {
             verified_sidecars: Default::default(),
         };
         if let Some(fts_in_sync) = fts_in_sync {
-            db.ensure_sidecars(&db.chunk_table, Some(fts_in_sync))?;
+            let mut verified = None;
+            db.execute_batch(|db| {
+                verified = Some(db.ensure_sidecars(&db.chunk_table, Some(fts_in_sync))?);
+                Ok(())
+            })?;
+            if let Some(sync) = verified {
+                db.remember_committed_sidecars(&db.chunk_table, sync);
+            }
         }
         Ok(db)
     }
@@ -951,10 +960,14 @@ impl Database {
                  the rebuild repopulates both sides row by row, healing it without a rewrite"
             );
         }
-        // Unconditional, unlike the incremental open's id-set check: a sidecar
-        // left behind when an older binary dropped and repopulated the chunk
-        // table can match its rowids while naming other paths, and a full
-        // rebuild is the pass that must not inherit that.
+        // Unconditional where the incremental open runs the pair check. Both
+        // end with a sidecar holding exactly the chunk table's (id, path)
+        // pairs; a full rebuild is the recovery pass, so it copies them
+        // through vec0 itself rather than trust the check's reading of the
+        // `_auxiliary` shadow table.
+        // Read before the rebuild takes its snapshot: a commit in between
+        // leaves the version older than the state, which costs a re-probe.
+        let version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
         rebuild_path_sidecar(&conn, &chunk_table, &path_table_name(&chunk_table))?;
         record_semantic_model_table(&conn, &chunk_table, model, dim, true)?;
         // Interrupted rebuilds must not leave an old attestation over mixed vectors.
@@ -969,7 +982,9 @@ impl Database {
         db.mark_sidecars_verified(
             &db.chunk_table,
             !matches!(fts_outcome, FtsRepairOutcome::SkippedOverCap { .. }),
+            version,
         );
+        db.remember_readable_paths(&db.chunk_table, true, version);
         Ok(db)
     }
 
@@ -995,6 +1010,17 @@ impl Database {
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
         })
+    }
+
+    /// Point this handle at `model`'s existing chunk table, chosen as
+    /// [`Database::open_for_existing_model`] chooses it, keeping the sidecar
+    /// verdicts the handle has reached. A writer that removed files through
+    /// this handle and goes on to that table's own removal skips a second
+    /// pair probe; a verdict reused inside a transaction still requires that
+    /// no other connection committed since it was reached.
+    pub fn select_existing_model(mut self, model: &str) -> Result<Self> {
+        self.chunk_table = Self::existing_model_chunk_table(&self.conn, model)?;
+        Ok(self)
     }
 
     pub fn open_read_only_for_existing_model(path: &Path, model: &str) -> Result<Self> {
@@ -2909,14 +2935,16 @@ mod tests {
                 "an untrusted sidecar must fall back to the scan"
             );
         };
-        // Equal id sets naming other paths pass the write path's id check,
-        // so neither handle may take its verdict for the per-file reads.
+        // Equal id sets naming other paths: a handle that cannot repair the
+        // sidecar must not trust it for the per-file reads.
         expect_fallback(&Database::open_read_only_for_existing_model(&path, model).unwrap());
-        expect_fallback(&Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap());
         {
-            // A transaction that deletes the mismatched pairs makes the probe
-            // pass; the rollback restores them, so that verdict must not stick.
-            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            // The query-path open leaves the sidecar alone; the first delete
+            // rebuilds it inside the transaction, so the probe after it
+            // passes. The rollback restores the mismatched pairs, so that
+            // verdict must not stick.
+            let db =
+                Database::open_for_model_existing(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
             let rolled_back = db.execute_batch(|db| {
                 db.delete_chunks_for_file("src/a.rs")?;
                 assert!(db.chunks_for_file("src/a.rs")?.is_empty());
@@ -2925,11 +2953,14 @@ mod tests {
             assert!(rolled_back.is_err());
             expect_fallback(&db);
         }
-        conn.execute_batch(&format!(
-            "UPDATE \"{paths}\" SET file_path = 'src/b.rs'
-             WHERE id = (SELECT max(id) FROM \"{paths}\")"
-        ))
-        .unwrap();
+        {
+            // The write-path open rebuilds the pairs, and its verdict serves
+            // the per-file reads.
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            expect_reads(&db);
+            assert_eq!(db.chunks_for_file("src/b.rs").unwrap().len(), 1);
+            assert!(per_file_chunk_plan(&db, "c.content", "").contains("_paths"));
+        }
 
         conn.execute_batch(&format!(
             "DELETE FROM \"{paths}\" WHERE id = (SELECT max(id) FROM \"{paths}\")"
@@ -3074,6 +3105,436 @@ mod tests {
         })
         .unwrap();
         assert!(remembered(&db));
+    }
+
+    /// Swap the paths the sidecar files `src/a.rs` and `src/b.rs` under while
+    /// keeping its ids: what a sidecar left behind by a chunk table an older
+    /// binary dropped and repopulated in another order looks like.
+    fn swap_sidecar_paths(path: &Path, table: &str) {
+        Connection::open(path)
+            .unwrap()
+            .execute_batch(&format!(
+                "UPDATE \"{}\" SET file_path = CASE file_path
+                     WHEN 'src/a.rs' THEN 'src/b.rs' ELSE 'src/a.rs' END",
+                quote_ident(&path_table_name(table))
+            ))
+            .unwrap();
+    }
+
+    /// Every write path resolves a file's rows through the path sidecar, so
+    /// one whose ids match but whose paths do not must be rebuilt first, or
+    /// deleting `src/a.rs` deletes `src/b.rs`'s vectors.
+    #[test]
+    fn path_sidecar_naming_other_paths_is_rebuilt_before_deletes() {
+        type Delete = fn(&Path, &str);
+        let deletes: [(&str, Delete); 3] = [
+            ("open_for_model", |path, model| {
+                let db = Database::open_for_model(path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+                assert_eq!(db.delete_chunks_for_file("src/a.rs").unwrap(), 2);
+            }),
+            ("open_for_model_existing", |path, model| {
+                let db =
+                    Database::open_for_model_existing(path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+                assert_eq!(db.delete_chunks_for_file("src/a.rs").unwrap(), 2);
+            }),
+            ("remove_file", |path, _| {
+                Database::open(path)
+                    .unwrap()
+                    .remove_file("src/a.rs")
+                    .unwrap();
+            }),
+        ];
+        for (name, delete) in deletes {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("index.db");
+            let model = "codesage-test/model";
+            let table = {
+                let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+                insert_two_files(&db);
+                db.chunk_table_name().to_string()
+            };
+            swap_sidecar_paths(&path, &table);
+
+            delete(&path, model);
+            let db = Database::open_read_only_for_existing_model(&path, model).unwrap();
+            assert_eq!(path_rows(&db, &table, "src/a.rs"), [0, 0, 0], "{name}");
+            assert_eq!(path_rows(&db, &table, "src/b.rs"), [1, 1, 1], "{name}");
+            assert_sidecars_mirror_chunks(&db, &table);
+            let b = db.chunks_for_file("src/b.rs").unwrap();
+            assert_eq!(b.len(), 1, "{name}");
+            assert_eq!(b[0].content, "fn b() {}", "{name}");
+        }
+    }
+
+    /// The write check and the read check are one pair probe, so a handle
+    /// that reached either verdict on committed state holds both.
+    #[test]
+    fn one_path_sidecar_pair_probe_serves_writes_and_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let table = {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            insert_two_files(&db);
+            db.chunk_table_name().to_string()
+        };
+        let verdicts = |db: &Database| {
+            let memo = db.verified_sidecars.borrow();
+            (
+                memo.tables.contains_key(&table),
+                memo.readable_paths.get(&table).map(|read| read.readable),
+            )
+        };
+
+        let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        assert_eq!(verdicts(&db), (true, Some(true)));
+
+        swap_sidecar_paths(&path, &table);
+        let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        assert_eq!(verdicts(&db), (true, Some(true)), "a committed rebuild");
+        assert_eq!(db.chunks_for_file("src/b.rs").unwrap().len(), 1);
+
+        let db = Database::open_for_model_rebuild(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        assert_eq!(verdicts(&db), (true, Some(true)));
+
+        let db = Database::open_for_model_existing(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        assert_eq!(verdicts(&db), (false, None));
+        assert_eq!(db.chunks_for_file("src/a.rs").unwrap().len(), 2);
+        assert_eq!(verdicts(&db), (false, Some(true)));
+        assert_eq!(db.delete_chunks_for_file("src/none.rs").unwrap(), 0);
+        assert_eq!(verdicts(&db), (true, Some(true)));
+
+        // Inside a transaction a positive pair verdict is not remembered for
+        // reads, as a read probe's would not be.
+        let db = Database::open_for_model_existing(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        db.execute_batch(|db| {
+            assert_eq!(db.delete_chunks_for_file("src/none.rs")?, 0);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(verdicts(&db), (true, None));
+    }
+
+    /// Tables that statements prepared on `db` read, as the authorizer sees
+    /// them, including the ones vec0 prepares internally.
+    fn tables_read_by(db: &mut Database, f: impl FnOnce(&Database)) -> Vec<String> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let read = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = read.clone();
+        db.conn
+            .authorizer(Some(move |ctx: AuthContext<'_>| {
+                if let AuthAction::Read { table_name, .. } = ctx.action {
+                    sink.lock().unwrap().push(table_name.to_string());
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        f(db);
+        db.conn
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        let mut tables = read.lock().unwrap().clone();
+        tables.sort();
+        tables.dedup();
+        tables
+    }
+
+    #[test]
+    fn all_chunk_file_paths_reads_a_trusted_path_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let table = {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            insert_two_files(&db);
+            db.chunk_table_name().to_string()
+        };
+        let auxiliary = format!("{table}_auxiliary");
+        let expected = ["src/a.rs".to_string(), "src/b.rs".to_string()];
+
+        let mut db = Database::open_read_only_for_existing_model(&path, model).unwrap();
+        assert!(db.path_sidecar_readable(&table).unwrap());
+        let read = tables_read_by(&mut db, |db| {
+            assert_eq!(db.all_chunk_file_paths().unwrap(), expected);
+        });
+        assert_eq!(
+            read,
+            [path_table_name(&table), "sqlite_master".to_string()],
+            "the sidecar alone, plus the schema read that fixes the snapshot"
+        );
+
+        swap_sidecar_paths(&path, &table);
+        let mut db = Database::open_read_only_for_existing_model(&path, model).unwrap();
+        assert!(!db.path_sidecar_readable(&table).unwrap());
+        let read = tables_read_by(&mut db, |db| {
+            assert_eq!(db.all_chunk_file_paths().unwrap(), expected);
+        });
+        assert!(
+            read.contains(&table) && read.contains(&auxiliary),
+            "{read:?}"
+        );
+    }
+
+    /// The sidecar stores a NULL path as `''`, so a sidecar holding `''`
+    /// defers to the vec0 read, which reports a real empty path as `""` and
+    /// a NULL one as an error.
+    #[test]
+    fn all_chunk_file_paths_keeps_the_vec0_result_for_empty_and_null_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let table = {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            insert_two_files(&db);
+            let embedding = make_embedding(0.3);
+            db.insert_chunks("", "rust", &[("fn e() {}", 1, 1, embedding.as_slice())])
+                .unwrap();
+            db.chunk_table_name().to_string()
+        };
+        let db = Database::open_read_only_for_existing_model(&path, model).unwrap();
+        assert!(db.path_sidecar_readable(&table).unwrap());
+        assert_eq!(
+            db.all_chunk_file_paths().unwrap(),
+            ["", "src/a.rs", "src/b.rs"]
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO \"{}\"(file_path, language, content, start_line, end_line, embedding)
+                 VALUES (NULL, 'rust', 'fn n() {{}}', 1, 1, ?1)",
+                quote_ident(&table)
+            ),
+            [embedding_to_bytes(&make_embedding(0.4))],
+        )
+        .unwrap();
+        crate::schema::rebuild_path_sidecar(&conn, &table, &path_table_name(&table)).unwrap();
+        let db = Database::open_read_only_for_existing_model(&path, model).unwrap();
+        assert!(db.path_sidecar_readable(&table).unwrap());
+        assert!(db.all_chunk_file_paths().is_err());
+    }
+
+    /// Every chunk write's verdict check relies on the `data_version` read
+    /// itself fixing a deferred transaction's snapshot, so that no commit can
+    /// land between the value and the snapshot the write uses.
+    #[test]
+    fn data_version_fixes_a_deferred_transactions_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db =
+            Database::open_for_model(&path, "codesage-test/model", DEFAULT_EMBEDDING_DIM).unwrap();
+        let state = |db: &Database| db.conn.transaction_state(Some("main")).unwrap();
+        db.conn.execute_batch("BEGIN").unwrap();
+        assert_eq!(state(&db), rusqlite::TransactionState::None);
+        let before = db.snapshot_data_version().unwrap();
+        assert_eq!(state(&db), rusqlite::TransactionState::Read);
+        insert_two_files(
+            &Database::open_for_model(&path, "codesage-test/model", DEFAULT_EMBEDDING_DIM).unwrap(),
+        );
+        assert_eq!(db.snapshot_data_version().unwrap(), before);
+        let in_snapshot: i64 = db
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM \"{}\"",
+                    quote_ident(db.chunk_table_name())
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            in_snapshot, 0,
+            "the snapshot predates the other connection's commit"
+        );
+        db.conn.execute_batch("COMMIT").unwrap();
+        db.conn.execute_batch("BEGIN").unwrap();
+        assert_ne!(db.snapshot_data_version().unwrap(), before);
+        db.conn.execute_batch("COMMIT").unwrap();
+    }
+
+    /// The watcher's removal batch writes through one handle twice: the
+    /// structural `remove_file` over every chunk table, then the model
+    /// table's own removal. The second reuses the first's pair check, unless
+    /// another connection committed in between.
+    #[test]
+    fn a_removal_batch_pair_checks_once_unless_another_connection_commits() {
+        let model = "codesage-test/model";
+        let index = |dir: &tempfile::TempDir| {
+            let path = dir.path().join("index.db");
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            insert_two_files(&db);
+            (path, db.chunk_table_name().to_string())
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = index(&dir);
+        let db = Database::open_existing(&path).unwrap();
+        db.execute_batch(|db| db.remove_file("src/a.rs")).unwrap();
+        assert_eq!(db.path_sidecar_probes_for_tests(), 1);
+        let db = db.select_existing_model(model).unwrap();
+        db.execute_batch(|db| {
+            assert_eq!(db.delete_chunks_for_file("src/a.rs")?, 0);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.path_sidecar_probes_for_tests(), 1, "one probe per batch");
+
+        let dir = tempfile::tempdir().unwrap();
+        let (path, table) = index(&dir);
+        let db = Database::open_existing(&path).unwrap();
+        db.execute_batch(|db| db.remove_file("src/none.rs"))
+            .unwrap();
+        swap_sidecar_paths(&path, &table);
+        let db = db.select_existing_model(model).unwrap();
+        db.execute_batch(|db| {
+            assert_eq!(db.delete_chunks_for_file("src/b.rs")?, 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.path_sidecar_probes_for_tests(), 2);
+        assert_eq!(path_rows(&db, &table, "src/a.rs"), [2, 2, 2]);
+        assert_eq!(path_rows(&db, &table, "src/b.rs"), [0, 0, 0]);
+        assert_sidecars_mirror_chunks(&db, &table);
+    }
+
+    /// A verdict the handle reached earlier, by a write or a read, in or out
+    /// of a transaction, must not authorize a write after another connection
+    /// committed: each chunk write rechecks against its own snapshot.
+    #[test]
+    fn a_remembered_verdict_never_outlives_another_connections_commit() {
+        type Write = fn(&Database) -> usize;
+        let writes: [(&str, Write); 2] = [
+            ("in a transaction", |db| {
+                let mut count = 0;
+                db.execute_batch(|db| {
+                    count = db.delete_chunks_for_file("src/a.rs")?;
+                    Ok(())
+                })
+                .unwrap();
+                count
+            }),
+            ("outside a transaction", |db| {
+                db.delete_chunks_for_file("src/a.rs").unwrap()
+            }),
+        ];
+        type Learn = fn(&Path, &str) -> Database;
+        let learns: [(&str, Learn); 2] = [
+            ("written", |path, model| {
+                let db = Database::open_for_model(path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+                insert_two_files(&db);
+                db
+            }),
+            ("read", |path, model| {
+                insert_two_files(
+                    &Database::open_for_model(path, model, DEFAULT_EMBEDDING_DIM).unwrap(),
+                );
+                let db =
+                    Database::open_for_model_existing(path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+                assert_eq!(db.chunks_for_file("src/a.rs").unwrap().len(), 2);
+                db
+            }),
+        ];
+        for (learned, learn) in learns {
+            for (how, write) in writes {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("index.db");
+                let model = "codesage-test/model";
+                let db = learn(&path, model);
+                let table = db.chunk_table_name().to_string();
+                let probes = db.path_sidecar_probes_for_tests();
+
+                swap_sidecar_paths(&path, &table);
+                assert_eq!(write(&db), 2, "{learned}, {how}");
+                assert_eq!(
+                    db.path_sidecar_probes_for_tests(),
+                    probes + 1,
+                    "{learned}, {how}"
+                );
+                assert_eq!(
+                    path_rows(&db, &table, "src/a.rs"),
+                    [0, 0, 0],
+                    "{learned}, {how}"
+                );
+                assert_eq!(
+                    path_rows(&db, &table, "src/b.rs"),
+                    [1, 1, 1],
+                    "{learned}, {how}"
+                );
+                let b = db.chunks_for_file("src/b.rs").unwrap();
+                assert_eq!(b.len(), 1, "{learned}, {how}");
+                assert_eq!(b[0].content, "fn b() {}", "{learned}, {how}");
+            }
+        }
+    }
+
+    /// A rebuild undone by an inner `ROLLBACK TO` leaves the mismatched
+    /// sidecar in place, so a later delete in the same outer transaction must
+    /// not trust the verdict that rebuild produced.
+    #[test]
+    fn a_rebuild_rolled_back_to_an_inner_savepoint_is_not_trusted_by_the_next_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let table = {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            insert_two_files(&db);
+            db.chunk_table_name().to_string()
+        };
+        swap_sidecar_paths(&path, &table);
+
+        let db = Database::open_for_model_existing(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        db.execute_batch(|db| {
+            db.conn.execute_batch("SAVEPOINT inner")?;
+            assert_eq!(db.delete_chunks_for_file("src/none.rs")?, 0);
+            db.conn.execute_batch("ROLLBACK TO inner; RELEASE inner")?;
+            assert_eq!(db.delete_chunks_for_file("src/a.rs")?, 2);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(path_rows(&db, &table, "src/a.rs"), [0, 0, 0]);
+        assert_eq!(path_rows(&db, &table, "src/b.rs"), [1, 1, 1]);
+        assert_sidecars_mirror_chunks(&db, &table);
+    }
+
+    /// A commit by another connection after a batch fixed its snapshot does
+    /// not reach that batch: the verdict still matches its snapshot, and its
+    /// first write fails as busy, deleting nothing. The retry reads the new
+    /// state, so its verdict must not be the one reached before the commit.
+    #[test]
+    fn a_batch_overtaken_by_another_connections_commit_fails_and_its_retry_is_correct() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        insert_two_files(&db);
+        let table = db.chunk_table_name().to_string();
+
+        let overtaken = db.execute_batch(|db| {
+            assert_eq!(db.chunks_for_file("src/a.rs")?.len(), 2);
+            swap_sidecar_paths(&path, &table);
+            db.delete_chunks_for_file("src/a.rs")?;
+            Ok(())
+        });
+        let error = overtaken.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("database is locked"),
+            "{error:#}"
+        );
+        assert_eq!(
+            db.chunk_count().unwrap(),
+            3,
+            "the failed batch deleted nothing"
+        );
+
+        db.execute_batch(|db| {
+            assert_eq!(db.delete_chunks_for_file("src/a.rs")?, 2);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(path_rows(&db, &table, "src/a.rs"), [0, 0, 0]);
+        assert_eq!(path_rows(&db, &table, "src/b.rs"), [1, 1, 1]);
+        assert_sidecars_mirror_chunks(&db, &table);
     }
 
     #[test]

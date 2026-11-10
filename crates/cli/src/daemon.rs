@@ -103,6 +103,37 @@ mod unix {
         }
     }
 
+    /// How often the daemon closes path-sidecar observers whose index file
+    /// was deleted or replaced.
+    const INDEX_OBSERVER_SWEEP: Duration = Duration::from_secs(60);
+
+    /// Close path-sidecar observers of deleted or replaced index files every
+    /// `every`, whatever the model idle setting. Each observer holds its file
+    /// open, and a project nobody queries again never attaches to release it.
+    fn spawn_index_observer_sweep(
+        state: Arc<CodeSageServerState>,
+        every: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let s = state.clone();
+                let released =
+                    tokio::task::spawn_blocking(move || s.release_stale_index_observers())
+                        .await
+                        .unwrap_or(0);
+                if released > 0 {
+                    tracing::info!(
+                        released,
+                        "closed observers of deleted or replaced index files"
+                    );
+                }
+            }
+        })
+    }
+
     /// Evict unused models even while clients stay connected. `CODESAGE_MODEL_IDLE_SECS=0`
     /// disables model eviction, not daemon idle exit.
     const DEFAULT_MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
@@ -453,6 +484,8 @@ mod unix {
                 }
             });
         }
+
+        spawn_index_observer_sweep(state.clone(), INDEX_OBSERVER_SWEEP);
 
         let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
         let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
@@ -1640,6 +1673,38 @@ mod unix {
     mod tests {
         use super::*;
         use tokio::io::AsyncWriteExt;
+
+        /// The sweep runs on its own timer, so it releases a deleted index
+        /// with model idle eviction off (`CODESAGE_MODEL_IDLE_SECS=0`) and no
+        /// further attach.
+        #[tokio::test]
+        async fn index_observer_sweep_releases_a_deleted_index_on_its_own_timer() {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let path = project.join("index.db");
+            {
+                let db = codesage_storage::Database::open_for_model(&path, "m", 4).unwrap();
+                db.insert_chunks("a.rs", "rust", &[("fn a() {}", 1, 1, &[0.25; 4])])
+                    .unwrap();
+            }
+            let state = Arc::new(CodeSageServerState::new());
+            let verdicts = state.sidecar_verdicts_for_tests();
+            verdicts.attach(
+                &codesage_storage::Database::open_read_only_for_existing_model(&path, "m").unwrap(),
+                &path,
+            );
+            assert_eq!(verdicts.observed_files_for_tests(), 1);
+
+            std::fs::remove_dir_all(&project).unwrap();
+            let sweep = spawn_index_observer_sweep(state.clone(), Duration::from_millis(10));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while verdicts.observed_files_for_tests() > 0 && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            sweep.abort();
+            assert_eq!(verdicts.observed_files_for_tests(), 0);
+        }
 
         #[tokio::test]
         async fn transport_eof_cancels_service_without_response_drain() {

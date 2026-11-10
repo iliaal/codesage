@@ -1348,14 +1348,16 @@ fn purge_index_rows(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcom
         }
     }
 
-    let semantic_db =
-        match Database::open_for_existing_model(&config.db_path, &config.embed_config.model) {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::warn!(error = %e, "opening DB for semantic removal");
-                return WorkOutcome::Failed;
-            }
-        };
+    // The structural removal already pair-checked every chunk table's path
+    // sidecar on this handle; keeping it spares the semantic pass a second
+    // probe of the whole `_auxiliary` shadow table.
+    let semantic_db = match db.select_existing_model(&config.embed_config.model) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(error = %e, "opening DB for semantic removal");
+            return WorkOutcome::Failed;
+        }
+    };
 
     if let Err(e) = semantic_remove_files(&semantic_db, paths) {
         if is_retryable_db_error(&e) {

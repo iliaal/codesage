@@ -1738,14 +1738,14 @@ impl Database {
     /// mid-delete failure can't leave the removal half-applied; a savepoint
     /// (not a bare BEGIN) composes with a caller's outer transaction.
     pub fn remove_file(&self, path: &str) -> Result<()> {
-        let mut chunk_tables = Vec::new();
-        for table in self.all_chunk_table_names()? {
-            let sync = self.ensure_sidecars(&table, None)?;
-            let has_fts = self.table_exists(&crate::schema::fts_table_name(&table))?;
-            chunk_tables.push((table, has_fts.then_some(sync)));
-        }
         self.conn.execute_batch("SAVEPOINT remove_file")?;
         let result = (|| -> Result<()> {
+            let mut chunk_tables = Vec::new();
+            for table in self.all_chunk_table_names()? {
+                let sync = self.ensure_sidecars(&table, None)?;
+                let has_fts = self.table_exists(&crate::schema::fts_table_name(&table))?;
+                chunk_tables.push((table, has_fts.then_some(sync)));
+            }
             self.conn
                 .prepare_cached("DELETE FROM files WHERE path = ?1")?
                 .execute(params![path])?;

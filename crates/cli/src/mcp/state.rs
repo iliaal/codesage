@@ -290,6 +290,13 @@ pub(crate) struct CodeSageServerState {
     /// envelope key for the daemon's whole lifetime, like `RUST_LOG`.
     pub(super) envelope_enabled: bool,
     project_cache: Mutex<ProjectCache>,
+    /// Path-sidecar verdicts shared by the per-request chunk-table handles.
+    sidecar_verdicts: codesage_storage::PathSidecarVerdicts,
+    /// Stands in for the embedder's dimension and the resolved model
+    /// fingerprint in [`CodeSageServer::open_db_for`], which otherwise need
+    /// real model files.
+    #[cfg(test)]
+    semantic_identity_for_tests: std::sync::OnceLock<(usize, codesage_graph::SemanticFingerprint)>,
     embedders: ModelMap<Embedder>,
     rerankers: ModelMap<Reranker>,
     /// One watcher per canonical project root, started lazily and reaped on shutdown.
@@ -656,6 +663,9 @@ impl CodeSageServerState {
                 std::env::var("CODESAGE_ENVELOPE").ok().as_deref(),
             ),
             project_cache: Mutex::new(ProjectCache::default()),
+            sidecar_verdicts: codesage_storage::PathSidecarVerdicts::new(),
+            #[cfg(test)]
+            semantic_identity_for_tests: std::sync::OnceLock::new(),
             embedders: Mutex::new(HashMap::new()),
             rerankers: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
@@ -692,6 +702,17 @@ impl CodeSageServerState {
             "watcher_entries": watchers.len(),
             "lifecycle_locks": self.watcher_lifecycle.lock().len(),
         })
+    }
+
+    /// Close path-sidecar observers whose index file was deleted or replaced;
+    /// see [`codesage_storage::PathSidecarVerdicts::prune`].
+    pub(crate) fn release_stale_index_observers(&self) -> usize {
+        self.sidecar_verdicts.prune()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sidecar_verdicts_for_tests(&self) -> &codesage_storage::PathSidecarVerdicts {
+        &self.sidecar_verdicts
     }
 
     /// Evict unused models without touching in-flight references. Call malloc_trim once
@@ -1053,12 +1074,34 @@ impl CodeSageServer {
     /// Require an attested chunk table matching the configured vector identity.
     fn open_db_for(&self, state: &ProjectState) -> Result<Database> {
         let config = self.semantic_embedding_config(state)?;
-        let embedder_arc = self.get_or_load_embedder(config)?;
-        let dim = model_lock(&embedder_arc)?.dim();
+        let dim = self.semantic_dim(config)?;
         let db = Database::open_for_model_existing(&state.db_path, &config.model, dim)?;
-        let fingerprint = crate::commands::index::resolved_fingerprint(&db, config, dim)?;
+        self.state.sidecar_verdicts.attach(&db, &state.db_path);
+        let fingerprint = self.semantic_table_fingerprint(&db, config, dim)?;
         codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
         Ok(db)
+    }
+
+    fn semantic_dim(&self, config: &EmbeddingConfig) -> Result<usize> {
+        #[cfg(test)]
+        if let Some((dim, _)) = self.state.semantic_identity_for_tests.get() {
+            return Ok(*dim);
+        }
+        let embedder_arc = self.get_or_load_embedder(config)?;
+        Ok(model_lock(&embedder_arc)?.dim())
+    }
+
+    fn semantic_table_fingerprint(
+        &self,
+        db: &Database,
+        config: &EmbeddingConfig,
+        dim: usize,
+    ) -> Result<codesage_graph::SemanticFingerprint> {
+        #[cfg(test)]
+        if let Some((_, fingerprint)) = self.state.semantic_identity_for_tests.get() {
+            return Ok(fingerprint.clone());
+        }
+        crate::commands::index::resolved_fingerprint(db, config, dim)
     }
 
     pub(super) fn open_structural_db_for(&self, state: &ProjectState) -> Result<Database> {
@@ -1067,7 +1110,9 @@ impl CodeSageServer {
 
     fn open_context_db_for(&self, state: &ProjectState) -> Result<Database> {
         let config = self.semantic_embedding_config(state)?;
-        Database::open_read_only_for_existing_model(&state.db_path, &config.model)
+        let db = Database::open_read_only_for_existing_model(&state.db_path, &config.model)?;
+        self.state.sidecar_verdicts.attach(&db, &state.db_path);
+        Ok(db)
     }
 
     // Real-binary integration tests cannot use cfg(test) fakes. Honor seeded vectors only
@@ -1146,6 +1191,7 @@ impl CodeSageServer {
         f: impl FnOnce(&Database) -> Result<R>,
     ) -> Result<R> {
         let db = Database::open_for_existing_model(&state.db_path, &config.model)?;
+        self.state.sidecar_verdicts.attach(&db, &state.db_path);
         let _snapshot = db.read_snapshot()?;
         let recorded = db.recorded_semantic_dim()?.ok_or_else(|| {
             anyhow::anyhow!(
@@ -2743,6 +2789,117 @@ mod tests {
         assert!(watcher_start_wanted(Some(true), true));
         assert!(!watcher_start_wanted(Some(false), false));
         assert!(!watcher_start_wanted(Some(false), true));
+    }
+
+    /// Each request opens its own handle, so the path-sidecar verdict one
+    /// request reached must be stored where the next request's handle finds it.
+    #[test]
+    fn context_requests_share_the_path_sidecar_verdict() {
+        let (_dir, root) = onboarded_project(Some(
+            "[index]\nwatch = false\n[embedding]\nmodel = \"m\"\ndevice = \"cpu\"\n",
+        ));
+        let db_path = root.join(".codesage/index.db");
+        let table = {
+            let db = Database::open_for_model(&db_path, "m", 4).unwrap();
+            db.insert_chunks("src/a.rs", "rust", &[("fn a() {}", 1, 1, &[0.25; 4])])
+                .unwrap();
+            db.chunk_table_name().to_string()
+        };
+        let server = CodeSageServer::new();
+        let project = root.to_str().unwrap();
+        let verdicts = &server.state.sidecar_verdicts;
+        assert_eq!(verdicts.stored_verdict_for_tests(&db_path, &table), None);
+        let read = || {
+            server
+                .with_project_context_db(project, |db| {
+                    let rows = db.chunks_for_file("src/a.rs")?.len();
+                    Ok((rows, db.path_sidecar_probes_for_tests()))
+                })
+                .unwrap()
+        };
+        assert_eq!(read(), (1, 1));
+        assert_eq!(
+            verdicts.stored_verdict_for_tests(&db_path, &table),
+            Some(true)
+        );
+        assert_eq!(read(), (1, 0), "the second request must reuse the verdict");
+    }
+
+    /// A semantic search reads per-file chunks through the writable handle
+    /// `open_db_for` opens, inside its query snapshot. The embedder load and
+    /// the fingerprint resolution behind its gate need real model files, so
+    /// a test identity stands in for those two values.
+    #[test]
+    fn semantic_requests_share_the_path_sidecar_verdict() {
+        let (_dir, root) = onboarded_project(Some(
+            "[index]\nwatch = false\n[embedding]\nmodel = \"m\"\ndevice = \"cpu\"\n",
+        ));
+        let db_path = root.join(".codesage/index.db");
+        let server = CodeSageServer::new();
+        let state = server
+            .resolve_project_inner(root.to_str().unwrap())
+            .unwrap();
+        let fingerprint = codesage_graph::SemanticFingerprint::with_artifact_digest(
+            &state.embedding_config,
+            4,
+            "test-artifact",
+        );
+        let table = {
+            let db = Database::open_for_model(&db_path, "m", 4).unwrap();
+            db.insert_chunks("src/a.rs", "rust", &[("fn a() {}", 1, 1, &[0.25; 4])])
+                .unwrap();
+            db.record_semantic_fingerprint(fingerprint.as_str())
+                .unwrap();
+            db.chunk_table_name().to_string()
+        };
+        server
+            .state
+            .semantic_identity_for_tests
+            .set((4, fingerprint))
+            .unwrap();
+        let verdicts = &server.state.sidecar_verdicts;
+        let search = || {
+            let db = server.open_db_for(&state).unwrap();
+            let _snapshot = db.read_snapshot().unwrap();
+            let rows = db.chunks_for_file("src/a.rs").unwrap().len();
+            (rows, db.path_sidecar_probes_for_tests())
+        };
+        assert_eq!(verdicts.stored_verdict_for_tests(&db_path, &table), None);
+        assert_eq!(search(), (1, 1));
+        assert_eq!(
+            verdicts.stored_verdict_for_tests(&db_path, &table),
+            Some(true)
+        );
+        assert_eq!(
+            search(),
+            (1, 0),
+            "the second request must reuse the verdict"
+        );
+    }
+
+    /// The daemon's index observer sweep calls this on its timer; the
+    /// deleted project's index is released with no further attach.
+    #[test]
+    fn observer_sweep_releases_a_deleted_projects_index_observer() {
+        let (dir, root) = onboarded_project(Some(
+            "[index]\nwatch = false\n[embedding]\nmodel = \"m\"\ndevice = \"cpu\"\n",
+        ));
+        {
+            let db = Database::open_for_model(&root.join(".codesage/index.db"), "m", 4).unwrap();
+            db.insert_chunks("src/a.rs", "rust", &[("fn a() {}", 1, 1, &[0.25; 4])])
+                .unwrap();
+        }
+        let server = CodeSageServer::new();
+        server
+            .with_project_context_db(root.to_str().unwrap(), |db| {
+                Ok(db.chunks_for_file("src/a.rs")?.len())
+            })
+            .unwrap();
+        assert_eq!(server.state.release_stale_index_observers(), 0);
+        std::fs::remove_dir_all(root.join(".codesage")).unwrap();
+        assert_eq!(server.state.release_stale_index_observers(), 1);
+        assert_eq!(server.state.release_stale_index_observers(), 0);
+        drop(dir);
     }
 
     #[test]

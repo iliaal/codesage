@@ -398,37 +398,12 @@ pub(crate) fn path_sidecar_schema(path_table: &str) -> String {
     )
 }
 
-/// Whether the path sidecar holds exactly the chunk table's rowids. vec0
-/// allocates rowids from an AUTOINCREMENT shadow table and never updates a
-/// row's `file_path`, so within one table instance an id names one path for
-/// its whole life: equal id sets imply equal (id, path) pairs.
-fn path_sidecar_in_sync(
-    conn: &Connection,
-    chunk_table: &str,
-    path_table: &str,
-) -> rusqlite::Result<bool> {
-    if table_row_count(conn, chunk_table)? != table_row_count(conn, path_table)? {
-        return Ok(false);
-    }
-    // Same one-direction probe as `fts_rowids_match`: both id sets are
-    // unique and equal in size, so chunk ⊆ sidecar proves equality.
-    let chunk = quote_ident(chunk_table);
-    let paths = quote_ident(path_table);
-    let sql = format!(
-        "SELECT NOT EXISTS (
-            SELECT 1 FROM \"{chunk}\" AS c
-            WHERE NOT EXISTS (SELECT 1 FROM \"{paths}\" AS p WHERE p.id = c.id)
-         )",
-    );
-    conn.query_row(&sql, [], |row| row.get::<_, bool>(0))
-}
-
 /// Whether the path sidecar holds exactly the chunk table's `(id, file_path)`
 /// pairs, read from vec0's `_auxiliary` shadow table: a plain rowid table,
 /// so the check costs one indexed join instead of the per-row auxiliary
-/// query a scan of the virtual table pays. Unlike [`path_sidecar_in_sync`]
-/// it compares paths too, which an id set left behind by a repopulated
-/// chunk table can match while naming other files. `file_path` is the first
+/// query a scan of the virtual table pays. It compares paths, not just ids:
+/// the id set left behind by a dropped and repopulated chunk table can match
+/// the new rowids while naming other files. `file_path` is the first
 /// auxiliary column in [`semantic_schema`]; a point read through vec0
 /// confirms that mapping before the shadow is trusted.
 pub(crate) fn path_sidecar_matches_auxiliary(
@@ -518,14 +493,14 @@ pub(crate) fn rebuild_path_sidecar(
     Ok(())
 }
 
-/// Create the path sidecar when missing and rebuild it when its id set
-/// diverges from the chunk table (an index written before the sidecar
+/// Create the path sidecar when missing and rebuild it when its `(id, path)`
+/// pairs diverge from the chunk table (an index written before the sidecar
 /// existed, or by a binary that does not maintain it). Returns whether a
-/// rebuild ran.
+/// rebuild ran; either way the sidecar then names exactly the chunk rows.
 pub(crate) fn sync_path_sidecar(conn: &Connection, chunk_table: &str) -> rusqlite::Result<bool> {
     let path_table = path_table_name(chunk_table);
     conn.execute_batch(&path_sidecar_schema(&path_table))?;
-    if path_sidecar_in_sync(conn, chunk_table, &path_table)? {
+    if path_sidecar_matches_auxiliary(conn, chunk_table, &path_table)? {
         return Ok(false);
     }
     rebuild_path_sidecar(conn, chunk_table, &path_table)?;

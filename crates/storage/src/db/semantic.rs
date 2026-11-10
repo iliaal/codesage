@@ -11,17 +11,43 @@ use crate::schema::{
     sync_path_sidecar,
 };
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once on this thread just before [`Database::confirmed_seed`]
+    /// fixes a deferred transaction's snapshot, so a test can land a commit
+    /// at that point.
+    pub(super) static BEFORE_DEFERRED_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_deferred_snapshot_hook() {
+    if let Some(hook) = BEFORE_DEFERRED_SNAPSHOT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
 /// Per-handle sidecar verdicts, keyed by chunk table.
 #[derive(Debug, Default)]
 pub(super) struct SidecarMemo {
     pub(super) tables: HashMap<String, SidecarSync>,
     /// A sidecar rebuild ran inside a transaction that has not been seen to
-    /// end. Until an autocommit call clears it, no verdict is remembered: a
-    /// rollback would undo the rebuild that made the table look in sync.
+    /// end. Until a transaction that has not written clears it, no verdict is
+    /// remembered: a rollback would undo the rebuild that made the table look
+    /// in sync.
     pub(super) uncommitted_rebuild: bool,
     /// Read-path verdicts on whether a chunk table's path sidecar names
     /// exactly its rows; see [`Database::path_sidecar_readable`].
-    pub(super) readable_paths: HashMap<String, bool>,
+    pub(super) readable_paths: HashMap<String, ReadVerdict>,
+    /// Where committed-state read verdicts are offered beyond this handle;
+    /// see [`super::PathSidecarVerdicts`].
+    pub(super) verdict_sink: Option<super::sidecar_verdicts::Attachment>,
+    /// A verdict another handle stored, trusted only inside a read snapshot
+    /// its version is confirmed for; see [`Database::confirmed_seed`].
+    pub(super) seed: Option<super::sidecar_verdicts::Seed>,
+    /// Pair probes this handle has run; see
+    /// [`Database::path_sidecar_probes_for_tests`].
+    pub(super) probes: u32,
 }
 
 /// What one handle has established about a chunk table's sidecars.
@@ -32,6 +58,18 @@ pub(super) struct SidecarSync {
     /// over the repair cap) FTS deletes keep the `file_path` scan, which also
     /// removes orphan rows naming the file.
     fts_by_rowid: bool,
+    /// `PRAGMA data_version` on this connection for the snapshot the verdict
+    /// was reached in; reuse requires the value unchanged.
+    version: i64,
+}
+
+/// A read-path verdict and the `PRAGMA data_version` it was reached at. A
+/// positive one is reused only while that value is unchanged; a negative one
+/// stands, since the scan it selects is always correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReadVerdict {
+    pub(super) readable: bool,
+    pub(super) version: i64,
 }
 
 /// Opaque comparison token returned by
@@ -176,39 +214,87 @@ impl Database {
         crate::schema::fts_table_name(&self.chunk_table)
     }
 
-    /// Bring `chunk_table`'s path sidecar in line with its rowids before this
-    /// handle writes through it, once per handle: a sidecar written by an
-    /// older binary (missing, or diverged by its inserts and deletes) is
-    /// rebuilt, so the rowid deletes below never leave a file's vectors
-    /// behind. `fts_in_sync` carries an FTS verdict the caller already holds;
+    /// Bring `chunk_table`'s path sidecar in line with its `(id, path)` pairs
+    /// before a write through it: a sidecar written by an older binary
+    /// (missing, diverged by its inserts and deletes, or left over from a
+    /// chunk table it dropped and repopulated) is rebuilt, so the rowid
+    /// deletes below never leave a file's vectors behind or delete another
+    /// file's. `fts_in_sync` carries an FTS verdict the caller already holds;
     /// `None` probes it.
     ///
+    /// Runs inside the write's own transaction or savepoint, against the
+    /// snapshot that transaction fixes. A remembered verdict, from this check
+    /// or from [`Database::path_sidecar_readable`] (the same pair check), is
+    /// reused only if `PRAGMA data_version` still reads the value it was
+    /// reached at, so no other connection has committed since; this
+    /// connection's own commits leave the value alone and keep both sides
+    /// paired.
+    ///
     /// A verdict is remembered unless a rebuild ran inside a still-open
-    /// transaction. An in-sync verdict reached inside a transaction without
-    /// one holds after a rollback too: every chunk write through this handle
-    /// runs this check first and keeps both sides equal, so the committed
-    /// state the transaction started from was already in sync.
+    /// transaction. One reached inside a transaction without one holds after
+    /// a rollback too: every chunk write through this handle runs this check
+    /// first and keeps both sides equal, so the state the transaction started
+    /// from was already in sync.
     pub(super) fn ensure_sidecars(
         &self,
         chunk_table: &str,
         fts_in_sync: Option<bool>,
     ) -> Result<SidecarSync> {
-        if let Some(sync) = self.verified_sidecars.borrow().tables.get(chunk_table) {
-            return Ok(*sync);
-        }
-        let committed = self.conn.is_autocommit();
-        if committed {
+        anyhow::ensure!(
+            !self.conn.is_autocommit(),
+            "a chunk write checks its sidecars inside its own transaction"
+        );
+        if self.conn.transaction_state(Some("main"))? != rusqlite::TransactionState::Write {
+            // A rebuild writes, so a transaction that has not written is not
+            // the one that ran it: that one committed or rolled back.
             self.verified_sidecars.borrow_mut().uncommitted_rebuild = false;
         }
-        let rebuilt = sync_path_sidecar(&self.conn, chunk_table)?;
-        if rebuilt {
+        let version = self.snapshot_data_version()?;
+        let remembered = self
+            .verified_sidecars
+            .borrow()
+            .tables
+            .get(chunk_table)
+            .copied();
+        if let Some(sync) = remembered {
+            if sync.version == version {
+                return Ok(sync);
+            }
             self.verified_sidecars
                 .borrow_mut()
-                .readable_paths
+                .tables
                 .remove(chunk_table);
         }
-        if rebuilt && !committed {
-            self.verified_sidecars.borrow_mut().uncommitted_rebuild = true;
+        let read = self
+            .verified_sidecars
+            .borrow()
+            .readable_paths
+            .get(chunk_table)
+            .copied();
+        let paired = match read {
+            Some(ReadVerdict {
+                readable: true,
+                version: at,
+            }) if at == version => true,
+            Some(ReadVerdict { readable: true, .. }) => {
+                self.verified_sidecars
+                    .borrow_mut()
+                    .readable_paths
+                    .remove(chunk_table);
+                false
+            }
+            _ => false,
+        };
+        let rebuilt = if paired {
+            false
+        } else {
+            self.verified_sidecars.borrow_mut().probes += 1;
+            sync_path_sidecar(&self.conn, chunk_table)?
+        };
+        if rebuilt {
+            let mut memo = self.verified_sidecars.borrow_mut();
+            memo.uncommitted_rebuild = true;
+            memo.readable_paths.remove(chunk_table);
         }
         let fts_by_rowid = match fts_in_sync {
             Some(in_sync) => in_sync,
@@ -220,17 +306,77 @@ impl Database {
             }
         };
         if !self.verified_sidecars.borrow().uncommitted_rebuild {
-            self.mark_sidecars_verified(chunk_table, fts_by_rowid);
+            self.mark_sidecars_verified(chunk_table, fts_by_rowid, version);
         }
-        Ok(SidecarSync { fts_by_rowid })
+        Ok(SidecarSync {
+            fts_by_rowid,
+            version,
+        })
     }
 
-    /// Record a sidecar state the caller established outside any transaction.
-    pub(super) fn mark_sidecars_verified(&self, chunk_table: &str, fts_by_rowid: bool) {
-        self.verified_sidecars
-            .borrow_mut()
-            .tables
-            .insert(chunk_table.to_string(), SidecarSync { fts_by_rowid });
+    /// Once the transaction that reached `sync` has committed, remember it
+    /// for writes and reads even if a rebuild ran in it: the committed state
+    /// is paired, and `data_version` has not moved since that snapshot
+    /// unless another connection committed after.
+    pub(super) fn remember_committed_sidecars(&self, chunk_table: &str, sync: SidecarSync) {
+        if !self.conn.is_autocommit() {
+            return;
+        }
+        self.verified_sidecars.borrow_mut().uncommitted_rebuild = false;
+        self.mark_sidecars_verified(chunk_table, sync.fts_by_rowid, sync.version);
+        self.remember_readable_paths(chunk_table, true, sync.version);
+    }
+
+    /// `PRAGMA data_version` for the open transaction's snapshot. The pragma
+    /// runs in a read transaction of its own, so in a deferred transaction
+    /// that has not read yet it is the read that fixes the snapshot.
+    pub(super) fn snapshot_data_version(&self) -> Result<i64> {
+        #[cfg(test)]
+        if self.conn.transaction_state(Some("main"))? == rusqlite::TransactionState::None {
+            run_before_deferred_snapshot_hook();
+        }
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
+    /// Whether this handle reads committed state: no transaction is open on
+    /// `main`, or the open one has not written. A read snapshot on a
+    /// writable handle qualifies; a failed state query does not.
+    fn reads_committed_state(&self) -> bool {
+        matches!(
+            self.conn.transaction_state(Some("main")),
+            Ok(rusqlite::TransactionState::None | rusqlite::TransactionState::Read)
+        )
+    }
+
+    /// Remember a read verdict on `chunk_table`'s path sidecar reached at
+    /// `version`, and offer it to the process-wide cache this handle was
+    /// attached to when it describes committed state.
+    pub(super) fn remember_readable_paths(&self, chunk_table: &str, readable: bool, version: i64) {
+        let committed = self.reads_committed_state();
+        let mut memo = self.verified_sidecars.borrow_mut();
+        memo.readable_paths
+            .insert(chunk_table.to_string(), ReadVerdict { readable, version });
+        if committed && let Some(sink) = &memo.verdict_sink {
+            sink.offer(chunk_table, readable);
+        }
+    }
+
+    /// Record a sidecar state reached at `version`.
+    pub(super) fn mark_sidecars_verified(
+        &self,
+        chunk_table: &str,
+        fts_by_rowid: bool,
+        version: i64,
+    ) {
+        self.verified_sidecars.borrow_mut().tables.insert(
+            chunk_table.to_string(),
+            SidecarSync {
+                fts_by_rowid,
+                version,
+            },
+        );
     }
 
     /// Delete `file_path`'s rows from `chunk_table`, its FTS sidecar, and its
@@ -292,11 +438,11 @@ impl Database {
             !self.chunk_table.is_empty(),
             "cannot insert chunks on a handle without a chunk table"
         );
-        self.ensure_sidecars(&self.chunk_table, None)?;
         // Keep vec0, FTS5, and path-sidecar rowids atomic, including calls
         // inside an outer transaction.
         self.conn.execute_batch("SAVEPOINT insert_chunks")?;
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<SidecarSync> {
+            let sync = self.ensure_sidecars(&self.chunk_table, None)?;
             let sql = format!(
                 "INSERT INTO \"{}\"(file_path, language, content, start_line, end_line, embedding)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -327,11 +473,12 @@ impl Database {
                 ])?;
                 paths_stmt.execute(params![rowid, file_path])?;
             }
-            Ok(())
+            Ok(sync)
         })();
         match result {
-            Ok(()) => {
+            Ok(sync) => {
                 self.conn.execute_batch("RELEASE insert_chunks")?;
+                self.remember_committed_sidecars(&self.chunk_table, sync);
                 Ok(())
             }
             Err(e) => {
@@ -348,12 +495,18 @@ impl Database {
         if self.chunk_table.is_empty() {
             return Ok(0);
         }
-        let sync = self.ensure_sidecars(&self.chunk_table, None)?;
         self.conn.execute_batch("SAVEPOINT delete_chunks")?;
-        let result = self.delete_chunk_rows_for_path(&self.chunk_table, file_path, Some(sync));
+        let result = self
+            .ensure_sidecars(&self.chunk_table, None)
+            .and_then(|sync| {
+                let count =
+                    self.delete_chunk_rows_for_path(&self.chunk_table, file_path, Some(sync))?;
+                Ok((sync, count))
+            });
         match result {
-            Ok(count) => {
+            Ok((sync, count)) => {
                 self.conn.execute_batch("RELEASE delete_chunks")?;
+                self.remember_committed_sidecars(&self.chunk_table, sync);
                 Ok(count)
             }
             Err(e) => {
@@ -746,6 +899,13 @@ impl Database {
         let mut memo = self.verified_sidecars.borrow_mut();
         memo.tables.remove(table_name);
         memo.readable_paths.remove(table_name);
+        if memo
+            .seed
+            .as_ref()
+            .is_some_and(|seed| seed.at.chunk_table() == table_name)
+        {
+            memo.seed = None;
+        }
         Ok(())
     }
 
@@ -779,6 +939,7 @@ impl Database {
         if self.chunk_table.is_empty() {
             return Ok(Vec::new());
         }
+        let _snapshot = self.verdict_snapshot()?;
         let sql = self.per_file_chunk_sql("c.content, c.embedding", "")?;
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt
@@ -798,6 +959,7 @@ impl Database {
         if self.chunk_table.is_empty() {
             return Ok(Vec::new());
         }
+        let _snapshot = self.verdict_snapshot()?;
         let sql = self.per_file_chunk_sql(
             "c.file_path, c.language, c.content, c.start_line, c.end_line",
             "ORDER BY c.start_line",
@@ -843,45 +1005,168 @@ impl Database {
 
     /// Whether `chunk_table`'s path sidecar holds exactly its `(id, path)`
     /// pairs, established without writing so read-only and query-path
-    /// handles can use it. [`Database::ensure_sidecars`] proves only the id
-    /// set, so its verdict is not reused here. A negative verdict stands
-    /// until a sidecar rebuild through this handle, since the scan it selects
-    /// is always correct; a positive one is remembered only outside a
-    /// writable transaction, after which this handle's writes keep both
-    /// sides paired.
-    fn path_sidecar_readable(&self, chunk_table: &str) -> Result<bool> {
-        {
-            if let Some(&readable) = self
-                .verified_sidecars
-                .borrow()
-                .readable_paths
-                .get(chunk_table)
-            {
-                return Ok(readable);
+    /// handles can use it. [`Database::ensure_sidecars`] records the same
+    /// verdict. A negative verdict stands until a committed chunk write
+    /// through this handle, whose own check proves the pairs, replaces it;
+    /// the scan it selects is always correct meanwhile. A positive one
+    /// is reused only inside a transaction whose snapshot reads the
+    /// `data_version` it was reached at, and is remembered only while no
+    /// transaction on this handle has written; this handle's later writes
+    /// keep both sides paired.
+    pub(super) fn path_sidecar_readable(&self, chunk_table: &str) -> Result<bool> {
+        let snapshot = if self.conn.is_autocommit() {
+            None
+        } else {
+            Some(self.snapshot_data_version()?)
+        };
+        let remembered = self
+            .verified_sidecars
+            .borrow()
+            .readable_paths
+            .get(chunk_table)
+            .copied();
+        match remembered {
+            Some(ReadVerdict {
+                readable: false, ..
+            }) => return Ok(false),
+            Some(ReadVerdict {
+                readable: true,
+                version,
+            }) if Some(version) == snapshot => return Ok(true),
+            Some(_) => {
+                self.verified_sidecars
+                    .borrow_mut()
+                    .readable_paths
+                    .remove(chunk_table);
             }
+            None => {}
         }
+        if let Some(readable) = self.confirmed_seed(chunk_table)? {
+            return Ok(readable);
+        }
+        // Outside a transaction the probe's statements take later snapshots
+        // than this read; a commit in between leaves the verdict newer than
+        // its version, which only costs a later re-probe.
+        let version = match snapshot {
+            Some(version) => version,
+            None => self
+                .conn
+                .query_row("PRAGMA data_version", [], |row| row.get(0))?,
+        };
+        self.verified_sidecars.borrow_mut().probes += 1;
         let readable =
             path_sidecar_matches_auxiliary(&self.conn, chunk_table, &path_table_name(chunk_table))?;
-        // Inside a writable transaction a positive verdict could rest on
-        // writes a rollback undoes, so only committed state is remembered.
-        if !readable || self.conn.is_autocommit() || self.conn.is_readonly("main")? {
-            self.verified_sidecars
-                .borrow_mut()
-                .readable_paths
-                .insert(chunk_table.to_string(), readable);
+        // Inside a transaction that has written, a positive verdict could
+        // rest on writes a rollback undoes, so only committed state is
+        // remembered.
+        if !readable || self.reads_committed_state() {
+            self.remember_readable_paths(chunk_table, readable, version);
         }
         Ok(readable)
     }
 
+    /// How many path-sidecar pair probes this handle has run. Exists only so
+    /// tests in dependent crates can see that a cached verdict spared one;
+    /// not a supported surface.
+    #[doc(hidden)]
+    pub fn path_sidecar_probes_for_tests(&self) -> u32 {
+        self.verified_sidecars.borrow().probes
+    }
+
+    /// A read snapshot for a per-file read opened outside any transaction:
+    /// a remembered or seeded verdict is confirmed against a snapshot, and
+    /// without one the confirmation and the read would each take their own,
+    /// with room for a commit between them.
+    fn verdict_snapshot(&self) -> Result<Option<super::ReadSnapshot<'_>>> {
+        if !self.conn.is_autocommit() {
+            return Ok(None);
+        }
+        Ok(Some(self.read_snapshot()?))
+    }
+
+    /// The seeded verdict for `chunk_table`, if this handle holds one that
+    /// still describes the snapshot it reads. Only a read transaction that
+    /// has not written qualifies: its WAL snapshot is fixed once taken, and a
+    /// snapshot taken after the attach while the observer still reads the
+    /// attach version is exactly that state. A deferred `BEGIN` takes its
+    /// snapshot at the first read, so one is forced before the observer is
+    /// consulted. A seed that fails the check is dropped for good.
+    fn confirmed_seed(&self, chunk_table: &str) -> Result<Option<bool>> {
+        use rusqlite::TransactionState;
+        let readable = match &self.verified_sidecars.borrow().seed {
+            Some(seed) if seed.at.chunk_table() == chunk_table => seed.readable,
+            _ => return Ok(None),
+        };
+        if self.conn.is_autocommit() {
+            return Ok(None);
+        }
+        self.take_deferred_snapshot()?;
+        if self.conn.transaction_state(Some("main"))? != TransactionState::Read {
+            return Ok(None);
+        }
+        let unchanged = self
+            .verified_sidecars
+            .borrow()
+            .seed
+            .as_ref()
+            .is_some_and(|seed| seed.at.unchanged());
+        if unchanged {
+            return Ok(Some(readable));
+        }
+        self.verified_sidecars.borrow_mut().seed = None;
+        Ok(None)
+    }
+
+    /// Fix the WAL snapshot of a transaction opened by a deferred `BEGIN`
+    /// that has not read yet; no-op once it has.
+    fn take_deferred_snapshot(&self) -> Result<()> {
+        if self.conn.transaction_state(Some("main"))? != rusqlite::TransactionState::None {
+            return Ok(());
+        }
+        #[cfg(test)]
+        run_before_deferred_snapshot_hook();
+        self.conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        Ok(())
+    }
+
+    /// Distinct `file_path` values of the chunk table, sorted. A trusted path
+    /// sidecar serves them from its `file_path` index instead of a vec0 scan
+    /// that prepares one auxiliary query per row. The sidecar stores a NULL
+    /// path as `''`, which the vec0 read reports as a type error and a real
+    /// empty path as `""`; a sidecar holding `''` cannot tell the two apart,
+    /// so that case keeps the scan.
     pub fn all_chunk_file_paths(&self) -> Result<Vec<String>> {
         if self.chunk_table.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = format!(
+        let _snapshot = self.verdict_snapshot()?;
+        let from_sidecar = self.path_sidecar_readable(&self.chunk_table)?;
+        let mut paths = self.distinct_chunk_file_paths(from_sidecar)?;
+        if from_sidecar && paths.first().is_some_and(String::is_empty) {
+            paths = self.distinct_chunk_file_paths(false)?;
+        }
+        Ok(paths)
+    }
+
+    fn distinct_chunk_file_paths_sql(&self, from_sidecar: bool) -> String {
+        let table = if from_sidecar {
+            path_table_name(&self.chunk_table)
+        } else {
+            self.chunk_table.clone()
+        };
+        format!(
             "SELECT DISTINCT file_path FROM \"{}\" ORDER BY file_path",
-            quote_ident(&self.chunk_table)
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
+            quote_ident(&table)
+        )
+    }
+
+    fn distinct_chunk_file_paths(&self, from_sidecar: bool) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(&self.distinct_chunk_file_paths_sql(from_sidecar))?;
         let paths = stmt
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
