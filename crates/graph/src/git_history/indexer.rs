@@ -6204,12 +6204,20 @@ mod tests {
         let db = db_dir.path().join("index.db");
         drop(Database::open(&db).unwrap());
         // Git's own switch for a repository owned by someone else; real
-        // foreign ownership needs a second user.
-        let foreign = [("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")];
+        // foreign ownership needs a second user. CI images set
+        // `safe.directory=*` globally, so the host's global and system config
+        // are cut off and only the environment-scoped entry can trust the repo.
+        let foreign = [
+            ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ];
         let refused = in_child("index", root, &db, &foreign);
         assert!(refused.contains("dubious ownership"), "{refused}");
         let trusted = [
             ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
             ("GIT_CONFIG_COUNT", "1"),
             ("GIT_CONFIG_KEY_0", "safe.directory"),
             ("GIT_CONFIG_VALUE_0", "*"),
