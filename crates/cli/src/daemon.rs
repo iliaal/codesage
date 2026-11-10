@@ -426,6 +426,12 @@ mod unix {
                 .with_context(|| format!("removing stale socket {}", paths.socket.display()))?;
         }
 
+        // Install the handlers before the socket and pid file exist: a SIGTERM
+        // that arrives once they are visible must reach the cleanup below, not
+        // the default disposition, which exits without removing them.
+        let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+        let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+
         // Restrict permissions at bind time to avoid a world-readable window before chmod.
         let prev_umask = unsafe { libc::umask(0o077) };
         let listener = UnixListener::bind(&paths.socket)
@@ -486,9 +492,6 @@ mod unix {
         }
 
         spawn_index_observer_sweep(state.clone(), INDEX_OBSERVER_SWEEP);
-
-        let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
-        let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
 
         let idle_timeout = daemon_idle_timeout();
         let active = Arc::new(AtomicUsize::new(0));

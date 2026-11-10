@@ -1832,7 +1832,16 @@ mod tests {
         );
         drop(held);
 
-        let acquired = acquire_index_lock(dir.path(), "skipping", Duration::ZERO).map(|_| ());
+        // A concurrent test's fork can hold a duplicate of the lock fd until its
+        // exec closes it, so the released lock may read as held for a moment.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let acquired = loop {
+            let attempt = acquire_index_lock(dir.path(), "skipping", Duration::ZERO).map(|_| ());
+            if exit_code_for(&attempt) == 0 || std::time::Instant::now() >= deadline {
+                break attempt;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert_eq!(exit_code_for(&acquired), 0);
         assert_eq!(
             exit_code_for(&Err(anyhow::anyhow!("boom"))),
