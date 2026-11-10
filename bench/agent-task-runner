@@ -287,7 +287,9 @@ def parse_run_output(
         except json.JSONDecodeError:
             continue
         if obj.get("type") == "assistant":
-            msg = obj.get("message") or {}
+            msg = obj.get("message")
+            if not isinstance(msg, dict):
+                continue
             for c in msg.get("content") or []:
                 if isinstance(c, dict) and c.get("type") == "tool_use":
                     tool_uses.append(c.get("name") or "")
