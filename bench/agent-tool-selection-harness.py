@@ -187,6 +187,8 @@ def run_task(
     tool_uses: list[str] = []
     result_text = ""
     cost_usd = 0.0
+    saw_result = False
+    is_error = False
     for line in r.stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -204,8 +206,10 @@ def run_task(
                 if isinstance(c, dict) and c.get("type") == "tool_use":
                     tool_uses.append(c.get("name") or "")
         elif obj.get("type") == "result":
+            saw_result = True
             result_text = (obj.get("result") or "").strip()
             cost_usd = _coerce_cost(obj.get("total_cost_usd"))
+            is_error = bool(obj.get("is_error")) or obj.get("subtype") not in (None, "success")
 
     first_tool = tool_uses[0] if tool_uses else None
     codesage_count = sum(1 for t in tool_uses if t.startswith("mcp__codesage__"))
@@ -222,6 +226,11 @@ def run_task(
     if r.returncode != 0 and stderr_tail.strip():
         print(f"  ! claude rc={r.returncode}: {stderr_tail.strip()}", file=sys.stderr)
     error = None if r.returncode == 0 else f"rc={r.returncode}"
+    if error is None:
+        if is_error:
+            error = "result_error"
+        elif not saw_result:
+            error = "missing_result"
     if unexpected_tools:
         unexpected = "unexpected_tools=" + ",".join(unexpected_tools)
         error = unexpected if error is None else f"{error};{unexpected}"
