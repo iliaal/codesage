@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- MCP transport dependency rmcp requires 3.9.0 or newer, clearing RUSTSEC-2026-0462 from dependency audits.
+
 ## [0.49.0] - 2026-11-07
 
 ### Changed
