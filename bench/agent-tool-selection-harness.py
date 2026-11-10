@@ -196,7 +196,10 @@ def run_task(
         except json.JSONDecodeError:
             continue
         if obj.get("type") == "assistant":
-            content = (obj.get("message") or {}).get("content") or []
+            msg = obj.get("message")
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content") or []
             for c in content:
                 if isinstance(c, dict) and c.get("type") == "tool_use":
                     tool_uses.append(c.get("name") or "")
