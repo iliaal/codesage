@@ -6,7 +6,10 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
 use super::{Database, drop_chunk_table_group, quote_ident};
-use crate::schema::{FtsSidecarHealth, fts_sidecar_health, path_table_name, sync_path_sidecar};
+use crate::schema::{
+    FtsSidecarHealth, fts_sidecar_health, path_sidecar_matches_auxiliary, path_table_name,
+    sync_path_sidecar,
+};
 
 /// Per-handle sidecar verdicts, keyed by chunk table.
 #[derive(Debug, Default)]
@@ -16,6 +19,9 @@ pub(super) struct SidecarMemo {
     /// end. Until an autocommit call clears it, no verdict is remembered: a
     /// rollback would undo the rebuild that made the table look in sync.
     pub(super) uncommitted_rebuild: bool,
+    /// Read-path verdicts on whether a chunk table's path sidecar names
+    /// exactly its rows; see [`Database::path_sidecar_readable`].
+    pub(super) readable_paths: HashMap<String, bool>,
 }
 
 /// What one handle has established about a chunk table's sidecars.
@@ -195,6 +201,12 @@ impl Database {
             self.verified_sidecars.borrow_mut().uncommitted_rebuild = false;
         }
         let rebuilt = sync_path_sidecar(&self.conn, chunk_table)?;
+        if rebuilt {
+            self.verified_sidecars
+                .borrow_mut()
+                .readable_paths
+                .remove(chunk_table);
+        }
         if rebuilt && !committed {
             self.verified_sidecars.borrow_mut().uncommitted_rebuild = true;
         }
@@ -731,10 +743,9 @@ impl Database {
 
     pub fn drop_vec_table(&self, table_name: &str) -> Result<()> {
         drop_chunk_table_group(&self.conn, table_name)?;
-        self.verified_sidecars
-            .borrow_mut()
-            .tables
-            .remove(table_name);
+        let mut memo = self.verified_sidecars.borrow_mut();
+        memo.tables.remove(table_name);
+        memo.readable_paths.remove(table_name);
         Ok(())
     }
 
@@ -768,10 +779,7 @@ impl Database {
         if self.chunk_table.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = format!(
-            "SELECT content, embedding FROM \"{}\" WHERE file_path = ?1",
-            quote_ident(&self.chunk_table)
-        );
+        let sql = self.per_file_chunk_sql("c.content, c.embedding", "")?;
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt
             .query_map(params![file_path], |row| {
@@ -790,13 +798,10 @@ impl Database {
         if self.chunk_table.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = format!(
-            "SELECT file_path, language, content, start_line, end_line
-             FROM \"{}\"
-             WHERE file_path = ?1
-             ORDER BY start_line",
-            quote_ident(&self.chunk_table)
-        );
+        let sql = self.per_file_chunk_sql(
+            "c.file_path, c.language, c.content, c.start_line, c.end_line",
+            "ORDER BY c.start_line",
+        )?;
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt
             .query_map(params![file_path], |row| {
@@ -812,6 +817,60 @@ impl Database {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// SQL selecting `columns` of `?1`'s rows in the chunk table, aliased `c`.
+    ///
+    /// A `file_path` constraint on vec0 is a full scan that prepares one
+    /// auxiliary-column query per row, so a trusted path sidecar supplies the
+    /// ids and vec0 serves each by its `id` point plan. The `c.file_path`
+    /// recheck keeps a sidecar whose ids name other paths (left by a binary
+    /// that repopulated the chunk table without it) from attributing another
+    /// file's chunks; an untrusted or absent sidecar falls back to the scan.
+    pub(super) fn per_file_chunk_sql(&self, columns: &str, order: &str) -> Result<String> {
+        let chunk = quote_ident(&self.chunk_table);
+        Ok(if self.path_sidecar_readable(&self.chunk_table)? {
+            let paths = quote_ident(&path_table_name(&self.chunk_table));
+            format!(
+                "SELECT {columns} FROM \"{paths}\" AS p CROSS JOIN \"{chunk}\" AS c
+                 ON c.id = p.id
+                 WHERE p.file_path = ?1 AND c.file_path = ?1 {order}"
+            )
+        } else {
+            format!("SELECT {columns} FROM \"{chunk}\" AS c WHERE c.file_path = ?1 {order}")
+        })
+    }
+
+    /// Whether `chunk_table`'s path sidecar holds exactly its `(id, path)`
+    /// pairs, established without writing so read-only and query-path
+    /// handles can use it. [`Database::ensure_sidecars`] proves only the id
+    /// set, so its verdict is not reused here. A negative verdict stands
+    /// until a sidecar rebuild through this handle, since the scan it selects
+    /// is always correct; a positive one is remembered only outside a
+    /// writable transaction, after which this handle's writes keep both
+    /// sides paired.
+    fn path_sidecar_readable(&self, chunk_table: &str) -> Result<bool> {
+        {
+            if let Some(&readable) = self
+                .verified_sidecars
+                .borrow()
+                .readable_paths
+                .get(chunk_table)
+            {
+                return Ok(readable);
+            }
+        }
+        let readable =
+            path_sidecar_matches_auxiliary(&self.conn, chunk_table, &path_table_name(chunk_table))?;
+        // Inside a writable transaction a positive verdict could rest on
+        // writes a rollback undoes, so only committed state is remembered.
+        if !readable || self.conn.is_autocommit() || self.conn.is_readonly("main")? {
+            self.verified_sidecars
+                .borrow_mut()
+                .readable_paths
+                .insert(chunk_table.to_string(), readable);
+        }
+        Ok(readable)
     }
 
     pub fn all_chunk_file_paths(&self) -> Result<Vec<String>> {

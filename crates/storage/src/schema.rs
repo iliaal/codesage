@@ -1,6 +1,6 @@
 use std::sync::Once;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -421,6 +421,72 @@ fn path_sidecar_in_sync(
          )",
     );
     conn.query_row(&sql, [], |row| row.get::<_, bool>(0))
+}
+
+/// Whether the path sidecar holds exactly the chunk table's `(id, file_path)`
+/// pairs, read from vec0's `_auxiliary` shadow table: a plain rowid table,
+/// so the check costs one indexed join instead of the per-row auxiliary
+/// query a scan of the virtual table pays. Unlike [`path_sidecar_in_sync`]
+/// it compares paths too, which an id set left behind by a repopulated
+/// chunk table can match while naming other files. `file_path` is the first
+/// auxiliary column in [`semantic_schema`]; a point read through vec0
+/// confirms that mapping before the shadow is trusted.
+pub(crate) fn path_sidecar_matches_auxiliary(
+    conn: &Connection,
+    chunk_table: &str,
+    path_table: &str,
+) -> rusqlite::Result<bool> {
+    let aux_table = format!("{chunk_table}_auxiliary");
+    let exists = |name: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+    };
+    if !exists(path_table)? || !exists(&aux_table)? {
+        return Ok(false);
+    }
+    let chunk = quote_ident(chunk_table);
+    let aux = quote_ident(&aux_table);
+    let paths = quote_ident(path_table);
+    let sample: Option<(i64, rusqlite::types::Value)> = conn
+        .query_row(
+            &format!("SELECT rowid, value00 FROM \"{aux}\" LIMIT 1"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((id, shadow_path)) = sample {
+        let path: Option<rusqlite::types::Value> = conn
+            .query_row(
+                &format!("SELECT file_path FROM \"{chunk}\" WHERE id = ?1"),
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if path != Some(shadow_path) {
+            return Ok(false);
+        }
+    }
+    if table_row_count(conn, &aux_table)? != table_row_count(conn, path_table)? {
+        return Ok(false);
+    }
+    // Equal sizes and unique ids on both sides: every shadow pair having a
+    // matching sidecar pair proves the pair sets are equal.
+    conn.query_row(
+        &format!(
+            "SELECT NOT EXISTS (
+                SELECT 1 FROM \"{aux}\" AS a
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM \"{paths}\" AS p
+                    WHERE p.id = a.rowid AND p.file_path = COALESCE(a.value00, '')
+                )
+             )"
+        ),
+        [],
+        |row| row.get(0),
+    )
 }
 
 /// Rebuild the path sidecar from the chunk table's `file_path` column. No

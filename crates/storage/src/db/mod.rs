@@ -2817,6 +2817,129 @@ mod tests {
             .unwrap();
     }
 
+    fn per_file_chunk_plan(db: &Database, columns: &str, order: &str) -> String {
+        let sql = db.per_file_chunk_sql(columns, order).unwrap();
+        let mut stmt = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        stmt.query_map(["src/a.rs"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    /// vec0 serves a `file_path` filter by a full scan, so per-file reads go
+    /// through the path sidecar's ids; a sidecar a read cannot trust (absent,
+    /// diverged, or naming other paths) must not drop or misattribute rows.
+    #[test]
+    fn per_file_chunk_reads_use_the_path_sidecar_point_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let table = {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            insert_two_files(&db);
+            db.chunk_table_name().to_string()
+        };
+        let expect_reads = |db: &Database| {
+            let chunks = db.chunks_for_file("src/a.rs").unwrap();
+            let lines: Vec<_> = chunks
+                .iter()
+                .map(|c| (c.file_path.as_str(), c.content.as_str(), c.start_line))
+                .collect();
+            assert_eq!(
+                lines,
+                [("src/a.rs", "fn a1() {}", 1), ("src/a.rs", "fn a2() {}", 2)]
+            );
+            let mut embedded = db.chunk_embeddings_for_file("src/a.rs").unwrap();
+            embedded.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                embedded,
+                [
+                    ("fn a1() {}".to_string(), make_embedding(0.1)),
+                    ("fn a2() {}".to_string(), make_embedding(0.1)),
+                ]
+            );
+            assert!(db.chunks_for_file("src/none.rs").unwrap().is_empty());
+            assert!(
+                db.chunk_embeddings_for_file("src/none.rs")
+                    .unwrap()
+                    .is_empty()
+            );
+        };
+
+        for db in [
+            Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap(),
+            Database::open_read_only_for_existing_model(&path, model).unwrap(),
+            Database::open_for_existing_model(&path, model).unwrap(),
+        ] {
+            expect_reads(&db);
+            for (columns, order) in [
+                ("c.content, c.embedding", ""),
+                (
+                    "c.file_path, c.language, c.content, c.start_line, c.end_line",
+                    "ORDER BY c.start_line",
+                ),
+            ] {
+                let plan = per_file_chunk_plan(&db, columns, order);
+                assert!(plan.contains(&format!("{table}_paths")), "{plan}");
+                assert!(
+                    plan.contains("VIRTUAL TABLE INDEX") && plan.contains(":2!"),
+                    "vec0 must use its id point plan: {plan}"
+                );
+            }
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        let paths = quote_ident(&path_table_name(&table));
+        conn.execute_batch(&format!(
+            "UPDATE \"{paths}\" SET file_path = 'src/a.rs' WHERE file_path = 'src/b.rs'"
+        ))
+        .unwrap();
+        let expect_fallback = |db: &Database| {
+            expect_reads(db);
+            let b = db.chunks_for_file("src/b.rs").unwrap();
+            assert_eq!(b.len(), 1, "a row the sidecar files elsewhere must survive");
+            assert_eq!(db.chunk_embeddings_for_file("src/b.rs").unwrap().len(), 1);
+            assert!(
+                !per_file_chunk_plan(db, "c.content", "").contains("_paths"),
+                "an untrusted sidecar must fall back to the scan"
+            );
+        };
+        // Equal id sets naming other paths pass the write path's id check,
+        // so neither handle may take its verdict for the per-file reads.
+        expect_fallback(&Database::open_read_only_for_existing_model(&path, model).unwrap());
+        expect_fallback(&Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap());
+        {
+            // A transaction that deletes the mismatched pairs makes the probe
+            // pass; the rollback restores them, so that verdict must not stick.
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            let rolled_back = db.execute_batch(|db| {
+                db.delete_chunks_for_file("src/a.rs")?;
+                assert!(db.chunks_for_file("src/a.rs")?.is_empty());
+                anyhow::bail!("roll back")
+            });
+            assert!(rolled_back.is_err());
+            expect_fallback(&db);
+        }
+        conn.execute_batch(&format!(
+            "UPDATE \"{paths}\" SET file_path = 'src/b.rs'
+             WHERE id = (SELECT max(id) FROM \"{paths}\")"
+        ))
+        .unwrap();
+
+        conn.execute_batch(&format!(
+            "DELETE FROM \"{paths}\" WHERE id = (SELECT max(id) FROM \"{paths}\")"
+        ))
+        .unwrap();
+        expect_fallback(&Database::open_read_only_for_existing_model(&path, model).unwrap());
+        conn.execute_batch(&format!("DROP TABLE \"{paths}\""))
+            .unwrap();
+        expect_fallback(&Database::open_read_only_for_existing_model(&path, model).unwrap());
+    }
+
     #[test]
     fn delete_chunks_for_file_removes_path_from_chunks_fts_and_path_sidecar() {
         let db = Database::open_in_memory().unwrap();
