@@ -1,21 +1,23 @@
 ## [Unreleased]
 
+## [0.50.0] - 2026-11-10
+
 ### Added
 
-- `codesage doctor` `git_history` check and `project_overview` `freshness.history_rebuild` report a saved `git-index` rebuild: target, commits saved and total, next slice size, cause, and whether its last run progressed, saved nothing, or failed.
+- `codesage doctor` `git_history` check and `project_overview` `freshness.history_rebuild` report a saved `git-index` rebuild: target, commits saved and total, next slice size, cause, and whether its runs progress, stall, or keep discarding.
 
 ### Changed
 
 - MCP transport dependency rmcp requires 3.9.0 or newer, clearing RUSTSEC-2026-0462 from dependency audits.
-- `git-index` history walks ignore inherited pathspec variables (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`, `GIT_NOGLOB_PATHSPECS`, `GIT_ICASE_PATHSPECS`), `GIT_CONFIG`, and `GIT_TRACE*`.
-- Git hooks record `.codesage/hook-state` after every successful `index` pass and track `git-index` separately in `.codesage/hook-git-state`; an unchanged tree reruns only a failed `git-index` pass. Rerun `codesage install-hooks` to update existing hooks.
+- `git-index` history walks ignore inherited `GIT_*_PATHSPECS`, `GIT_CONFIG`, and `GIT_TRACE*` variables.
+- Git hooks record `.codesage/hook-state` after every successful `index` pass and track `git-index` separately in `.codesage/hook-git-state`; a failed `git-index` no longer forces a full `index` on every checkout. Rerun `codesage install-hooks` to update existing hooks.
 
 ### Fixed
 
-- `git-index` full rebuilds and incremental ranges that exceed `CODESAGE_GIT_HISTORY_TIMEOUT_MS` save progress (schema migration `0031_git_history_build_v2`) and resume, reusing saved commits across branch switches, kept separately for each set of diff-relevant settings; history is unchanged until the rebuild completes. A rebuild forced by an off-branch stored head names that cause and the recovery.
-- A `git-index` rebuild saves its plan and each slice as soon as they are read, discards a slice read while diff-relevant git settings changed, and stays in progress; `codesage doctor` warns when runs keep discarding.
-- Deleting a file's chunks no longer removes another file's vectors when the path sidecar matches the chunk table's ids but not its paths, the state an older binary leaves after dropping and repopulating the table; the write path rebuilds the sidecar first.
-- `codesage edit-check`, `codesage rehearse`, the brief hook, MCP `edit_check` and `review_rehearsal`, and the MCP `index` block skip a stray `.git` such as an empty directory: a nearer `.codesage` still wins, Git's worktree root containing the start is used, and Git failures fall back to the nearest structurally valid `.git`.
+- `git-index` no longer fails forever when a full rebuild or an incremental range exceeds `CODESAGE_GIT_HISTORY_TIMEOUT_MS`: it saves progress per run (schema migration `0031_git_history_build_v2`), keeps it across branch switches and environment changes, and keeps the previous history until the rebuild completes. A rebuild forced by an off-branch stored head names that cause and the recovery.
+- Deleting a file's chunks no longer removes another file's vectors in an index whose chunk table an older binary dropped and repopulated.
+- `codesage edit-check`, `codesage rehearse`, the brief hook, MCP `edit_check` and `review_rehearsal`, and the MCP `index` block ignore a stray `.git` entry such as an empty directory, instead of treating it as the project root.
+- The MCP daemon removes its socket and pid file when SIGTERM arrives during startup.
 
 ## [0.49.0] - 2026-11-07
 
@@ -1457,5 +1459,7 @@ Initial public release.
 
 [0.48.0]: https://github.com/iliaal/codesage/releases/tag/v0.48.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.49.0...HEAD
 [0.49.0]: https://github.com/iliaal/codesage/releases/tag/v0.49.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.50.0...HEAD
+[0.50.0]: https://github.com/iliaal/codesage/releases/tag/v0.50.0
