@@ -50,9 +50,14 @@ def parse_session(path: Path) -> list[dict]:
     return messages
 
 
+def message_content(msg: dict):
+    message = msg.get("message")
+    return message.get("content") if isinstance(message, dict) else None
+
+
 def extract_tool_file_paths(msg: dict) -> set[str]:
     paths = set()
-    content = msg.get("message", {}).get("content", [])
+    content = message_content(msg)
     if not isinstance(content, list):
         return paths
     for block in content:
@@ -108,7 +113,7 @@ CODESAGE_BASH_RE = re.compile(
 
 
 def tool_use_blocks(msg: dict):
-    content = msg.get("message", {}).get("content", [])
+    content = message_content(msg)
     if not isinstance(content, list):
         return
     for block in content:
@@ -132,14 +137,16 @@ def uses_codesage(msg: dict) -> bool:
 
 
 def get_user_text(msg: dict) -> str:
-    content = msg.get("message", {}).get("content", "")
+    content = message_content(msg)
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text", ""))
+                text = block.get("text", "")
+                if isinstance(text, str):
+                    parts.append(text)
             elif isinstance(block, str):
                 parts.append(block)
         return " ".join(parts)
