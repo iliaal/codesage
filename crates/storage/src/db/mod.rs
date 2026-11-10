@@ -28,7 +28,8 @@ mod semantic;
 mod structural;
 
 pub use git_hist::{
-    CoChangeRow, CoChangeWrite, GitFileRow, ONE_OFF_RANK_MULTIPLIER, RECURRING_SPAN_SECS,
+    CoChangeRow, CoChangeWrite, GitFileRow, GitHistoryBuild, ONE_OFF_RANK_MULTIPLIER,
+    RECURRING_SPAN_SECS,
 };
 pub use overlay::StructuralOverlayFile;
 pub use semantic::{RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes};

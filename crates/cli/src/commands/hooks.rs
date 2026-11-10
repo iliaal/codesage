@@ -105,8 +105,9 @@ pub(crate) fn install_hooks_at(
 
 /// Sequence both passes because they share the index lock; failure in one must not skip the other.
 /// Wait for the watcher, which never refreshes features or git history.
-/// Record pre-run HEAD/content state only after both passes succeed so failures and concurrent
-/// edits force a retry. Exclude .codesage state from the digest to avoid self-invalidation.
+/// Record pre-run HEAD/content state per pass, only after that pass succeeds, so failures and
+/// concurrent edits force a retry of the failed pass alone. Exclude .codesage state from the
+/// digest to avoid self-invalidation.
 /// Keep the configured device: mixing CPU/CUDA vectors would violate the fingerprint.
 pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
     let bin = shell_single_quote(bin);
@@ -149,6 +150,10 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # permanent skip.\n\
          state=\"$root/.codesage/hook-state\"\n\
          if [ -L \"$state\" ] || {{ [ -e \"$state\" ] && [ ! -f \"$state\" ]; }}; then state=/dev/null; fi\n\
+         # git-index keeps its own stamp, so a failed history pass is retried\n\
+         # without repeating an index pass that already succeeded.\n\
+         gstate=\"$root/.codesage/hook-git-state\"\n\
+         if [ -L \"$gstate\" ] || {{ [ -e \"$gstate\" ] && [ ! -f \"$gstate\" ]; }}; then gstate=/dev/null; fi\n\
          # Content digest of the worktree relative to HEAD: the name of every\n\
          # tracked file that differs from HEAD (modified, staged, deleted) and\n\
          # of every untracked file, NUL-delimited end to end, then a checksum\n\
@@ -196,9 +201,13 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          if [ -n \"$head\" ]; then\n\
            digest=\"$(worktree_digest 2>/dev/null)\" && stamp=\"$head $digest\"\n\
          fi\n\
+         index_current=0\n\
          if [ -n \"$stamp\" ] && [ -f \"$state\" ] && [ \"$(cat \"$state\" 2>/dev/null)\" = \"$stamp\" ]; then\n\
-           echo \"[$(date)] $(basename \"$0\") hook skip: HEAD and worktree unchanged since last index\" >>\"$log\"\n\
-           exit 0\n\
+           if [ -f \"$gstate\" ] && [ \"$(cat \"$gstate\" 2>/dev/null)\" = \"$stamp\" ]; then\n\
+             echo \"[$(date)] $(basename \"$0\") hook skip: HEAD and worktree unchanged since last index\" >>\"$log\"\n\
+             exit 0\n\
+           fi\n\
+           index_current=1\n\
          fi\n\
          # Run structural+semantic index then git-history index sequentially\n\
          # in one background subshell. Both subcommands take the same\n\
@@ -209,10 +218,13 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # runs feature mapping or git-history indexing, so --lock-wait\n\
          # polls it out instead of skipping. The device is the configured\n\
          # one (or the daemon's resident session); the hook never overrides it.\n\
-         # The stamp is recorded only after both passes exit 0, so a failed\n\
-         # run — or one that exited 75 because another indexer held the lock\n\
-         # for the whole wait — is retried by the next hook. An empty stamp\n\
-         # (no HEAD, or a digest stage failed) is never recorded.\n\
+         # Each pass records the stamp in its own file only after it exits 0,\n\
+         # so a failed pass — or one that exited 75 because another indexer\n\
+         # held the lock for the whole wait — is retried by the next hook. A\n\
+         # matching index stamp skips only the index pass: an unfinished\n\
+         # git-history rebuild continues on the next hook without a repeat of\n\
+         # the costlier index pass. An empty stamp (no HEAD, or a digest stage\n\
+         # failed) is never recorded.\n\
          lockdir=\"$root/.codesage/hook-index.lock\"\n\
          pidfile=\"$lockdir/pid\"\n\
          # Single-flight: rapid commits must not queue serial full passes.\n\
@@ -308,14 +320,20 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
            fi\n\
            cd \"$root\" || exit 0\n\
            echo \"[$(date)] $(basename \"$0\") hook start pid=$pid\" >>\"$log\"\n\
-           # shellcheck disable=SC2086 # IONICE and NICE are command words, split on purpose\n\
-           $IONICE $NICE {bin} index --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
-           echo \"[$(date)] index exit=$rc\" >>\"$log\"\n\
+           rc=0\n\
+           if [ \"$index_current\" -eq 1 ]; then\n\
+             echo \"[$(date)] index skip: unchanged since last index\" >>\"$log\"\n\
+           else\n\
+             # shellcheck disable=SC2086 # IONICE and NICE are command words, split on purpose\n\
+             $IONICE $NICE {bin} index --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
+             [ -n \"$stamp\" ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$state\"\n\
+             echo \"[$(date)] index exit=$rc\" >>\"$log\"\n\
+           fi\n\
            index_rc=$rc\n\
            # shellcheck disable=SC2086\n\
            $IONICE $NICE {bin} git-index --incremental --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
+           [ -n \"$stamp\" ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$gstate\"\n\
            echo \"[$(date)] git-index exit=$rc\" >>\"$log\"\n\
-           [ -n \"$stamp\" ] && [ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$state\"\n\
            [ \"$index_rc\" -ne 0 ] && exit \"$index_rc\"\n\
            exit \"$rc\" ) >>\"$log\" 2>&1 &\n\
          # An explicit parent exit hides the worker's EXIT trap from ShellCheck.\n\
@@ -778,11 +796,29 @@ mod tests {
         let launch = body.find("hook start").unwrap();
         let record = body.find("printf '%s\\n' \"$stamp\" >\"$state\"").unwrap();
         assert!(skip < launch && launch < record, "{body}");
+        let index_pass = body.find("index --lock-wait 60").unwrap();
+        let git_pass = body.find("git-index --incremental").unwrap();
+        let index_record = body
+            .find("[ -n \"$stamp\" ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$state\"")
+            .expect("hook-state must require a computed digest and index exiting 0");
+        let git_record = body
+            .find(
+                "[ -n \"$stamp\" ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$gstate\"",
+            )
+            .expect("hook-git-state must require a computed digest and git-index exiting 0");
+        assert!(
+            index_pass < index_record && index_record < git_pass && git_pass < git_record,
+            "each stamp must follow its own pass, got:\n{body}"
+        );
         assert!(
             body.contains(
-                "[ -n \"$stamp\" ] && [ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf"
+                "if [ -L \"$gstate\" ] || { [ -e \"$gstate\" ] && [ ! -f \"$gstate\" ]; }; then gstate=/dev/null; fi"
             ),
-            "stamp must require a computed digest and both passes exiting 0, got:\n{body}"
+            "expected the git stamp symlink guard, got:\n{body}"
+        );
+        assert!(
+            body.find("[ -L \"$gstate\" ]").unwrap() < body.find("cat \"$gstate\"").unwrap(),
+            "{body}"
         );
         assert!(
             body.contains(
@@ -1536,9 +1572,71 @@ mod tests {
         let content = wait_for_log(&log, "hook exit=3");
         assert!(content.contains("] git-index exit=3"), "{content}");
         assert!(
-            !root.join(".codesage/hook-state").exists(),
-            "a failed pass must not record the stamp"
+            !root.join(".codesage/hook-git-state").exists(),
+            "a failed pass must not record its stamp"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_stamps_a_successful_index_and_retries_only_a_failed_git_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(
+            root,
+            "#!/bin/sh\necho \"$1\" >>.codesage/passes\n\
+             [ \"$1\" = git-index ] && [ -f .codesage/git-fail ] && exit 1\nexit 0\n",
+        );
+        let log = root.join(".codesage/hooks.log");
+        let state = root.join(".codesage/hook-state");
+        let git_state = root.join(".codesage/hook-git-state");
+        let passes = || std::fs::read_to_string(root.join(".codesage/passes")).unwrap();
+        let fire = |runs: usize| {
+            assert!(run_script(&hook, root).success());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let content = std::fs::read_to_string(&log).unwrap_or_default();
+                if content.matches("hook exit=").count() == runs
+                    && !root.join(".codesage/hook-index.lock").exists()
+                {
+                    return content;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hook run {runs} never finished:\n{content}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        std::fs::write(root.join(".codesage/git-fail"), "").unwrap();
+
+        let content = fire(1);
+        assert!(content.contains("] index exit=0"), "{content}");
+        assert!(content.contains("] git-index exit=1"), "{content}");
+        let stamp = std::fs::read_to_string(&state).expect("index success records hook-state");
+        assert!(!stamp.trim().is_empty());
+        assert!(
+            !git_state.exists(),
+            "a failed git-index must not be stamped"
+        );
+
+        // HEAD and worktree are unchanged (.codesage is outside the digest),
+        // so only the failed pass may run again.
+        let content = fire(2);
+        assert_eq!(passes(), "index\ngit-index\ngit-index\n", "{content}");
+        assert_eq!(content.matches("] index skip:").count(), 1, "{content}");
+        assert!(!git_state.exists());
+
+        std::fs::remove_file(root.join(".codesage/git-fail")).unwrap();
+        fire(3);
+        assert_eq!(passes(), "index\ngit-index\ngit-index\ngit-index\n");
+        assert_eq!(std::fs::read_to_string(&git_state).unwrap(), stamp);
+
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_log(&log, "hook skip: HEAD and worktree unchanged");
+        assert_eq!(content.matches("hook start").count(), 3, "{content}");
+        assert_eq!(passes(), "index\ngit-index\ngit-index\ngit-index\n");
     }
 
     #[cfg(unix)]

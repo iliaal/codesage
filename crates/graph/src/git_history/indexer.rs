@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use codesage_parser::discover::{
@@ -54,12 +55,12 @@ use codesage_parser::discover::{
 };
 use codesage_protocol::GitIndexStats;
 use codesage_storage::Database;
-use codesage_storage::db::CoChangeWrite;
+use codesage_storage::db::{CoChangeWrite, GitHistoryBuild};
 use globset::GlobSet;
 
 use super::bus_factor::normalized_author;
 use super::source::HistorySource;
-use crate::git::{git_history_command, history_output};
+use crate::git::{HistoryDeadline, git_history_command, history_output};
 
 const DECAY_TAU_DAYS: f64 = 180.0;
 const SECONDS_PER_DAY: f64 = 86_400.0;
@@ -231,6 +232,7 @@ struct PassAnchors<'a> {
     previous: i64,
     exclusion_fingerprint: &'a str,
     source: &'a HistorySource,
+    limits: WalkLimits,
 }
 
 type CommitEpochKey = (PathBuf, String);
@@ -336,6 +338,82 @@ pub fn git_history_index_with_options(
     extra_excludes: &[String],
     mode: IndexMode,
 ) -> Result<GitIndexStats> {
+    index_history(db, root, extra_excludes, mode, WalkLimits::from_env()?)
+}
+
+/// Bounds on the git children of one `git-index` run.
+#[derive(Debug, Clone, Copy)]
+struct WalkLimits {
+    /// Deadline for an incremental walk, and for all the slices one run of a
+    /// full rebuild reads.
+    budget: Duration,
+    /// Commits in the first slice of a new full rebuild.
+    first_slice: usize,
+    /// Stop a full rebuild after this many slices in one run.
+    max_slices: Option<usize>,
+    /// Walks reported as past their deadline without running git, so tests
+    /// can exhaust a budget deterministically.
+    forced_deadline: Option<fn(HistoryWalk) -> bool>,
+}
+
+/// One budgeted git child of a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryWalk {
+    /// Listing the commits a full rebuild reads.
+    Plan,
+    /// Reading one slice of that many commits.
+    Slice(usize),
+    /// Reading an incremental range.
+    Incremental,
+}
+
+impl WalkLimits {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            budget: history_walk_budget()?,
+            first_slice: FIRST_SLICE_COMMITS,
+            max_slices: None,
+            forced_deadline: None,
+        })
+    }
+
+    fn run<T>(&self, walk: HistoryWalk, child: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.forced_deadline.is_some_and(|forced| forced(walk)) {
+            return Err(HistoryDeadline {
+                budget: self.budget,
+            }
+            .into());
+        }
+        child()
+    }
+}
+
+fn is_deadline(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<HistoryDeadline>().is_some()
+}
+
+/// Why a pass rebuilds history in full, for the error an unfinished rebuild returns.
+#[derive(Debug, Clone, Copy)]
+enum FullReason<'a> {
+    Rebuild,
+    /// The stored head is not an ancestor of HEAD, so its rows cannot be
+    /// composed with the commits HEAD added.
+    Diverged {
+        stored: &'a str,
+    },
+    /// Reading the commits after the stored head took longer than the budget.
+    RangeTooLong {
+        stored: &'a str,
+    },
+}
+
+fn index_history(
+    db: &Database,
+    root: &Path,
+    extra_excludes: &[String],
+    mode: IndexMode,
+    limits: WalkLimits,
+) -> Result<GitIndexStats> {
     let (exclude_set, test_like_set) = compile_excludes(extra_excludes)?;
     let head_sha = resolve_head_sha(root)?;
     let source = HistorySource::read(root)?;
@@ -349,11 +427,17 @@ pub fn git_history_index_with_options(
     let anchor = anchor_at_commit(root, &head_sha)?;
     log_anchor(root, anchor);
 
+    let mut diverged_from = None;
     let effective_mode = match mode {
         IndexMode::Full => IndexMode::Full,
         IndexMode::Incremental | IndexMode::Auto => match db.get_git_index_state()? {
             // Rows built under another history policy cannot be composed.
-            Some(_) if policy_changed => IndexMode::Full,
+            Some((last_sha, _)) if policy_changed => {
+                if last_sha != head_sha && !is_ancestor(root, &last_sha, &head_sha)? {
+                    diverged_from = Some(last_sha);
+                }
+                IndexMode::Full
+            }
             Some((last_sha, last_indexed_at)) if last_sha == head_sha => {
                 // HEAD is unchanged, so the anchor is too: the decay below is a
                 // no-op unless the last pass measured from a different clock.
@@ -362,7 +446,8 @@ pub fn git_history_index_with_options(
                     decay_git_history_between(db, previous, anchor.epoch)?;
                     db.prune_git_author_events(anchor.cutoff())?;
                     anchor.persist(db, &head_sha, false)?;
-                    db.set_git_index_exclusion_fingerprint(&exclusion_fingerprint)
+                    db.set_git_index_exclusion_fingerprint(&exclusion_fingerprint)?;
+                    db.clear_git_history_build()
                 })?;
                 return Ok(GitIndexStats {
                     commits_scanned: 0,
@@ -372,10 +457,15 @@ pub fn git_history_index_with_options(
                 });
             }
             Some((last_sha, _)) => {
-                if is_ancestor(root, &last_sha, &head_sha)? {
-                    IndexMode::Incremental
-                } else {
+                if !is_ancestor(root, &last_sha, &head_sha)? {
+                    diverged_from = Some(last_sha);
                     IndexMode::Full
+                } else if resumable_build(db, root, &head_sha, &exclusion_fingerprint)?.is_some() {
+                    // Only a failed pass leaves a rebuild behind, so the
+                    // incremental range would fail the same way again.
+                    IndexMode::Full
+                } else {
+                    IndexMode::Incremental
                 }
             }
             None => IndexMode::Full,
@@ -394,6 +484,11 @@ pub fn git_history_index_with_options(
                 previous: anchor.epoch,
                 exclusion_fingerprint: &exclusion_fingerprint,
                 source: &source,
+                limits,
+            },
+            match &diverged_from {
+                Some(stored) => FullReason::Diverged { stored },
+                None => FullReason::Rebuild,
             },
         ),
         IndexMode::Incremental => {
@@ -405,6 +500,7 @@ pub fn git_history_index_with_options(
                 previous: previous_anchor(root, &last_sha, last_at, anchor)?,
                 exclusion_fingerprint: &exclusion_fingerprint,
                 source: &source,
+                limits,
             };
             run_incremental(
                 db,
@@ -418,6 +514,18 @@ pub fn git_history_index_with_options(
         }
         IndexMode::Auto => unreachable!("resolved above"),
     }?;
+    // A resumed rebuild completes at the commit it was planned for; HEAD may
+    // have moved on since, along a range an incremental pass composes onto it.
+    if db
+        .get_git_index_state()?
+        .is_some_and(|(indexed, _)| indexed != head_sha)
+    {
+        let follow_up = index_history(db, root, extra_excludes, IndexMode::Incremental, limits)?;
+        stats = GitIndexStats {
+            commits_scanned: stats.commits_scanned + follow_up.commits_scanned,
+            ..follow_up
+        };
+    }
     stats.notes = source.notes();
     Ok(stats)
 }
@@ -525,11 +633,26 @@ fn run_full(
     test_like_set: &GlobSet,
     head_sha: &str,
     anchors: PassAnchors<'_>,
+    reason: FullReason<'_>,
 ) -> Result<GitIndexStats> {
-    let anchor = anchors.current;
-    let mut commits = history_commits(root, None, anchor.cutoff(), anchors.source)?;
+    let (target, mut commits) = match stage_history(db, root, head_sha, &anchors)? {
+        Staged::Complete { target, commits } => (target, commits),
+        Staged::Incomplete(progress) => {
+            return Err(rebuild_incomplete(
+                &progress,
+                reason,
+                head_sha,
+                anchors.limits.budget,
+            ));
+        }
+    };
+    let anchor = if target == head_sha {
+        anchors.current
+    } else {
+        anchor_at_commit(root, &target)?
+    };
     let successor = follow_renames(&mut commits, exclude_set);
-    remap_dead_paths(root, head_sha, &mut commits, &successor)?;
+    remap_dead_paths(root, &target, &mut commits, &successor)?;
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
     let mut pairs: HashMap<(String, String), PairStats> = HashMap::new();
@@ -571,9 +694,9 @@ fn run_full(
                 co_change_kept += 1;
             }
         }
-        anchor.persist(db, head_sha, true)?;
+        anchor.persist(db, &target, true)?;
         db.set_git_index_exclusion_fingerprint(anchors.exclusion_fingerprint)?;
-        Ok(())
+        db.clear_git_history_build()
     })?;
 
     Ok(GitIndexStats {
@@ -582,6 +705,283 @@ fn run_full(
         co_change_pairs: co_change_kept,
         notes: Vec::new(),
     })
+}
+
+/// Commits in the first slice of a new rebuild; later slices are sized from
+/// the observed rate.
+const FIRST_SLICE_COMMITS: usize = 512;
+/// Upper bound on one slice, which passes every SHA as an argument.
+const MAX_SLICE_COMMITS: usize = 4096;
+
+/// Progress of a rebuild that did not finish in this run.
+#[derive(Debug)]
+struct BuildProgress {
+    target: String,
+    staged: usize,
+    total: usize,
+    /// Commits the next run reads in its first slice.
+    slice_len: usize,
+    /// Why this run saved nothing, when it saved nothing.
+    stalled: Option<String>,
+}
+
+enum Staged {
+    Complete {
+        target: String,
+        commits: Vec<Commit>,
+    },
+    Incomplete(BuildProgress),
+}
+
+/// The staged rebuild a pass at `head_sha` may finish: same policy and
+/// window, planned at HEAD or at an ancestor an incremental pass can extend.
+fn resumable_build(
+    db: &Database,
+    root: &Path,
+    head_sha: &str,
+    policy: &str,
+) -> Result<Option<GitHistoryBuild>> {
+    let Some(build) = db.git_history_build()? else {
+        return Ok(None);
+    };
+    if build.policy != policy {
+        return Ok(None);
+    }
+    if build.target_sha != head_sha && !is_ancestor(root, &build.target_sha, head_sha)? {
+        return Ok(None);
+    }
+    if anchor_at_commit(root, &build.target_sha)?.cutoff() != build.cutoff {
+        return Ok(None);
+    }
+    Ok(Some(build))
+}
+
+/// Read the full history in slices that each fit in what remains of the
+/// run's budget, saving each one, so a history whose single walk exceeds the
+/// budget completes over several runs. The commits are planned once, in the
+/// order and window a single walk would list them, and each slice reads the
+/// same per-commit output, so the assembled commits equal that walk's.
+fn stage_history(
+    db: &Database,
+    root: &Path,
+    head_sha: &str,
+    anchors: &PassAnchors<'_>,
+) -> Result<Staged> {
+    let limits = anchors.limits;
+    let source = anchors.source;
+    let mut planned_at = None;
+    let build = match resumable_build(db, root, head_sha, anchors.exclusion_fingerprint)? {
+        Some(build) => build,
+        None => {
+            let started = Instant::now();
+            planned_at = Some(started);
+            let cutoff = anchors.current.cutoff();
+            let planned = limits.run(HistoryWalk::Plan, || {
+                plan_history(root, head_sha, cutoff, limits.budget)
+            });
+            let commits = match planned {
+                Ok(commits) => commits,
+                Err(error) if is_deadline(&error) => {
+                    return Ok(Staged::Incomplete(BuildProgress {
+                        target: head_sha.to_owned(),
+                        staged: 0,
+                        total: 0,
+                        slice_len: 0,
+                        stalled: Some(
+                            "listing the commits in the history window ran out of time".into(),
+                        ),
+                    }));
+                }
+                Err(error) => return Err(error),
+            };
+            let slice_len = limits.first_slice.clamp(1, MAX_SLICE_COMMITS);
+            db.execute_batch(|db| {
+                db.start_git_history_build(
+                    head_sha,
+                    anchors.exclusion_fingerprint,
+                    cutoff,
+                    &commits,
+                    slice_len,
+                )
+            })?;
+            GitHistoryBuild {
+                target_sha: head_sha.to_owned(),
+                policy: anchors.exclusion_fingerprint.to_owned(),
+                cutoff,
+                commits,
+                slice_len,
+                staged: 0,
+            }
+        }
+    };
+
+    // A run that planned shares the budget with planning; one that resumes
+    // gives its first slice the whole budget, so a timeout there measures
+    // the slice rather than the overhead before it.
+    let deadline = planned_at.unwrap_or_else(Instant::now) + limits.budget;
+    let total = build.commits.len();
+    let mut staged = build.staged;
+    let mut slice_len = build.slice_len.clamp(1, MAX_SLICE_COMMITS);
+    let mut slices = 0usize;
+    let mut advanced = planned_at.is_some();
+    let mut stalled = None;
+    while staged < total {
+        if limits.max_slices.is_some_and(|max| slices >= max) {
+            break;
+        }
+        let started = Instant::now();
+        let given = deadline.saturating_duration_since(started);
+        if (slices > 0 || planned_at.is_some()) && given.is_zero() {
+            break;
+        }
+        let shas = &build.commits[staged..(staged + slice_len).min(total)];
+        let read = limits.run(HistoryWalk::Slice(shas.len()), || {
+            read_history_slice(root, shas, source.tree_only, given)
+        });
+        match read {
+            Ok(output) => {
+                // Headers, not parsed commits: a single walk also drops a
+                // commit whose date does not parse, and so must the slice.
+                let (_, headers) = parse_history_with_headers(&output, source)?;
+                anyhow::ensure!(
+                    headers.iter().eq(shas.iter()),
+                    "git log returned other commits than the {} requested from {}",
+                    shas.len(),
+                    shas[0]
+                );
+                let next = next_slice_len(shas.len(), started.elapsed(), limits.budget);
+                db.execute_batch(|db| {
+                    db.stage_git_history_slice(staged, shas.len(), &output, next)
+                })?;
+                staged += shas.len();
+                slice_len = next;
+                slices += 1;
+                advanced = true;
+            }
+            Err(error) if is_deadline(&error) => {
+                // Only a slice that had most of the budget says the slice is too large.
+                if slices == 0 && given >= limits.budget / 2 {
+                    if shas.len() > 1 {
+                        slice_len = shas.len() / 2;
+                        db.set_git_history_slice_len(slice_len)?;
+                        advanced = true;
+                    } else {
+                        stalled = Some(format!(
+                            "commit {} alone takes longer than the budget",
+                            short_sha(&shas[0])
+                        ));
+                    }
+                }
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if staged < total {
+        return Ok(Staged::Incomplete(BuildProgress {
+            target: build.target_sha,
+            staged,
+            total,
+            slice_len,
+            stalled: if advanced {
+                None
+            } else {
+                Some(stalled.unwrap_or_else(|| "no slice was read".into()))
+            },
+        }));
+    }
+
+    let assembled = (|| -> Result<Vec<Commit>> {
+        let mut commits = Vec::with_capacity(total);
+        let mut expected = 0usize;
+        for (start, len, output) in db.git_history_build_slices()? {
+            anyhow::ensure!(
+                start == expected,
+                "staged git history skips from commit {expected} to {start}"
+            );
+            let (parsed, headers) = parse_history_with_headers(&output, source)?;
+            anyhow::ensure!(
+                headers.len() == len,
+                "staged git history slice at commit {start} holds {} of {len} commits",
+                headers.len()
+            );
+            commits.extend(parsed);
+            expected += len;
+        }
+        anyhow::ensure!(
+            expected == total,
+            "staged git history holds {expected} of {total} planned commits"
+        );
+        Ok(commits)
+    })();
+    match assembled {
+        Ok(commits) => Ok(Staged::Complete {
+            target: build.target_sha,
+            commits,
+        }),
+        Err(error) => {
+            // Re-plan rather than fail on the same staged rows every run.
+            db.clear_git_history_build()?;
+            Err(error)
+        }
+    }
+}
+
+/// Size the next slice so it takes about a quarter of the budget, growing at
+/// most fourfold per slice.
+fn next_slice_len(len: usize, took: Duration, budget: Duration) -> usize {
+    let target = budget.as_secs_f64() / 4.0;
+    let scaled = len as f64 * target / took.as_secs_f64().max(1e-3);
+    let ceiling = len.saturating_mul(4).clamp(1, MAX_SLICE_COMMITS);
+    (scaled as usize).clamp(1, ceiling)
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+/// The error for a full rebuild this run could not finish. It names how to
+/// finish it; a rebuild forced by a diverged stored head also names that cause,
+/// since rerunning the hook alone repeats it otherwise.
+fn rebuild_incomplete(
+    progress: &BuildProgress,
+    reason: FullReason<'_>,
+    head_sha: &str,
+    budget: Duration,
+) -> anyhow::Error {
+    let budget_ms = budget.as_millis();
+    let cause = match reason {
+        FullReason::Diverged { stored } => format!(
+            "stored git history head {} is not an ancestor of HEAD {}, so history must be rebuilt in full; ",
+            short_sha(stored),
+            short_sha(head_sha)
+        ),
+        FullReason::RangeTooLong { stored } => format!(
+            "reading the commits from stored git history head {} to HEAD {} took longer than \
+             the {budget_ms} ms budget, so history is rebuilt in full; ",
+            short_sha(stored),
+            short_sha(head_sha)
+        ),
+        FullReason::Rebuild => String::new(),
+    };
+    match &progress.stalled {
+        Some(stall) => anyhow!(
+            "{cause}git history rebuild made no progress within the {budget_ms} ms budget: \
+             {stall}; the previous history index is unchanged. Rerun with a larger budget: \
+             `CODESAGE_GIT_HISTORY_TIMEOUT_MS=<ms> codesage git-index --full` (at most 600000)"
+        ),
+        None => anyhow!(
+            "{cause}git history rebuild in progress: {} of {} commits saved toward {} within \
+             the {budget_ms} ms budget, next slice {} commits; the previous history index is \
+             unchanged until the rebuild completes. Rerun `codesage git-index` to continue; \
+             `CODESAGE_GIT_HISTORY_TIMEOUT_MS=600000 codesage git-index --full` finishes in one \
+             run when the remaining slices fit in that budget",
+            progress.staged,
+            progress.total,
+            short_sha(&progress.target),
+            progress.slice_len
+        ),
+    }
 }
 
 fn run_incremental(
@@ -595,7 +995,36 @@ fn run_incremental(
 ) -> Result<GitIndexStats> {
     let anchor = anchors.current;
     let range = format!("{last_sha}..{head_sha}");
-    let mut commits = history_commits(root, Some(&range), anchor.cutoff(), anchors.source)?;
+    let walked = anchors.limits.run(HistoryWalk::Incremental, || {
+        history_commits(
+            root,
+            Some(&range),
+            anchor.cutoff(),
+            anchors.source,
+            anchors.limits.budget,
+        )
+    });
+    let mut commits = match walked {
+        Ok(commits) => commits,
+        // Retrying the same range would fail the same way every run; a staged
+        // rebuild saves progress and leaves the current rows in place meanwhile.
+        Err(error) if is_deadline(&error) => {
+            tracing::info!(
+                root = %root.display(),
+                "the incremental range exceeds the history budget; rebuilding in slices"
+            );
+            return run_full(
+                db,
+                root,
+                exclude_set,
+                test_like_set,
+                head_sha,
+                anchors,
+                FullReason::RangeTooLong { stored: last_sha },
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let successor = follow_renames(&mut commits, exclude_set);
     remap_dead_paths(root, head_sha, &mut commits, &successor)?;
     // Stored rows are keyed by the names files had at `last_sha`; a rename in
@@ -612,7 +1041,15 @@ fn run_incremental(
             root = %root.display(),
             "a rename in the incremental range cannot be re-keyed exactly; rescanning in full"
         );
-        return run_full(db, root, exclude_set, test_like_set, head_sha, anchors);
+        return run_full(
+            db,
+            root,
+            exclude_set,
+            test_like_set,
+            head_sha,
+            anchors,
+            FullReason::Rebuild,
+        );
     }
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
@@ -658,7 +1095,7 @@ fn run_incremental(
         }
         anchor.persist(db, head_sha, false)?;
         db.set_git_index_exclusion_fingerprint(anchors.exclusion_fingerprint)?;
-        Ok(())
+        db.clear_git_history_build()
     })?;
 
     Ok(GitIndexStats {
@@ -1051,17 +1488,125 @@ fn history_commits(
     range: Option<&str>,
     since_epoch: i64,
     source: &HistorySource,
+    budget: Duration,
 ) -> Result<Vec<Commit>> {
-    let raw = run_git_log(root, range, since_epoch, source.tree_only)?;
-    let mut commits = if source.tree_only {
-        parse_name_log(&raw)?
+    let raw = run_git_log(root, range, since_epoch, source.tree_only, budget)?;
+    parse_history(&raw, source)
+}
+
+fn parse_history(raw: &str, source: &HistorySource) -> Result<Vec<Commit>> {
+    Ok(parse_history_with_headers(raw, source)?.0)
+}
+
+/// [`parse_history`] plus the SHA of every commit header in `raw`, in order,
+/// including headers whose commit the parse dropped.
+fn parse_history_with_headers(
+    raw: &str,
+    source: &HistorySource,
+) -> Result<(Vec<Commit>, Vec<String>)> {
+    let (mut commits, headers) = if source.tree_only {
+        // The tree-only parse fails on a header it cannot read, so it drops none.
+        let commits = parse_name_log(raw)?;
+        let headers = commits.iter().map(|commit| commit.sha.clone()).collect();
+        (commits, headers)
     } else {
-        parse_log(&raw)?
+        parse_log_with_headers(raw)?
     };
     for commit in &mut commits {
         commit.boundary = source.shallow.contains(&commit.sha);
     }
-    Ok(commits)
+    Ok((commits, headers))
+}
+
+/// The commits a full walk of `target` lists, in its order, without reading
+/// any diff. Selection and order options must match [`run_git_log`].
+fn plan_history(
+    root: &Path,
+    target: &str,
+    since_epoch: i64,
+    budget: Duration,
+) -> Result<Vec<String>> {
+    let since_arg = format!("--since=@{since_epoch}");
+    let mut command = git_history_command(root);
+    command.args([
+        "log",
+        "--no-show-signature",
+        "--no-merges",
+        "--topo-order",
+        &since_arg,
+        "--pretty=format:%H",
+        target,
+        "--",
+    ]);
+    let output = history_output(command, budget)
+        .with_context(|| format!("listing git history in {}", root.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git log failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8(output.stdout).context("git log output not UTF-8")?;
+    text.split_whitespace()
+        .map(|sha| {
+            anyhow::ensure!(
+                matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                "git log listed {sha:?} where a commit SHA was expected"
+            );
+            Ok(sha.to_owned())
+        })
+        .collect()
+}
+
+/// [`run_git_log`] output for exactly `shas`, in the given order.
+fn read_history_slice(
+    root: &Path,
+    shas: &[String],
+    tree_only: bool,
+    budget: Duration,
+) -> Result<String> {
+    let mut command = git_history_command(root);
+    command
+        .args([
+            "log",
+            "--no-show-signature",
+            "--no-walk=unsorted",
+            "--no-merges",
+            "--root",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-z",
+        ])
+        .args(history_format_args(tree_only))
+        .args(shas)
+        .arg("--");
+    let output = history_output(command, budget)
+        .with_context(|| format!("running git log in {}", root.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git log failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout).context("git log output not UTF-8")
+}
+
+fn history_format_args(tree_only: bool) -> [&'static str; 3] {
+    if tree_only {
+        [
+            "--no-renames",
+            "--name-only",
+            "--pretty=format:%x00commit\x09%H\x09%ct\x09%ae%x1f%an%x1f%s%x00",
+        ]
+    } else {
+        [
+            "-M",
+            "--numstat",
+            "--pretty=format:commit\x09%H\x09%ct\x09%ae%x1f%an%x1f%s%x00",
+        ]
+    }
 }
 
 fn history_walk_budget() -> Result<std::time::Duration> {
@@ -1084,6 +1629,7 @@ fn run_git_log(
     range: Option<&str>,
     since_epoch: i64,
     tree_only: bool,
+    budget: Duration,
 ) -> Result<String> {
     // `@<unix>` is git's epoch-format specifier; locale-independent.
     let since_arg = format!("--since=@{since_epoch}");
@@ -1102,26 +1648,14 @@ fn run_git_log(
         "-z",
         &since_arg,
     ];
-    if tree_only {
-        args.extend([
-            "--no-renames",
-            "--name-only",
-            "--pretty=format:%x00commit\x09%H\x09%ct\x09%ae%x1f%an%x1f%s%x00",
-        ]);
-    } else {
-        args.extend([
-            "-M",
-            "--numstat",
-            "--pretty=format:commit\x09%H\x09%ct\x09%ae%x1f%an%x1f%s%x00",
-        ]);
-    }
+    args.extend(history_format_args(tree_only));
     if let Some(r) = range {
         args.push(r);
     }
     args.push("--");
     let mut command = git_history_command(root);
     command.args(&args);
-    let output = history_output(command, history_walk_budget()?)
+    let output = history_output(command, budget)
         .with_context(|| format!("running git log in {}", root.display()))?;
 
     if !output.status.success() {
@@ -1190,7 +1724,13 @@ fn parse_name_log(raw: &str) -> Result<Vec<Commit>> {
 /// numstat line is an error rather than a skip: text injected ahead of a header
 /// hides that commit and attributes its files to the previous one.
 fn parse_log(raw: &str) -> Result<Vec<Commit>> {
+    Ok(parse_log_with_headers(raw)?.0)
+}
+
+/// [`parse_log`] plus the SHA of every commit header, kept or skipped.
+fn parse_log_with_headers(raw: &str) -> Result<(Vec<Commit>, Vec<String>)> {
     let mut commits = Vec::new();
+    let mut headers = Vec::new();
     let mut current: Option<Commit> = None;
     let mut skipped_commits = 0usize;
     let mut skipped_changes = 0usize;
@@ -1209,6 +1749,7 @@ fn parse_log(raw: &str) -> Result<Vec<Commit>> {
             }
             let mut parts = rest.splitn(3, '\t');
             let _sha = parts.next().unwrap_or("");
+            headers.push(_sha.to_owned());
             // A fabricated timestamp of zero would still affect fix counts despite zero churn.
             let ts: Option<i64> = parts.next().and_then(|s| s.parse().ok());
             let Some(ts) = ts else {
@@ -1300,7 +1841,7 @@ fn parse_log(raw: &str) -> Result<Vec<Commit>> {
             "parse_log skipped unparseable git output entries"
         );
     }
-    Ok(commits)
+    Ok((commits, headers))
 }
 
 /// Numstat's added-lines field: a decimal count, or `-` for a binary file.
@@ -2104,5 +2645,490 @@ mod tests {
         assert!(!is_numstat_count(""));
         assert!(!is_numstat_count("-1"));
         assert!(!is_numstat_count("gpg: Good signature"));
+    }
+
+    fn commit_all(root: &Path, files: &[(&str, &str)], subject: &str) {
+        for (path, body) in files {
+            std::fs::write(root.join(path), body).unwrap();
+        }
+        policy_git(root, &["add", "-A"]);
+        policy_git(root, &["commit", "-qm", subject]);
+    }
+
+    /// `main` and `side` share two commits; HEAD is left on `side`. `main`
+    /// then gains commits `side` lacks, including a rename and a fix.
+    fn diverging_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        policy_git(root, &["init", "-q", "-b", "main"]);
+        policy_git(root, &["config", "user.email", "test@example.com"]);
+        policy_git(root, &["config", "user.name", "Test"]);
+        commit_all(root, &[("a.rs", "a0\n"), ("b.rs", "b0\n")], "base one");
+        commit_all(root, &[("a.rs", "a1\n"), ("b.rs", "b1\n")], "base two");
+        policy_git(root, &["checkout", "-qb", "side"]);
+        commit_all(root, &[("side.rs", "s0\n"), ("a.rs", "s-a\n")], "side work");
+        dir
+    }
+
+    fn advance_main(root: &Path) {
+        policy_git(root, &["checkout", "-q", "main"]);
+        for round in 2..6 {
+            commit_all(
+                root,
+                &[
+                    ("a.rs", &format!("a{round}\n")),
+                    ("b.rs", &format!("b{round}\n")),
+                ],
+                &format!("main {round}"),
+            );
+        }
+        policy_git(root, &["mv", "b.rs", "c.rs"]);
+        commit_all(root, &[("a.rs", "a6\n")], "fix: rename b");
+        commit_all(root, &[("c.rs", "c7\nmore\n"), ("a.rs", "a7\n")], "main 7");
+    }
+
+    fn head(root: &Path) -> String {
+        resolve_head_sha(root).unwrap()
+    }
+
+    type FileRow = (String, u32, u32, Option<i64>, i64);
+    type PairRow = (String, String, u32, u64, Option<i64>, Option<i64>, i64);
+    type AuthorRow = (String, String, i64);
+    type HistoryRows = (Vec<FileRow>, Vec<PairRow>, Vec<AuthorRow>);
+
+    /// Every stored history row, floats rounded so composed decay compares.
+    fn history_rows(db: &Database) -> HistoryRows {
+        let mut paths: Vec<String> = db.churn_percentiles().unwrap().into_keys().collect();
+        paths.sort();
+        let mut files = Vec::new();
+        let mut pairs = Vec::new();
+        let mut authors = Vec::new();
+        for path in &paths {
+            let row = db.git_file(path).unwrap().unwrap();
+            files.push((
+                path.clone(),
+                row.fix_count,
+                row.total_commits,
+                row.last_commit_at,
+                (row.churn_score * 1e6).round() as i64,
+            ));
+            for pair in db.co_changes_for(path, 1000).unwrap() {
+                pairs.push((
+                    path.clone(),
+                    pair.file,
+                    pair.count,
+                    pair.window_mask,
+                    pair.first_observed_at,
+                    pair.last_observed_at,
+                    (pair.weight * 1e6).round() as i64,
+                ));
+            }
+            for (author, at) in db.git_author_events(path).unwrap() {
+                authors.push((path.clone(), author, at));
+            }
+        }
+        authors.sort();
+        (files, pairs, authors)
+    }
+
+    fn sliced(first_slice: usize, max_slices: Option<usize>) -> WalkLimits {
+        WalkLimits {
+            budget: Duration::from_secs(60),
+            first_slice,
+            max_slices,
+            forced_deadline: None,
+        }
+    }
+
+    fn forcing(limits: WalkLimits, forced: fn(HistoryWalk) -> bool) -> WalkLimits {
+        WalkLimits {
+            forced_deadline: Some(forced),
+            ..limits
+        }
+    }
+
+    fn assert_finish_command_is_scoped(message: &str) {
+        assert!(
+            message.contains(
+                "`CODESAGE_GIT_HISTORY_TIMEOUT_MS=600000 codesage git-index --full` finishes in \
+                 one run when the remaining slices fit in that budget"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn diverged_stored_head_rebuilds_across_bounded_runs_without_exposing_partial_rows() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        let stored = head(root);
+        let before = history_rows(&db);
+        assert!(db.git_file("side.rs").unwrap().is_some());
+        advance_main(root);
+        assert!(!is_ancestor(root, &stored, &head(root)).unwrap());
+
+        let mut runs = 0;
+        let mut last_staged = 0;
+        loop {
+            runs += 1;
+            assert!(runs <= 20, "the rebuild never completed");
+            match index_history(&db, root, &[], IndexMode::Incremental, sliced(2, Some(1))) {
+                Ok(_) => break,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    assert!(
+                        message.contains(&format!(
+                            "stored git history head {} is not an ancestor of HEAD",
+                            short_sha(&stored)
+                        )),
+                        "{message}"
+                    );
+                    assert!(
+                        message.contains("git history rebuild in progress"),
+                        "{message}"
+                    );
+                    assert_finish_command_is_scoped(&message);
+                    let staged = db.git_history_build().unwrap().unwrap().staged;
+                    assert!(staged > last_staged, "run {runs} saved nothing: {message}");
+                    last_staged = staged;
+                    assert_eq!(db.get_git_index_state().unwrap().unwrap().0, stored);
+                    assert_eq!(history_rows(&db), before, "partial rows became visible");
+                    if runs == 1 {
+                        // HEAD moves on mid-rebuild, as a post-commit hook sees it.
+                        commit_all(root, &[("a.rs", "a8\n"), ("d.rs", "d8\n")], "main 8");
+                    }
+                }
+            }
+        }
+        assert!(
+            runs >= 2,
+            "a two-commit first slice must not finish in one run"
+        );
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+        assert!(db.git_history_build().unwrap().is_none());
+        assert!(db.git_file("side.rs").unwrap().is_none());
+
+        let fresh = Database::open_in_memory().unwrap();
+        git_history_index(&fresh, root).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&fresh));
+    }
+
+    #[test]
+    fn staged_rebuild_assembles_exactly_the_single_walk() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        advance_main(root);
+        let source = HistorySource::read(root).unwrap();
+        let anchor = anchor_at_commit(root, &head(root)).unwrap();
+        let walk = history_commits(
+            root,
+            None,
+            anchor.cutoff(),
+            &source,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let project = |commits: &[Commit]| {
+            commits
+                .iter()
+                .map(|commit| {
+                    let changes: Vec<_> = commit
+                        .changes
+                        .iter()
+                        .map(|change| (change.path.clone(), change.added, change.deleted))
+                        .collect();
+                    (
+                        commit.sha.clone(),
+                        commit.timestamp,
+                        commit.author.clone(),
+                        commit.subject.clone(),
+                        changes,
+                        commit.renames.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(walk.iter().any(|commit| !commit.renames.is_empty()));
+
+        let db = Database::open_in_memory().unwrap();
+        let fingerprint = source.fingerprint(&effective_exclusion_fingerprint(&[]));
+        let anchors = PassAnchors {
+            current: anchor,
+            previous: anchor.epoch,
+            exclusion_fingerprint: &fingerprint,
+            source: &source,
+            limits: sliced(1, Some(1)),
+        };
+        let head_sha = head(root);
+        let mut runs = 0;
+        let staged = loop {
+            runs += 1;
+            assert!(runs <= 4 * walk.len(), "staging never completed");
+            match stage_history(&db, root, &head_sha, &anchors).unwrap() {
+                Staged::Complete { target, commits } => {
+                    assert_eq!(target, head_sha);
+                    break commits;
+                }
+                Staged::Incomplete(progress) => assert!(progress.stalled.is_none()),
+            }
+        };
+        assert!(runs > 2);
+        assert_eq!(project(&staged), project(&walk));
+    }
+
+    #[test]
+    fn diverged_rebuild_that_cannot_fit_one_commit_names_the_recovery() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        let stored = head(root);
+        advance_main(root);
+        // Plan the rebuild, then let every slice run out of time.
+        let planned = index_history(&db, root, &[], IndexMode::Auto, sliced(4, Some(0)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            planned.contains("git history rebuild in progress"),
+            "{planned}"
+        );
+        let slices_time_out = forcing(sliced(4, None), |walk| {
+            matches!(walk, HistoryWalk::Slice(_))
+        });
+        let messages: Vec<String> = (0..3)
+            .map(|_| {
+                let error =
+                    index_history(&db, root, &[], IndexMode::Auto, slices_time_out).unwrap_err();
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains(&format!(
+                        "stored git history head {} is not an ancestor of HEAD",
+                        short_sha(&stored)
+                    )),
+                    "{message}"
+                );
+                assert!(!message.contains("truncated by"), "{message}");
+                assert_eq!(db.get_git_index_state().unwrap().unwrap().0, stored);
+                message
+            })
+            .collect();
+        assert!(
+            messages[0].contains("0 of 8 commits saved")
+                && messages[0].contains("next slice 2 commits"),
+            "{messages:#?}"
+        );
+        assert!(
+            messages[1].contains("next slice 1 commits"),
+            "{messages:#?}"
+        );
+        let last = &messages[2];
+        assert!(
+            last.contains("made no progress within the 60000 ms budget"),
+            "{last}"
+        );
+        assert!(
+            last.contains("alone takes longer than the budget"),
+            "{last}"
+        );
+        assert!(
+            last.contains("`CODESAGE_GIT_HISTORY_TIMEOUT_MS=<ms> codesage git-index --full`"),
+            "{last}"
+        );
+        assert_eq!(db.git_history_build().unwrap().unwrap().slice_len, 1);
+    }
+
+    #[test]
+    fn incremental_range_over_budget_rebuilds_in_slices_instead_of_failing_every_run() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        let stored = head(root);
+        let before = history_rows(&db);
+        for round in 0..4 {
+            commit_all(
+                root,
+                &[
+                    ("side.rs", &format!("s{round}\n")),
+                    ("e.rs", &format!("e{round}\n")),
+                ],
+                &format!("side {round}"),
+            );
+        }
+        assert!(is_ancestor(root, &stored, &head(root)).unwrap());
+
+        let range_times_out = forcing(sliced(2, Some(1)), |walk| walk == HistoryWalk::Incremental);
+        let message = format!(
+            "{:#}",
+            index_history(&db, root, &[], IndexMode::Incremental, range_times_out).unwrap_err()
+        );
+        assert!(
+            message.contains(&format!(
+                "reading the commits from stored git history head {} to HEAD",
+                short_sha(&stored)
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("git history rebuild in progress: 2 of 7 commits saved"),
+            "{message}"
+        );
+        assert_finish_command_is_scoped(&message);
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, stored);
+        assert_eq!(history_rows(&db), before, "partial rows became visible");
+
+        // Later runs resume the rebuild rather than retry the range.
+        let mut runs = 0;
+        while let Err(error) =
+            index_history(&db, root, &[], IndexMode::Incremental, range_times_out)
+        {
+            runs += 1;
+            assert!(runs <= 10, "the rebuild never completed: {error:#}");
+            assert!(
+                format!("{error:#}").contains("rebuild in progress"),
+                "{error:#}"
+            );
+            assert_eq!(history_rows(&db), before, "partial rows became visible");
+        }
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+        assert!(db.git_history_build().unwrap().is_none());
+        let fresh = Database::open_in_memory().unwrap();
+        git_history_index(&fresh, root).unwrap();
+        assert_eq!(history_rows(&db), history_rows(&fresh));
+    }
+
+    #[test]
+    fn commit_with_an_unparseable_date_is_dropped_as_by_a_single_walk() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let dir = diverging_repo();
+        let root = dir.path();
+        let rev = |spec: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", spec])
+                .current_dir(root)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        // Git's walk reads the leading digits of this date; `%ct` prints nothing.
+        let object = format!(
+            "tree {}\nparent {}\nauthor T <t@e> {now} +0000\ncommitter T <t@e> {now}x +0000\n\nbad date\n",
+            rev("HEAD^{tree}"),
+            rev("HEAD"),
+            now = unix_now() - 60
+        );
+        let mut child = Command::new("git")
+            .args([
+                "hash-object",
+                "-t",
+                "commit",
+                "--literally",
+                "-w",
+                "--stdin",
+            ])
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(object.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        let bad = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+        policy_git(root, &["update-ref", "HEAD", &bad]);
+        commit_all(root, &[("a.rs", "after\n")], "after bad date");
+
+        let source = HistorySource::read(root).unwrap();
+        let anchor = anchor_at_commit(root, &head(root)).unwrap();
+        let plan =
+            plan_history(root, &head(root), anchor.cutoff(), Duration::from_secs(60)).unwrap();
+        assert!(plan.contains(&bad), "the walk must list the commit");
+        let walk = history_commits(
+            root,
+            None,
+            anchor.cutoff(),
+            &source,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(walk.iter().all(|commit| commit.sha != bad));
+        let shas = |commits: &[Commit]| commits.iter().map(|c| c.sha.clone()).collect::<Vec<_>>();
+
+        let db = Database::open_in_memory().unwrap();
+        let fingerprint = source.fingerprint(&effective_exclusion_fingerprint(&[]));
+        let anchors = PassAnchors {
+            current: anchor,
+            previous: anchor.epoch,
+            exclusion_fingerprint: &fingerprint,
+            source: &source,
+            limits: sliced(2, None),
+        };
+        match stage_history(&db, root, &head(root), &anchors).unwrap() {
+            Staged::Complete { commits, .. } => assert_eq!(shas(&commits), shas(&walk)),
+            Staged::Incomplete(progress) => panic!("staging stopped: {progress:?}"),
+        }
+        git_history_index(&db, root).unwrap();
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, head(root));
+    }
+
+    #[test]
+    fn policy_change_on_a_diverged_head_still_names_the_divergence() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        index_history(&db, root, &[], IndexMode::Auto, sliced(512, None)).unwrap();
+        let stored = head(root);
+        advance_main(root);
+        let message = format!(
+            "{:#}",
+            index_history(
+                &db,
+                root,
+                &["side.rs".to_owned()],
+                IndexMode::Auto,
+                sliced(1, Some(1))
+            )
+            .unwrap_err()
+        );
+        assert!(
+            message.starts_with(&format!(
+                "stored git history head {} is not an ancestor of HEAD {}",
+                short_sha(&stored),
+                short_sha(&head(root))
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("git history rebuild in progress"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn unfinished_first_rebuild_reports_progress_without_a_divergence_cause() {
+        let dir = diverging_repo();
+        let root = dir.path();
+        let db = Database::open_in_memory().unwrap();
+        let message = index_history(&db, root, &[], IndexMode::Auto, sliced(1, Some(1)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.starts_with("git history rebuild in progress: 1 of 3 commits saved"),
+            "{message}"
+        );
+        assert!(!message.contains("not an ancestor"), "{message}");
+        assert!(db.get_git_index_state().unwrap().is_none());
+        assert!(db.git_file("a.rs").unwrap().is_none());
     }
 }

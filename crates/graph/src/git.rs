@@ -61,6 +61,25 @@ pub(crate) fn git_history_command(root: &Path) -> Command {
     command
 }
 
+/// A history walk that ran past its deadline. Its child was killed and no
+/// output was used, so callers can tell a budget overrun from a git failure.
+#[derive(Debug)]
+pub(crate) struct HistoryDeadline {
+    pub budget: Duration,
+}
+
+impl std::fmt::Display for HistoryDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "git history walk truncated by {} ms deadline; index unchanged",
+            self.budget.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for HistoryDeadline {}
+
 pub(crate) fn history_output(mut command: Command, budget: Duration) -> Result<Output> {
     use std::io::Read;
 
@@ -100,12 +119,7 @@ pub(crate) fn history_output(mut command: Command, budget: Duration) -> Result<O
         for _ in 0..2 {
             let (is_stdout, bytes) = receiver
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .with_context(|| {
-                    format!(
-                        "git history walk truncated by {} ms deadline; index unchanged",
-                        budget.as_millis()
-                    )
-                })?;
+                .map_err(|_| HistoryDeadline { budget })?;
             let bytes = bytes.context("reading git history output")?;
             ensure!(
                 bytes.len() as u64 <= MAX_OUTPUT_BYTES,
@@ -126,11 +140,9 @@ pub(crate) fn history_output(mut command: Command, budget: Duration) -> Result<O
                     stderr,
                 });
             }
-            ensure!(
-                Instant::now() < deadline,
-                "git history walk truncated by {} ms deadline; index unchanged",
-                budget.as_millis()
-            );
+            if Instant::now() >= deadline {
+                return Err(HistoryDeadline { budget }.into());
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
     })();

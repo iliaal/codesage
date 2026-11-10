@@ -43,6 +43,23 @@ pub struct CoChangeWrite {
     pub last_observed_at: Option<i64>,
 }
 
+/// A full history rebuild staged across bounded `git-index` runs. Rows in
+/// `git_history_build_slices` hold raw `git log` output for consecutive
+/// ranges of `commits`; readers of `git_files` and `git_co_changes` never see
+/// them, so the previous history stays in place until the rebuild completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHistoryBuild {
+    pub target_sha: String,
+    pub policy: String,
+    pub cutoff: i64,
+    /// Commits in walk order.
+    pub commits: Vec<String>,
+    /// Commits the next slice reads.
+    pub slice_len: usize,
+    /// Leading commits whose output is staged.
+    pub staged: usize,
+}
+
 fn windows_of(mask: u64) -> u32 {
     mask.count_ones().max(1)
 }
@@ -851,6 +868,125 @@ impl Database {
         }
         Ok(out)
     }
+
+    /// The staged full rebuild, if one exists.
+    pub fn git_history_build(&self) -> Result<Option<GitHistoryBuild>> {
+        let Some((target_sha, policy, cutoff, commits)) = self
+            .conn
+            .query_row(
+                "SELECT target_sha, policy, cutoff, commits FROM git_history_build WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let slice_len: i64 = self
+            .conn
+            .query_row(
+                "SELECT slice_len FROM git_history_build_progress WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(1);
+        let staged: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(len), 0) FROM git_history_build_slices",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(Some(GitHistoryBuild {
+            target_sha,
+            policy,
+            cutoff,
+            commits: commits
+                .split('\n')
+                .filter(|sha| !sha.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            slice_len: usize::try_from(slice_len).unwrap_or(1).max(1),
+            staged: usize::try_from(staged).unwrap_or(0),
+        }))
+    }
+
+    /// Replace any staged rebuild with an empty one for `commits`.
+    pub fn start_git_history_build(
+        &self,
+        target_sha: &str,
+        policy: &str,
+        cutoff: i64,
+        commits: &[String],
+        slice_len: usize,
+    ) -> Result<()> {
+        self.clear_git_history_build()?;
+        self.conn.execute(
+            "INSERT INTO git_history_build (id, target_sha, policy, cutoff, commits)
+             VALUES (1, ?1, ?2, ?3, ?4)",
+            rusqlite::params![target_sha, policy, cutoff, commits.join("\n")],
+        )?;
+        self.set_git_history_slice_len(slice_len)
+    }
+
+    /// Stage the output for `len` commits starting at `start`, and size the next slice.
+    pub fn stage_git_history_slice(
+        &self,
+        start: usize,
+        len: usize,
+        output: &str,
+        next_slice_len: usize,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO git_history_build_slices (start, len, output) VALUES (?1, ?2, ?3)",
+            rusqlite::params![start as i64, len as i64, output],
+        )?;
+        self.set_git_history_slice_len(next_slice_len)
+    }
+
+    pub fn set_git_history_slice_len(&self, slice_len: usize) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO git_history_build_progress (id, slice_len) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET slice_len = excluded.slice_len",
+            [slice_len as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Staged slices as `(start, len, output)`, in commit order.
+    pub fn git_history_build_slices(&self) -> Result<Vec<(usize, usize, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT start, len, output FROM git_history_build_slices ORDER BY start")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(start, len, output)| (start.max(0) as usize, len.max(0) as usize, output))
+            .collect())
+    }
+
+    pub fn clear_git_history_build(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM git_history_build_slices", [])?;
+        self.conn
+            .execute("DELETE FROM git_history_build_progress", [])?;
+        self.conn.execute("DELETE FROM git_history_build", [])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1496,5 +1632,34 @@ mod tests {
         let churn = db.git_file("a.rs").unwrap().expect("git file row");
         assert_eq!(churn.churn_score, 5.0);
         assert_eq!(db.co_change_weight("a.rs", "b.rs").unwrap(), 4.0);
+    }
+
+    #[test]
+    fn staging_slices_never_rewrites_the_planned_commit_list() {
+        let db = Database::open_in_memory().unwrap();
+        let commits: Vec<String> = (0..6).map(|i| format!("{i:040x}")).collect();
+        db.start_git_history_build("head", "policy", 7, &commits, 2)
+            .unwrap();
+        db.execute_raw_for_tests(
+            "CREATE TRIGGER keep_commits BEFORE UPDATE ON git_history_build
+             BEGIN SELECT RAISE(ABORT, 'planned commit list rewritten'); END;",
+        )
+        .unwrap();
+        db.stage_git_history_slice(0, 2, "out-0", 4).unwrap();
+        db.set_git_history_slice_len(1).unwrap();
+        db.stage_git_history_slice(2, 1, "out-2", 3).unwrap();
+
+        let build = db.git_history_build().unwrap().unwrap();
+        assert_eq!(build.commits, commits);
+        assert_eq!((build.staged, build.slice_len, build.cutoff), (3, 3, 7));
+        assert_eq!(
+            db.git_history_build_slices().unwrap(),
+            vec![(0, 2, "out-0".to_owned()), (2, 1, "out-2".to_owned())]
+        );
+        db.clear_git_history_build().unwrap();
+        assert!(db.git_history_build().unwrap().is_none());
+        db.start_git_history_build("next", "policy", 7, &commits, 5)
+            .unwrap();
+        assert_eq!(db.git_history_build().unwrap().unwrap().slice_len, 5);
     }
 }

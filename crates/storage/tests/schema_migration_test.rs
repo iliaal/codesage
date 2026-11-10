@@ -205,6 +205,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0026_python_bindings",
         "0027_symbol_signatures",
         "0029_feature_entrypoints",
+        "0030_git_history_build",
     ];
     for migration in expected_migrations {
         let count: i64 = conn

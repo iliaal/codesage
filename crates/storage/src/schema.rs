@@ -807,6 +807,7 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ("0026_python_bindings", migrate_0026_python_bindings),
     ("0027_symbol_signatures", migrate_0027_symbol_signatures),
     ("0029_feature_entrypoints", migrate_0029_feature_entrypoints),
+    ("0030_git_history_build", migrate_0030_git_history_build),
 ];
 
 fn migrate_0027_symbol_signatures(conn: &Connection) -> rusqlite::Result<()> {
@@ -821,6 +822,32 @@ fn migrate_0027_symbol_signatures(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Staging for a full history rebuild that resumes across bounded runs. The
+/// rebuild replaces `git_files`, `git_co_changes`, and `git_index_state` only
+/// once every slice is staged; until then these tables are not read. The
+/// planned commit list is written once; per-slice progress lives in its own
+/// row, since updating a column rewrites the whole record.
+fn migrate_0030_git_history_build(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS git_history_build (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            target_sha TEXT NOT NULL,
+            policy TEXT NOT NULL,
+            cutoff INTEGER NOT NULL,
+            commits TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS git_history_build_progress (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            slice_len INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS git_history_build_slices (
+            start INTEGER PRIMARY KEY,
+            len INTEGER NOT NULL,
+            output TEXT NOT NULL
+        );",
+    )
 }
 
 fn migrate_0029_feature_entrypoints(conn: &Connection) -> rusqlite::Result<()> {

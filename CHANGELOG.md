@@ -3,6 +3,11 @@
 ### Changed
 
 - MCP transport dependency rmcp requires 3.9.0 or newer, clearing RUSTSEC-2026-0462 from dependency audits.
+- Git hooks record `.codesage/hook-state` after every successful `index` pass and track `git-index` separately in `.codesage/hook-git-state`; an unchanged tree reruns only a failed `git-index` pass. Rerun `codesage install-hooks` to update existing hooks.
+
+### Fixed
+
+- `git-index` full rebuilds and incremental ranges that exceed `CODESAGE_GIT_HISTORY_TIMEOUT_MS` save progress (schema migration `0030_git_history_build`) and resume on the next run instead of failing identically forever; the previous history stays in place until the rebuild completes. A rebuild forced by a stored head that is not an ancestor of HEAD names that cause and the recovery.
 
 ## [0.49.0] - 2026-11-07
 
