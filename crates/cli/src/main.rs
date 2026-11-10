@@ -649,14 +649,192 @@ pub(crate) fn evidence_root(path: &Path) -> Result<PathBuf> {
     if !canonical.is_dir() {
         return Err(project_path("project must be a directory".into()));
     }
+    evidence_ancestor(&canonical, true, || discover_git(&canonical))
+        .ok_or_else(|| project_path("no CodeSage project or Git repository found".into()))
+}
+
+/// The Git worktree root for `start`, resolved exactly as [`evidence_root`]
+/// resolves it but without `.codesage` markers.
+pub(crate) fn git_root(start: &Path) -> Option<PathBuf> {
+    let canonical = start.canonicalize().ok()?;
+    evidence_ancestor(&canonical, false, || discover_git(&canonical))
+}
+
+/// The nearest ancestor of `canonical` holding a `.codesage` marker (when
+/// `markers` is set) or the Git worktree root. `discover` runs at most once,
+/// only when a `.git` entry is nearer than any marker.
+///
+/// - Git's toplevel counts at its own depth when it contains the start; that
+///   depth is below the `.git` holder when `core.worktree` names a
+///   subdirectory.
+/// - [`GitDiscovery::NotARepository`] makes every `.git` entry ignored.
+/// - Any other answer, including a toplevel that does not contain the start,
+///   falls back to the scan Git performs before its other checks: the nearest
+///   `.git` entry that is structurally a repository (see [`is_git_entry`]).
+fn evidence_ancestor(
+    canonical: &Path,
+    markers: bool,
+    discover: impl FnOnce() -> GitDiscovery,
+) -> Option<PathBuf> {
+    enum Mode {
+        Undiscovered,
+        Toplevel(PathBuf),
+        IgnoreGit,
+        Structural,
+    }
+    let mut discover = Some(discover);
+    let mut mode = Mode::Undiscovered;
     for ancestor in canonical.ancestors() {
-        if ancestor.join(PROJECT_DIR).is_dir() || ancestor.join(".git").exists() {
-            return Ok(ancestor.to_path_buf());
+        if markers && ancestor.join(PROJECT_DIR).is_dir() {
+            return Some(ancestor.to_path_buf());
+        }
+        if ancestor.join(".git").exists()
+            && let Some(discover) = discover.take()
+        {
+            mode = match discover() {
+                GitDiscovery::Toplevel(found) => match found.canonicalize() {
+                    // At or below this ancestor, every directory between the
+                    // start and the toplevel was already checked for a marker.
+                    Ok(found) if canonical.starts_with(&found) && found.starts_with(ancestor) => {
+                        return Some(found);
+                    }
+                    Ok(found) if canonical.starts_with(&found) => Mode::Toplevel(found),
+                    _ => Mode::Structural,
+                },
+                GitDiscovery::NotARepository => Mode::IgnoreGit,
+                GitDiscovery::Failed => Mode::Structural,
+            };
+        }
+        match &mode {
+            Mode::Toplevel(top) if top == ancestor => return Some(ancestor.to_path_buf()),
+            Mode::Structural if is_git_entry(&ancestor.join(".git")) => {
+                return Some(ancestor.to_path_buf());
+            }
+            _ => {}
         }
     }
-    Err(project_path(
-        "no CodeSage project or Git repository found".into(),
-    ))
+    None
+}
+
+/// A structural repository check for a `.git` entry modeled on Git's
+/// `is_git_directory` and `read_gitfile`, without running Git. A directory
+/// qualifies with a valid `HEAD` (see [`is_head_ref`]) and `objects` and
+/// `refs` directories, both resolved through a `commondir` file when one
+/// exists, as in a linked worktree's Git directory. A regular file qualifies
+/// when its first line starts with `gitdir: `. Where Git tests `objects` and
+/// `refs` with `access(X_OK)`, this checks that they are directories: it
+/// ignores permissions, and it rejects an executable regular file that Git
+/// would accept in their place.
+fn is_git_entry(entry: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(entry) else {
+        return false;
+    };
+    if metadata.is_dir() {
+        let common = match std::fs::read_to_string(entry.join("commondir")) {
+            Ok(target) => entry.join(target.trim_end_matches(['\n', '\r'])),
+            Err(_) => entry.to_path_buf(),
+        };
+        return is_head_ref(&entry.join("HEAD"))
+            && common.join("objects").is_dir()
+            && common.join("refs").is_dir();
+    }
+    metadata.is_file()
+        && leading_bytes(entry, 4096).is_some_and(|first| first.starts_with(b"gitdir: "))
+}
+
+/// Git's `validate_headref`: a symlink whose target starts with `refs/`, even
+/// when dangling (packed refs leave no loose target), or a regular file whose
+/// first 255 bytes hold `ref:`, Git's `isspace` whitespace (space, tab, LF,
+/// and CR; unlike C's, it excludes vertical tab and form feed), and
+/// `refs/...`, or a hexadecimal object ID.
+fn is_head_ref(head: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(head) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        return std::fs::read_link(head)
+            .is_ok_and(|target| target.to_string_lossy().starts_with("refs/"));
+    }
+    if !metadata.is_file() {
+        return false;
+    }
+    let Some(content) = leading_bytes(head, 255) else {
+        return false;
+    };
+    if let Some(rest) = content.strip_prefix(b"ref:") {
+        let start = rest
+            .iter()
+            .position(|&byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+            .unwrap_or(rest.len());
+        return rest[start..].starts_with(b"refs/");
+    }
+    content.len() >= 40 && content[..40].iter().all(u8::is_ascii_hexdigit)
+}
+
+fn leading_bytes(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
+/// Git's answer to `rev-parse --show-toplevel`.
+#[derive(Debug)]
+pub(crate) enum GitDiscovery {
+    Toplevel(PathBuf),
+    /// Exit 128 with `fatal: not a git repository (or any of the parent
+    /// directories)`: no `.git` entry up to the root or the discovery ceiling
+    /// is one Git accepts. The filesystem-boundary form of that refusal is
+    /// [`GitDiscovery::Failed`], since Git never looked past the mount point.
+    NotARepository,
+    /// Git could not answer (not installed, dubious ownership, run inside a
+    /// Git directory, and so on). Callers fall back to the nearest `.git`
+    /// entry, where a persistent failure resurfaces from the next Git read.
+    Failed,
+}
+
+/// Ask Git which worktree contains `dir`, with the same environment stripping
+/// as every later Git call, so discovery cannot stop short of a root those
+/// calls would use. `LC_ALL=C` keeps the not-a-repository message matchable.
+pub(crate) fn discover_git(dir: &Path) -> GitDiscovery {
+    let mut command = codesage_graph::git_command(dir);
+    let Ok(output) = command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C")
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return GitDiscovery::Failed;
+    };
+    if !output.status.success() {
+        if is_no_repository(output.status.code(), &output.stderr) {
+            return GitDiscovery::NotARepository;
+        }
+        return GitDiscovery::Failed;
+    }
+    let Ok(top) = String::from_utf8(output.stdout) else {
+        return GitDiscovery::Failed;
+    };
+    let top = top.trim_end_matches(['\n', '\r']);
+    if top.is_empty() {
+        return GitDiscovery::Failed;
+    }
+    GitDiscovery::Toplevel(PathBuf::from(top))
+}
+
+/// Whether a failed `rev-parse` is Git's whole-ancestry "no repository"
+/// refusal. Configuration warnings, such as a malformed `safe.directory`, can
+/// precede the fatal line, so every line is checked.
+fn is_no_repository(code: Option<i32>, stderr: &[u8]) -> bool {
+    code == Some(128)
+        && stderr.split(|&byte| byte == b'\n').any(|line| {
+            line.starts_with(b"fatal: not a git repository (or any of the parent directories)")
+        })
 }
 
 pub(crate) fn open_db(root: &Path) -> Result<Database> {
@@ -2025,6 +2203,334 @@ mod tests {
         assert!(
             project.is_none(),
             "bare `watch run` must leave project unset, got {project:?}"
+        );
+    }
+
+    fn init_repository(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn git_root_takes_the_nearer_of_codesage_marker_and_git_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        init_repository(&base.join("repo"));
+        std::fs::create_dir_all(base.join("repo/module/.codesage")).unwrap();
+        std::fs::create_dir_all(base.join("repo/module/src")).unwrap();
+        assert_eq!(
+            evidence_root(&base.join("repo/module/src")).unwrap(),
+            base.join("repo/module")
+        );
+        std::fs::create_dir_all(base.join("outer/.codesage")).unwrap();
+        init_repository(&base.join("outer/inner"));
+        std::fs::create_dir_all(base.join("outer/inner/src")).unwrap();
+        assert_eq!(
+            evidence_root(&base.join("outer/inner/src")).unwrap(),
+            base.join("outer/inner")
+        );
+        std::fs::create_dir_all(base.join("repo/.codesage")).unwrap();
+        assert_eq!(
+            evidence_root(&base.join("repo")).unwrap(),
+            base.join("repo")
+        );
+    }
+
+    /// The layout Git's `is_git_directory` accepts, without running Git.
+    fn structural_git_dir(dir: &Path) {
+        std::fs::create_dir_all(dir.join("objects")).unwrap();
+        std::fs::create_dir_all(dir.join("refs")).unwrap();
+        std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn git_root_falls_back_to_the_nearest_git_entry_when_git_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("outer/.codesage")).unwrap();
+        structural_git_dir(&base.join("outer/inner/.git"));
+        std::fs::create_dir_all(base.join("outer/inner/src")).unwrap();
+        let start = base.join("outer/inner/src");
+        assert_eq!(
+            evidence_ancestor(&start, true, || GitDiscovery::Failed),
+            Some(base.join("outer/inner"))
+        );
+        assert_eq!(
+            evidence_ancestor(&start, true, || GitDiscovery::NotARepository),
+            Some(base.join("outer"))
+        );
+        assert_eq!(
+            evidence_ancestor(&start, true, || GitDiscovery::Toplevel(
+                base.join("elsewhere")
+            )),
+            Some(base.join("outer/inner"))
+        );
+        std::fs::create_dir_all(base.join("outer/inner/src/.codesage")).unwrap();
+        assert_eq!(
+            evidence_ancestor(&start, true, || panic!(
+                "Git consulted past a nearer marker"
+            )),
+            Some(start.clone())
+        );
+    }
+
+    /// A fresh directory from which Git, run with CodeSage's environment
+    /// stripping, reports no repository in any parent directory. Decided from
+    /// Git's own stderr, independently of [`is_no_repository`].
+    fn repository_free_dir() -> Option<tempfile::TempDir> {
+        let cache = std::env::var_os("HOME").map(|home| Path::new(&home).join(".cache"));
+        for base in std::iter::once(std::env::temp_dir()).chain(cache) {
+            let Ok(dir) = tempfile::Builder::new()
+                .prefix("codesage-discovery-")
+                .tempdir_in(&base)
+            else {
+                continue;
+            };
+            let Ok(output) = codesage_graph::git_command(dir.path())
+                .env("LC_ALL", "C")
+                .args(["rev-parse", "--show-toplevel"])
+                .stdin(std::process::Stdio::null())
+                .output()
+            else {
+                continue;
+            };
+            if output.status.code() == Some(128)
+                && String::from_utf8_lossy(&output.stderr).lines().any(|line| {
+                    line.starts_with(
+                        "fatal: not a git repository (or any of the parent directories)",
+                    )
+                })
+            {
+                return Some(dir);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn git_root_real_git_refusal_classifies_as_no_repository() {
+        let Some(dir) = repository_free_dir() else {
+            let reason = "no candidate directory where Git finds no repository";
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "precondition missing under CI: {reason}"
+            );
+            eprintln!("skipping {reason}");
+            return;
+        };
+        let answer = discover_git(dir.path());
+        assert!(matches!(answer, GitDiscovery::NotARepository), "{answer:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_root_structural_check_follows_git_head_and_commondir_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        std::fs::create_dir_all(base.join("empty/.git")).unwrap();
+        assert!(!is_git_entry(&base.join("empty/.git")));
+
+        let packed = base.join("packed/.git");
+        std::fs::create_dir_all(packed.join("objects")).unwrap();
+        std::fs::create_dir_all(packed.join("refs")).unwrap();
+        std::os::unix::fs::symlink("refs/heads/master", packed.join("HEAD")).unwrap();
+        assert!(!packed.join("HEAD").exists(), "the symlink must dangle");
+        assert!(is_git_entry(&packed));
+        std::fs::remove_file(packed.join("HEAD")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", packed.join("HEAD")).unwrap();
+        assert!(!is_git_entry(&packed));
+        std::fs::remove_file(packed.join("HEAD")).unwrap();
+        std::fs::write(packed.join("HEAD"), format!("{}\n", "a1".repeat(20))).unwrap();
+        assert!(is_git_entry(&packed));
+        std::fs::write(packed.join("HEAD"), "garbage\n").unwrap();
+        assert!(!is_git_entry(&packed));
+        for (head, accepted) in [
+            ("ref: \t\r\nrefs/heads/main\n".to_owned(), true),
+            ("ref:\x0brefs/heads/main\n".to_owned(), false),
+            ("ref:\x0crefs/heads/main\n".to_owned(), false),
+            (format!("ref:{}refs/heads/main\n", " ".repeat(251)), false),
+            (format!("ref:{}refs/heads/main\n", " ".repeat(246)), true),
+        ] {
+            std::fs::write(packed.join("HEAD"), &head).unwrap();
+            assert_eq!(is_git_entry(&packed), accepted, "{head:?}");
+        }
+
+        structural_git_dir(&base.join("main/.git"));
+        for (name, commondir) in [
+            ("relative", "../..".to_owned()),
+            ("absolute", base.join("main/.git").display().to_string()),
+        ] {
+            let worktree_git = base.join("main/.git/worktrees").join(name);
+            std::fs::create_dir_all(&worktree_git).unwrap();
+            std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+            std::fs::write(worktree_git.join("commondir"), format!("{commondir}\n")).unwrap();
+            assert!(is_git_entry(&worktree_git), "{name}");
+        }
+        let orphan = base.join("orphan");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+        std::fs::write(orphan.join("commondir"), "../missing\n").unwrap();
+        assert!(!is_git_entry(&orphan));
+    }
+
+    #[test]
+    fn git_root_failed_discovery_falls_back_only_to_a_structural_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        structural_git_dir(&base.join("repo/.git"));
+        std::fs::create_dir_all(base.join("repo/stray/.git")).unwrap();
+        std::fs::create_dir_all(base.join("repo/stray/src")).unwrap();
+        assert_eq!(
+            evidence_ancestor(&base.join("repo/stray/src"), false, || {
+                GitDiscovery::Failed
+            }),
+            Some(base.join("repo"))
+        );
+
+        std::fs::create_dir_all(base.join("lone/.git")).unwrap();
+        std::fs::create_dir_all(base.join("lone/src")).unwrap();
+        let found = evidence_ancestor(&base.join("lone/src"), false, || GitDiscovery::Failed);
+        if base
+            .ancestors()
+            .any(|ancestor| is_git_entry(&ancestor.join(".git")))
+        {
+            assert!(
+                found.as_ref().is_some_and(|root| !root.starts_with(&base)),
+                "{found:?}"
+            );
+        } else {
+            assert_eq!(found, None);
+        }
+
+        std::fs::create_dir_all(base.join("linked/src")).unwrap();
+        std::fs::write(base.join("linked/.git"), "gitdir: /elsewhere/worktrees/w\n").unwrap();
+        std::fs::create_dir_all(base.join("linked/src/junk")).unwrap();
+        std::fs::write(base.join("linked/src/junk/.git"), "not a pointer\n").unwrap();
+        assert_eq!(
+            evidence_ancestor(&base.join("linked/src/junk"), false, || {
+                GitDiscovery::Failed
+            }),
+            Some(base.join("linked"))
+        );
+    }
+
+    #[test]
+    fn git_root_is_shared_by_edit_check_and_evidence_root_outside_a_core_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repo = base.join("repo");
+        init_repository(&repo);
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["config", "core.worktree"])
+            .arg(repo.join("sub"))
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(evidence_root(&repo).unwrap(), repo);
+        assert_eq!(git_root(&repo), Some(repo.clone()));
+        assert_eq!(git_root(&repo.join("sub")), Some(repo.join("sub")));
+    }
+
+    #[test]
+    fn git_root_classification_excludes_the_filesystem_boundary_refusal() {
+        assert!(is_no_repository(
+            Some(128),
+            b"fatal: not a git repository (or any of the parent directories): .git\n"
+        ));
+        assert!(is_no_repository(
+            Some(128),
+            b"warning: safe.directory 'x' not absolute\n\
+              fatal: not a git repository (or any of the parent directories): .git\n"
+        ));
+        assert!(!is_no_repository(
+            Some(128),
+            b"fatal: not a git repository (or any parent up to mount point /mnt)\n\
+              Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n"
+        ));
+        assert!(!is_no_repository(
+            Some(128),
+            b"fatal: detected dubious ownership in repository at '/repo'\n"
+        ));
+        assert!(!is_no_repository(
+            Some(1),
+            b"fatal: not a git repository (or any of the parent directories): .git\n"
+        ));
+    }
+
+    #[test]
+    fn git_root_toplevel_above_the_git_holder_yields_to_a_nearer_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let top = base.join("top");
+        std::fs::create_dir_all(top.join("mid/.codesage")).unwrap();
+        std::fs::create_dir_all(top.join("mid/skipped/.git")).unwrap();
+        std::fs::create_dir_all(top.join("mid/skipped/src")).unwrap();
+        let start = top.join("mid/skipped/src");
+        assert_eq!(
+            evidence_ancestor(&start, true, || GitDiscovery::Toplevel(top.clone())),
+            Some(top.join("mid"))
+        );
+        assert_eq!(
+            evidence_ancestor(&start, false, || GitDiscovery::Toplevel(top.clone())),
+            Some(top.clone())
+        );
+    }
+
+    #[test]
+    fn git_root_takes_a_core_worktree_below_the_git_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repo = base.join("repo");
+        init_repository(&repo);
+        std::fs::create_dir_all(repo.join("sub/x")).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["config", "core.worktree"])
+            .arg(repo.join("sub"))
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            evidence_root(&repo.join("sub/x")).unwrap(),
+            repo.join("sub")
+        );
+    }
+
+    #[test]
+    fn git_root_skips_a_nearer_git_entry_that_git_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join(".codesage")).unwrap();
+        std::fs::create_dir_all(base.join("stray/.git")).unwrap();
+        std::fs::create_dir_all(base.join("stray/src")).unwrap();
+        assert_eq!(
+            evidence_ancestor(&base.join("stray/src"), true, || {
+                GitDiscovery::NotARepository
+            }),
+            Some(base.clone())
+        );
+        // Real Git from here on: each answer is a repository found below any
+        // mount point, so it does not depend on the host's temp ancestry.
+        init_repository(&base.join("outer"));
+        std::fs::create_dir_all(base.join("outer/stray/.git")).unwrap();
+        std::fs::create_dir_all(base.join("outer/stray/src")).unwrap();
+        assert_eq!(
+            evidence_root(&base.join("outer/stray/src")).unwrap(),
+            base.join("outer")
+        );
+        init_repository(&base.join("stray/src/repo"));
+        std::fs::create_dir_all(base.join("stray/src/repo/lib")).unwrap();
+        assert_eq!(
+            evidence_root(&base.join("stray/src/repo/lib")).unwrap(),
+            base.join("stray/src/repo")
         );
     }
 }

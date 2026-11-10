@@ -1,5 +1,5 @@
 use std::io::{IsTerminal, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -13,10 +13,8 @@ pub(crate) fn run(
     json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("reading current directory")?;
-    let root = cwd
-        .ancestors()
-        .find(|path| path.join(".git").exists())
-        .context("no Git worktree found; run edit-check inside a Git worktree")?;
+    let root = worktree_root(&cwd)?;
+    let root = root.as_path();
     let replacement = match replacement {
         Some(path) if path.as_os_str() != "-" => {
             let input = std::fs::File::open(path)
@@ -100,4 +98,10 @@ fn read_replacement(input: impl Read) -> Result<String> {
     let replacement = String::from_utf8(bytes).context("replacement must be UTF-8")?;
     ensure!(!replacement.trim().is_empty(), "replacement is empty");
     Ok(replacement)
+}
+
+/// A Git failure that leaves a structural repository as the root, such as
+/// dubious ownership, resurfaces from the analysis's own Git reads.
+fn worktree_root(cwd: &Path) -> Result<PathBuf> {
+    crate::git_root(cwd).context("no Git worktree found; run edit-check inside a Git worktree")
 }

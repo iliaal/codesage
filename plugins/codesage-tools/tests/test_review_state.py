@@ -1409,7 +1409,48 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
 
+def _has_no_git_entry(directory):
+    try:
+        (directory / ".git").lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def git_free_base():
+    """A directory whose whole resolved ancestry holds no `.git` entry.
+
+    `changed-files` refuses the no-repository answer when any ancestor of the
+    project has a `.git` entry, even one Git rejects, so a fixture under such
+    an ancestor cannot exercise that answer.
+    """
+    for candidate in (Path(tempfile.gettempdir()), Path.home() / ".cache"):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if all(_has_no_git_entry(directory) for directory in (resolved, *resolved.parents)):
+            return resolved
+    return None
+
+
 class ChangedFilesTests(unittest.TestCase):
+    def plain_project(self):
+        base = git_free_base()
+        if base is None:
+            reason = "no temporary or cache directory has a .git-free ancestry"
+            if os.environ.get("CI"):
+                self.fail(f"precondition missing under CI: {reason}")
+            self.skipTest(reason)
+        temporary = tempfile.TemporaryDirectory(dir=base, prefix="codesage-review-state-")
+        self.addCleanup(temporary.cleanup)
+        project = Path(temporary.name) / "plain"
+        project.mkdir()
+        return project
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -1546,14 +1587,23 @@ class ChangedFilesTests(unittest.TestCase):
         self.assertIn("target finding IDs are missing", result.stderr)
 
     def test_initial_review_without_git_produces_an_empty_change_list(self):
-        self.project = self.root / "plain"
-        self.project.mkdir()
+        self.project = self.plain_project()
         self.findings.write_text("{}")
         self.assertEqual(json.loads(self.changed().stdout), [])
 
-    def test_revalidation_without_git_preserves_selected_target_paths(self):
-        self.project = self.root / "plain"
+    def test_stray_ancestor_git_entry_without_prior_sha_remains_an_error(self):
+        stray = self.plain_project().parent / "stray"
+        (stray / ".git").mkdir(parents=True)
+        self.project = stray / "plain"
         self.project.mkdir()
+        self.findings.write_text("{}")
+        result = self.changed(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Git changed-file collection failed", result.stderr)
+
+    def test_revalidation_without_git_preserves_selected_target_paths(self):
+        self.project = self.plain_project()
         self.findings.write_text(json.dumps({"reviewed_at_sha": None, "findings": [
             {"finding_id": "fnd_target", "file": "context.rs"},
         ]}))

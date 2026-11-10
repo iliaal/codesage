@@ -9,6 +9,7 @@
 
 - `git-index` full rebuilds and incremental ranges that exceed `CODESAGE_GIT_HISTORY_TIMEOUT_MS` save progress (schema migration `0030_git_history_build`) and resume on the next run instead of failing identically forever; the previous history stays in place until the rebuild completes. A rebuild forced by a stored head that is not an ancestor of HEAD names that cause and the recovery.
 - Deleting a file's chunks no longer removes another file's vectors when the path sidecar matches the chunk table's ids but not its paths, the state an older binary leaves after dropping and repopulating the table; the write path rebuilds the sidecar first.
+- `codesage edit-check`, `codesage rehearse`, the brief hook, MCP `edit_check` and `review_rehearsal`, and the MCP `index` block skip a stray `.git` such as an empty directory: a nearer `.codesage` still wins, Git's worktree root containing the start is used, and Git failures fall back to the nearest structurally valid `.git`.
 
 ## [0.49.0] - 2026-11-07
 

@@ -321,9 +321,24 @@ fn cli_fixture(source: &str) -> tempfile::TempDir {
 }
 
 fn cli(root: &Path, args: &[&str], input: &[u8]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_codesage"))
+    cli_with_env(root, args, input, &[], &[])
+}
+
+fn cli_with_env(
+    root: &Path,
+    args: &[&str],
+    input: &[u8],
+    env: &[(&str, &Path)],
+    removed: &[&str],
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codesage"));
+    for name in removed {
+        command.env_remove(name);
+    }
+    let mut child = command
         .current_dir(root)
         .args(args)
+        .envs(env.iter().copied())
         .env("CODESAGE_WATCH", "1")
         .env("ORT_DYLIB_PATH", root.join("missing-ort-library"))
         .stdin(Stdio::piped())
@@ -535,7 +550,9 @@ fn cli_refuses_bad_replacements_and_paths() {
         1,
         "handle names `other.rs`",
     );
-    let outside = tempfile::tempdir().unwrap();
+    let Some(outside) = repository_free_dir() else {
+        return skip("the outside case: no candidate directory where Git finds no repository");
+    };
     cli_error(
         cli(
             outside.path(),
@@ -545,6 +562,211 @@ fn cli_refuses_bad_replacements_and_paths() {
         1,
         "no Git worktree found",
     );
+}
+
+/// The variables `codesage_graph::git_command` strips from every Git child.
+const STRIPPED_GIT_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_REFERENCE_BACKEND",
+];
+
+/// A fresh directory from which Git, run as CodeSage runs it, finds no
+/// repository in any parent directory. The system temp directory can sit
+/// under a repository or on its own mount, where Git stops at the boundary
+/// with a different refusal, so `~/.cache` is tried too.
+fn repository_free_dir() -> Option<tempfile::TempDir> {
+    let cache = std::env::var_os("HOME").map(|home| Path::new(&home).join(".cache"));
+    for base in std::iter::once(std::env::temp_dir()).chain(cache) {
+        if std::fs::create_dir_all(&base).is_err() {
+            continue;
+        }
+        let Ok(dir) = tempfile::Builder::new()
+            .prefix("codesage-discovery-")
+            .tempdir_in(&base)
+        else {
+            continue;
+        };
+        let Some(output) = probe_git(dir.path()) else {
+            continue;
+        };
+        if output.status.code() == Some(128)
+            && String::from_utf8_lossy(&output.stderr).lines().any(|line| {
+                line.starts_with("fatal: not a git repository (or any of the parent directories)")
+            })
+        {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// `git rev-parse --show-toplevel` from `dir`, run as CodeSage runs it.
+fn probe_git(dir: &Path) -> Option<Output> {
+    let mut probe = Command::new("git");
+    probe
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null());
+    for name in STRIPPED_GIT_ENV {
+        probe.env_remove(name);
+    }
+    probe.output().ok()
+}
+
+/// A missing precondition fails under CI, where it would hide a regression,
+/// and is reported as a skip on a developer host.
+fn skip(reason: &str) {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "precondition missing under CI: {reason}"
+    );
+    eprintln!("skipping {reason}");
+}
+
+/// `safe.directory` is honored only from system, global, and command-line or
+/// environment-scoped config, so dropping all of them keeps a
+/// `safe.directory = *` from overriding the simulated foreign owner.
+const FOREIGN_OWNER: [(&str, &str); 3] = [
+    ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
+
+/// Environment-scoped config that could carry `safe.directory = *`.
+const ENV_SCOPED_CONFIG: [&str; 2] = ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"];
+
+fn foreign_owner_env() -> Vec<(&'static str, &'static Path)> {
+    FOREIGN_OWNER
+        .iter()
+        .map(|&(name, value)| (name, Path::new(value)))
+        .collect()
+}
+
+#[test]
+fn cli_reports_git_refusal_instead_of_a_missing_worktree() {
+    let dir = cli_fixture("fn f() {}\n");
+    let output = cli_with_env(
+        dir.path(),
+        &["edit-check", "lib.rs", "f", "--json"],
+        b"fn f() {}",
+        &foreign_owner_env(),
+        &ENV_SCOPED_CONFIG,
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("dubious ownership"), "{stderr}");
+    assert!(!stderr.contains("no Git worktree found"), "{stderr}");
+}
+
+#[test]
+fn cli_runs_from_inside_the_git_directory() {
+    let dir = cli_fixture("pub fn f(a: i32) {}\n");
+    let report = cli_report(cli(
+        &dir.path().join(".git"),
+        &["edit-check", "lib.rs", "f", "--json"],
+        b"fn f() {}",
+    ));
+    assert_eq!(report["arity_changed"], true);
+}
+
+#[test]
+fn cli_ignores_an_ancestor_git_entry_that_git_rejects() {
+    let Some(base) = repository_free_dir() else {
+        return skip("no candidate directory where Git finds no repository");
+    };
+    let base_path = base.path().canonicalize().unwrap();
+    std::fs::create_dir(base_path.join(".git")).unwrap();
+    let cwd = base_path.join("work").join("nested");
+    std::fs::create_dir_all(&cwd).unwrap();
+    cli_error(
+        cli(&cwd, &["edit-check", "lib.rs", "f", "--json"], b""),
+        1,
+        "no Git worktree found",
+    );
+}
+
+/// Unlike the test above, this keeps the system temp directory, which may be
+/// its own mount: Git then stops at the boundary, and the stray entry must
+/// still fail the structural fallback.
+#[test]
+fn cli_ignores_a_stray_git_entry_in_the_system_temp_dir() {
+    let base = tempfile::tempdir().unwrap();
+    let base_path = base.path().canonicalize().unwrap();
+    if probe_git(&base_path).is_none_or(|output| output.status.success()) {
+        return skip("the system temp directory lies inside a Git worktree");
+    }
+    std::fs::create_dir(base_path.join(".git")).unwrap();
+    let cwd = base_path.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    cli_error(
+        cli(&cwd, &["edit-check", "lib.rs", "f", "--json"], b""),
+        1,
+        "no Git worktree found",
+    );
+}
+
+#[test]
+fn cli_outside_a_core_worktree_takes_the_git_holder_as_root() {
+    let dir = cli_fixture("pub fn f(a: i32) {}\n");
+    let root = dir.path();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    run(
+        root,
+        "git",
+        &[
+            "config",
+            "core.worktree",
+            root.join("sub").to_str().unwrap(),
+        ],
+    );
+    cli_error(
+        cli(root, &["edit-check", "lib.rs", "f", "--json"], b"fn f() {}"),
+        1,
+        "project must be the Git worktree root",
+    );
+}
+
+#[test]
+fn cli_resolves_a_linked_worktree_from_a_subdirectory() {
+    let dir = cli_fixture("pub fn f(a: i32) {}\n");
+    let linked_parent = tempfile::tempdir().unwrap();
+    let linked = linked_parent.path().join("linked");
+    run(
+        dir.path(),
+        "git",
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().unwrap(),
+        ],
+    );
+    assert!(linked.join(".git").is_file());
+    let cwd = linked.join("nested");
+    std::fs::create_dir(&cwd).unwrap();
+    let report = cli_report(cli(
+        &cwd,
+        &["edit-check", "lib.rs", "f", "--json"],
+        b"fn f() {}",
+    ));
+    assert_eq!(report["arity_changed"], true);
+    assert_eq!(report["visibility_changed"], true);
 }
 
 #[test]

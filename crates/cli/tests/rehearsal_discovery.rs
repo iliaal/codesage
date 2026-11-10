@@ -205,3 +205,182 @@ fn piped_rehearsal_paths_take_precedence_over_discovery() {
         ["piped.rs", "second.rs"]
     );
 }
+
+fn rehearse_explicit(cwd: &Path, env: &[(&str, &std::ffi::OsStr)]) -> std::process::Output {
+    rehearse_explicit_without(cwd, env, &[])
+}
+
+fn rehearse_explicit_without(
+    cwd: &Path,
+    env: &[(&str, &std::ffi::OsStr)],
+    removed: &[&str],
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codesage"));
+    for name in removed {
+        command.env_remove(name);
+    }
+    command
+        .current_dir(cwd)
+        .args(["rehearse", "x.rs", "--json"])
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// `outer/.codesage` holds an unreadable index, so resolving to `outer`
+/// instead of the nested `inner` repository fails the rehearsal.
+fn nested_repository() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let outer = dir.path().canonicalize().unwrap().join("outer");
+    std::fs::create_dir_all(outer.join(".codesage")).unwrap();
+    std::fs::write(outer.join(".codesage/index.db"), "not a database").unwrap();
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(inner.join("src")).unwrap();
+    git(&inner, &["init", "-q"]);
+    (dir, inner.join("src"))
+}
+
+#[test]
+fn rehearsal_resolves_the_nested_repository_when_git_refuses_ownership() {
+    let (_dir, cwd) = nested_repository();
+    assert_eq!(files(rehearse_explicit(&cwd, &[])), ["x.rs"]);
+    // `safe.directory` is honored only from system, global, and command-line
+    // or environment-scoped config, so dropping all of them keeps a
+    // `safe.directory = *` from overriding the simulated foreign owner.
+    let output = rehearse_explicit_without(
+        &cwd,
+        &[
+            ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1".as_ref()),
+            ("GIT_CONFIG_GLOBAL", "/dev/null".as_ref()),
+            ("GIT_CONFIG_NOSYSTEM", "1".as_ref()),
+        ],
+        &["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"],
+    );
+    assert_eq!(files(output), ["x.rs"]);
+}
+
+#[test]
+fn rehearsal_falls_back_to_the_git_entry_when_git_is_not_installed() {
+    let (_dir, cwd) = nested_repository();
+    let empty = tempfile::tempdir().unwrap();
+    let output = rehearse_explicit(&cwd, &[("PATH", empty.path().as_os_str())]);
+    assert_eq!(files(output), ["x.rs"]);
+}
+
+#[test]
+fn rehearsal_refuses_when_only_a_git_rejected_ancestor_entry_exists() {
+    let Some(dir) = repository_free_dir() else {
+        return skip("no candidate directory where Git finds no repository");
+    };
+    let base = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("stray/.git")).unwrap();
+    let cwd = base.join("stray/work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let output = rehearse_explicit(&cwd, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no CodeSage project or Git repository found"),
+        "{stderr}"
+    );
+}
+
+/// A missing precondition fails under CI, where it would hide a regression,
+/// and is reported as a skip on a developer host.
+fn skip(reason: &str) {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "precondition missing under CI: {reason}"
+    );
+    eprintln!("skipping {reason}");
+}
+
+/// Discovery runs here because no `.codesage` is nearer than the `.git`
+/// entry. An inherited `GIT_DIR` would make Git report the start directory as
+/// the toplevel, and a ceiling at the repository would hide it.
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_rehearsal_root_ignores_inherited_git_dir_and_ceiling() {
+    let root = fixture();
+    std::fs::remove_dir_all(root.path().join("module/.codesage")).unwrap();
+    let project = root.path().join("module");
+    let expected = terminal_files(&project);
+    assert!(
+        expected.iter().any(|file| file == "outside.rs"),
+        "{expected:?}"
+    );
+
+    let foreign = tempfile::tempdir().unwrap();
+    git(foreign.path(), &["init", "-q"]);
+    let found = files(
+        terminal_command(&project)
+            .env("GIT_DIR", foreign.path().join(".git"))
+            .env(
+                "GIT_CEILING_DIRECTORIES",
+                root.path().canonicalize().unwrap(),
+            )
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(found, expected);
+}
+
+/// The variables `codesage_graph::git_command` strips from every Git child.
+const STRIPPED_GIT_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_REFERENCE_BACKEND",
+];
+
+/// A fresh directory from which Git, run as CodeSage runs it, finds no
+/// repository in any parent directory. The system temp directory can sit
+/// under a repository or on its own mount, where Git stops at the boundary
+/// with a different refusal, so `~/.cache` is tried too.
+fn repository_free_dir() -> Option<tempfile::TempDir> {
+    let cache = std::env::var_os("HOME").map(|home| Path::new(&home).join(".cache"));
+    for base in std::iter::once(std::env::temp_dir()).chain(cache) {
+        if std::fs::create_dir_all(&base).is_err() {
+            continue;
+        }
+        let Ok(dir) = tempfile::Builder::new()
+            .prefix("codesage-discovery-")
+            .tempdir_in(&base)
+        else {
+            continue;
+        };
+        let mut probe = Command::new("git");
+        probe
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(dir.path())
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null());
+        for name in STRIPPED_GIT_ENV {
+            probe.env_remove(name);
+        }
+        let Ok(output) = probe.output() else {
+            continue;
+        };
+        if output.status.code() == Some(128)
+            && String::from_utf8_lossy(&output.stderr).lines().any(|line| {
+                line.starts_with("fatal: not a git repository (or any of the parent directories)")
+            })
+        {
+            return Some(dir);
+        }
+    }
+    None
+}
