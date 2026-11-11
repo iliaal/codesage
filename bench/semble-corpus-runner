@@ -103,16 +103,18 @@ def first_hit_rank(returned: list[str], expected: list[str]) -> int | None:
 
 
 def recall_at(returned: list[str], expected: list[str], k: int) -> float:
-    if not expected:
+    # Multiple annotated spans in one file still represent one recall target.
+    expected_set = set(expected)
+    if not expected_set:
         return 0.0
     top = returned[:k]
     hits = 0
-    for e in expected:
+    for e in expected_set:
         for p in top:
             if p == e or p.endswith("/" + e) or e.endswith("/" + p):
                 hits += 1
                 break
-    return hits / len(expected)
+    return hits / len(expected_set)
 
 
 def score_corpus(codesage_bin: str, project_root: Path, records: list[dict],
