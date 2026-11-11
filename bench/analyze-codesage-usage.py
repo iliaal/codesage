@@ -29,6 +29,7 @@ import os
 import re
 import sys
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +59,7 @@ def iter_transcripts(root: Path, min_mtime: float) -> list[Path]:
     return out
 
 
-def extract_calls(transcript: Path) -> list[dict[str, Any]]:
+def iter_calls(transcript: Path) -> Iterator[dict[str, Any]]:
     """Emit one record per codesage tool_use/tool_result pair found in the file.
 
     A record looks like:
@@ -71,11 +72,10 @@ def extract_calls(transcript: Path) -> list[dict[str, Any]]:
         }
     """
     pending: dict[str, dict[str, Any]] = {}  # tool_use_id -> partial
-    out: list[dict[str, Any]] = []
     try:
         fp = transcript.open("r", encoding="utf-8", errors="replace")
     except OSError:
-        return out
+        return
     with fp:
         for line in fp:
             line = line.strip()
@@ -114,8 +114,12 @@ def extract_calls(transcript: Path) -> list[dict[str, Any]]:
                     text = _flatten_result(c.get("content"))
                     partial["output_bytes"] = _utf8_size(text)
                     partial["output_text"] = text
-                    out.append(partial)
-    return out
+                    yield partial
+
+
+def extract_calls(transcript: Path) -> list[dict[str, Any]]:
+    """Collect completed calls for callers that need a reusable list."""
+    return list(iter_calls(transcript))
 
 
 def _flatten_result(content: Any) -> str:
@@ -340,7 +344,7 @@ def _safe_json(text: str) -> Any:
 
 
 
-def summarize(calls: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize(calls: Iterable[dict[str, Any]]) -> dict[str, Any]:
     per_tool: dict[str, list[int]] = defaultdict(list)
     totals = {"calls": 0, "bytes": 0, "errors": 0}
     errors_re = re.compile(r"^(MCP error|Error:|Exit code \d+)")
@@ -510,11 +514,8 @@ def main() -> int:
 
     min_mtime = (_dt.datetime.now() - _dt.timedelta(days=args.window_days)).timestamp()
     transcripts = iter_transcripts(args.projects_root, min_mtime)
-    all_calls: list[dict[str, Any]] = []
-    for t in transcripts:
-        all_calls.extend(extract_calls(t))
-
-    summary = summarize(all_calls)
+    # Keep response text only while scoring it, rather than for the whole corpus.
+    summary = summarize(call for t in transcripts for call in iter_calls(t))
     now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     report = render(summary, window_days=args.window_days, transcripts=len(transcripts), now=now)
 
