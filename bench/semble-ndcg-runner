@@ -2,8 +2,8 @@
 """Score `codesage search` on semble's published annotation corpus, NDCG@k (default k=10).
 
 This uses semble's annotations and binary-relevance NDCG formula, but deduplicates
-results by file and weights language means by query count. Upstream rankings can
-retain chunks and its language means weight repositories equally. These scores
+results and annotation targets by file and weights language means by query count.
+Upstream rankings can retain chunks and weight repositories equally. These scores
 are not directly comparable to upstream's published table.
 
 Scope: semble's corpus spans 19 languages; CodeSage parses 9. Running the
@@ -110,7 +110,7 @@ def target_path(entry):
     """Annotation targets are paths, optionally carrying a `:start-end` span."""
     if isinstance(entry, dict):
         entry = entry.get("path", "")
-    return str(entry).split(":", 1)[0]
+    return str(entry).split(":", 1)[0].replace("\\", "/")
 
 
 def search(binary, repo_dir, query, limit, timeout=120):
@@ -246,8 +246,10 @@ def main():
         statuses = Counter()
         query_results = []
         for query_index, t in enumerate(tasks):
-            targets = [target_path(x) for x in
-                       (t.get("relevant", []) + t.get("secondary", []))]
+            # Spans and repeated annotations must not inflate the ideal file count.
+            targets = list(dict.fromkeys(
+                target_path(x) for x in (t.get("relevant", []) + t.get("secondary", []))
+            ))
             got, status, evidence = search(args.codesage_bin, repo_dir, t["query"], args.limit)
             statuses[status] += 1
             ranks = [r for tp in targets if (r := file_rank(got, tp)) is not None]
