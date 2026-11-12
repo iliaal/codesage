@@ -2,6 +2,8 @@ import importlib.machinery
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -47,6 +49,75 @@ def make_repo(root, workspace="1.2.3", codex="1.2.3", claude="1.2.3", marketplac
 
 
 class PluginVersionTests(unittest.TestCase):
+    def run_checker(self, root):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--root", str(root)],
+            capture_output=True, text=True, check=False,
+        )
+
+    def test_invalid_json_shapes_have_controlled_cli_diagnostics(self):
+        paths = (
+            "plugins/codesage-tools/.codex-plugin/plugin.json",
+            "plugins/codesage-tools/.claude-plugin/plugin.json",
+            ".claude-plugin/marketplace.json",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in paths:
+                for value in (None, [], "version", 7, True):
+                    with self.subTest(path=path, value=value):
+                        make_repo(root)
+                        write_json(root / path, value)
+                        result = self.run_checker(root)
+                        self.assertEqual(result.returncode, 1)
+                        self.assertEqual(result.stdout, "")
+                        self.assertEqual(
+                            result.stderr,
+                            f"check-plugin-versions: {root / path}: expected a JSON object\n",
+                        )
+
+    def test_invalid_marketplace_members_have_controlled_cli_diagnostics(self):
+        cases = []
+        for value in (None, [], "version", 7, True):
+            cases.append(("metadata", value, "metadata: expected a JSON object"))
+        for value in (None, {}, "plugins", 7, True):
+            cases.append(("plugins", value, "plugins: expected a JSON array"))
+        for value in (None, [], "plugin", 7, True):
+            cases.append(("plugins", [{"name": "other"}, value],
+                          "plugins[1]: expected a JSON object"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / ".claude-plugin/marketplace.json"
+            for key, value, message in cases:
+                with self.subTest(key=key, value=value):
+                    make_repo(root)
+                    document = json.loads(path.read_text())
+                    document[key] = value
+                    write_json(path, document)
+                    result = self.run_checker(root)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(result.stderr, f"check-plugin-versions: marketplace {message}\n")
+
+    def test_optional_fields_and_unrelated_entries_keep_existing_results(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_repo(root)
+            path = root / ".claude-plugin/marketplace.json"
+            document = json.loads(path.read_text())
+            document["plugins"].append({"name": "other", "version": "0.0.0"})
+            write_json(path, document)
+            self.assertEqual(checker.version_errors(root), [])
+            self.assertEqual(self.run_checker(root).returncode, 0)
+            del document["metadata"]
+            del document["plugins"]
+            write_json(path, document)
+            self.assertEqual(checker.version_errors(root), [
+                "Claude marketplace metadata version <missing>; expected 1.2.3",
+                "Claude marketplace has 0 codesage-tools entries; expected 1",
+            ])
+
     def test_matching_versions_accept_codex_cachebuster(self):
         checker = load_checker()
         with tempfile.TemporaryDirectory() as directory:

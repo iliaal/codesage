@@ -9,7 +9,14 @@ import tomllib
 
 def load_json(path):
     with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+        value = json.load(handle)
+    return require_object(value, str(path))
+
+
+def require_object(value, label):
+    if not isinstance(value, dict):
+        raise ValueError(f"{label}: expected a JSON object")
+    return value
 
 
 def workspace_version(root):
@@ -38,17 +45,21 @@ def version_errors(root):
         )
 
     marketplace = load_json(root / ".claude-plugin/marketplace.json")
-    metadata_version = str(marketplace.get("metadata", {}).get("version", ""))
+    metadata = require_object(marketplace.get("metadata", {}), "marketplace metadata")
+    metadata_version = str(metadata.get("version", ""))
     if metadata_version != expected:
         errors.append(
             f"Claude marketplace metadata version {metadata_version or '<missing>'}; expected {expected}"
         )
 
-    entries = [
-        plugin
-        for plugin in marketplace.get("plugins", [])
-        if plugin.get("name") == "codesage-tools"
-    ]
+    plugins = marketplace.get("plugins", [])
+    if not isinstance(plugins, list):
+        raise ValueError("marketplace plugins: expected a JSON array")
+    entries = []
+    for index, plugin in enumerate(plugins):
+        plugin = require_object(plugin, f"marketplace plugins[{index}]")
+        if plugin.get("name") == "codesage-tools":
+            entries.append(plugin)
     if len(entries) != 1:
         errors.append(
             f"Claude marketplace has {len(entries)} codesage-tools entries; expected 1"
