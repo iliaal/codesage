@@ -12,7 +12,7 @@ use codesage_storage::Database;
 
 use crate::bundle::{
     import_ref_targets_file_with_indexed, import_refs_for_file, resolve_callee_definitions,
-    resolve_callee_definitions_with_modules,
+    resolve_callee_definitions_with_lookup,
 };
 use crate::resolver::{ResolveOptions, TargetError, matched_symbols, resolve_symbols};
 
@@ -110,7 +110,7 @@ pub(crate) struct WalkCache {
     resolutions: HashMap<(String, String), ResolvedDefinitions>,
     caller_imports: HashMap<String, Arc<Vec<String>>>,
     reference_bytes: usize,
-    file_imports: Option<Arc<Vec<Reference>>>,
+    file_imports: Option<Arc<FileImports>>,
     python_indexed: Option<Arc<HashSet<String>>>,
     python_probes: codesage_storage::db::PythonPackageProbes,
     python_imports: HashMap<codesage_protocol::python::PythonImportSite, Arc<Vec<String>>>,
@@ -118,6 +118,7 @@ pub(crate) struct WalkCache {
     rust_modules: Option<Arc<crate::rust_modules::RustModules>>,
     constructors: crate::construction::Constructors,
     reference_candidates: Option<((String, String, ReferenceKind), Vec<Symbol>)>,
+    symbols_named: SymbolsNamed,
     #[cfg(test)]
     hits: usize,
     #[cfg(test)]
@@ -280,14 +281,20 @@ impl WalkCache {
         } else {
             Arc::new(crate::rust_modules::RustModules::default())
         };
-        resolve_callee_definitions_with_modules(
+        // The name memo leaves `self` for the call so the import loader can
+        // borrow it; it goes back whether or not resolution succeeds.
+        let mut named = std::mem::take(&mut self.symbols_named);
+        let resolved = resolve_callee_definitions_with_lookup(
             db,
             caller_file,
             spelling,
             &mut || self.caller_imports(db, caller_file),
+            &mut |name| named.get(db, name),
             &modules,
             kind,
-        )
+        );
+        self.symbols_named = named;
+        resolved
     }
 
     pub(crate) fn resolve_reference(
@@ -405,6 +412,127 @@ impl WalkCache {
     }
 }
 
+/// `file_import_references` rows with each importer's matcher shape read
+/// once, since a file-rooted walk tests every row against every frontier file.
+#[derive(Debug, Default)]
+pub(crate) struct FileImports {
+    rows: Vec<Reference>,
+    shapes: Vec<FileImportShape>,
+    /// Some importer is C or C++, so path matching needs the indexed paths.
+    c_family: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileImportShape {
+    /// Resolved by module path through the Python binding probes.
+    Python,
+    /// The path matcher decides per target file.
+    PathMatched,
+    /// The path matcher rejects this row for every target file.
+    NoFile,
+}
+
+impl FileImports {
+    fn load(db: &Database) -> Result<Self> {
+        let rows = db.file_import_references()?;
+        let mut c_family = false;
+        let mut shapes = Vec::with_capacity(rows.len());
+        for row in &rows {
+            c_family |= matches!(
+                codesage_parser::detect::detect_language(std::path::Path::new(&row.from_file)),
+                Some(codesage_protocol::Language::C | codesage_protocol::Language::Cpp)
+            );
+            shapes.push(
+                if codesage_protocol::python::is_python_path(&row.from_file) {
+                    FileImportShape::Python
+                } else if crate::bundle::import_ref_may_target_file(&row.to_name, &row.from_file) {
+                    FileImportShape::PathMatched
+                } else {
+                    FileImportShape::NoFile
+                },
+            );
+        }
+        Ok(Self {
+            rows,
+            shapes,
+            c_family,
+        })
+    }
+}
+
+/// Request-local `find_symbols(name, None)` rows. Every caller file that
+/// spells a name reads the same definitions before its own filters run, so a
+/// walk that resolves one name from many files hydrates its rows once. Its
+/// byte budget is separate from the edge evidence in [`WalkCache`]; a name
+/// whose rows do not fit is read again on each lookup.
+#[derive(Default)]
+struct SymbolsNamed {
+    rows: HashMap<String, Arc<Vec<Symbol>>>,
+    bytes: usize,
+}
+
+impl SymbolsNamed {
+    const MAX_BYTES: usize = 32 * 1024 * 1024;
+
+    fn get(&mut self, db: &Database, name: &str) -> Result<Arc<Vec<Symbol>>> {
+        codesage_protocol::work::checkpoint()?;
+        if let Some(rows) = self.rows.get(name) {
+            return Ok(Arc::clone(rows));
+        }
+        let rows = Arc::new(db.find_symbols(name, None)?);
+        let bytes = rows.iter().fold(
+            rows.capacity()
+                .saturating_mul(std::mem::size_of::<Symbol>())
+                .saturating_add(name.len()),
+            |bytes, symbol| bytes.saturating_add(symbol_heap_bytes(symbol)),
+        );
+        if bytes <= Self::MAX_BYTES.saturating_sub(self.bytes) {
+            self.bytes += bytes;
+            self.rows.insert(name.to_string(), Arc::clone(&rows));
+        }
+        Ok(rows)
+    }
+}
+
+fn symbol_heap_bytes(symbol: &Symbol) -> usize {
+    let optional = |value: &Option<String>| value.as_ref().map_or(0, String::capacity);
+    let rationale = symbol.rationale.iter().fold(
+        symbol
+            .rationale
+            .capacity()
+            .saturating_mul(std::mem::size_of::<codesage_protocol::RationaleEntry>()),
+        |bytes, entry| bytes.saturating_add(entry.text.capacity()),
+    );
+    let signature = symbol.signature.as_ref().map_or(0, |signature| {
+        signature.parameters.iter().fold(
+            signature
+                .declaration
+                .capacity()
+                .saturating_add(optional(&signature.returns))
+                .saturating_add(
+                    signature
+                        .parameters
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<codesage_protocol::Parameter>()),
+                ),
+            |bytes, parameter| {
+                bytes
+                    .saturating_add(parameter.declaration.capacity())
+                    .saturating_add(optional(&parameter.name))
+                    .saturating_add(optional(&parameter.type_name))
+                    .saturating_add(optional(&parameter.default_value))
+            },
+        )
+    });
+    symbol
+        .name
+        .capacity()
+        .saturating_add(symbol.qualified_name.capacity())
+        .saturating_add(symbol.file_path.capacity())
+        .saturating_add(rationale)
+        .saturating_add(signature)
+}
+
 /// Hard work budget for a walk, counted in resolution steps (see
 /// [`WalkBudget::cost`]), plus an optional wall-clock deadline. One instance
 /// serves several walks: [`WalkBudget::reset`] refills the steps between
@@ -421,7 +549,7 @@ pub(crate) struct WalkBudget {
     candidate_counts: HashMap<String, usize>,
     caller_file_counts: HashMap<String, usize>,
     symbol_reference_names: HashMap<DefinitionKey, Vec<String>>,
-    file_imports: Option<Arc<Vec<Reference>>>,
+    file_imports: Option<Arc<FileImports>>,
 }
 
 impl WalkBudget {
@@ -578,10 +706,10 @@ pub(crate) fn impact_analysis_walk_shared(
         HashMap::new();
     let mut seed_count = seed_symbols.len();
     let file_imports = if file_frontier.is_empty() {
-        Arc::new(Vec::new())
+        Arc::new(FileImports::default())
     } else if let Some(cache) = cache.as_deref_mut() {
         if cache.file_imports.is_none() {
-            cache.file_imports = Some(Arc::new(db.file_import_references()?));
+            cache.file_imports = Some(Arc::new(FileImports::load(db)?));
         }
         Arc::clone(
             cache
@@ -591,18 +719,13 @@ pub(crate) fn impact_analysis_walk_shared(
         )
     } else if let Some(b) = budget.as_deref_mut() {
         if b.file_imports.is_none() {
-            b.file_imports = Some(Arc::new(db.file_import_references()?));
+            b.file_imports = Some(Arc::new(FileImports::load(db)?));
         }
         Arc::clone(b.file_imports.as_ref().expect("file imports initialized"))
     } else {
-        Arc::new(db.file_import_references()?)
+        Arc::new(FileImports::load(db)?)
     };
-    let indexed = if file_imports.iter().any(|row| {
-        matches!(
-            codesage_parser::detect::detect_language(std::path::Path::new(&row.from_file)),
-            Some(codesage_protocol::Language::C | codesage_protocol::Language::Cpp)
-        )
-    }) {
+    let indexed = if file_imports.c_family {
         cache
             .as_deref_mut()
             .expect("walk cache initialized")
@@ -719,12 +842,12 @@ pub(crate) fn impact_analysis_walk_shared(
                 continue;
             }
             if let Some(b) = budget.as_deref_mut() {
-                if b.exhausted || b.over_deadline() || file_imports.len() > b.remaining {
+                if b.exhausted || b.over_deadline() || file_imports.rows.len() > b.remaining {
                     b.exhausted = true;
                     budget_spent = true;
                     break;
                 }
-                b.charge(file_imports.len());
+                b.charge(file_imports.rows.len());
             }
             let cached_matches = cache
                 .as_deref()
@@ -733,7 +856,7 @@ pub(crate) fn impact_analysis_walk_shared(
             let mut matches = Vec::new();
             for index in 0..cached_matches
                 .as_ref()
-                .map_or(file_imports.len(), |rows| rows.len())
+                .map_or(file_imports.rows.len(), |rows| rows.len())
             {
                 codesage_protocol::work::checkpoint()?;
                 if index % 256 == 0
@@ -744,9 +867,10 @@ pub(crate) fn impact_analysis_walk_shared(
                     break;
                 }
                 let reference_index = cached_matches.as_ref().map_or(index, |rows| rows[index]);
-                let r = &file_imports[reference_index];
+                let r = &file_imports.rows[reference_index];
+                let shape = file_imports.shapes[reference_index];
                 if cached_matches.is_none()
-                    && codesage_protocol::python::is_python_path(&r.from_file)
+                    && shape == FileImportShape::Python
                     && !cache
                         .as_deref_mut()
                         .expect("walk cache initialized")
@@ -757,14 +881,15 @@ pub(crate) fn impact_analysis_walk_shared(
                     continue;
                 }
                 if cached_matches.is_none()
-                    && !codesage_protocol::python::is_python_path(&r.from_file)
-                    && !import_ref_targets_file_with_indexed(
-                        &r.to_name,
-                        &r.from_file,
-                        file,
-                        &rust_modules,
-                        &indexed,
-                    )
+                    && shape != FileImportShape::Python
+                    && (shape == FileImportShape::NoFile
+                        || !import_ref_targets_file_with_indexed(
+                            &r.to_name,
+                            &r.from_file,
+                            file,
+                            &rust_modules,
+                            &indexed,
+                        ))
                 {
                     continue;
                 }

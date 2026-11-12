@@ -858,6 +858,30 @@ pub(crate) fn resolve_callee_definitions_with_modules(
     modules: &crate::rust_modules::RustModules,
     kind: Option<ReferenceKind>,
 ) -> Result<Vec<Symbol>> {
+    resolve_callee_definitions_with_lookup(
+        db,
+        caller_file,
+        to_name,
+        load_imports,
+        &mut |name| Ok(Arc::new(db.find_symbols(name, None)?)),
+        modules,
+        kind,
+    )
+}
+
+/// [`resolve_callee_definitions_with_modules`] with the same-name definition
+/// lookup supplied by the caller, so a request can read each name's rows once
+/// however many caller files spell it. `find_named` must return what
+/// `db.find_symbols(name, None)` returns.
+pub(crate) fn resolve_callee_definitions_with_lookup(
+    db: &Database,
+    caller_file: &str,
+    to_name: &str,
+    load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
+    find_named: &mut dyn FnMut(&str) -> Result<Arc<Vec<Symbol>>>,
+    modules: &crate::rust_modules::RustModules,
+    kind: Option<ReferenceKind>,
+) -> Result<Vec<Symbol>> {
     if caller_file.ends_with(".rs")
         && let Some(mut resolved) = modules.external_definitions(db, caller_file, to_name)?
     {
@@ -888,15 +912,22 @@ pub(crate) fn resolve_callee_definitions_with_modules(
     // import evidence). The lone-candidate shortcut keys on the pre-gate
     // count, so a homonym set the gate thins to one survivor still owes the
     // same import evidence as the full set did.
-    let mut all_candidates = db.find_symbols(to_name, None)?;
-    all_candidates.retain(|symbol| reference_kind_admits(caller_file, kind, symbol));
+    let named = find_named(to_name)?;
+    let mut all_candidates: Vec<&Symbol> = named
+        .iter()
+        .filter(|symbol| reference_kind_admits(caller_file, kind, symbol))
+        .collect();
     let mut module_qualified = false;
+    let tail_named;
     if caller_file.ends_with(".rs")
         && all_candidates.is_empty()
         && let Some((_, tail)) = to_name.rsplit_once("::")
     {
-        let mut tail_candidates = db.find_symbols(tail, None)?;
-        tail_candidates.retain(|symbol| reference_kind_admits(caller_file, kind, symbol));
+        tail_named = find_named(tail)?;
+        let tail_candidates: Vec<&Symbol> = tail_named
+            .iter()
+            .filter(|symbol| reference_kind_admits(caller_file, kind, symbol))
+            .collect();
         let mut seen = HashSet::new();
         let mut ambiguous = HashSet::new();
         for symbol in &tail_candidates {
@@ -910,7 +941,7 @@ pub(crate) fn resolve_callee_definitions_with_modules(
             if !ambiguous.contains(&(&symbol.file_path, &symbol.qualified_name, symbol.line_start))
                 && modules.qualified_target(db, caller_file, to_name, symbol)?
             {
-                all_candidates.push(symbol.clone());
+                all_candidates.push(symbol);
             }
         }
         module_qualified = true;
@@ -922,7 +953,7 @@ pub(crate) fn resolve_callee_definitions_with_modules(
             && reference_kind_admits(caller_file, kind, symbol)
     });
     let total_candidates = all_candidates.len();
-    let candidates: Vec<Symbol> = all_candidates
+    let candidates: Vec<&Symbol> = all_candidates
         .into_iter()
         .filter(|s| {
             if s.visibility == Some(Visibility::Module)
@@ -938,48 +969,51 @@ pub(crate) fn resolve_callee_definitions_with_modules(
             visibility_admits(s, caller_file)
         })
         .collect();
+    let owned = |symbols: Vec<&Symbol>| symbols.into_iter().cloned().collect();
     if module_qualified {
-        return Ok(candidates);
+        return Ok(owned(candidates));
     }
     if is_qualified_symbol_name(to_name) {
-        let exact: Vec<Symbol> = candidates
+        let exact: Vec<&Symbol> = candidates
             .iter()
+            .copied()
             .filter(|s| s.qualified_name == to_name || s.name == to_name)
-            .cloned()
             .collect();
         if !exact.is_empty() {
-            return Ok(exact);
+            return Ok(owned(exact));
         }
         // Case-only mismatches may resolve; otherwise try import evidence.
-        let folded: Vec<Symbol> = candidates
+        let folded: Vec<&Symbol> = candidates
             .iter()
+            .copied()
             .filter(|s| qualified_name_matches_normalized(s, to_name))
-            .cloned()
             .collect();
         if !folded.is_empty() {
-            return Ok(folded);
+            return Ok(owned(folded));
         }
     }
     if total_candidates <= 1 {
-        return Ok(candidates);
+        return Ok(owned(candidates));
     }
     let import_refs = load_imports()?;
+    let prepared: Vec<ImportRef<'_>> = import_refs.iter().map(|imp| ImportRef::new(imp)).collect();
+    let importer = Importer::new(caller_file);
 
     // Local calls need no import edge.
     let is_local = |s: &Symbol| s.file_path == caller_file;
 
     // Import refs do not associate bindings with specifiers. Keep both forms
     // of evidence so an unrelated path import cannot suppress a real target.
-    let filtered: Vec<Symbol> = candidates
+    let filtered: Vec<&Symbol> = candidates
         .into_iter()
         .filter(|s| {
             is_local(s)
-                || import_refs.iter().any(|imp| {
-                    import_ref_targets_symbol_with_modules(imp, caller_file, to_name, s, modules)
-                })
+                || prepared
+                    .iter()
+                    .any(|imp| prepared_import_targets_symbol(imp, importer, to_name, s, modules))
         })
         .collect();
-    Ok(filtered)
+    Ok(owned(filtered))
 }
 
 pub(crate) fn reference_kind_admits(
@@ -1137,28 +1171,67 @@ pub(crate) fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<V
     Ok(refs)
 }
 
+/// An import ref with its shape read once, so matching it against every
+/// candidate of a name repeats no substring search.
+pub(crate) struct ImportRef<'a> {
+    text: &'a str,
+    module_tail: Option<(&'a str, &'a str)>,
+    rust_glob: bool,
+    python_glob: bool,
+    path_specifier: bool,
+}
+
+impl<'a> ImportRef<'a> {
+    pub(crate) fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            module_tail: text.rsplit_once("::"),
+            rust_glob: text.ends_with("::*"),
+            python_glob: text.ends_with(".*"),
+            path_specifier: is_path_specifier(text),
+        }
+    }
+}
+
+/// The importing file's language facts that every import ref match reads.
+#[derive(Clone, Copy)]
+pub(crate) struct Importer<'a> {
+    file: &'a str,
+    rust: bool,
+    python: bool,
+}
+
+impl<'a> Importer<'a> {
+    pub(crate) fn new(file: &'a str) -> Self {
+        Self {
+            file,
+            rust: file.ends_with(".rs"),
+            python: codesage_protocol::python::is_python_path(file),
+        }
+    }
+}
+
 /// True when `import_ref` (e.g. `crate::helpers_a::helper`) names `sym` in
 /// `sym_file` even if the symbol table only stores the bare tail (`helper`).
-pub(crate) fn import_ref_targets_symbol(
-    import_ref: &str,
-    caller_file: &str,
+fn import_ref_targets_symbol(
+    import_ref: &ImportRef<'_>,
+    importer: Importer<'_>,
     callee_name: &str,
     sym: &Symbol,
 ) -> bool {
-    if import_ref.ends_with("::*")
-        || (codesage_protocol::python::is_python_path(caller_file) && import_ref.ends_with(".*"))
-    {
-        return import_ref_targets_file(import_ref, caller_file, &sym.file_path);
+    let caller_file = importer.file;
+    if import_ref.rust_glob || (importer.python && import_ref.python_glob) {
+        return import_ref_targets_file(import_ref.text, caller_file, &sym.file_path);
     }
-    if import_ref == sym.qualified_name || import_ref == sym.name {
+    if import_ref.text == sym.qualified_name || import_ref.text == sym.name {
         return true;
     }
     // JS/TS imports and C/C++ includes can name a file instead of a symbol.
-    if is_path_specifier(import_ref) {
-        return import_path_targets_file(import_ref, caller_file, &sym.file_path);
+    if import_ref.path_specifier {
+        return import_path_targets_file(import_ref.text, caller_file, &sym.file_path);
     }
-    let Some((module, tail)) = import_ref.rsplit_once("::") else {
-        return import_ref == callee_name && import_ref == sym.name;
+    let Some((module, tail)) = import_ref.module_tail else {
+        return import_ref.text == callee_name && import_ref.text == sym.name;
     };
     if tail != callee_name && tail != sym.name {
         return false;
@@ -1175,26 +1248,44 @@ pub(crate) fn import_ref_targets_symbol_with_modules(
     sym: &Symbol,
     modules: &crate::rust_modules::RustModules,
 ) -> bool {
-    if caller_file.ends_with(".rs") {
-        if import_ref.starts_with("./") {
+    prepared_import_targets_symbol(
+        &ImportRef::new(import_ref),
+        Importer::new(caller_file),
+        callee_name,
+        sym,
+        modules,
+    )
+}
+
+/// [`import_ref_targets_symbol_with_modules`] over an import ref and
+/// importer whose shapes were read once.
+pub(crate) fn prepared_import_targets_symbol(
+    import_ref: &ImportRef<'_>,
+    importer: Importer<'_>,
+    callee_name: &str,
+    sym: &Symbol,
+    modules: &crate::rust_modules::RustModules,
+) -> bool {
+    if importer.rust {
+        if import_ref.text.starts_with("./") {
             return false;
         }
-        if import_ref.ends_with("::*") {
+        if import_ref.rust_glob {
             return import_ref_targets_file_with_modules(
-                import_ref,
-                caller_file,
+                import_ref.text,
+                importer.file,
                 &sym.file_path,
                 modules,
             );
         }
-        if let Some((module, tail)) = import_ref.rsplit_once("::")
+        if let Some((module, tail)) = import_ref.module_tail
             && (tail == callee_name || tail == sym.name)
-            && let Some(candidates) = modules.candidates(caller_file, module)
+            && let Some(candidates) = modules.candidates(importer.file, module)
         {
             return candidates.contains(&sym.file_path);
         }
     }
-    import_ref_targets_symbol(import_ref, caller_file, callee_name, sym)
+    import_ref_targets_symbol(import_ref, importer, callee_name, sym)
 }
 
 /// Resolve conventional Cargo targets without crossing into the library's `src/`.
@@ -1419,6 +1510,18 @@ pub(crate) fn resolved_path_import_candidates(
     } else {
         candidates
     }
+}
+
+/// False only when [`import_ref_targets_file_with_indexed`] rejects
+/// `import_ref` from `importer_file` for every target file, so a caller
+/// matching one row against many targets can skip it without asking.
+pub(crate) fn import_ref_may_target_file(import_ref: &str, importer_file: &str) -> bool {
+    importer_file.ends_with(".rs")
+        || codesage_protocol::python::is_python_path(importer_file)
+        || importer_dialect(importer_file) == ImporterDialect::CFamily
+        || import_ref.starts_with("./")
+        || import_ref.starts_with("../")
+        || import_ref.contains("::")
 }
 
 pub(crate) fn import_ref_targets_file_with_indexed(
@@ -2056,6 +2159,67 @@ mod import_path_tests {
             "std::io::Read",
             "src/lib.rs",
             "src/io.rs"
+        ));
+    }
+
+    #[test]
+    fn rows_skipped_by_the_file_shape_filter_name_no_file() {
+        let importers = [
+            "app/Http/A.php",
+            "src/a.rs",
+            "src/a.ts",
+            "src/a.js",
+            "src/a.c",
+            "src/a.h",
+            "cmd/a.go",
+            "src/A.java",
+        ];
+        let refs = [
+            "App\\Models\\User",
+            "./util",
+            "../lib/b.js",
+            "crate::util::helper",
+            "util::*",
+            "util.h",
+            "lib/b.js",
+            "lodash",
+            "User",
+        ];
+        let targets = [
+            "app/Models/User.php",
+            "src/util.rs",
+            "src/util/mod.rs",
+            "src/util.ts",
+            "src/util.js",
+            "lib/b.js",
+            "src/lib/b.js",
+            "util.h",
+            "src/util.h",
+            "include/util.h",
+            "src/User.java",
+        ];
+        let indexed: HashSet<String> = targets.iter().map(|t| t.to_string()).collect();
+        let modules = crate::rust_modules::RustModules::default();
+        let mut matched_with_shape = 0;
+        for importer in importers {
+            for import in refs {
+                let may = import_ref_may_target_file(import, importer);
+                for target in targets {
+                    let hit = import_ref_targets_file_with_indexed(
+                        import, importer, target, &modules, &indexed,
+                    );
+                    assert!(
+                        may || !hit,
+                        "{import} from {importer} names {target} but was skipped"
+                    );
+                    matched_with_shape += usize::from(hit);
+                }
+            }
+        }
+        assert!(matched_with_shape > 0, "the matrix exercises no match");
+        assert!(!import_ref_may_target_file(
+            "App\\Models\\User",
+            "app/Http/A.php"
         ));
     }
 

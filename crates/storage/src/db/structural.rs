@@ -796,11 +796,15 @@ impl Database {
     /// [`Self::path_import_refs`], and a Go import names a package, never a
     /// symbol, so it joins nothing.
     pub fn enumerate_file_import_pairs(&self) -> Result<ImportPairs> {
+        // CROSS JOIN pins refs as the outer loop. Left to the planner, this
+        // whole-graph query scanned every symbol and probed refs by name,
+        // visiting each call site of a common short name before the kind
+        // filter dropped it.
         let sql = r#"
             SELECT f_from.path, f_to.path, MIN(r.lazy)
             FROM refs r
-            JOIN files f_from ON r.from_file_id = f_from.id
-            JOIN symbols s ON (
+            CROSS JOIN files f_from ON r.from_file_id = f_from.id
+            CROSS JOIN symbols s ON (
               s.qualified_name = r.to_name
               OR (
                 s.name = r.to_name
@@ -812,7 +816,7 @@ impl Database {
                 )
               )
             )
-            JOIN files f_to ON s.file_id = f_to.id
+            CROSS JOIN files f_to ON s.file_id = f_to.id
             WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
               AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
