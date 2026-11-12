@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- `codesage risk-diff`, `risk-batch`, and `rehearse` run 40-60x faster on large indexes, and `risk-batch --json` and `rehearse` return complete results that repeat across runs: work budgets (20,000 reference rows per file and 200,000 per request for `top_symbols`; step and ref caps for rehearsal) replace the 750 ms, 3 s, 1.5 s, and 250 ms cutoffs.
+
 ## [0.50.0] - 2026-11-10
 
 ### Added
