@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.51.0] - 2026-11-12
+
 ### Changed
 
 - `codesage risk-diff`, `risk-batch`, and `rehearse` run 40-60x faster on large indexes, and `risk-batch --json` and `rehearse` return complete results that repeat across runs: work budgets (20,000 reference rows per file and 200,000 per request for `top_symbols`; step and ref caps for rehearsal) replace the 750 ms, 3 s, 1.5 s, and 250 ms cutoffs.
@@ -1465,5 +1467,7 @@ Initial public release.
 
 [0.49.0]: https://github.com/iliaal/codesage/releases/tag/v0.49.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.50.0...HEAD
 [0.50.0]: https://github.com/iliaal/codesage/releases/tag/v0.50.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.51.0...HEAD
+[0.51.0]: https://github.com/iliaal/codesage/releases/tag/v0.51.0
