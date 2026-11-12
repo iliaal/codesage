@@ -2,15 +2,22 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use codesage_protocol::{BranchOverlap, BranchOverlapReport, ReviewObjection, ReviewSeverity};
 
 const MAX_REFS: usize = 50;
 const MAX_ROWS: usize = 3;
 const MAX_FILES: usize = 5;
 const MAX_GIT_BYTES: usize = 4 * 1024 * 1024;
+/// Refs probed concurrently. Each probe is one `merge-base` history walk, and
+/// without a commit-graph a walk over a long history costs hundreds of
+/// milliseconds, so a serial scan of [`MAX_REFS`] refs runs for many seconds.
+/// The walks are independent; a few workers cut the scan without letting one
+/// rehearsal saturate a shared machine.
+const GIT_JOBS: usize = 4;
 
 pub fn branch_overlap(root: &Path, files: &[String], budget: Duration) -> BranchOverlapReport {
     let mut report = BranchOverlapReport::default();
@@ -59,44 +66,33 @@ fn scan(
         .filter(|file| !noise_path(file))
         .map(String::as_str)
         .collect();
+    let considered = &refs[..refs.len().min(MAX_REFS)];
     let mut seen = BTreeSet::new();
-    for (sha, branch) in refs.iter().take(MAX_REFS) {
-        if Instant::now() >= deadline {
-            bail!("time budget exhausted");
-        }
+    let unique: Vec<&str> = considered
+        .iter()
+        .map(|(sha, _)| *sha)
+        .filter(|sha| seen.insert(*sha))
+        .collect();
+    let mut probes = probe_refs(root, head, &unique, deadline).into_iter();
+    let mut seen = BTreeSet::new();
+    for (sha, branch) in considered {
         if !seen.insert(*sha) {
             report.scanned_refs += 1;
             continue;
         }
-        let bases = git(root, &["merge-base", "--all", head, sha], deadline)?;
-        let bases = std::str::from_utf8(&bases)?;
-        let bases: Vec<_> = bases.lines().collect();
-        if bases.len() != 1 {
+        let probe = probes
+            .next()
+            .unwrap_or_else(|| Err(anyhow!("ref was not probed")))?;
+        if probe.bases.len() != 1 {
             report.note = Some("Some refs have no unique merge base and were skipped.".to_string());
             report.scanned_refs += 1;
             continue;
         }
-        let base = bases[0];
-        if base == head || base == *sha {
+        let base = probe.bases[0].as_str();
+        let Some(diff) = probe.diff else {
             report.scanned_refs += 1;
             continue;
-        }
-        let range = format!("{head}...{sha}");
-        let diff = git(
-            root,
-            &[
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-renames",
-                "--relative",
-                "--name-only",
-                "-z",
-                &range,
-                "--",
-            ],
-            deadline,
-        )?;
+        };
         let mut matching = BTreeSet::new();
         for path in diff
             .split(|byte| *byte == 0)
@@ -131,6 +127,91 @@ fn scan(
         note.push_str("Only the newest 50 refs were considered.");
     }
     Ok(())
+}
+
+/// One ref's merge bases with HEAD and, when it has a single base that is
+/// neither tip, the paths `base..tip` changes.
+struct RefProbe {
+    bases: Vec<String>,
+    diff: Option<Vec<u8>>,
+}
+
+fn probe_ref(root: &Path, head: &str, sha: &str, deadline: Instant) -> Result<RefProbe> {
+    ensure!(Instant::now() < deadline, "time budget exhausted");
+    let bases = git(root, &["merge-base", "--all", head, sha], deadline)?;
+    let bases: Vec<String> = std::str::from_utf8(&bases)?
+        .lines()
+        .map(str::to_string)
+        .collect();
+    // With exactly one merge base, `HEAD...tip` is `base..tip`; diffing from
+    // the base already in hand skips the second history walk the three-dot
+    // form would repeat.
+    let diff = match bases.as_slice() {
+        [base] if base != head && base != sha => Some(git(
+            root,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--relative",
+                "--name-only",
+                "-z",
+                base,
+                sha,
+                "--",
+            ],
+            deadline,
+        )?),
+        _ => None,
+    };
+    Ok(RefProbe { bases, diff })
+}
+
+/// Probe `shas` on up to [`GIT_JOBS`] threads and return the results in input
+/// order. Workers claim indices in increasing order and stop claiming after a
+/// failure, so every probe before the first failed one has a result and the
+/// caller, consuming in order, stops at the same ref a serial scan would.
+fn probe_refs(root: &Path, head: &str, shas: &[&str], deadline: Instant) -> Vec<Result<RefProbe>> {
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let mut slots: Vec<Option<Result<RefProbe>>> = shas.iter().map(|_| None).collect();
+    let finished: Vec<Vec<(usize, Result<RefProbe>)>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..GIT_JOBS.min(shas.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    while !failed.load(Ordering::Relaxed) {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(sha) = shas.get(index) else {
+                            break;
+                        };
+                        let probe = probe_ref(root, head, sha, deadline);
+                        if probe.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        done.push((index, probe));
+                    }
+                    done
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    for (index, probe) in finished.into_iter().flatten() {
+        slots[index] = Some(probe);
+    }
+    slots
+        .into_iter()
+        .map(|slot| slot.unwrap_or_else(|| Err(anyhow!("ref was not probed"))))
+        .collect()
 }
 
 fn noise_path(path: &str) -> bool {

@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use codesage_protocol::{
@@ -713,17 +712,18 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
 }
 
 /// State one risk request shares across its files. A single-file request
-/// passes `None` and gets its own cache with only the per-file symbol
-/// deadline; `assess_risk_diff` and `assess_risk_batch` build one scope for
-/// the whole file list.
+/// passes `None` and gets its own cache with only the per-file row budget;
+/// `assess_risk_diff` and `assess_risk_batch` build one scope for the whole
+/// file list.
 pub(crate) struct RiskRequestScope<'a> {
     cache: &'a mut WalkCache,
-    /// Symbol-resolution time left for the request; each file's pass is
-    /// bounded by the smaller of this and [`TOP_SYMBOLS_RESOLVE_DEADLINE`]
-    /// and charges what it spent. Only resolution time counts, so a slow
-    /// dependents walk earlier in the request does not silently zero the
-    /// symbol breakdown of every file after it.
-    top_symbols_budget: Option<Duration>,
+    /// Reference rows the request's symbol resolution may still read; each
+    /// file's pass is bounded by the smaller of this and
+    /// [`TOP_SYMBOLS_REF_BUDGET`] and charges what it admitted. Only
+    /// resolution rows count, so a large dependents walk earlier in the
+    /// request does not silently zero the symbol breakdown of every file
+    /// after it.
+    top_symbols_budget: Option<u64>,
     /// `false` skips the `top_symbols` pass entirely: the composite score
     /// does not read it, so a caller that keeps only `score` pays nothing
     /// for symbol resolution.
@@ -734,7 +734,7 @@ impl<'a> RiskRequestScope<'a> {
     fn multi_file(cache: &'a mut WalkCache) -> Self {
         Self {
             cache,
-            top_symbols_budget: Some(TOP_SYMBOLS_REQUEST_BUDGET),
+            top_symbols_budget: Some(TOP_SYMBOLS_REQUEST_REF_BUDGET),
             resolve_top_symbols: true,
         }
     }
@@ -791,18 +791,15 @@ fn assess_risk_with_context(
     // this file, so the Rust module table and each (caller, spelling) lookup
     // load once per request rather than once per pass.
     let mut local_cache = WalkCache::default();
-    let (cache, top_symbols_budget, resolve_top_symbols): (
-        &mut WalkCache,
-        Option<&mut Duration>,
-        bool,
-    ) = match scope {
-        Some(shared) => (
-            &mut *shared.cache,
-            shared.top_symbols_budget.as_mut(),
-            shared.resolve_top_symbols,
-        ),
-        None => (&mut local_cache, None, true),
-    };
+    let (cache, top_symbols_budget, resolve_top_symbols): (&mut WalkCache, Option<&mut u64>, bool) =
+        match scope {
+            Some(shared) => (
+                &mut *shared.cache,
+                shared.top_symbols_budget.as_mut(),
+                shared.resolve_top_symbols,
+            ),
+            None => (&mut local_cache, None, true),
+        };
     let git = db.git_file(file_path)?;
     let structural_found = db
         .file_id_for_path(file_path)
@@ -1269,8 +1266,7 @@ const TOP_SYMBOLS_CAP: usize = 5;
 /// of five rows `bounded`, 8x leaves none, and the difference costs nothing
 /// measurable on a multi-file request. A single pathological name is bounded
 /// by [`TOP_SYMBOLS_REF_BUDGET`], which is checked against the name's own
-/// count before any row is read; the pass as a whole is bounded by
-/// [`TOP_SYMBOLS_RESOLVE_DEADLINE`].
+/// count before any row is read and also bounds the pass as a whole.
 const TOP_SYMBOLS_RESOLVE_CAP: usize = TOP_SYMBOLS_CAP * 8;
 
 /// Reference rows one file's breakdown may resolve. Charged per same-named
@@ -1280,16 +1276,14 @@ const TOP_SYMBOLS_RESOLVE_CAP: usize = TOP_SYMBOLS_CAP * 8;
 /// resolution moves on to the next unresolved name.
 const TOP_SYMBOLS_REF_BUDGET: u64 = 20_000;
 
-/// Wall-clock bound on one file's resolution pass, matching the
-/// `to`-resolution deadline `find_references` applies to the same resolver.
-const TOP_SYMBOLS_RESOLVE_DEADLINE: Duration = Duration::from_millis(750);
-
-/// Resolution time the files of one `assess_risk_diff` / `assess_risk_batch`
-/// request share, so N files cost at most this rather than
-/// N x [`TOP_SYMBOLS_RESOLVE_DEADLINE`]: each file gets the smaller of the
-/// per-file deadline and what is left. Files reached after it is spent keep
-/// their name counts and are emitted `bounded`.
-const TOP_SYMBOLS_REQUEST_BUDGET: Duration = Duration::from_secs(3);
+/// Reference rows the files of one `assess_risk_diff` / `assess_risk_batch`
+/// request share, so N files read at most this rather than
+/// N x [`TOP_SYMBOLS_REF_BUDGET`]: each file gets the smaller of the per-file
+/// budget and what is left, charged in request order. Files reached after it
+/// is spent keep their name counts and are emitted `bounded`. The bounds are
+/// row counts, not wall-clock time, so the breakdown is a function of the
+/// index and the file list rather than of machine load.
+const TOP_SYMBOLS_REQUEST_REF_BUDGET: u64 = TOP_SYMBOLS_REF_BUDGET * 10;
 
 #[cfg(test)]
 thread_local! {
@@ -1341,9 +1335,8 @@ struct SymbolRank {
 /// Resolution is lazy: name counts are upper bounds, so once the returned rows
 /// are resolved no unresolved symbol can overtake them. A symbol still
 /// unresolved when [`TOP_SYMBOLS_RESOLVE_CAP`], [`TOP_SYMBOLS_REF_BUDGET`],
-/// [`TOP_SYMBOLS_RESOLVE_DEADLINE`], or the caller's `request_budget` runs
-/// out keeps its name count and is emitted `bounded`; the pass charges the
-/// time it spent to that budget.
+/// or the caller's `request_budget` runs out keeps its name count and is
+/// emitted `bounded`; the pass charges the rows it admitted to that budget.
 ///
 /// Empty when the file has no indexed symbols. Not an error.
 fn compute_top_symbols(
@@ -1352,7 +1345,7 @@ fn compute_top_symbols(
     in_cycle: bool,
     cycle_size: u32,
     cache: &mut WalkCache,
-    request_budget: Option<&mut Duration>,
+    request_budget: Option<&mut u64>,
 ) -> Result<Vec<TopSymbol>> {
     #[cfg(test)]
     TOP_SYMBOLS_PASSES.with(|passes| passes.set(passes.get() + 1));
@@ -1428,14 +1421,12 @@ fn compute_top_symbols(
         groups.entry(s.name.as_str()).or_default().push(i);
     }
 
-    let started = Instant::now();
     let allowance = request_budget
         .as_deref()
         .copied()
-        .map_or(TOP_SYMBOLS_RESOLVE_DEADLINE, |left| {
-            left.min(TOP_SYMBOLS_RESOLVE_DEADLINE)
+        .map_or(TOP_SYMBOLS_REF_BUDGET, |left| {
+            left.min(TOP_SYMBOLS_REF_BUDGET)
         });
-    let deadline = started + allowance;
     let mut resolved_symbols = 0usize;
     let mut rows_spent = 0u64;
     loop {
@@ -1448,7 +1439,7 @@ fn compute_top_symbols(
         else {
             break;
         };
-        if resolved_symbols >= TOP_SYMBOLS_RESOLVE_CAP || Instant::now() >= deadline {
+        if resolved_symbols >= TOP_SYMBOLS_RESOLVE_CAP {
             break;
         }
         let group = groups
@@ -1459,7 +1450,7 @@ fn compute_top_symbols(
         // a hub name with more rows than remain is never hydrated, and the
         // pass moves on to names that still fit.
         let group_rows: u64 = group.iter().map(|&i| u64::from(ranks[i].raw)).sum();
-        if rows_spent.saturating_add(group_rows) > TOP_SYMBOLS_REF_BUDGET {
+        if rows_spent.saturating_add(group_rows) > allowance {
             for &i in &group {
                 ranks[i].capped = true;
             }
@@ -1497,7 +1488,7 @@ fn compute_top_symbols(
         }
     }
     if let Some(left) = request_budget {
-        *left = left.saturating_sub(started.elapsed());
+        *left = left.saturating_sub(rows_spent);
     }
 
     Ok(rank_order(&ranks)
@@ -2228,7 +2219,7 @@ mod tests {
                     serde_json::to_value(ranked).unwrap(),
                     serde_json::to_value(warmed).unwrap()
                 );
-                let mut spent = Duration::ZERO;
+                let mut spent = 0;
                 let bounded =
                     compute_top_symbols(&db, "models.py", false, 0, &mut cache, Some(&mut spent))
                         .unwrap();
@@ -2521,8 +2512,8 @@ mod tests {
     }
 
     /// A spent request budget leaves every referenced symbol on its name
-    /// count and discloses it; the per-file deadline alone resolves them, and
-    /// a live budget is charged only what the pass used.
+    /// count and discloses it; the per-file budget alone resolves them, and
+    /// a live budget is charged only the rows the pass admitted.
     #[test]
     fn request_budget_bounds_top_symbols_without_hiding_the_cut() {
         let (_dir, db) = setup_project();
@@ -2537,21 +2528,21 @@ mod tests {
             !find.bounded && find.why.contains("2 refs") && !find.why.contains("by name"),
             "without a request budget the per-file pass resolves: {find:?}"
         );
-        let mut live = TOP_SYMBOLS_REQUEST_BUDGET;
+        let mut live = TOP_SYMBOLS_REQUEST_REF_BUDGET;
         let charged =
             compute_top_symbols(&db, "Repository.php", false, 0, &mut cache, Some(&mut live))
                 .unwrap();
         assert_eq!(
             serde_json::to_value(&resolved).unwrap(),
             serde_json::to_value(&charged).unwrap(),
-            "a live budget changes nothing but the time left"
+            "a live budget changes nothing but the rows left"
         );
         assert!(
-            live < TOP_SYMBOLS_REQUEST_BUDGET,
-            "the pass charges the time it spent, left {live:?}"
+            live < TOP_SYMBOLS_REQUEST_REF_BUDGET,
+            "the pass charges the rows it admitted, left {live:?}"
         );
 
-        let mut spent = Duration::ZERO;
+        let mut spent = 0;
         let cut = compute_top_symbols(
             &db,
             "Repository.php",
@@ -2561,7 +2552,7 @@ mod tests {
             Some(&mut spent),
         )
         .unwrap();
-        assert_eq!(spent, Duration::ZERO, "a spent budget cannot go negative");
+        assert_eq!(spent, 0, "a spent budget cannot go negative");
         let find = cut
             .iter()
             .find(|t| t.name == "find")

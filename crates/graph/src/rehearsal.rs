@@ -18,11 +18,15 @@ const REHEARSAL_REACHABLE_NOTE_CAP: usize = 5;
 /// to a count.
 const REHEARSAL_COMMAND_NOTE_CAP: usize = 5;
 
-/// Wall-clock cap on the rehearsal's reachability walk. `assess_risk_diff`
-/// shares resolved reverse edges with this walk while retaining its narrower
-/// frontier. The remaining test-discovery work stays bounded more tightly
-/// than the standalone tool's 5 s.
-const REHEARSAL_REACH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_500);
+/// Wall-clock backstop on the rehearsal's reachability walk. The walk's
+/// step budget is the bound that is meant to stop it, so the reachable-test
+/// list repeats run to run; this fires only when the machine is several times
+/// slower than the walk needs. `assess_risk_diff` shares resolved reverse
+/// edges with this walk while retaining its narrower frontier.
+const REHEARSAL_REACH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+/// Wall-clock backstop on the branch-overlap scan. The ref cap bounds the
+/// scan; this only stops Git that hangs or crawls.
+const REHEARSAL_BRANCH_OVERLAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 use codesage_protocol::{
     FeatureFileRole, ReviewObjection, ReviewRehearsal, ReviewSeverity, RiskAssessment,
     TrustBoundary,
@@ -395,7 +399,7 @@ pub fn build_review_rehearsal(
     }
 
     let overlap =
-        crate::branch_overlap::branch_overlap(root, files, std::time::Duration::from_millis(250));
+        crate::branch_overlap::branch_overlap(root, files, REHEARSAL_BRANCH_OVERLAP_BUDGET);
     if let Some(objection) = crate::branch_overlap::branch_overlap_objection(&overlap) {
         objections.push(objection);
     }
@@ -418,7 +422,7 @@ pub fn build_review_rehearsal(
 
 pub fn build_branch_only_rehearsal(root: &Path, files: &[String]) -> ReviewRehearsal {
     let overlap =
-        crate::branch_overlap::branch_overlap(root, files, std::time::Duration::from_millis(250));
+        crate::branch_overlap::branch_overlap(root, files, REHEARSAL_BRANCH_OVERLAP_BUDGET);
     ReviewRehearsal {
         files: files.to_vec(),
         objections: crate::branch_overlap::branch_overlap_objection(&overlap).into_iter().collect(),
