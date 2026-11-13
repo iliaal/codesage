@@ -180,7 +180,56 @@ pub struct Symbol {
     pub overloaded: bool,
 }
 
+/// Estimated heap bytes of `symbols`, including the vector's own slots, for
+/// callers that bound memoized rows by size.
+pub fn symbols_heap_bytes(symbols: &Vec<Symbol>) -> usize {
+    symbols.iter().fold(
+        symbols
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Symbol>()),
+        |bytes, symbol| bytes.saturating_add(symbol.heap_bytes()),
+    )
+}
+
 impl Symbol {
+    /// Estimated heap bytes this symbol owns outside its own struct.
+    pub fn heap_bytes(&self) -> usize {
+        let optional = |value: &Option<String>| value.as_ref().map_or(0, String::capacity);
+        let rationale = self.rationale.iter().fold(
+            self.rationale
+                .capacity()
+                .saturating_mul(std::mem::size_of::<RationaleEntry>()),
+            |bytes, entry| bytes.saturating_add(entry.text.capacity()),
+        );
+        let signature = self.signature.as_ref().map_or(0, |signature| {
+            signature.parameters.iter().fold(
+                signature
+                    .declaration
+                    .capacity()
+                    .saturating_add(optional(&signature.returns))
+                    .saturating_add(
+                        signature
+                            .parameters
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Parameter>()),
+                    ),
+                |bytes, parameter| {
+                    bytes
+                        .saturating_add(parameter.declaration.capacity())
+                        .saturating_add(optional(&parameter.name))
+                        .saturating_add(optional(&parameter.type_name))
+                        .saturating_add(optional(&parameter.default_value))
+                },
+            )
+        });
+        self.name
+            .capacity()
+            .saturating_add(self.qualified_name.capacity())
+            .saturating_add(self.file_path.capacity())
+            .saturating_add(rationale)
+            .saturating_add(signature)
+    }
+
     /// `sym:<file_path>#<qualified_name>`, with `@<line_start>` only when
     /// `overloaded`. Falls back to `name` when `qualified_name` is empty.
     pub fn handle(&self) -> Handle {

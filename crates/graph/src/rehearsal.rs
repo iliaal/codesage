@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::git_history::{
-    ReachabilityOptions, assess_risk_diff_with_walk_cache, reach_cap_clause,
+    ReachabilityOptions, assess_risk_diff_and_batch, reach_cap_clause,
     recommend_tests_with_walk_cache,
 };
 use crate::impact::WalkCache;
@@ -29,7 +29,7 @@ const REHEARSAL_REACH_DEADLINE: std::time::Duration = std::time::Duration::from_
 const REHEARSAL_BRANCH_OVERLAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 use codesage_protocol::{
     FeatureFileRole, ReviewObjection, ReviewRehearsal, ReviewSeverity, RiskAssessment,
-    TrustBoundary,
+    RiskBatchAssessment, RiskDiffAssessment, TrustBoundary,
 };
 use codesage_storage::Database;
 
@@ -53,16 +53,59 @@ pub fn build_review_rehearsal(
     db: &Database,
     files: &[String],
 ) -> Result<ReviewRehearsal> {
+    Ok(build_rehearsal(root, db, files, false)?.0)
+}
+
+/// The patch-risk, rehearsal, and per-file risk reports for one file set.
+pub struct ReviewInputs {
+    /// What [`crate::assess_risk_diff`] reports for `files`.
+    pub risk_diff: RiskDiffAssessment,
+    /// What [`build_review_rehearsal`] reports for `files`.
+    pub rehearsal: ReviewRehearsal,
+    /// What [`crate::assess_risk_batch`] reports for `files`.
+    pub risk_batch: RiskBatchAssessment,
+}
+
+/// Build all three reports from the rehearsal's single scoring pass. Each
+/// report equals the one its own entry point returns; run separately, the
+/// three score every file three times.
+pub fn build_review_inputs(root: &Path, db: &Database, files: &[String]) -> Result<ReviewInputs> {
+    let (rehearsal, risk) = build_rehearsal(root, db, files, true)?;
+    let (risk_diff, risk_batch) = match risk {
+        Some(risk) => risk,
+        None => (
+            crate::assess_risk_diff(db, files)?,
+            crate::assess_risk_batch(db, files)?,
+        ),
+    };
+    Ok(ReviewInputs {
+        risk_diff,
+        rehearsal,
+        risk_batch,
+    })
+}
+
+type RiskReports = (RiskDiffAssessment, RiskBatchAssessment);
+
+fn build_rehearsal(
+    root: &Path,
+    db: &Database,
+    files: &[String],
+    with_risk_reports: bool,
+) -> Result<(ReviewRehearsal, Option<RiskReports>)> {
     codesage_protocol::work::checkpoint()?;
     if files.is_empty() {
-        return Ok(ReviewRehearsal {
-            files: Vec::new(),
-            objections: Vec::new(),
-            summary_notes: vec![
-                "No files supplied — pass the patch's file list (e.g. `git diff --name-only`)."
-                    .to_string(),
-            ],
-        });
+        return Ok((
+            ReviewRehearsal {
+                files: Vec::new(),
+                objections: Vec::new(),
+                summary_notes: vec![
+                    "No files supplied — pass the patch's file list (e.g. `git diff --name-only`)."
+                        .to_string(),
+                ],
+            },
+            None,
+        ));
     }
 
     let mut objections: Vec<ReviewObjection> = Vec::new();
@@ -83,8 +126,11 @@ pub fn build_review_rehearsal(
         });
     }
 
+    let _python_memo = db.python_memo_scope();
     let mut walk_cache = WalkCache::default();
-    let scored = assess_risk_diff_with_walk_cache(db, files, Some(&mut walk_cache))?;
+    let mut scored =
+        assess_risk_diff_and_batch(db, files, Some(&mut walk_cache), with_risk_reports)?;
+    let risk_batch = scored.batch.take();
     let risk = scored.diff;
     // Clustering keeps wire detail for only three files per directory; the
     // omitted rows were scored in the same pass and are read back here so
@@ -413,11 +459,12 @@ pub fn build_review_rehearsal(
     let mut summary_notes = build_summary(root, db, files, &risk, &objections, &mut walk_cache)?;
     summary_notes.push(crate::branch_overlap::branch_overlap_summary(&overlap));
 
-    Ok(ReviewRehearsal {
+    let rehearsal = ReviewRehearsal {
         files: files.to_vec(),
         objections,
         summary_notes,
-    })
+    };
+    Ok((rehearsal, risk_batch.map(|batch| (risk, batch))))
 }
 
 pub fn build_branch_only_rehearsal(root: &Path, files: &[String]) -> ReviewRehearsal {

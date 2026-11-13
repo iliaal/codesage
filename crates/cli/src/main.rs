@@ -454,6 +454,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// The `risk-diff`, `rehearse`, and `risk-batch` reports for one file set from a single
+    /// scoring pass, for review pipelines that would otherwise run all three
+    ReviewInputs {
+        /// Repo-relative file paths. If empty, read newline-separated paths from stdin.
+        files: Vec<String>,
+        /// Emit one JSON object holding each report's text and JSON forms
+        #[arg(long)]
+        json: bool,
+    },
     /// Trust-boundary tags derived from a file's imports/includes/calls (network, filesystem,
     /// secrets, process-exec, etc.). Composes into `assess_risk`. Empty when the file
     /// matches no boundary rule or has never been derived (run `codesage index`).
@@ -1426,6 +1435,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::RiskBatch { files, json } => risk::cmd_risk_batch(files, json),
         Commands::TestsFor { files, json } => risk::cmd_tests_for(files, json),
         Commands::Rehearse { files, json } => risk::cmd_rehearse(files, json),
+        Commands::ReviewInputs { files, json } => risk::cmd_review_inputs(files, json),
         Commands::TrustBoundaries { file, json } => features::cmd_trust_boundaries(&file, json),
         Commands::Map { json } => index::cmd_map(json),
         Commands::FeaturesList {

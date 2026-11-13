@@ -19,7 +19,7 @@ pub(crate) use risk::ImportCycles;
 #[cfg(test)]
 pub(crate) use risk::TOP_SYMBOLS_PASSES;
 pub(crate) use risk::{
-    RiskRequestScope, assess_risk_batch_for_ranking, assess_risk_diff_with_walk_cache,
+    RiskRequestScope, assess_risk_batch_for_ranking, assess_risk_diff_and_batch,
     assess_risk_with_scope,
 };
 pub use risk::{

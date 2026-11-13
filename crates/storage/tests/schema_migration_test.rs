@@ -98,6 +98,20 @@ fn migrates_legacy_schema_to_current() {
         .unwrap();
     assert_eq!(has_idx, 1, "idx_refs_to_name_tail must exist after init_db");
 
+    let import_edge_index: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_refs_import_edges'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("idx_refs_import_edges must exist after init_db");
+    assert!(
+        import_edge_index.contains(
+            "WHERE kind IN ('import', 'import_binding', 'include', 'inheritance', 'trait_use')"
+        ),
+        "{import_edge_index}"
+    );
+
     for (id, to_name) in &cases {
         let tail: String = conn
             .query_row(
@@ -207,6 +221,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0029_feature_entrypoints",
         "0030_git_history_build",
         "0031_git_history_build_v2",
+        "0032_refs_import_edges",
     ];
     for migration in expected_migrations {
         let count: i64 = conn
@@ -1166,4 +1181,31 @@ fn dot_tail_migration_backfills_existing_refs() {
         )
         .unwrap();
     assert_eq!(migration_recorded, 1);
+}
+
+/// Commands open the index through the migrating path, and searches through
+/// the model path on top of it. On a current index both must only read: a
+/// statement that takes the write lock, even one that changes nothing, waits
+/// out the busy timeout behind an indexing transaction and then fails the
+/// command.
+#[test]
+fn opening_a_current_index_succeeds_while_another_connection_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    drop(codesage_storage::Database::open(&path).unwrap());
+    drop(codesage_storage::Database::open_for_model(&path, "probe-model", 8).unwrap());
+
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE schema_migrations SET applied_at = applied_at;",
+        )
+        .unwrap();
+
+    codesage_storage::Database::open(&path)
+        .expect("a current index opens while another connection holds the write lock");
+    codesage_storage::Database::open_for_model_existing(&path, "probe-model", 8)
+        .expect("a recorded model opens while another connection holds the write lock");
+    writer.execute_batch("ROLLBACK").unwrap();
 }

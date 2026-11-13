@@ -1,5 +1,18 @@
 ## [Unreleased]
 
+### Added
+
+- `codesage review-inputs [FILE...] [--json]` returns the `risk-diff`, `rehearse`, and `risk-batch` reports for one file set from a single scoring pass; `--json` carries each report's text and JSON forms.
+
+### Changed
+
+- `codesage risk-diff`, `risk-batch`, `rehearse`, and MCP `assess_risk` read import references through a new partial index (schema migration `0032_refs_import_edges`) instead of scanning every reference row. The first command that opens the index for writing after upgrading, such as `codesage index`, builds it once. Results are unchanged.
+- `codesage index` compacts the index after a complete pass when no compaction is recorded or the reference rows written since the last one reach 35% of the index, and prints a `Compacted:` line. It needs free space for two copies of the index and is skipped with a note otherwise; `CODESAGE_INDEX_COMPACT=0` disables it.
+
+### Fixed
+
+- `risk-diff`, `risk-batch`, `find-symbol`, and other commands that open a current index no longer wait 5 seconds and fail with `database is locked` while another process holds a write transaction, such as a hook-driven `codesage index`.
+
 ## [0.51.0] - 2026-11-12
 
 ### Changed

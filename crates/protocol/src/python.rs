@@ -51,7 +51,7 @@ pub struct PythonBindingTarget {
     pub namespace: Option<Vec<(String, PythonBindingTarget)>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PythonModule {
     pub file: Option<String>,
     pub package: bool,
@@ -194,7 +194,8 @@ fn walk_module(
                 selected = Some((path, file, false));
                 break;
             }
-            if indexed.iter().any(|p| p.starts_with(&format!("{path}/"))) {
+            let directory = format!("{path}/");
+            if indexed.iter().any(|p| p.starts_with(&directory)) {
                 namespaces.push(path);
             }
         }

@@ -24,6 +24,7 @@ mod git_authors;
 mod git_hist;
 mod hash_cache;
 mod overlay;
+mod python_memo;
 mod semantic;
 mod sidecar_verdicts;
 mod structural;
@@ -34,7 +35,10 @@ pub use git_hist::{
     STAGED_ENVIRONMENTS_KEPT,
 };
 pub use overlay::StructuralOverlayFile;
-pub use semantic::{RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes};
+pub use python_memo::PythonMemoScope;
+pub use semantic::{
+    Compaction, RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes,
+};
 pub use sidecar_verdicts::PathSidecarVerdicts;
 pub use structural::{FingerprintInput, ImportPairs, PythonPackageProbes, StoredFingerprint};
 
@@ -111,6 +115,8 @@ pub struct Database {
     cache_id: u64,
     /// Sidecar verdicts this handle may reuse; see [`Database::ensure_sidecars`].
     verified_sidecars: RefCell<semantic::SidecarMemo>,
+    /// Python binding answers; see [`Database::python_memo_scope`].
+    python_memo: RefCell<python_memo::PythonMemo>,
 }
 
 pub struct ReadSnapshot<'a> {
@@ -664,22 +670,41 @@ fn record_semantic_model_table(
     dim: usize,
     refresh_indexed_at: bool,
 ) -> Result<()> {
-    conn.execute(
-        "DELETE FROM semantic_models
-         WHERE lower(chunk_table) = lower(?1) AND chunk_table <> ?1",
+    // Both statements below take the write lock even when they change
+    // nothing, and every model open runs this, so each is preceded by a read:
+    // a search must not wait on, or fail behind, an indexing transaction.
+    let case_variant: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM semantic_models
+                       WHERE lower(chunk_table) = lower(?1) AND chunk_table <> ?1)",
         params![chunk_table],
+        |row| row.get(0),
     )?;
-    conn.execute(
-        "INSERT INTO semantic_models (chunk_table, model, dim, indexed_at)
-         VALUES (?1, ?2, ?3, unixepoch())
-         ON CONFLICT(chunk_table) DO UPDATE SET
-             model = excluded.model,
-             dim = excluded.dim,
-             indexed_at = excluded.indexed_at
-         WHERE ?4 OR semantic_models.model <> excluded.model
-                  OR semantic_models.dim <> excluded.dim",
-        params![chunk_table, model, dim as i64, refresh_indexed_at],
+    if case_variant {
+        conn.execute(
+            "DELETE FROM semantic_models
+             WHERE lower(chunk_table) = lower(?1) AND chunk_table <> ?1",
+            params![chunk_table],
+        )?;
+    }
+    let recorded: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM semantic_models
+                       WHERE chunk_table = ?1 AND model = ?2 AND dim = ?3)",
+        params![chunk_table, model, dim as i64],
+        |row| row.get(0),
     )?;
+    if refresh_indexed_at || !recorded {
+        conn.execute(
+            "INSERT INTO semantic_models (chunk_table, model, dim, indexed_at)
+             VALUES (?1, ?2, ?3, unixepoch())
+             ON CONFLICT(chunk_table) DO UPDATE SET
+                 model = excluded.model,
+                 dim = excluded.dim,
+                 indexed_at = excluded.indexed_at
+             WHERE ?4 OR semantic_models.model <> excluded.model
+                      OR semantic_models.dim <> excluded.dim",
+            params![chunk_table, model, dim as i64, refresh_indexed_at],
+        )?;
+    }
     Ok(())
 }
 
@@ -747,6 +772,7 @@ impl Database {
             chunk_table: String::new(),
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
+            python_memo: Default::default(),
         })
     }
 
@@ -759,6 +785,7 @@ impl Database {
             chunk_table: String::new(),
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
+            python_memo: Default::default(),
         })
     }
 
@@ -773,6 +800,7 @@ impl Database {
             chunk_table: String::new(),
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
+            python_memo: Default::default(),
         })
     }
 
@@ -826,6 +854,7 @@ impl Database {
             chunk_table: String::new(),
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
+            python_memo: Default::default(),
         })
     }
 
@@ -919,6 +948,7 @@ impl Database {
             chunk_table,
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
+            python_memo: Default::default(),
         };
         if let Some(fts_in_sync) = fts_in_sync {
             let mut verified = None;
@@ -979,6 +1009,7 @@ impl Database {
             chunk_table,
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
+            python_memo: Default::default(),
         };
         db.mark_sidecars_verified(
             &db.chunk_table,
@@ -1010,6 +1041,7 @@ impl Database {
             chunk_table,
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
+            python_memo: Default::default(),
         })
     }
 
@@ -1091,6 +1123,7 @@ impl Database {
             chunk_table,
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
+            python_memo: Default::default(),
         })
     }
 
@@ -2552,6 +2585,7 @@ mod tests {
             chunk_table: table.clone(),
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
+            python_memo: Default::default(),
         };
         if with_chunk {
             let embedding = make_embedding(0.1);

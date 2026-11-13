@@ -3034,3 +3034,34 @@ fn package_directory_probes_are_memoized_across_one_resolution_pass() {
     assert_eq!(resolved, 20);
     assert_eq!(probes.queries(), 1);
 }
+
+#[test]
+fn scoped_import_loads_answer_only_for_the_scope_file_set() {
+    let (_root, db) = project(&[
+        (
+            "tests/test_a.py",
+            "import helpers\ndef test_it():\n    helpers.value()\n",
+        ),
+        ("tests/helpers.py", "def value():\n    return 1\n"),
+    ]);
+    let row = db
+        .references_in_file_range("tests/test_a.py", 0, u32::MAX)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.kind == ReferenceKind::Import)
+        .unwrap();
+    let probes = codesage_storage::db::PythonPackageProbes::default();
+    let targets = |indexed: &std::collections::HashSet<String>| {
+        db.python_import_targets_indexed(&row, indexed, &probes)
+            .unwrap()
+    };
+
+    let _scope = db.python_memo_scope();
+    let shared = db.python_indexed_files().unwrap();
+    assert_eq!(targets(&shared), ["tests/helpers.py"]);
+    // A caller's own file set is never answered from the scope's memo, and
+    // its answer never replaces the scope's.
+    let without_target = std::collections::HashSet::from(["tests/test_a.py".to_string()]);
+    assert!(targets(&without_target).is_empty());
+    assert_eq!(targets(&shared), ["tests/helpers.py"]);
+}

@@ -97,7 +97,7 @@ CODESAGE_SUBCOMMANDS = frozenset(
         "find-references", "dependencies", "impact", "trace", "from-trace", "export",
         "status", "mcp", "daemon", "watch", "install-hooks", "install",
         "uninstall", "cleanup", "coverage", "git-index", "coupling", "risk",
-        "risk-batch", "risk-diff", "similar", "tests-for", "rehearse", "edit-check",
+        "risk-batch", "risk-diff", "similar", "tests-for", "rehearse", "review-inputs", "edit-check",
         "session-start", "session-end", "doctor", "map", "features-list",
         "feature-show", "feature-for", "feature-bundle", "trust-boundaries",
     }

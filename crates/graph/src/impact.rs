@@ -113,7 +113,9 @@ pub(crate) struct WalkCache {
     file_imports: Option<Arc<FileImports>>,
     python_indexed: Option<Arc<HashSet<String>>>,
     python_probes: codesage_storage::db::PythonPackageProbes,
-    python_imports: HashMap<codesage_protocol::python::PythonImportSite, Arc<Vec<String>>>,
+    /// Estimated bytes of Python import targets retained in `file_imports`.
+    python_target_bytes: usize,
+    python_references: PythonReferences,
     import_matches: HashMap<String, Arc<Vec<usize>>>,
     rust_modules: Option<Arc<crate::rust_modules::RustModules>>,
     constructors: crate::construction::Constructors,
@@ -141,6 +143,7 @@ impl WalkCache {
 
     const MAX_SYMBOLS: usize = 8192;
     const MAX_REFERENCE_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_PYTHON_TARGET_BYTES: usize = 16 * 1024 * 1024;
 
     #[cfg(test)]
     pub(crate) fn stats(&self) -> (usize, usize, usize) {
@@ -189,28 +192,20 @@ impl WalkCache {
             + self.import_matches.len()
             + self.resolutions.len()
             + self.caller_imports.len()
-            + self.python_imports.len()
     }
 
+    /// The indexed files one Python import row loads, and whether the caller
+    /// may retain the answer: [`FileImports`] keeps one answer per row, so
+    /// retention is charged here against its own byte budget. An answer over
+    /// budget is resolved again on each lookup.
     fn python_import_targets(
         &mut self,
         db: &Database,
         row: &Reference,
-    ) -> Result<Arc<Vec<String>>> {
-        use codesage_protocol::python::PythonImportSite;
-
+    ) -> Result<(Arc<Vec<String>>, bool)> {
         codesage_protocol::work::checkpoint()?;
         if row.kind != ReferenceKind::Import {
-            return Ok(Arc::new(Vec::new()));
-        }
-        let key = PythonImportSite {
-            file: row.from_file.clone(),
-            to_name: row.to_name.clone(),
-            line: row.line,
-            col: row.col,
-        };
-        if let Some(targets) = self.python_imports.get(&key) {
-            return Ok(Arc::clone(targets));
+            return Ok((Arc::new(Vec::new()), true));
         }
         let indexed = self.indexed_files(db)?;
         let targets =
@@ -218,26 +213,22 @@ impl WalkCache {
         let bytes = targets.iter().fold(
             targets
                 .capacity()
-                .saturating_mul(std::mem::size_of::<String>())
-                .saturating_add(std::mem::size_of::<PythonImportSite>())
-                .saturating_add(key.file.capacity())
-                .saturating_add(key.to_name.capacity()),
+                .saturating_mul(std::mem::size_of::<String>()),
             |bytes, path| bytes.saturating_add(path.capacity()),
         );
-        if self.entry_count() < Self::MAX_SYMBOLS
-            && bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes)
-        {
-            self.reference_bytes += bytes;
-            self.python_imports.insert(key, Arc::clone(&targets));
+        let retain =
+            bytes <= Self::MAX_PYTHON_TARGET_BYTES.saturating_sub(self.python_target_bytes);
+        if retain {
+            self.python_target_bytes += bytes;
         }
-        Ok(targets)
+        Ok((targets, retain))
     }
 
     fn indexed_files(&mut self, db: &Database) -> Result<Arc<HashSet<String>>> {
         Ok(match &self.python_indexed {
             Some(indexed) => Arc::clone(indexed),
             None => {
-                let indexed = Arc::new(db.all_file_paths()?.into_iter().collect::<HashSet<_>>());
+                let indexed = db.python_indexed_files()?;
                 let bytes = indexed.iter().fold(
                     indexed
                         .capacity()
@@ -302,7 +293,7 @@ impl WalkCache {
         db: &Database,
         row: &Reference,
     ) -> Result<Vec<Symbol>> {
-        let mut resolved = match crate::python_bindings::resolve_reference(db, row)? {
+        let mut resolved = match self.python_reference(db, row)? {
             Some(resolved) => resolved,
             None => {
                 let key = (row.from_file.clone(), row.to_name.clone(), row.kind);
@@ -328,6 +319,34 @@ impl WalkCache {
         };
         self.constructors.append_targets(db, row, &mut resolved)?;
         Ok(resolved)
+    }
+
+    fn python_reference(&mut self, db: &Database, row: &Reference) -> Result<Option<Vec<Symbol>>> {
+        if !codesage_protocol::python::is_python_path(&row.from_file) {
+            return Ok(None);
+        }
+        codesage_protocol::work::checkpoint()?;
+        let key = (
+            row.from_file.clone(),
+            row.kind,
+            row.to_name.clone(),
+            row.line,
+            row.col,
+        );
+        if let Some(resolved) = self.python_references.rows.get(&key) {
+            return Ok(resolved.as_ref().clone());
+        }
+        let resolved = Arc::new(crate::python_bindings::resolve_reference(db, row)?);
+        let bytes = resolved
+            .as_ref()
+            .as_ref()
+            .map_or(0, codesage_protocol::symbols_heap_bytes)
+            .saturating_add(std::mem::size_of_val(&key))
+            .saturating_add(key.0.capacity())
+            .saturating_add(key.2.capacity());
+        let value = resolved.as_ref().clone();
+        self.python_references.admit(key, &resolved, bytes);
+        Ok(value)
     }
 
     fn resolve(
@@ -418,6 +437,12 @@ impl WalkCache {
 pub(crate) struct FileImports {
     rows: Vec<Reference>,
     shapes: Vec<FileImportShape>,
+    /// Files each Python row loads, by row index and filled on first use; empty
+    /// when no row is Python. Every frontier file tests every Python row, so
+    /// indexing by row avoids building and hashing an import-site key per row
+    /// per frontier file. One pointer-sized slot per row of `rows`; the
+    /// retained targets are charged to `WalkCache::MAX_PYTHON_TARGET_BYTES`.
+    python_targets: Vec<std::sync::OnceLock<Arc<Vec<String>>>>,
     /// Some importer is C or C++, so path matching needs the indexed paths.
     c_family: bool,
 }
@@ -452,86 +477,90 @@ impl FileImports {
                 },
             );
         }
+        let python_targets = if shapes.contains(&FileImportShape::Python) {
+            rows.iter().map(|_| std::sync::OnceLock::new()).collect()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
+            python_targets,
             rows,
             shapes,
             c_family,
         })
     }
+
+    fn python_targets(
+        &self,
+        db: &Database,
+        index: usize,
+        cache: &mut WalkCache,
+    ) -> Result<Arc<Vec<String>>> {
+        if let Some(targets) = self.python_targets[index].get() {
+            return Ok(Arc::clone(targets));
+        }
+        let (targets, retain) = cache.python_import_targets(db, &self.rows[index])?;
+        if retain {
+            let _ = self.python_targets[index].set(Arc::clone(&targets));
+        }
+        Ok(targets)
+    }
+}
+
+/// Request-local answers under a byte budget separate from the edge evidence
+/// in [`WalkCache`], for lookups that recur once per frontier file or per
+/// same-named definition and would otherwise compete for the shared entry
+/// cap. An answer that does not fit is computed again on each lookup.
+struct BudgetedMemo<K, V, const MAX_BYTES: usize> {
+    rows: HashMap<K, Arc<V>>,
+    bytes: usize,
+}
+
+impl<K, V, const MAX_BYTES: usize> Default for BudgetedMemo<K, V, MAX_BYTES> {
+    fn default() -> Self {
+        Self {
+            rows: HashMap::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V, const MAX_BYTES: usize> BudgetedMemo<K, V, MAX_BYTES> {
+    fn admit(&mut self, key: K, value: &Arc<V>, bytes: usize) {
+        if bytes <= MAX_BYTES.saturating_sub(self.bytes) {
+            self.bytes += bytes;
+            self.rows.insert(key, Arc::clone(value));
+        }
+    }
 }
 
 /// Request-local `find_symbols(name, None)` rows. Every caller file that
 /// spells a name reads the same definitions before its own filters run, so a
-/// walk that resolves one name from many files hydrates its rows once. Its
-/// byte budget is separate from the edge evidence in [`WalkCache`]; a name
-/// whose rows do not fit is read again on each lookup.
+/// walk that resolves one name from many files hydrates its rows once.
 #[derive(Default)]
-struct SymbolsNamed {
-    rows: HashMap<String, Arc<Vec<Symbol>>>,
-    bytes: usize,
-}
+struct SymbolsNamed(BudgetedMemo<String, Vec<Symbol>, { 32 * 1024 * 1024 }>);
 
 impl SymbolsNamed {
-    const MAX_BYTES: usize = 32 * 1024 * 1024;
-
     fn get(&mut self, db: &Database, name: &str) -> Result<Arc<Vec<Symbol>>> {
         codesage_protocol::work::checkpoint()?;
-        if let Some(rows) = self.rows.get(name) {
+        if let Some(rows) = self.0.rows.get(name) {
             return Ok(Arc::clone(rows));
         }
         let rows = Arc::new(db.find_symbols(name, None)?);
-        let bytes = rows.iter().fold(
-            rows.capacity()
-                .saturating_mul(std::mem::size_of::<Symbol>())
-                .saturating_add(name.len()),
-            |bytes, symbol| bytes.saturating_add(symbol_heap_bytes(symbol)),
-        );
-        if bytes <= Self::MAX_BYTES.saturating_sub(self.bytes) {
-            self.bytes += bytes;
-            self.rows.insert(name.to_string(), Arc::clone(&rows));
-        }
+        let bytes = codesage_protocol::symbols_heap_bytes(&rows).saturating_add(name.len());
+        self.0.admit(name.to_string(), &rows, bytes);
         Ok(rows)
     }
 }
 
-fn symbol_heap_bytes(symbol: &Symbol) -> usize {
-    let optional = |value: &Option<String>| value.as_ref().map_or(0, String::capacity);
-    let rationale = symbol.rationale.iter().fold(
-        symbol
-            .rationale
-            .capacity()
-            .saturating_mul(std::mem::size_of::<codesage_protocol::RationaleEntry>()),
-        |bytes, entry| bytes.saturating_add(entry.text.capacity()),
-    );
-    let signature = symbol.signature.as_ref().map_or(0, |signature| {
-        signature.parameters.iter().fold(
-            signature
-                .declaration
-                .capacity()
-                .saturating_add(optional(&signature.returns))
-                .saturating_add(
-                    signature
-                        .parameters
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<codesage_protocol::Parameter>()),
-                ),
-            |bytes, parameter| {
-                bytes
-                    .saturating_add(parameter.declaration.capacity())
-                    .saturating_add(optional(&parameter.name))
-                    .saturating_add(optional(&parameter.type_name))
-                    .saturating_add(optional(&parameter.default_value))
-            },
-        )
-    });
-    symbol
-        .name
-        .capacity()
-        .saturating_add(symbol.qualified_name.capacity())
-        .saturating_add(symbol.file_path.capacity())
-        .saturating_add(rationale)
-        .saturating_add(signature)
-}
+/// Python reference row `(file, kind, spelling, line, col)` to the definitions
+/// its recorded binding resolves to. Raw reference rows are read by tail
+/// name, so every same-named definition re-resolves the same rows.
+type PythonReferences = BudgetedMemo<
+    (String, ReferenceKind, String, u32, u32),
+    Option<Vec<Symbol>>,
+    { 16 * 1024 * 1024 },
+>;
 
 /// Hard work budget for a walk, counted in resolution steps (see
 /// [`WalkBudget::cost`]), plus an optional wall-clock deadline. One instance
@@ -871,10 +900,12 @@ pub(crate) fn impact_analysis_walk_shared(
                 let shape = file_imports.shapes[reference_index];
                 if cached_matches.is_none()
                     && shape == FileImportShape::Python
-                    && !cache
-                        .as_deref_mut()
-                        .expect("walk cache initialized")
-                        .python_import_targets(db, r)?
+                    && !file_imports
+                        .python_targets(
+                            db,
+                            reference_index,
+                            cache.as_deref_mut().expect("walk cache initialized"),
+                        )?
                         .iter()
                         .any(|target| target == file)
                 {

@@ -1,5 +1,5 @@
 //! Git-history intelligence commands: `git-index`, `coupling`, `risk`,
-//! `risk-batch`, `risk-diff`, `tests-for`, `rehearse`.
+//! `risk-batch`, `risk-diff`, `tests-for`, `rehearse`, `review-inputs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -197,6 +197,59 @@ fn resolve_file_list(files: Vec<String>) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Appends one formatted line, as `println!` would print it.
+macro_rules! line {
+    ($out:expr, $($arg:tt)*) => {{
+        $out.push_str(&format!($($arg)*));
+        $out.push('\n');
+    }};
+}
+
+fn risk_diff_text(assessment: &codesage_protocol::RiskDiffAssessment) -> String {
+    let mut out = String::new();
+    line!(
+        out,
+        "Patch risk: {} file(s) | max={:.2} mean={:.2}",
+        assessment.files.len(),
+        assessment.max_score,
+        assessment.mean_score
+    );
+    if let Some(top) = &assessment.max_risk_file {
+        line!(out, "  highest-risk file: {top}");
+    }
+    for label in [
+        ("hotspot", &assessment.hotspot_files),
+        ("fix-heavy", &assessment.fix_heavy_files),
+        ("test gap", &assessment.test_gap_files),
+        ("wide blast radius", &assessment.wide_blast_files),
+        ("unscored", &assessment.unscored_files),
+    ] {
+        if !label.1.is_empty() {
+            line!(out, "  {} ({}):", label.0, label.1.len());
+            for f in label.1 {
+                line!(out, "    - {f}");
+            }
+        }
+    }
+    if !assessment.summary_notes.is_empty() {
+        line!(out, "  Notes:");
+        for n in &assessment.summary_notes {
+            line!(out, "    - {n}");
+        }
+    }
+    for file in assessment.files.iter().chain(
+        assessment
+            .clustered_directories
+            .iter()
+            .flat_map(|cluster| &cluster.top_files),
+    ) {
+        for note in file_risk_notes(&file.file, &file.notes, &assessment.legend) {
+            line!(out, "  Note: {note}");
+        }
+    }
+    out
+}
+
 pub(crate) fn cmd_risk_diff(files: Vec<String>, json: bool) -> Result<()> {
     let root = find_project_root()?;
     let db = open_db(&root)?;
@@ -208,47 +261,33 @@ pub(crate) fn cmd_risk_diff(files: Vec<String>, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&assessment)?);
     } else {
-        println!(
-            "Patch risk: {} file(s) | max={:.2} mean={:.2}",
-            assessment.files.len(),
-            assessment.max_score,
-            assessment.mean_score
-        );
-        if let Some(top) = &assessment.max_risk_file {
-            println!("  highest-risk file: {top}");
-        }
-        for label in [
-            ("hotspot", &assessment.hotspot_files),
-            ("fix-heavy", &assessment.fix_heavy_files),
-            ("test gap", &assessment.test_gap_files),
-            ("wide blast radius", &assessment.wide_blast_files),
-            ("unscored", &assessment.unscored_files),
-        ] {
-            if !label.1.is_empty() {
-                println!("  {} ({}):", label.0, label.1.len());
-                for f in label.1 {
-                    println!("    - {f}");
-                }
-            }
-        }
-        if !assessment.summary_notes.is_empty() {
-            println!("  Notes:");
-            for n in &assessment.summary_notes {
-                println!("    - {n}");
-            }
-        }
-        for file in assessment.files.iter().chain(
-            assessment
-                .clustered_directories
-                .iter()
-                .flat_map(|cluster| &cluster.top_files),
-        ) {
-            for note in file_risk_notes(&file.file, &file.notes, &assessment.legend) {
-                println!("  Note: {note}");
-            }
-        }
+        print!("{}", risk_diff_text(&assessment));
     }
     Ok(())
+}
+
+fn risk_batch_text(assessment: &codesage_protocol::RiskBatchAssessment) -> String {
+    let mut out = String::new();
+    line!(out, "Per-file risk: {} file(s)", assessment.files.len());
+    for f in &assessment.files {
+        line!(
+            out,
+            "  {:>5.2}  {}{}",
+            f.score,
+            f.file,
+            unscored_marker(f.unscored)
+        );
+        for note in file_risk_notes(&f.file, &f.notes, &assessment.legend) {
+            line!(out, "    {note}");
+        }
+    }
+    if !assessment.legend.is_empty() {
+        line!(out, "  Legend:");
+        for (code, full) in &assessment.legend {
+            line!(out, "    {code} = {full}");
+        }
+    }
+    out
 }
 
 pub(crate) fn cmd_risk_batch(files: Vec<String>, json: bool) -> Result<()> {
@@ -262,24 +301,7 @@ pub(crate) fn cmd_risk_batch(files: Vec<String>, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&assessment)?);
     } else {
-        println!("Per-file risk: {} file(s)", assessment.files.len());
-        for f in &assessment.files {
-            println!(
-                "  {:>5.2}  {}{}",
-                f.score,
-                f.file,
-                unscored_marker(f.unscored)
-            );
-            for note in file_risk_notes(&f.file, &f.notes, &assessment.legend) {
-                println!("    {note}");
-            }
-        }
-        if !assessment.legend.is_empty() {
-            println!("  Legend:");
-            for (code, full) in &assessment.legend {
-                println!("    {code} = {full}");
-            }
-        }
+        print!("{}", risk_batch_text(&assessment));
     }
     Ok(())
 }
@@ -477,6 +499,35 @@ fn working_tree_changes(root: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
+fn rehearsal_text(rehearsal: &codesage_protocol::ReviewRehearsal) -> String {
+    let mut out = String::new();
+    line!(
+        out,
+        "Review rehearsal: {} file(s), {} objection(s)",
+        rehearsal.files.len(),
+        rehearsal.objections.len()
+    );
+    for o in &rehearsal.objections {
+        line!(
+            out,
+            "  [{}] {} — {}",
+            o.severity.as_str(),
+            o.category,
+            o.title
+        );
+        for e in &o.evidence {
+            line!(out, "      {e}");
+        }
+    }
+    if !rehearsal.summary_notes.is_empty() {
+        line!(out, "Summary:");
+        for n in &rehearsal.summary_notes {
+            line!(out, "  - {n}");
+        }
+    }
+    out
+}
+
 pub(crate) fn cmd_rehearse(files: Vec<String>, json: bool) -> Result<()> {
     let root = crate::evidence_root(&std::env::current_dir()?)?;
     let files = resolve_patch_files(&root, files)?;
@@ -493,24 +544,68 @@ pub(crate) fn cmd_rehearse(files: Vec<String>, json: bool) -> Result<()> {
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&rehearsal)?);
-        return Ok(());
+    } else {
+        print!("{}", rehearsal_text(&rehearsal));
     }
-    println!(
-        "Review rehearsal: {} file(s), {} objection(s)",
-        rehearsal.files.len(),
-        rehearsal.objections.len()
-    );
-    for o in &rehearsal.objections {
-        println!("  [{}] {} — {}", o.severity.as_str(), o.category, o.title);
-        for e in &o.evidence {
-            println!("      {e}");
-        }
+    Ok(())
+}
+
+/// `risk-diff`, `rehearse`, and `risk-batch` for one file set from a single
+/// scoring pass. Each `text` is what that command prints, and each `report`
+/// is what it prints with `--json`.
+pub(crate) fn cmd_review_inputs(files: Vec<String>, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    // `rehearse` resolves its root from Git and the other two from the index;
+    // one pass can stand in for all three only where those agree.
+    if crate::evidence_root(&std::env::current_dir()?)? != root {
+        bail!(
+            "the project root and the Git work tree differ here; run `risk-diff`, `rehearse`, \
+             and `risk-batch` separately"
+        );
     }
-    if !rehearsal.summary_notes.is_empty() {
-        println!("Summary:");
-        for n in &rehearsal.summary_notes {
-            println!("  - {n}");
+    let files = resolve_file_list(files)?;
+    if files.is_empty() {
+        bail!("no file paths provided (pass as args or pipe via stdin)");
+    }
+    let db = crate::open_db_read_only(&root)?;
+    let inputs = codesage_graph::build_review_inputs(&root, &db, &files)?;
+    let risk_diff = risk_diff_text(&inputs.risk_diff);
+    let rehearsal = rehearsal_text(&inputs.rehearsal);
+    let risk_batch = risk_batch_text(&inputs.risk_batch);
+    if json {
+        // Serialized from the report types themselves: routing them through
+        // `serde_json::Value` would widen their `f32` fields to `f64` and
+        // print digits the separate commands do not.
+        #[derive(serde::Serialize)]
+        struct Section<'a, T> {
+            text: &'a str,
+            report: &'a T,
         }
+        #[derive(serde::Serialize)]
+        struct Sections<'a> {
+            risk_diff: Section<'a, codesage_protocol::RiskDiffAssessment>,
+            rehearsal: Section<'a, codesage_protocol::ReviewRehearsal>,
+            risk_batch: Section<'a, codesage_protocol::RiskBatchAssessment>,
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Sections {
+                risk_diff: Section {
+                    text: &risk_diff,
+                    report: &inputs.risk_diff,
+                },
+                rehearsal: Section {
+                    text: &rehearsal,
+                    report: &inputs.rehearsal,
+                },
+                risk_batch: Section {
+                    text: &risk_batch,
+                    report: &inputs.risk_batch,
+                },
+            })?
+        );
+    } else {
+        print!("{risk_diff}\n{rehearsal}\n{risk_batch}");
     }
     Ok(())
 }
