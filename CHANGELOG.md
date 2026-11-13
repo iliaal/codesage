@@ -1,12 +1,14 @@
 ## [Unreleased]
 
+## [0.52.0] - 2026-11-12
+
 ### Added
 
 - `codesage review-inputs [FILE...] [--json]` returns the `risk-diff`, `rehearse`, and `risk-batch` reports for one file set from a single scoring pass; `--json` carries each report's text and JSON forms.
 
 ### Changed
 
-- `codesage risk-diff`, `risk-batch`, `rehearse`, and MCP `assess_risk` read import references through a new partial index (schema migration `0032_refs_import_edges`) instead of scanning every reference row. The first command that opens the index for writing after upgrading, such as `codesage index`, builds it once. Results are unchanged.
+- `codesage risk-diff`, `risk-batch`, `rehearse`, and MCP `assess_risk` are faster on Python projects: a 690-file Python index went from 15-34 seconds per command to under 1 second. Schema migration `0032_refs_import_edges` adds an index that the first command opening the index for writing after upgrading, such as `codesage index`, builds once. Results are unchanged.
 - `codesage index` compacts the index after a complete pass when no compaction is recorded or the reference rows written since the last one reach 35% of the index, and prints a `Compacted:` line. It needs free space for two copies of the index and is skipped with a note otherwise; `CODESAGE_INDEX_COMPACT=0` disables it.
 
 ### Fixed
@@ -1482,5 +1484,7 @@ Initial public release.
 
 [0.50.0]: https://github.com/iliaal/codesage/releases/tag/v0.50.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.51.0...HEAD
 [0.51.0]: https://github.com/iliaal/codesage/releases/tag/v0.51.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.52.0...HEAD
+[0.52.0]: https://github.com/iliaal/codesage/releases/tag/v0.52.0
