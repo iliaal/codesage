@@ -67,7 +67,9 @@ pub use overview::{
     build_project_overview, build_project_overview_with_options,
     build_project_overview_with_top_risk,
 };
-pub use rehearsal::{build_branch_only_rehearsal, build_review_rehearsal};
+pub use rehearsal::{
+    ReviewInputs, build_branch_only_rehearsal, build_review_inputs, build_review_rehearsal,
+};
 pub use resolver::{ResolveOptions, TargetError, require_one, resolve_target};
 pub use search::{RerankFn, search, search_page};
 pub use semantic::{

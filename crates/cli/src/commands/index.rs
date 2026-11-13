@@ -187,6 +187,162 @@ fn write_feature_map_state(root: &Path, fingerprint: u64) {
     }
 }
 
+/// Reference rows written since the last compaction, as a share of the rows
+/// the index held then, at which it is compacted again. Measured on a 900 MB
+/// index replaying its real hook history: at 0.37 a cold structural query
+/// read scattered pages for about twice as long as on a compacted copy, and
+/// the cost kept growing.
+const COMPACTION_REWRITE_THRESHOLD: f64 = 0.35;
+
+fn compaction_state_path(root: &Path) -> PathBuf {
+    root.join(PROJECT_DIR).join("compaction.state")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionState {
+    /// No compaction has been recorded for this index.
+    Absent,
+    /// Reference rows written since the last compaction, and the rows held
+    /// when it ran.
+    Record { rewritten: u64, rows: u64 },
+    /// Something other than a readable state file sits at the path.
+    Unusable,
+}
+
+fn read_compaction_state(root: &Path) -> CompactionState {
+    let path = compaction_state_path(root);
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CompactionState::Absent,
+        Err(_) => return CompactionState::Unusable,
+        Ok(_) => {}
+    }
+    let Ok(state) = crate::fsguard::read_state_to_string(&path) else {
+        return CompactionState::Unusable;
+    };
+    let mut fields = state.split_whitespace().map(str::parse::<u64>);
+    match (fields.next(), fields.next()) {
+        (Some(Ok(rewritten)), Some(Ok(rows))) if rows > 0 => {
+            CompactionState::Record { rewritten, rows }
+        }
+        // A truncated or foreign record carries no count worth keeping.
+        _ => CompactionState::Absent,
+    }
+}
+
+fn write_compaction_state(root: &Path, rewritten: u64, rows: u64) -> std::io::Result<()> {
+    use std::io::Write as _;
+    // Repository-supplied symlinks must not redirect marker writes.
+    let mut f = crate::fsguard::create_no_follow(&compaction_state_path(root))?;
+    writeln!(f, "{rewritten} {rows}")
+}
+
+/// Why the index should be compacted now, or `None` when it should not.
+/// `record` is `(rows written since the last compaction, rows held then)`.
+fn compaction_due(record: Option<(u64, u64)>) -> Option<String> {
+    let Some((rewritten, rows)) = record else {
+        return Some("no compaction recorded for this index".to_string());
+    };
+    let share = rewritten as f64 / rows.max(1) as f64;
+    (share >= COMPACTION_REWRITE_THRESHOLD).then(|| {
+        format!(
+            "reference rows written since the last compaction reached {:.0}% of the index",
+            share * 100.0
+        )
+    })
+}
+
+/// Compact the index after a complete pass once rewrites have scattered it.
+/// `references_written` is the pass's own count; rowids cannot stand in for
+/// it, because SQLite reuses the highest ones when their rows are deleted.
+/// The index is already written, so a failure here is reported, not returned.
+fn compact_if_due(root: &Path, db: &Database, references_written: usize) {
+    if std::env::var_os("CODESAGE_INDEX_COMPACT").is_some_and(|value| value == "0") {
+        return;
+    }
+    let previous = read_compaction_state(root);
+    let record = match previous {
+        CompactionState::Unusable => {
+            tracing::warn!(
+                path = %compaction_state_path(root).display(),
+                "compaction state is not a readable file; index compaction is off until it is removed"
+            );
+            return;
+        }
+        CompactionState::Absent => None,
+        CompactionState::Record { rewritten, rows } => Some((
+            rewritten.saturating_add(u64::try_from(references_written).unwrap_or(u64::MAX)),
+            rows,
+        )),
+    };
+    // Put the pass's count back, so a compaction that did not happen is
+    // retried by the next pass instead of waiting out a fresh threshold.
+    let keep_count = || {
+        let kept = match record {
+            Some((rewritten, rows)) => write_compaction_state(root, rewritten, rows),
+            None => match crate::fsguard::remove_state_file(&compaction_state_path(root)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            },
+        };
+        if let Err(e) = kept {
+            tracing::warn!(error = %e, "failed to record compaction state");
+        }
+    };
+    let outcome = (|| -> Result<Option<String>> {
+        // An index without references has nothing to scatter.
+        if db.max_reference_id()? == 0 {
+            return Ok(None);
+        }
+        let Some(reason) = compaction_due(record) else {
+            if references_written > 0 {
+                keep_count();
+            }
+            return Ok(None);
+        };
+        let rows = u64::try_from(db.reference_count()?).unwrap_or(u64::MAX);
+        // Recorded first: if the record cannot be written, every later pass
+        // would find none and compact again.
+        if let Err(e) = write_compaction_state(root, 0, rows) {
+            tracing::warn!(error = %e, "compaction state is not writable; index not compacted");
+            return Ok(None);
+        }
+        let started = std::time::Instant::now();
+        match db.compact() {
+            Ok(codesage_storage::db::Compaction::Done {
+                bytes_before,
+                bytes_after,
+            }) => Ok(Some(format!(
+                "Compacted:  {} -> {} in {:.1}s ({reason})",
+                format_bytes(bytes_before),
+                format_bytes(bytes_after),
+                started.elapsed().as_secs_f64()
+            ))),
+            Ok(codesage_storage::db::Compaction::NoSpace {
+                required,
+                available,
+            }) => {
+                keep_count();
+                Ok(Some(format!(
+                    "Compaction: skipped, needs {} free and {} is available ({reason})",
+                    format_bytes(required),
+                    format_bytes(available)
+                )))
+            }
+            Err(e) => {
+                keep_count();
+                Err(e)
+            }
+        }
+    })();
+    match outcome {
+        Ok(Some(line)) => println!("{line}"),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "index compaction failed; the index itself is complete")
+        }
+    }
+}
+
 /// A partial map cannot authorize skipping unchanged inputs on the next pass.
 fn record_feature_map_state(
     root: &Path,
@@ -622,6 +778,7 @@ fn run_index_passes(
         incomplete.join("; ")
     );
 
+    compact_if_due(&root, &db, stats.references_found);
     Ok(())
 }
 
@@ -938,6 +1095,20 @@ mod tests {
 
     fn fp_of(v: u64) -> impl FnOnce() -> Option<u64> {
         move || Some(v)
+    }
+
+    #[test]
+    fn compaction_is_due_without_a_record_and_at_the_rewrite_threshold() {
+        assert!(compaction_due(None).is_some());
+        assert_eq!(compaction_due(Some((0, 1_000))), None);
+        assert_eq!(compaction_due(Some((349, 1_000))), None);
+        assert_eq!(
+            compaction_due(Some((350, 1_000))).as_deref(),
+            Some("reference rows written since the last compaction reached 35% of the index")
+        );
+        // A full rebuild writes every row again.
+        assert!(compaction_due(Some((1_000, 1_000))).is_some());
+        assert!(compaction_due(Some((u64::MAX, 1))).is_some());
     }
 
     #[test]

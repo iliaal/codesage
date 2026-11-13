@@ -11,7 +11,7 @@ use codesage_protocol::{
 };
 use rusqlite::{OptionalExtension, params};
 
-use crate::schema::name_tail;
+use crate::schema::{IMPORT_EDGE_KINDS_SQL, name_tail};
 
 /// A reference is test code when its enclosing definition is, or when the
 /// whole file is. Derived per row; `refs` stores no flag of its own.
@@ -30,6 +30,75 @@ const REF_IS_TEST_SQL: &str = "(f.is_test <> 0 OR COALESCE( \
      (SELECT MAX(s.is_test) FROM symbols s \
         WHERE s.file_id = r.from_file_id AND s.qualified_name = r.from_symbol), \
      0) <> 0)";
+
+/// CROSS JOIN pins refs as the outer loop. Left to the planner, this
+/// whole-graph query scanned every symbol and probed refs by name, visiting
+/// each call site of a common short name before the kind filter dropped it.
+fn enumerate_file_import_pairs_sql() -> String {
+    format!(
+        r#"
+        SELECT f_from.path, f_to.path, MIN(r.lazy)
+        FROM refs r
+        CROSS JOIN files f_from ON r.from_file_id = f_from.id
+        CROSS JOIN symbols s ON (
+          s.qualified_name = r.to_name
+          OR (
+            s.name = r.to_name
+            AND NOT EXISTS (
+              SELECT 1
+              FROM symbols s2
+              WHERE s2.name = r.to_name
+                AND s2.file_id <> s.file_id
+            )
+          )
+        )
+        CROSS JOIN files f_to ON s.file_id = f_to.id
+        WHERE r.kind IN {IMPORT_EDGE_KINDS_SQL}
+          AND (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+               OR (r.kind = 'import_binding' AND f_from.language = 'python'))
+          AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
+          AND f_from.language <> 'python'
+          AND f_from.path <> f_to.path
+        GROUP BY f_from.path, f_to.path
+    "#
+    )
+}
+
+fn python_file_import_refs_sql() -> String {
+    format!(
+        "SELECT f.path, r.to_name, r.line, r.col, r.lazy FROM refs r JOIN files f ON f.id = r.from_file_id
+         WHERE r.kind IN {IMPORT_EDGE_KINDS_SQL} AND f.language = 'python' AND r.kind = 'import'"
+    )
+}
+
+fn path_import_refs_sql() -> String {
+    format!(
+        "SELECT f.path, r.to_name, MIN(r.lazy)
+         FROM refs r JOIN files f ON r.from_file_id = f.id
+         WHERE r.kind IN {IMPORT_EDGE_KINDS_SQL}
+           AND ((r.kind = 'import' AND f.language IN ('javascript', 'typescript'))
+                OR (r.kind = 'include' AND f.language IN ('c', 'cpp')))
+         GROUP BY f.path, r.to_name"
+    )
+}
+
+fn import_include_refs_all_sql() -> String {
+    format!(
+        "SELECT DISTINCT f.path, r.to_name
+         FROM refs r
+         JOIN files f ON r.from_file_id = f.id
+         WHERE r.kind IN {IMPORT_EDGE_KINDS_SQL} AND r.kind IN ('import', 'include')"
+    )
+}
+
+fn file_import_references_sql() -> String {
+    format!(
+        "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
+         FROM refs r JOIN files f ON r.from_file_id = f.id
+         WHERE r.kind IN {IMPORT_EDGE_KINDS_SQL} AND r.kind IN ('import', 'include')
+         ORDER BY f.path, r.line, r.col, r.to_name"
+    )
+}
 
 // `CROSS JOIN` pins the join order: driving from the `files.path` range keeps a
 // directory with no relative imports from scanning every relative import row.
@@ -270,11 +339,22 @@ impl Database {
     }
 
     pub fn file_interpretation_matches(&self, path: &str, interpretation: &str) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 AND interpretation = ?2)",
-            params![path, interpretation],
-            |row| row.get(0),
-        )?)
+        if let Some(matches) = self
+            .python_memo()
+            .and_then(|memo| memo.interpretation(path, interpretation))
+        {
+            return Ok(matches);
+        }
+        let matches = self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 AND interpretation = ?2)",
+            )?
+            .query_row(params![path, interpretation], |row| row.get(0))?;
+        if let Some(mut memo) = self.python_memo() {
+            memo.set_interpretation(path, interpretation, matches);
+        }
+        Ok(matches)
     }
 
     /// Stamp only after all structural and derived rows have been written,
@@ -481,13 +561,25 @@ impl Database {
         line: u32,
         col: u32,
     ) -> Result<Option<PythonBindingTarget>> {
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'python_bindings' AND type = 'table')", [], |row| row.get(0),
-        )?;
-        if !exists {
+        let key = self.python_memo().map(|memo| {
+            let key = (
+                file.to_string(),
+                kind.to_string(),
+                name.to_string(),
+                line,
+                col,
+            );
+            (memo.binding(&key), key)
+        });
+        let key = match key {
+            Some((Some(target), _)) => return Ok(target),
+            Some((None, key)) => Some(key),
+            None => None,
+        };
+        if !self.python_bindings_table_exists()? {
             return Ok(None);
         }
-        let target: Option<String> = self
+        let json: Option<String> = self
             .conn
             .prepare_cached(
                 "SELECT p.target FROM python_bindings p
@@ -496,9 +588,30 @@ impl Database {
             )?
             .query_row(params![file, kind, name, line, col], |row| row.get(0))
             .optional()?;
-        target
-            .map(|target| serde_json::from_str(&target).map_err(Into::into))
-            .transpose()
+        let target = json
+            .as_deref()
+            .map(serde_json::from_str::<PythonBindingTarget>)
+            .transpose()?;
+        if let (Some(key), Some(mut memo)) = (key, self.python_memo()) {
+            memo.set_binding(key, &target, json.as_ref().map_or(0, String::capacity));
+        }
+        Ok(target)
+    }
+
+    fn python_bindings_table_exists(&self) -> Result<bool> {
+        if let Some(exists) = self.python_memo().and_then(|memo| memo.table()) {
+            return Ok(exists);
+        }
+        let exists = self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'python_bindings' AND type = 'table')",
+            )?
+            .query_row([], |row| row.get(0))?;
+        if let Some(mut memo) = self.python_memo() {
+            memo.set_table(exists);
+        }
+        Ok(exists)
     }
 
     /// Persist MinHash fingerprints for one file's functions/methods. Caller
@@ -796,35 +909,8 @@ impl Database {
     /// [`Self::path_import_refs`], and a Go import names a package, never a
     /// symbol, so it joins nothing.
     pub fn enumerate_file_import_pairs(&self) -> Result<ImportPairs> {
-        // CROSS JOIN pins refs as the outer loop. Left to the planner, this
-        // whole-graph query scanned every symbol and probed refs by name,
-        // visiting each call site of a common short name before the kind
-        // filter dropped it.
-        let sql = r#"
-            SELECT f_from.path, f_to.path, MIN(r.lazy)
-            FROM refs r
-            CROSS JOIN files f_from ON r.from_file_id = f_from.id
-            CROSS JOIN symbols s ON (
-              s.qualified_name = r.to_name
-              OR (
-                s.name = r.to_name
-                AND NOT EXISTS (
-                  SELECT 1
-                  FROM symbols s2
-                  WHERE s2.name = r.to_name
-                    AND s2.file_id <> s.file_id
-                )
-              )
-            )
-            CROSS JOIN files f_to ON s.file_id = f_to.id
-            WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
-                   OR (r.kind = 'import_binding' AND f_from.language = 'python'))
-              AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
-              AND f_from.language <> 'python'
-              AND f_from.path <> f_to.path
-            GROUP BY f_from.path, f_to.path
-        "#;
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = enumerate_file_import_pairs_sql();
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut pairs = ImportPairs::default();
         for row in stmt.query_map([], |row| {
             Ok((
@@ -859,10 +945,7 @@ impl Database {
     }
 
     fn python_file_import_pairs(&self) -> Result<BTreeMap<(String, String), bool>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT f.path, r.to_name, r.line, r.col, r.lazy FROM refs r JOIN files f ON f.id = r.from_file_id
-             WHERE f.language = 'python' AND r.kind = 'import'",
-        )?;
+        let mut stmt = self.conn.prepare(&python_file_import_refs_sql())?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -877,7 +960,7 @@ impl Database {
         if rows.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let indexed = self.all_file_paths()?.into_iter().collect();
+        let indexed = self.python_indexed_files()?;
         let probes = PythonPackageProbes::default();
         let mut pairs = BTreeMap::new();
         for (from, module, line, col, lazy) in rows {
@@ -911,9 +994,10 @@ impl Database {
         from: &str,
         module: &str,
     ) -> Result<Option<codesage_protocol::python::PythonModule>> {
-        let files = self.all_file_paths()?.into_iter().collect();
+        let files = self.python_indexed_files()?;
         codesage_protocol::python::load_module(module, from, &files, |directory| {
-            self.python_directory_imported_as_package(directory)
+            self.python_package_directory_scoped(directory)
+                .map(|(answer, _)| answer)
         })
     }
 
@@ -925,13 +1009,27 @@ impl Database {
         if let Some(answer) = probes.answers.borrow().get(directory) {
             return Ok(*answer);
         }
-        let answer = self.python_directory_imported_as_package(directory)?;
-        probes.queries.set(probes.queries.get() + 1);
+        let (answer, queried) = self.python_package_directory_scoped(directory)?;
+        if queried {
+            probes.queries.set(probes.queries.get() + 1);
+        }
         probes
             .answers
             .borrow_mut()
             .insert(directory.to_string(), answer);
         Ok(answer)
+    }
+
+    /// The package answer for `directory` and whether it took a database probe.
+    fn python_package_directory_scoped(&self, directory: &str) -> Result<(bool, bool)> {
+        if let Some(answer) = self.python_memo().and_then(|memo| memo.package(directory)) {
+            return Ok((answer, false));
+        }
+        let answer = self.python_directory_imported_as_package(directory)?;
+        if let Some(mut memo) = self.python_memo() {
+            memo.set_package(directory, answer);
+        }
+        Ok((answer, true))
     }
 
     /// Whether an indexed Python import names `directory` as a package: an
@@ -956,7 +1054,7 @@ impl Database {
     }
 
     pub fn python_import_targets(&self, row: &Reference) -> Result<Vec<String>> {
-        let indexed = self.all_file_paths()?.into_iter().collect();
+        let indexed = self.python_indexed_files()?;
         self.python_import_targets_indexed(row, &indexed, &PythonPackageProbes::default())
     }
 
@@ -966,7 +1064,7 @@ impl Database {
         module: &str,
     ) -> Result<Option<bool>> {
         use codesage_protocol::python::BINDING_INTERPRETATION;
-        let indexed = self.all_file_paths()?.into_iter().collect();
+        let indexed = self.python_indexed_files()?;
         let probes = PythonPackageProbes::default();
         let mut pending: Vec<_> = sites
             .iter()
@@ -1025,7 +1123,7 @@ impl Database {
         child: &str,
     ) -> Result<codesage_protocol::python::PythonModuleLoad> {
         use codesage_protocol::python::{BINDING_INTERPRETATION, PythonModuleLoad};
-        let indexed = self.all_file_paths()?.into_iter().collect();
+        let indexed = self.python_indexed_files()?;
         let probes = PythonPackageProbes::default();
         let mut statements = Vec::new();
         for row in self.references_in_file_range(initializer, 0, u32::MAX)? {
@@ -1089,6 +1187,49 @@ impl Database {
     }
 
     fn python_import_load_indexed(
+        &self,
+        row: &Reference,
+        indexed: &HashSet<String>,
+        probes: &PythonPackageProbes,
+    ) -> Result<Option<codesage_protocol::python::PythonModule>> {
+        // Memoized only against the scope's own file set: the answer depends
+        // on `indexed`, which a caller may supply.
+        let key = self.python_memo().and_then(|memo| {
+            let shared = memo.indexed()?;
+            std::ptr::eq(indexed, &*shared).then(|| {
+                let key = (
+                    row.from_file.clone(),
+                    row.kind.as_str().to_string(),
+                    row.to_name.clone(),
+                    row.line,
+                    row.col,
+                );
+                (memo.import(&key), key)
+            })
+        });
+        let key = match key {
+            Some((Some(loaded), _)) => {
+                codesage_protocol::work::checkpoint()?;
+                return Ok(loaded);
+            }
+            Some((None, key)) => Some(key),
+            None => None,
+        };
+        let loaded = self.python_import_load_uncached(row, indexed, probes)?;
+        // The load may have replaced the scope's file set (a write through
+        // this handle discards it), so the answer is stored only while
+        // `indexed` is still that set.
+        if let (Some(key), Some(mut memo)) = (key, self.python_memo())
+            && memo
+                .indexed()
+                .is_some_and(|shared| std::ptr::eq(indexed, &*shared))
+        {
+            memo.set_import(key, &loaded);
+        }
+        Ok(loaded)
+    }
+
+    fn python_import_load_uncached(
         &self,
         row: &Reference,
         indexed: &HashSet<String>,
@@ -1385,13 +1526,7 @@ impl Database {
     /// resolves them against the indexed file set. `lazy_only` is true when
     /// every directive spelling that specifier in that file is lazy.
     pub fn path_import_refs(&self) -> Result<Vec<(String, String, bool)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT f.path, r.to_name, MIN(r.lazy)
-             FROM refs r JOIN files f ON r.from_file_id = f.id
-             WHERE ((r.kind = 'import' AND f.language IN ('javascript', 'typescript'))
-                    OR (r.kind = 'include' AND f.language IN ('c', 'cpp')))
-             GROUP BY f.path, r.to_name",
-        )?;
+        let mut stmt = self.conn.prepare(&path_import_refs_sql())?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1404,13 +1539,7 @@ impl Database {
 
     /// Unresolved (from_path, to_name) import/include pairs for bulk resolution.
     pub fn import_include_refs_all(&self) -> Result<Vec<(String, String)>> {
-        let sql = r#"
-            SELECT DISTINCT f.path, r.to_name
-            FROM refs r
-            JOIN files f ON r.from_file_id = f.id
-            WHERE r.kind IN ('import', 'include')
-        "#;
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn.prepare(&import_include_refs_all_sql())?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1420,15 +1549,7 @@ impl Database {
     }
 
     pub fn file_import_references(&self) -> Result<Vec<Reference>> {
-        self.query_refs(
-            &format!(
-                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
-             FROM refs r JOIN files f ON r.from_file_id = f.id
-             WHERE r.kind IN ('import', 'include')
-             ORDER BY f.path, r.line, r.col, r.to_name"
-            ),
-            [],
-        )
+        self.query_refs(&file_import_references_sql(), [])
     }
 
     pub fn import_cycle_cache_key(&self) -> Option<String> {
@@ -1440,15 +1561,17 @@ impl Database {
 
     pub fn import_cycle_validity_token(&self) -> Result<(i64, i64, i64, i64, i64, i64)> {
         let token = self.conn.query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM refs WHERE kind IN ('import', 'import_binding', 'include', 'inheritance', 'trait_use')),
-                 (SELECT COALESCE(MAX(id), 0) FROM refs WHERE kind IN ('import', 'import_binding', 'include', 'inheritance', 'trait_use')),
+            &format!(
+                "SELECT
+                 (SELECT COUNT(*) FROM refs WHERE kind IN {IMPORT_EDGE_KINDS_SQL}),
+                 (SELECT COALESCE(MAX(id), 0) FROM refs WHERE kind IN {IMPORT_EDGE_KINDS_SQL}),
                  (SELECT COALESCE(SUM(line + length(to_name) + length(kind) + lazy), 0)
-                  FROM refs WHERE kind IN ('import', 'import_binding', 'include', 'inheritance', 'trait_use')),
+                  FROM refs WHERE kind IN {IMPORT_EDGE_KINDS_SQL}),
                  (SELECT COUNT(*) FROM symbols),
                  (SELECT COALESCE(MAX(id), 0) FROM symbols),
                  (SELECT COALESCE(SUM(file_id + line_start + line_end + length(qualified_name)), 0)
-                  FROM symbols)",
+                  FROM symbols)"
+            ),
             [],
             |row| {
                 Ok((
@@ -2072,6 +2195,37 @@ mod tests {
     };
 
     use super::Database;
+
+    #[test]
+    fn whole_graph_import_queries_read_refs_through_the_import_edge_index() {
+        let db = Database::open_in_memory().unwrap();
+        for (name, sql) in [
+            ("enumerate", super::enumerate_file_import_pairs_sql()),
+            ("python", super::python_file_import_refs_sql()),
+            ("path", super::path_import_refs_sql()),
+            ("import_include", super::import_include_refs_all_sql()),
+            ("file_import", super::file_import_references_sql()),
+        ] {
+            let mut stmt = db
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let plan = stmt
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|step| step.starts_with("SEARCH r USING")
+                    && step.contains("INDEX idx_refs_import_edges")),
+                "{name}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN r")),
+                "{name}: {plan:?}"
+            );
+        }
+    }
 
     #[test]
     fn python_relative_import_probe_drives_from_the_directory_path_range() {

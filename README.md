@@ -479,7 +479,7 @@ flowchart LR
     G --> H[(sqlite-vec<br/>chunks_jina_768)]
 ```
 
-Parsing happens in parallel via Rayon; SQLite writes are batched. Re-running `codesage index` is incremental: changes to file contents, detected language, or the parser's interpretation identity trigger structural parsing. After an extraction upgrade, run `codesage index` to refresh unchanged files automatically. Structural updates also invalidate semantic reuse so symbol-derived chunk headers are refreshed. Use `codesage status` to see stored interpretation versions and files awaiting refresh.
+Parsing happens in parallel via Rayon; SQLite writes are batched. Re-running `codesage index` is incremental: changes to file contents, detected language, or the parser's interpretation identity trigger structural parsing. After an extraction upgrade, run `codesage index` to refresh unchanged files automatically. Structural updates also invalidate semantic reuse so symbol-derived chunk headers are refreshed. Use `codesage status` to see stored interpretation versions and files awaiting refresh. After a complete pass, `codesage index` also compacts the database once enough rows have been rewritten that cold queries would read most of the file; see `docs/reference.md` for the trigger and `CODESAGE_INDEX_COMPACT=0`.
 
 ## Search pipeline
 

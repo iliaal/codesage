@@ -209,6 +209,67 @@ fn available_disk_space(_path: &str) -> Option<u64> {
     None
 }
 
+/// The first directory SQLite would create a temporary file in, following
+/// its own search order.
+fn sqlite_temp_dir() -> Option<std::path::PathBuf> {
+    ["SQLITE_TMPDIR", "TMPDIR"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(std::path::PathBuf::from)
+        .chain(["/var/tmp", "/usr/tmp", "/tmp"].map(std::path::PathBuf::from))
+        .find(|dir| dir.is_dir())
+}
+
+/// `Some(NoSpace)` when the filesystems a compaction writes to lack room for
+/// a database of `bytes`; `None` when they have it or cannot be measured.
+#[cfg(unix)]
+fn compaction_shortfall(db_path: &str, bytes: u64) -> Option<Compaction> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let device = |path: &std::path::Path| std::fs::metadata(path).ok().map(|meta| meta.dev());
+    let temp_dir = sqlite_temp_dir();
+    let temp_elsewhere = temp_dir
+        .as_deref()
+        .is_some_and(|dir| device(dir) != device(std::path::Path::new(db_path)));
+    let mut needs = vec![(
+        db_path.to_string(),
+        if temp_elsewhere {
+            bytes
+        } else {
+            bytes.saturating_mul(2)
+        },
+    )];
+    if temp_elsewhere && let Some(dir) = temp_dir.as_deref().and_then(|dir| dir.to_str()) {
+        needs.push((dir.to_string(), bytes));
+    }
+    needs.into_iter().find_map(|(path, required)| {
+        let available = available_disk_space(&path)?;
+        (available < required).then_some(Compaction::NoSpace {
+            required,
+            available,
+        })
+    })
+}
+
+#[cfg(not(unix))]
+fn compaction_shortfall(_db_path: &str, _bytes: u64) -> Option<Compaction> {
+    None
+}
+
+/// What [`Database::compact`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compaction {
+    Done {
+        bytes_before: u64,
+        bytes_after: u64,
+    },
+    /// Free space is below the headroom the rewrite needs; nothing changed.
+    NoSpace {
+        required: u64,
+        available: u64,
+    },
+}
+
 impl Database {
     fn fts_table(&self) -> String {
         crate::schema::fts_table_name(&self.chunk_table)
@@ -907,6 +968,70 @@ impl Database {
             memo.seed = None;
         }
         Ok(())
+    }
+
+    /// Highest `refs` rowid, or 0 for an empty table. Re-indexing a file
+    /// deletes its reference rows and inserts new ones above this value, so
+    /// its growth since a recorded point counts the rows rewritten since.
+    pub fn max_reference_id(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM refs", [], |row| {
+                row.get(0)
+            })?)
+    }
+
+    /// Rewrite the database so each table's pages are contiguous again.
+    /// Rewrites scatter them across the file, and a cold structural query
+    /// then reads most of the file to reach one table.
+    ///
+    /// Unlike [`Self::vacuum`], too little free space is an outcome rather
+    /// than an error, so a caller compacting opportunistically can carry on.
+    /// In WAL mode `VACUUM` writes a temporary copy and then the whole
+    /// database through the write-ahead log; the measured peak was 1.8 times
+    /// the database size. Each of the two needs the database's size free:
+    /// the log beside the database, the copy in SQLite's temporary directory.
+    pub fn compact(&self) -> Result<Compaction> {
+        let path = self.conn.path().filter(|p| !p.is_empty());
+        // Sizes include the log: after a pass whose checkpoint a reader
+        // blocked, most of the data is still there.
+        if let Err(e) = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+        {
+            tracing::debug!(error = %e, "write-ahead log not checkpointed before compaction");
+        }
+        let size = |path: Option<&str>| {
+            path.map_or(0, |p| {
+                [p.to_string(), format!("{p}-wal")]
+                    .iter()
+                    .filter_map(|file| std::fs::metadata(file).ok())
+                    .map(|meta| meta.len())
+                    .sum()
+            })
+        };
+        let bytes_before = size(path);
+        if let Some(path) = path
+            && let Some(shortfall) = compaction_shortfall(path, bytes_before)
+        {
+            return Ok(shortfall);
+        }
+        self.conn.execute_batch("VACUUM")?;
+        // A reader on an older snapshot blocks truncating the log, and
+        // SQLite folds it into the database at a later checkpoint; waiting
+        // out the busy timeout for that would hold the caller's index lock.
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let truncated = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        crate::schema::set_writer_busy_timeout(&self.conn)?;
+        if let Err(e) = truncated {
+            tracing::debug!(error = %e, "write-ahead log not truncated after compaction");
+        }
+        Ok(Compaction::Done {
+            bytes_before,
+            bytes_after: size(path),
+        })
     }
 
     pub fn vacuum(&self) -> Result<()> {

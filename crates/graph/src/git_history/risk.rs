@@ -787,6 +787,7 @@ fn assess_risk_with_context(
     scope: Option<&mut RiskRequestScope<'_>>,
 ) -> Result<(RiskAssessment, bool)> {
     codesage_protocol::work::checkpoint()?;
+    let _python_memo = db.python_memo_scope();
     // One cache serves both the dependents walk and the symbol resolution of
     // this file, so the Rust module table and each (caller, spelling) lookup
     // load once per request rather than once per pass.
@@ -1545,12 +1546,27 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
 pub(crate) struct RiskDiffWithOmitted {
     pub(crate) diff: RiskDiffAssessment,
     pub(crate) omitted: Vec<RiskAssessment>,
+    /// What [`assess_risk_batch`] reports for the same paths, built from the
+    /// rows this pass scored; present only when the caller asked for it.
+    pub(crate) batch: Option<RiskBatchAssessment>,
 }
 
 pub(crate) fn assess_risk_diff_with_walk_cache(
     db: &Database,
     file_paths: &[String],
     cache: Option<&mut WalkCache>,
+) -> Result<RiskDiffWithOmitted> {
+    assess_risk_diff_and_batch(db, file_paths, cache, false)
+}
+
+/// [`assess_risk_diff_with_walk_cache`], optionally also returning the
+/// per-file report. Both reports score each path the same way, so one pass
+/// serves both.
+pub(crate) fn assess_risk_diff_and_batch(
+    db: &Database,
+    file_paths: &[String],
+    cache: Option<&mut WalkCache>,
+    with_batch: bool,
 ) -> Result<RiskDiffWithOmitted> {
     if file_paths.is_empty() {
         return Ok(RiskDiffWithOmitted {
@@ -1563,8 +1579,10 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
                 ..RiskDiffAssessment::default()
             },
             omitted: Vec::new(),
+            batch: with_batch.then(RiskBatchAssessment::default),
         });
     }
+    let _python_memo = db.python_memo_scope();
 
     // Cycles are graph-wide SCCs; compute once for the patch, then reuse the
     // result for per-file scores and the patch-level cycle list.
@@ -1616,6 +1634,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
             f.notes.push(CYCLE_SIGNAL_FAILED_NOTE.to_string());
         }
     }
+    let batch = with_batch.then(|| risk_batch_from_scored(files.clone()));
 
     // Unmeasured scores must not dilute aggregates; retain their rows for
     // structural rollups and rehearsal's per-file gates. For indexer-written
@@ -1799,7 +1818,15 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
             legend,
         },
         omitted,
+        batch,
     })
+}
+
+/// The per-file report over rows already scored and annotated.
+fn risk_batch_from_scored(mut files: Vec<RiskAssessment>) -> RiskBatchAssessment {
+    let mut refs: Vec<&mut RiskAssessment> = files.iter_mut().collect();
+    let legend = alias_categorical_notes_in_place(&mut refs);
+    RiskBatchAssessment { files, legend }
 }
 
 /// `assess_risk` over a list of files, returning per-file decomposition
@@ -1825,6 +1852,7 @@ fn assess_risk_batch_with_detail(
     if file_paths.is_empty() {
         return Ok(RiskBatchAssessment::default());
     }
+    let _python_memo = db.python_memo_scope();
     let mut cycles_failed = false;
     let cycles = match find_cycles_touching(db, file_paths) {
         Ok(c) => c,
@@ -1871,9 +1899,7 @@ fn assess_risk_batch_with_detail(
             f.notes.push(CYCLE_SIGNAL_FAILED_NOTE.to_string());
         }
     }
-    let mut refs: Vec<&mut RiskAssessment> = files.iter_mut().collect();
-    let legend = alias_categorical_notes_in_place(&mut refs);
-    Ok(RiskBatchAssessment { files, legend })
+    Ok(risk_batch_from_scored(files))
 }
 
 /// Categorical notes eligible for aliasing into a top-level `_legend`.

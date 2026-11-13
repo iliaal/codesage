@@ -25,6 +25,7 @@ The index summaries describe this pass:
 - `Structural: N files (X skipped, Y failed, Z removed), S symbols, R references` records structural work performed. An optional `D parsed with syntax errors` suffix identifies recovered parses, not failed files.
 - `Semantic: N files (X skipped, Y failed, Z removed), C chunks` records semantic work performed. **C is chunks created during this pass, not the retained index total.**
 - Feature and trust-boundary summaries describe their own work; preserve their failures and warnings too.
+- `Compacted: A -> B in Ns (reason)` reports that the pass also rewrote the database so its tables are contiguous again; `Compaction: skipped, needs X free and Y is available` reports that free disk space was too low and the next pass retries. Neither changes indexed content.
 
 ## Clean orphan tables after successful indexing
 

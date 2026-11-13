@@ -74,7 +74,7 @@ fn resolve_target(
     let Some(line) = target.definition_line else {
         return Ok(Vec::new());
     };
-    let symbols = db.symbols_for_file(from)?;
+    let symbols = db.python_file_symbols(from)?;
     let owner = symbols.iter().find(|s| s.line_start == line);
     if owner.is_some_and(|owner| {
         owner.kind == codesage_protocol::SymbolKind::Class
@@ -329,7 +329,7 @@ fn capture_prefix(db: &Database, from: &str, target: &PythonBindingTarget) -> Re
         return Ok(0);
     };
     Ok(db
-        .symbols_for_file(from)?
+        .python_file_symbols(from)?
         .iter()
         .find(|symbol| symbol.line_start == line)
         .and_then(|symbol| {

@@ -876,12 +876,14 @@ fn describe_old_schema_preserves_database_wal_and_available_facts() {
          ALTER TABLE files DROP COLUMN is_test;
          ALTER TABLE symbols DROP COLUMN visibility;
          ALTER TABLE symbols DROP COLUMN is_test;
+         DROP INDEX idx_refs_import_edges;
          ALTER TABLE refs DROP COLUMN lazy;
          DROP TABLE semantic_files;
          CREATE TABLE semantic_files(chunk_table TEXT, content_hash TEXT, indexed_at INTEGER);
          DELETE FROM schema_migrations WHERE name IN (
              '0020_file_interpretation', '0022_refs_lazy',
-             '0023_symbols_visibility', '0024_is_test'
+             '0023_symbols_visibility', '0024_is_test',
+             '0032_refs_import_edges'
          );",
         )
         .unwrap();

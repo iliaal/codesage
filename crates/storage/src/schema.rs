@@ -559,9 +559,17 @@ pub fn init_db_read_only(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Writers give up on a lock sooner than readers: holding the index lock
+/// while waiting behind another writer helps nobody.
+const WRITE_BUSY_TIMEOUT_MS: i64 = 5000;
+
+pub(crate) fn set_writer_busy_timeout(conn: &Connection) -> rusqlite::Result<()> {
+    set_busy_timeout(conn, WRITE_BUSY_TIMEOUT_MS)
+}
+
 pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     // Set the timeout before WAL's exclusive-lock attempt to tolerate brief contention.
-    set_busy_timeout(conn, 5000)?;
+    set_writer_busy_timeout(conn)?;
     // The index is rebuildable; retain the current mode if contention outlasts
     // the timeout, and let the next opener retry WAL.
     if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
@@ -787,7 +795,28 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         "0031_git_history_build_v2",
         migrate_0031_git_history_build_v2,
     ),
+    ("0032_refs_import_edges", migrate_0032_refs_import_edges),
 ];
+
+/// The reference kinds that can form a file-level import edge, as a SQL list.
+/// `idx_refs_import_edges` is partial on exactly this list. SQLite uses a
+/// partial index only when the query repeats the index predicate term for
+/// term, so each whole-graph import query interpolates this constant as
+/// `r.kind IN {IMPORT_EDGE_KINDS_SQL}`; a hand-written list would silently
+/// fall back to scanning every row of `refs`.
+pub(crate) const IMPORT_EDGE_KINDS_SQL: &str =
+    "('import', 'import_binding', 'include', 'inheritance', 'trait_use')";
+
+/// Whole-graph import queries keep about a tenth of `refs` (the rest are call
+/// sites), and no other index leads with `kind`. The trailing columns let
+/// those queries answer from the index without visiting the table.
+fn migrate_0032_refs_import_edges(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_refs_import_edges
+             ON refs(kind, from_file_id, to_name, lazy, line, col, from_symbol)
+             WHERE kind IN {IMPORT_EDGE_KINDS_SQL};"
+    ))
+}
 
 fn migrate_0027_symbol_signatures(conn: &Connection) -> rusqlite::Result<()> {
     for column in ["signature", "arity", "parameters", "return_type"] {
@@ -1199,12 +1228,17 @@ fn run_migration_list(
 /// Development-build names replaced by idempotent migrations in the current list.
 const SUPERSEDED_MIGRATIONS: &[&str] = &["0017_git_co_changes_windows"];
 
+/// A `DELETE` takes the write lock even when it matches nothing, and this runs
+/// on every migrating open, so the stamp is looked up first: opening a current
+/// index must not wait on, or fail behind, an indexing transaction.
 fn forget_superseded_migrations(conn: &Connection) -> rusqlite::Result<()> {
     for name in SUPERSEDED_MIGRATIONS {
-        conn.execute(
-            "DELETE FROM schema_migrations WHERE name = ?1",
-            rusqlite::params![name],
-        )?;
+        if migration_applied(conn, name)? {
+            conn.execute(
+                "DELETE FROM schema_migrations WHERE name = ?1",
+                rusqlite::params![name],
+            )?;
+        }
     }
     Ok(())
 }
