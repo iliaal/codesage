@@ -40,6 +40,20 @@ fn prerequisites(depinfo: &str) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
+fn collect_depinfo(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_depinfo(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "d") {
+            out.push(path);
+        }
+    }
+}
+
 fn compiler_sources(root: &Path, test_target: Option<&str>) -> Option<BTreeSet<String>> {
     let target = test_target.map_or_else(|| vec!["--lib"], |name| vec!["--test", name]);
     let output = match Command::new("cargo")
@@ -65,10 +79,13 @@ fn compiler_sources(root: &Path, test_target: Option<&str>) -> Option<BTreeSet<S
         "cargo check failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let depfiles: Vec<_> = std::fs::read_dir(root.join("target/debug/deps"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "d"))
+    // Cargo 1.100 moved rustc dep-info from target/debug/deps into
+    // target/debug/build/<pkg>/<hash>/out; older toolchains keep deps/.
+    let mut candidates = Vec::new();
+    collect_depinfo(&root.join("target/debug/deps"), &mut candidates);
+    collect_depinfo(&root.join("target/debug/build"), &mut candidates);
+    let depfiles: Vec<_> = candidates
+        .into_iter()
         .filter(|path| {
             test_target.is_none_or(|target| {
                 path.file_name()
