@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.53.0] - 2026-11-14
+
 ### Added
 
 - `codesage rehearse`, `codesage review-inputs`, and MCP `review_rehearsal` raise a `removed-symbol-callers` objection when a patch removes, renames, or moves a definition that indexed files outside the patch still reference, naming each definition and its callers; it is high severity, or medium when every caller matches by name alone.
@@ -1503,5 +1505,7 @@ Initial public release.
 
 [0.51.0]: https://github.com/iliaal/codesage/releases/tag/v0.51.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.52.0...HEAD
 [0.52.0]: https://github.com/iliaal/codesage/releases/tag/v0.52.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.53.0...HEAD
+[0.53.0]: https://github.com/iliaal/codesage/releases/tag/v0.53.0
