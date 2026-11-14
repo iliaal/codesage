@@ -2,22 +2,20 @@
 
 ### Added
 
-- `codesage rehearse`, `codesage review-inputs`, and MCP `review_rehearsal` raise a `removed-symbol-callers` objection when the patch removes, renames, or deletes a definition that indexed files outside the patch still reference, naming each definition and its caller files with `counts_floor: true`; it is high severity, or medium when every reference binds by name alone.
-- JavaScript/TypeScript imports through `tsconfig`/`jsconfig` `compilerOptions.paths` and `baseUrl` (`@/routes`), including `extends` chains, `${configDir}`, and solution-style `references`, resolve to indexed files in dependencies, impact, `find_references`, `trace`, and import cycles. Each index pass rereads the configs (schema migration `0033_js_aliases`).
+- `codesage rehearse`, `codesage review-inputs`, and MCP `review_rehearsal` raise a `removed-symbol-callers` objection when a patch removes, renames, or moves a definition that indexed files outside the patch still reference, naming each definition and its callers; it is high severity, or medium when every caller matches by name alone.
+- JavaScript/TypeScript imports through `tsconfig`/`jsconfig` `paths` and `baseUrl` aliases (`@/routes`), including `extends` chains, `${configDir}`, and solution-style `references`, resolve to indexed files in `dependencies`, `impact`, `find_references`, `trace`, and import cycles (schema migration `0033_js_aliases`).
 
 ### Changed
 
-- `find-references` on a Rust spelling with no definition of its own, such as a `use … as` alias, now fills `to` for call and macro rows that a renamed or in-crate import binds, and reports `to_resolution.capped` when the screen would need more than 32 caller files for one spelling.
-- Schema migration `0034_php_nocase_lookups` adds the case-insensitive indexes PHP name lookups use; the first command that opens the index for writing, such as `codesage index`, builds them once.
+- Schema migration `0034_php_nocase_lookups` adds case-insensitive indexes for PHP name lookups; the first command that opens the index for writing, such as `codesage index`, builds them once.
 
 ### Fixed
 
-- Calls, `new`, `extends`, and type uses through a renamed JavaScript/TypeScript import (`import { x as y }`, `const { x: y } = require(..)`) bind to the imported item in `trace`, `impact`, and `find_references`. Run `codesage index` to reparse JavaScript/TypeScript files.
-- Rust calls and macro invocations through renamed in-crate imports (`use crate::f as g; g()`, `super::`/`self::`, grouped and nested lists, `pub use … as` re-exports, `#[macro_export]` macros) now bind in `trace`, `impact`, and `find-references`; a renamed function import no longer hides a same-named macro.
-- Rust calls into a dependency's `#[macro_export]` macro (`dep::name!()`, `use dep::name as m; m!()`) now bind to the macro at the dependency's root.
-- `find-references`, `impact`, `tests-for`, and MCP `recommend_tests` include PHP class references written with a namespace (`new \A\B()`, `A\B::m()`, `\A\B::class`, class `extends`/`implements \A\B`, trait `use`, type hints including `namespace\A` hints), bound case-insensitively to the fully qualified class PHP resolves from the file's namespace and `use` aliases.
-- PHP interface `extends`, enum `implements`, and anonymous-class `extends`/`implements` are recorded as inheritance references.
-- PHP trust-boundary rules match fully qualified global classes such as `\PDO` and `\SplFileObject`.
+- Calls and type uses through renamed JavaScript/TypeScript imports (`import { x as y }`, `const { x: y } = require(..)`) bind to the imported item in `trace`, `impact`, and `find_references`.
+- Rust calls and macros through renamed or in-crate imports (`use crate::f as g`, `self::`/`super::`, grouped lists, `pub use … as`, binary crate roots) and dependency `#[macro_export]` macros (`dep::name!()`) bind in `trace`, `impact`, and `find-references`.
+- A renamed Rust function import no longer hides a same-named macro, and `find-references` reports `to_resolution.capped` when it stops screening alias callers early.
+- `find-references`, `impact`, `tests-for`, and MCP `recommend_tests` include PHP class references written with a namespace (`new \A\B()`, `A\B::m()`, `\A\B::class`, `extends`/`implements` on classes, interfaces, enums, and anonymous classes, trait `use`, and type hints), bound case-insensitively to the class PHP resolves.
+- PHP trust-boundary rules match fully qualified global names such as `\PDO`.
 
 ## [0.52.0] - 2026-11-12
 
