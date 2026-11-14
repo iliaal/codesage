@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- `codesage rehearse`, `codesage review-inputs`, and MCP `review_rehearsal` raise a `removed-symbol-callers` objection when the patch removes, renames, or deletes a definition that indexed files outside the patch still reference, naming each definition and its caller files with `counts_floor: true`; it is high severity, or medium when every reference binds by name alone.
+
 ## [0.52.0] - 2026-11-12
 
 ### Added

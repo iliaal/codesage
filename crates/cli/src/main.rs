@@ -445,7 +445,8 @@ enum Commands {
         json: bool,
     },
     /// Predict likely review objections for a patch (missing tests, risky files,
-    /// blast radius, cycles, trust boundaries, feature-test gaps) before committing
+    /// blast radius, cycles, trust boundaries, feature-test gaps, removed
+    /// definitions that callers outside the patch still reference) before committing
     Rehearse {
         /// Repo-relative file paths. If empty, read stdin (when piped) or fall
         /// back to the working-tree changes vs HEAD.

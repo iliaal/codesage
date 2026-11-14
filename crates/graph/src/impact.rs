@@ -99,7 +99,7 @@ pub(crate) struct WalkOutcome {
     pub seed_count: usize,
 }
 
-type DefinitionKey = (String, String, u32, u32, SymbolKind);
+pub(crate) type DefinitionKey = (String, String, u32, u32, SymbolKind);
 type ResolvedDefinitions = Arc<Vec<DefinitionKey>>;
 
 /// Request-local resolved edges shared across walks with different frontier
@@ -387,6 +387,87 @@ impl WalkCache {
             self.resolutions.insert(key, Arc::clone(&rows));
         }
         Ok(rows)
+    }
+
+    /// Definitions one reference row resolves to, by the same rule
+    /// [`resolve_references_to_symbol`] applies; `None` for a package import,
+    /// which names no definition.
+    pub(crate) fn reference_targets(
+        &mut self,
+        db: &Database,
+        row: &Reference,
+    ) -> Result<Option<Vec<DefinitionKey>>> {
+        if needs_reference_resolution(row) {
+            let resolved = self.resolve_reference(db, row)?;
+            return Ok(Some(resolved.iter().map(symbol_identity_key).collect()));
+        }
+        if crate::bundle::is_package_import(row.kind, &row.from_file, &row.to_name) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.resolve(db, &row.from_file, &row.to_name)?.to_vec(),
+        ))
+    }
+
+    /// [`Self::reference_targets`] as symbols, for callers that weigh each
+    /// target's binding evidence.
+    pub(crate) fn reference_target_symbols(
+        &mut self,
+        db: &Database,
+        row: &Reference,
+    ) -> Result<Option<Vec<Symbol>>> {
+        if needs_reference_resolution(row) {
+            return Ok(Some(self.resolve_reference(db, row)?));
+        }
+        if crate::bundle::is_package_import(row.kind, &row.from_file, &row.to_name) {
+            return Ok(None);
+        }
+        Ok(Some(self.resolve_symbols(
+            db,
+            &row.from_file,
+            &row.to_name,
+        )?))
+    }
+
+    /// Whether `row` names `sym` through more than a shared bare name: a
+    /// Python binding, a qualified spelling, the same file, or one of the
+    /// caller's imports naming `sym` or its owner.
+    /// Without any of these, resolution rests on the name being unique.
+    pub(crate) fn binding_evidence(
+        &mut self,
+        db: &Database,
+        row: &Reference,
+        sym: &Symbol,
+    ) -> Result<bool> {
+        if codesage_protocol::python::is_python_path(&row.from_file)
+            || is_qualified_symbol_name(&row.to_name)
+            || row.from_file == sym.file_path
+        {
+            return Ok(true);
+        }
+        let imports = self.caller_imports(db, &row.from_file)?;
+        // A member spelled bare (`Provider::lock()` records `lock`) is held by
+        // an import of its owner (`use App\Models\Provider`).
+        let owner = ["::", "\\", "."]
+            .iter()
+            .filter_map(|sep| sym.qualified_name.rfind(sep))
+            .max()
+            .map(|cut| &sym.qualified_name[..cut]);
+        if owner.is_some_and(|owner| imports.iter().any(|import| import == owner)) {
+            return Ok(true);
+        }
+        let modules = if row.from_file.ends_with(".rs") {
+            self.rust_modules(db)?
+        } else {
+            Arc::new(crate::rust_modules::RustModules::default())
+        };
+        Ok(crate::bundle::imports_name_symbol(
+            &imports,
+            &row.from_file,
+            &row.to_name,
+            sym,
+            &modules,
+        ))
     }
 
     fn caller_imports(&mut self, db: &Database, caller_file: &str) -> Result<Arc<Vec<String>>> {
@@ -1338,7 +1419,7 @@ fn definition_keys(symbols: Vec<Symbol>) -> ResolvedDefinitions {
 }
 
 /// Source columns separate same-line methods; kind separates macro and value namespaces.
-fn symbol_identity_key(sym: &Symbol) -> DefinitionKey {
+pub(crate) fn symbol_identity_key(sym: &Symbol) -> DefinitionKey {
     (
         sym.file_path.clone(),
         sym.qualified_name.clone(),

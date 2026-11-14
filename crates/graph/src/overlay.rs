@@ -329,34 +329,45 @@ impl WorkingTreeOverlayCache {
             entries.insert(file.path.clone(), entry);
         }
         codesage_protocol::work::checkpoint()?;
-        let mut sorted: Vec<_> = entries.values().collect();
-        sorted.sort_by(|left, right| left.parsed.info.path.cmp(&right.parsed.info.path));
-        let fingerprints: Vec<_> = sorted
-            .iter()
-            .map(|entry| fingerprint_inputs(&entry.parsed))
+        let parsed: Vec<_> = entries
+            .values()
+            .map(|entry| (&entry.parsed, entry.source.as_str()))
             .collect();
-        let replacements: Vec<_> = sorted
-            .iter()
-            .zip(&fingerprints)
-            .map(|(entry, fingerprints)| {
-                let parsed = &entry.parsed;
-                StructuralOverlayFile {
-                    file: &parsed.info,
-                    symbols: &parsed.symbols,
-                    references: &parsed.refs,
-                    python_bindings: &parsed.python_bindings,
-                    fingerprints,
-                    trust_boundaries: &parsed.boundaries,
-                    interpretation: STRUCTURAL_INTERPRETATION,
-                    source: &entry.source,
-                }
-            })
-            .collect();
-        db.install_structural_overlay(&affected_paths, &replacements)?;
+        install_parsed_overlay(db, &affected_paths, &parsed)?;
         self.entries = entries;
         report.state = OverlayState::Overlay;
         Ok(())
     }
+}
+
+/// Shadow `affected_paths` on a read-only connection with `parsed` files and
+/// their sources; an affected path without a parsed file reads as deleted.
+pub(crate) fn install_parsed_overlay(
+    db: &Database,
+    affected_paths: &[String],
+    parsed: &[(&ParsedFile, &str)],
+) -> Result<()> {
+    let mut sorted = parsed.to_vec();
+    sorted.sort_by(|left, right| left.0.info.path.cmp(&right.0.info.path));
+    let fingerprints: Vec<_> = sorted
+        .iter()
+        .map(|(parsed, _)| fingerprint_inputs(parsed))
+        .collect();
+    let replacements: Vec<_> = sorted
+        .iter()
+        .zip(&fingerprints)
+        .map(|((parsed, source), fingerprints)| StructuralOverlayFile {
+            file: &parsed.info,
+            symbols: &parsed.symbols,
+            references: &parsed.refs,
+            python_bindings: &parsed.python_bindings,
+            fingerprints,
+            trust_boundaries: &parsed.boundaries,
+            interpretation: STRUCTURAL_INTERPRETATION,
+            source,
+        })
+        .collect();
+    db.install_structural_overlay(affected_paths, &replacements)
 }
 
 #[cfg(all(test, unix))]

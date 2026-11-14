@@ -18,7 +18,7 @@ use codesage_parser::parse::{ParsedTree, parse_file_tolerant};
 use codesage_parser::references::extract_references;
 use codesage_parser::source::read_indexable_file;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ParsedFile {
     pub(crate) info: FileInfo,
     pub(crate) symbols: Vec<Symbol>,
@@ -28,7 +28,7 @@ pub(crate) struct ParsedFile {
     pub(crate) boundaries: Vec<TrustBoundary>,
     /// The tree carried `ERROR` / `MISSING` nodes; everything outside them
     /// was still extracted.
-    degraded: bool,
+    pub(crate) degraded: bool,
 }
 
 fn parse_one(

@@ -641,7 +641,15 @@ impl ExternalCrates {
         if let Some(surface) = self.sources.get(&key) {
             return Ok(surface.clone());
         }
-        let source = self.read(file);
+        // An overlaid file reads as the overlay holds it, so a request-local
+        // view of other content still matches its own indexed hash.
+        let source = match db.overlay_source(file)? {
+            Some(content) => content.map(|content| codesage_parser::source::IndexableSource {
+                content_hash: codesage_parser::discover::content_hash(content.as_bytes()),
+                bytes: content.into_bytes(),
+            }),
+            None => self.read(file),
+        };
         let mut surface = if let Some(source) = source
             && db.get_file_hash(file)?.as_deref() == Some(source.content_hash.as_str())
         {

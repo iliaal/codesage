@@ -1016,6 +1016,22 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
     Ok(owned(filtered))
 }
 
+/// Whether one of `import_refs` (the caller's import rows) names `symbol`
+/// under the spelling `to_name`: the import evidence tier of
+/// [`resolve_callee_definitions_with_lookup`].
+pub(crate) fn imports_name_symbol(
+    import_refs: &[String],
+    caller_file: &str,
+    to_name: &str,
+    symbol: &Symbol,
+    modules: &crate::rust_modules::RustModules,
+) -> bool {
+    let importer = Importer::new(caller_file);
+    import_refs.iter().any(|imp| {
+        prepared_import_targets_symbol(&ImportRef::new(imp), importer, to_name, symbol, modules)
+    })
+}
+
 pub(crate) fn reference_kind_admits(
     caller_file: &str,
     kind: Option<ReferenceKind>,

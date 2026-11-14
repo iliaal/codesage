@@ -123,6 +123,7 @@ fn build_rehearsal(
                 "Re-run `codesage index` before trusting this rehearsal".to_string(),
             ],
             files: Vec::new(),
+            counts_floor: false,
         });
     }
 
@@ -173,6 +174,7 @@ fn build_rehearsal(
             ),
             evidence,
             files: risk.unscored_files.clone(),
+            counts_floor: false,
         });
     }
 
@@ -198,6 +200,7 @@ fn build_rehearsal(
             ),
             evidence,
             files: risk.test_gap_files.clone(),
+            counts_floor: false,
         });
     }
 
@@ -235,6 +238,7 @@ fn build_rehearsal(
             ),
             evidence,
             files: high.iter().map(|a| a.file.clone()).collect(),
+            counts_floor: false,
         });
     }
     if !elevated.is_empty() {
@@ -248,6 +252,7 @@ fn build_rehearsal(
             ),
             evidence: elevated.iter().map(|a| risk_score_evidence(a)).collect(),
             files: elevated.iter().map(|a| a.file.clone()).collect(),
+            counts_floor: false,
         });
     }
 
@@ -268,6 +273,7 @@ fn build_rehearsal(
                 })
                 .collect(),
             files: risk.wide_blast_files.clone(),
+            counts_floor: false,
         });
     }
 
@@ -291,6 +297,7 @@ fn build_rehearsal(
                 })
                 .collect(),
             files: risk.fix_heavy_files.clone(),
+            counts_floor: false,
         });
     }
 
@@ -304,6 +311,7 @@ fn build_rehearsal(
             ),
             evidence: vec![format!("hotspot: {}", risk.hotspot_files.join(", "))],
             files: risk.hotspot_files.clone(),
+            counts_floor: false,
         });
     }
 
@@ -328,6 +336,7 @@ fn build_rehearsal(
             title: "Patch touches an import cycle".to_string(),
             evidence,
             files: c.members.clone(),
+            counts_floor: false,
         });
     }
 
@@ -348,6 +357,7 @@ fn build_rehearsal(
                 ),
                 evidence: vec![format!("boundaries: {}", names.join(", "))],
                 files: vec![f.clone()],
+                counts_floor: false,
             });
         }
     }
@@ -405,6 +415,7 @@ fn build_rehearsal(
                     ),
                     evidence: vec![format!("feature tests: {}", test_files.join(", "))],
                     files: test_files,
+                    counts_floor: false,
                 });
             }
         }
@@ -441,6 +452,7 @@ fn build_rehearsal(
             ),
             evidence,
             files: orphan_files,
+            counts_floor: false,
         });
     }
 
@@ -450,6 +462,9 @@ fn build_rehearsal(
         objections.push(objection);
     }
 
+    let removed = crate::removed_definitions::check(root, db, files)?;
+    objections.extend(removed.objection);
+
     objections.sort_by(|a, b| {
         a.severity
             .cmp(&b.severity)
@@ -457,6 +472,7 @@ fn build_rehearsal(
     });
 
     let mut summary_notes = build_summary(root, db, files, &risk, &objections, &mut walk_cache)?;
+    summary_notes.extend(removed.notes);
     summary_notes.push(crate::branch_overlap::branch_overlap_summary(&overlap));
 
     let rehearsal = ReviewRehearsal {

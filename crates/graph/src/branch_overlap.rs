@@ -423,6 +423,7 @@ pub fn branch_overlap_objection(report: &BranchOverlapReport) -> Option<ReviewOb
             .to_string(),
         evidence,
         files: files.into_iter().collect(),
+        counts_floor: false,
     })
 }
 

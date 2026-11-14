@@ -40,6 +40,25 @@ impl Database {
             .optional()?)
     }
 
+    pub fn indexed_file_info(&self, path: &str) -> Result<Option<FileInfo>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT path, language, content_hash, is_test FROM main.files WHERE path = ?1",
+                [path],
+                |row| {
+                    let language: String = row.get(1)?;
+                    Ok(FileInfo {
+                        path: row.get(0)?,
+                        language: row_enum(&language, Language::parse, "Language")?,
+                        content_hash: row.get(2)?,
+                        is_test: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     pub fn overlay_file_infos(&self) -> Result<Vec<FileInfo>> {
         let mut statement = self.conn.prepare(
             "SELECT path, language, content_hash, is_test FROM main.files ORDER BY path",
@@ -371,6 +390,31 @@ impl Database {
             [],
             |row| row.get(0),
         )?)
+    }
+
+    /// The overlay's source for `path`: `None` when no overlay shadows it,
+    /// `Some(None)` when the overlay reads it as deleted.
+    pub fn overlay_source(&self, path: &str) -> Result<Option<Option<String>>> {
+        if !self.has_structural_overlay()? {
+            return Ok(None);
+        }
+        let dirty: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.__overlay_dirty WHERE path = ?1)",
+            [path],
+            |row| row.get(0),
+        )?;
+        if !dirty {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.conn
+                .query_row(
+                    "SELECT content FROM temp.__overlay_sources WHERE path = ?1",
+                    [path],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        ))
     }
 
     pub(super) fn overlay_source_chunks(&self, path: &str) -> Result<Option<Vec<RawSearchRow>>> {

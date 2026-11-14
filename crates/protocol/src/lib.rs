@@ -3210,7 +3210,7 @@ pub struct ReviewObjection {
     pub severity: ReviewSeverity,
     /// Short machine code: `missing-tests`, `high-risk-file`, `blast-radius`,
     /// `fix-prone`, `hotspot`, `import-cycle`, `trust-boundary`,
-    /// `feature-test-gap`, `stale-index`.
+    /// `feature-test-gap`, `stale-index`, `removed-symbol-callers`.
     pub category: String,
     /// One-line human-readable objection.
     pub title: String,
@@ -3219,6 +3219,11 @@ pub struct ReviewObjection {
     /// Files this objection concerns.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub files: Vec<String>,
+    /// `true` when the objection's counts come from name-based reference
+    /// extraction and are lower bounds: dynamic dispatch, reflection, and
+    /// generated call sites leave no row. Omitted when `false`.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub counts_floor: bool,
 }
 
 /// Predicted review objections for a patch, severity-ranked. Read-only,

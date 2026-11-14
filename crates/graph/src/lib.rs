@@ -19,6 +19,7 @@ pub mod overlay;
 mod overview;
 mod python_bindings;
 mod rehearsal;
+mod removed_definitions;
 pub mod resolver;
 mod rust_modules;
 mod scc;
