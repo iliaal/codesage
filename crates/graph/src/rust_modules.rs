@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use codesage_protocol::{Reference, Symbol, SymbolKind};
+use codesage_protocol::{Reference, ReferenceKind, Symbol, SymbolKind};
 use codesage_storage::Database;
 
 use crate::bundle::rust_crate_layout;
@@ -31,6 +31,13 @@ struct CandidateCache {
 const CANDIDATE_CACHE_ENTRIES: usize = 16_384;
 const CANDIDATE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
+/// `use` re-export hops followed from a renamed binding to the files that
+/// import the new name.
+const MAX_ALIAS_DEPTH: usize = 3;
+
+/// Distinct alias names one lookup follows across files.
+const MAX_ALIAS_NAMES: usize = 32;
+
 #[derive(Default)]
 pub(crate) struct RustModules {
     modules: HashMap<String, Vec<Module>>,
@@ -39,6 +46,7 @@ pub(crate) struct RustModules {
     scopes: Mutex<HashMap<String, Vec<Symbol>>>,
     external: Mutex<Option<external::ExternalCrates>>,
     candidates: Mutex<CandidateCache>,
+    reexports: Mutex<HashMap<String, Arc<HashSet<String>>>>,
 }
 
 #[derive(Default)]
@@ -182,11 +190,83 @@ impl RustModules {
         } else {
             format!("self::{module}")
         };
-        Ok(self.candidates(caller, &module).is_some_and(|candidates| {
-            candidates
+        let Some(candidates) = self.candidates(caller, &module) else {
+            return Ok(false);
+        };
+        if target.kind == SymbolKind::Macro {
+            // A `macro_rules!` has a module path only where a `use` of itself
+            // re-exports it; `#[macro_export]` places it at its crate root,
+            // which `crate::`, or `super::` from a direct child of the root,
+            // names.
+            let in_module = candidates
                 .iter()
-                .any(|candidate| candidate == &target.file_path)
-        }))
+                .any(|candidate| candidate == &target.file_path);
+            if owners.is_empty() && in_module && self.self_reexports(db, target)? {
+                return Ok(true);
+            }
+            let roots: Vec<&str> = self
+                .modules
+                .get(caller)
+                .into_iter()
+                .flatten()
+                .map(|context| context.root_file.as_str())
+                .collect();
+            if !owners.is_empty()
+                || !candidates
+                    .iter()
+                    .any(|candidate| roots.contains(&candidate.as_str()))
+            {
+                return Ok(false);
+            }
+            let mut external = self
+                .external
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Past the resolver's read limits, keep the module-path rule.
+            return Ok(external
+                .get_or_insert_with(|| external::ExternalCrates::new(db, &self.modules))
+                .exported_macro(db, target)?
+                .unwrap_or(in_module));
+        }
+        Ok(candidates
+            .iter()
+            .any(|candidate| candidate == &target.file_path))
+    }
+
+    /// A module-level `use` of itself (`pub(crate) use name;`) in `target`'s
+    /// file re-exports the macro at that module's path. Read from the stored
+    /// import rows, once per file.
+    fn self_reexports(&self, db: &Database, target: &Symbol) -> Result<bool> {
+        let cached = self
+            .reexports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&target.file_path)
+            .cloned();
+        let names = match cached {
+            Some(names) => names,
+            None => {
+                let names: HashSet<String> = db
+                    .references_in_file_range(&target.file_path, 1, u32::MAX)?
+                    .into_iter()
+                    .filter(|row| row.kind == ReferenceKind::Import && row.from_symbol.is_none())
+                    .map(|row| {
+                        row.to_name
+                            .strip_prefix("self::")
+                            .unwrap_or(&row.to_name)
+                            .to_string()
+                    })
+                    .filter(|name| !name.contains("::"))
+                    .collect();
+                let names = Arc::new(names);
+                self.reexports
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(target.file_path.clone(), Arc::clone(&names));
+                names
+            }
+        };
+        Ok(names.contains(&target.name))
     }
 
     pub(crate) fn load(db: &Database) -> Result<Self> {
@@ -450,6 +530,199 @@ impl RustModules {
             None
         }
     }
+
+    /// Reference rows that may reach the definition named `name` through a
+    /// renamed Rust `use` (`use crate::f as g; g()`), given `rows`, the rows
+    /// spelled `name`. Each import row spelled `…::name` whose source text
+    /// renames it contributes its file's rows spelled with the alias; a
+    /// `pub use … as alias` re-export also contributes the rows spelled
+    /// `alias` elsewhere. Candidates only: callers keep a row when forward
+    /// resolution binds it to the definition.
+    pub(crate) fn alias_references(
+        &self,
+        db: &Database,
+        name: &str,
+        rows: &[Reference],
+    ) -> Result<Vec<Reference>> {
+        let Some(root) = external::project_root(db) else {
+            return Ok(Vec::new());
+        };
+        let key = |row: &Reference| {
+            (
+                row.from_file.clone(),
+                row.line,
+                row.col,
+                row.to_name.clone(),
+            )
+        };
+        let mut seen: HashSet<_> = rows.iter().map(key).collect();
+        let mut names = HashSet::from([name.to_string()]);
+        let mut aliases = HashSet::new();
+        let mut sources: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+        let mut found = Vec::new();
+        let mut level = vec![(name.to_string(), rows.to_vec())];
+        for _ in 0..MAX_ALIAS_DEPTH {
+            let mut next = Vec::new();
+            for (current, rows) in &level {
+                for row in rows.iter().filter(|row| {
+                    row.kind == ReferenceKind::Import
+                        && row.from_file.ends_with(".rs")
+                        && row.to_name.rsplit("::").next() == Some(current.as_str())
+                }) {
+                    codesage_protocol::work::checkpoint()?;
+                    let source = sources.entry(row.from_file.clone()).or_insert_with(|| {
+                        codesage_parser::source::read_indexable_file(
+                            &root,
+                            std::path::Path::new(&row.from_file),
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|source| source.bytes)
+                    });
+                    let Some((alias, public)) = source
+                        .as_deref()
+                        .and_then(|bytes| use_alias_at(bytes, row.line, row.col, &row.to_name))
+                    else {
+                        continue;
+                    };
+                    if alias == *current || !aliases.insert((row.from_file.clone(), alias.clone()))
+                    {
+                        continue;
+                    }
+                    let spelled = |to_name: &str| {
+                        to_name == alias
+                            || to_name
+                                .strip_prefix(alias.as_str())
+                                .is_some_and(|rest| rest.starts_with("::"))
+                    };
+                    for reference in db.references_in_file_range(&row.from_file, 1, u32::MAX)? {
+                        if reference.kind != ReferenceKind::Import
+                            && spelled(&reference.to_name)
+                            && seen.insert(key(&reference))
+                        {
+                            found.push(reference);
+                        }
+                    }
+                    if public && names.len() < MAX_ALIAS_NAMES && names.insert(alias.clone()) {
+                        let chained = db.find_references(&alias, None)?;
+                        for reference in &chained {
+                            if seen.insert(key(reference)) {
+                                found.push(reference.clone());
+                            }
+                        }
+                        next.push((alias, chained));
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            level = next;
+        }
+        Ok(found)
+    }
+}
+
+/// The alias a `use` path at (`line`, `col`) is renamed to (`x as y` yields
+/// `y`), and whether its declaration is `pub` in any form. `to_name` is the
+/// row's full path, whose tail the source text there must spell. A text
+/// scan, not a parse: what it reports is only a candidate for resolution.
+fn use_alias_at(bytes: &[u8], line: u32, col: u32, to_name: &str) -> Option<(String, bool)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let line_start = if line <= 1 {
+        0
+    } else {
+        text.match_indices('\n')
+            .nth(line as usize - 2)
+            .map(|(index, _)| index + 1)?
+    };
+    let start = line_start
+        + text[line_start..]
+            .char_indices()
+            .nth(col as usize)
+            .map(|(index, _)| index)?;
+    let rest = &text[start..];
+    let path_len = rest
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | ':' | '#')))
+        .unwrap_or(rest.len());
+    let path = &rest[..path_len];
+    let head = to_name.strip_suffix(path)?;
+    if path.is_empty() || !(head.is_empty() || head.ends_with("::")) {
+        return None;
+    }
+    let after = rest[path_len..].trim_start();
+    let after = after.strip_prefix("as")?;
+    if !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let after = after.trim_start();
+    let after = after.strip_prefix("r#").unwrap_or(after);
+    let alias_len = after
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(after.len());
+    let alias = &after[..alias_len];
+    if alias.is_empty() || alias == "_" {
+        return None;
+    }
+    Some((alias.to_string(), use_is_public(&text[..start])))
+}
+
+/// The indexed source of `file` spells `as alias` somewhere, the shape of a
+/// `use` rename; a cheap screen before resolution, not evidence of one.
+pub(crate) fn source_renames_to(db: &Database, file: &str, alias: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    if alias.is_empty() || !alias.chars().all(ident) {
+        return false;
+    }
+    let Some(root) = external::project_root(db) else {
+        return false;
+    };
+    let Ok(Some(source)) =
+        codesage_parser::source::read_indexable_file(&root, std::path::Path::new(file))
+    else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&source.bytes) else {
+        return false;
+    };
+    text.match_indices(alias).any(|(index, _)| {
+        let after = text[index + alias.len()..].chars().next();
+        let before = text[..index].trim_end_matches(char::is_whitespace);
+        after.is_none_or(|c| !ident(c))
+            && before.len() < index
+            && before
+                .strip_suffix("as")
+                .is_some_and(|head| head.chars().next_back().is_none_or(|c| !ident(c)))
+    })
+}
+
+/// Whether the `use` declaration that `before` ends inside is `pub`: the
+/// last `use` keyword at an item boundary carries a `pub` visibility.
+fn use_is_public(before: &str) -> bool {
+    let mut search = before;
+    while let Some(index) = search.rfind("use") {
+        let preceding = &search[..index];
+        let following = search[index + 3..].chars().next();
+        let boundary_before = preceding
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if boundary_before && following.is_some_and(char::is_whitespace) {
+            let visibility = preceding.trim_end();
+            let visibility = match visibility.strip_suffix(')') {
+                Some(scoped) => scoped.rfind('(').map_or(visibility, |open| &scoped[..open]),
+                None => visibility,
+            };
+            let visibility = visibility.trim_end();
+            return visibility.ends_with("pub")
+                && visibility[..visibility.len() - 3]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        }
+        search = preceding;
+    }
+    false
 }
 
 fn module_files(path: &str) -> Vec<String> {

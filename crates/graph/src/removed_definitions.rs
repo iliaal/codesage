@@ -342,7 +342,9 @@ pub(crate) fn check(
             name_only: BTreeSet::new(),
         };
         let mut evidenced: BTreeSet<String> = BTreeSet::new();
-        let mut rows = crate::construction::references_for_symbol(before, symbol)?;
+        let mut rows = crate::construction::references_for_symbol(before, symbol, &mut || {
+            before_cache.rust_modules(before)
+        })?;
         // The row budget cuts in a fixed order, not in SQLite's scan order.
         rows.sort_by(|a, b| (&a.from_file, a.line, a.col).cmp(&(&b.from_file, b.line, b.col)));
         for row in rows {

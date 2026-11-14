@@ -886,8 +886,14 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
     if caller_file.ends_with(".rs")
         && let Some(mut resolved) = modules.external_definitions(db, caller_file, to_name)?
     {
+        let bound = !resolved.is_empty();
         resolved.retain(|symbol| reference_kind_admits(caller_file, kind, symbol));
-        return Ok(resolved);
+        // A `use` binding that names only another namespace's item (a
+        // function imported under a macro's name) leaves this spelling to
+        // whatever else binds it in its own namespace.
+        if !resolved.is_empty() || !bound {
+            return Ok(resolved);
+        }
     }
     if codesage_protocol::python::is_python_path(caller_file) {
         let mut resolved = Vec::new();

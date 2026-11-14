@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -111,7 +111,61 @@ pub fn find_references_with_budget(
         rows
     };
     let definition_count = definitions.len();
-    let to_resolution = attach_handles(db, &mut results, &definitions, req.kind, to_budget)?;
+    let mut caches = EvidenceCaches::new(db);
+    // Rows spelled with a Rust `use` alias of a definition stay only when
+    // their `to` resolves to one of the definitions.
+    let mut aliased = HashSet::new();
+    for name in distinct_sorted(
+        definitions
+            .iter()
+            .filter(|s| s.file_path.ends_with(".rs"))
+            .map(|s| s.name.as_str()),
+    ) {
+        // Aliases are found from the item's imports whatever kind the rows
+        // are filtered to.
+        let imports;
+        let seed: &[Reference] = if req.kind.is_none_or(|kind| kind == ReferenceKind::Import) {
+            &results
+        } else {
+            imports = db.find_references(name, Some(ReferenceKind::Import))?;
+            &imports
+        };
+        if !crate::construction::rust_imports_name(seed, name) {
+            continue;
+        }
+        let modules = caches.modules(db)?;
+        for row in modules.alias_references(db, name, seed)? {
+            if req.kind.is_none_or(|kind| kind == row.kind)
+                && aliased.insert((
+                    row.from_file.clone(),
+                    row.line,
+                    row.col,
+                    row.to_name.clone(),
+                ))
+            {
+                results.push(row);
+            }
+        }
+    }
+    let to_resolution = attach_handles(
+        db,
+        &mut caches,
+        &mut results,
+        &definitions,
+        req.kind,
+        to_budget,
+    )?;
+    if !aliased.is_empty() {
+        let handles: HashSet<String> = definitions.iter().map(|s| s.handle().to_string()).collect();
+        results.retain(|row| {
+            !aliased.contains(&(
+                row.from_file.clone(),
+                row.line,
+                row.col,
+                row.to_name.clone(),
+            )) || row.to.as_ref().is_some_and(|to| handles.contains(to))
+        });
+    }
     let ambiguous = definition_count > 1;
     // The name the rows are keyed on, which is the spelling itself when the
     // query used it: a qualified input keeps `Foo::run`, while a `sym:`
@@ -230,12 +284,12 @@ const TO_RESOLUTION_BUDGET: Duration = Duration::from_millis(750);
 /// it carry no `to`.
 fn attach_handles(
     db: &Database,
+    caches: &mut EvidenceCaches<'_>,
     rows: &mut Vec<Reference>,
     definitions: &[Symbol],
     kind: Option<ReferenceKind>,
     budget: Duration,
 ) -> Result<Option<ToResolution>> {
-    let mut caches = EvidenceCaches::new(db);
     for row in rows.iter_mut() {
         codesage_protocol::work::checkpoint()?;
         let Some(caller) = row.from_symbol.as_deref() else {
@@ -246,27 +300,36 @@ fn attach_handles(
             .filter(|s| s.overloaded)
             .map(|s| s.line_start);
     }
-    if definitions.is_empty()
-        && !rows
-            .iter()
-            .any(|row| codesage_protocol::python::is_python_path(&row.from_file))
-    {
-        return Ok(None);
-    }
-
     let mut deadline = Instant::now() + budget;
     if let Some(work) = codesage_protocol::work::current().and_then(|w| w.deadline()) {
         deadline = deadline.min(work);
     }
+    let mut capped = false;
+    let redirectable = if definitions.is_empty() {
+        let (flags, screen_capped) = redirectable_rows(db, rows, kind)?;
+        capped |= screen_capped;
+        if !flags.contains(&true) {
+            return Ok(capped.then_some(ToResolution {
+                resolved_pairs: 0,
+                capped,
+            }));
+        }
+        flags
+    } else {
+        Vec::new()
+    };
+
     let sole_definition = match definitions {
         [only] => Some(only),
         _ => None,
     };
     let mut resolved: HashMap<(String, String, ReferenceKind), Option<String>> = HashMap::new();
     let mut resolved_pairs = HashSet::new();
-    let mut capped = false;
-    for row in rows.iter_mut() {
+    for (index, row) in rows.iter_mut().enumerate() {
         codesage_protocol::work::checkpoint()?;
+        if redirectable.get(index) == Some(&false) {
+            continue;
+        }
         if Instant::now() >= deadline {
             capped = true;
             break;
@@ -388,6 +451,105 @@ fn attach_handles(
         resolved_pairs: resolved_pairs.len(),
         capped,
     }))
+}
+
+/// Caller files read per spelling head, and per query, to screen for a
+/// `use … as` rename.
+const MAX_RENAME_SCREEN_FILES: usize = 32;
+const MAX_RENAME_SCREEN_READS: usize = 64;
+
+/// For a query no definition carries, which rows a binding can redirect:
+/// Python rows, and Rust call or macro rows whose file renames an import to
+/// the spelling's first segment or, for a bare spelling, imports it by a
+/// `crate::`, `self::`, or `super::` path (a re-export alias defined
+/// elsewhere). The import test is one indexed lookup per spelling head; the
+/// rename test reads at most [`MAX_RENAME_SCREEN_FILES`] caller files per
+/// head and [`MAX_RENAME_SCREEN_READS`] per query, and reports `true` as
+/// capped when a head needs more. Its time counts against the caller's
+/// resolution deadline.
+fn redirectable_rows(
+    db: &Database,
+    rows: &[Reference],
+    kind: Option<ReferenceKind>,
+) -> Result<(Vec<bool>, bool)> {
+    let rust_call = |row: &Reference| {
+        row.from_file.ends_with(".rs")
+            && matches!(row.kind, ReferenceKind::Call | ReferenceKind::MacroCall)
+    };
+    let head_of = |row: &Reference| {
+        row.to_name
+            .split("::")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    // Sorted, so the read cap admits the same heads and files on every call.
+    let mut callers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for row in rows.iter().filter(|row| rust_call(row)) {
+        callers
+            .entry(head_of(row))
+            .or_default()
+            .insert(row.from_file.clone());
+    }
+    let mut capped = false;
+    let mut reads = 0;
+    let mut imported: HashSet<(String, String)> = HashSet::new();
+    let mut renamed: HashSet<(String, String)> = HashSet::new();
+    // Rows of a bare spelling carry its import rows unless the request
+    // filtered them out.
+    let carried = kind.is_none_or(|kind| kind == ReferenceKind::Import);
+    for (head, files) in &callers {
+        codesage_protocol::work::checkpoint()?;
+        let fetched;
+        let imports: &[Reference] = if carried {
+            rows
+        } else {
+            fetched = db.find_references(head, Some(ReferenceKind::Import))?;
+            &fetched
+        };
+        for row in imports {
+            if row.kind == ReferenceKind::Import
+                && files.contains(&row.from_file)
+                && ["crate::", "self::", "super::"]
+                    .iter()
+                    .any(|prefix| row.to_name.starts_with(prefix))
+                && last_segment(&row.to_name) == head
+            {
+                imported.insert((row.from_file.clone(), head.clone()));
+            }
+        }
+        let unscreened: Vec<&String> = files
+            .iter()
+            .filter(|file| !imported.contains(&((*file).clone(), head.clone())))
+            .collect();
+        if unscreened.len() > MAX_RENAME_SCREEN_FILES
+            || reads + unscreened.len() > MAX_RENAME_SCREEN_READS
+        {
+            capped = true;
+            continue;
+        }
+        reads += unscreened.len();
+        for file in unscreened {
+            codesage_protocol::work::checkpoint()?;
+            if crate::rust_modules::source_renames_to(db, file, head) {
+                renamed.insert((file.clone(), head.clone()));
+            }
+        }
+    }
+    let flags = rows
+        .iter()
+        .map(|row| {
+            if codesage_protocol::python::is_python_path(&row.from_file) {
+                return true;
+            }
+            if !rust_call(row) {
+                return false;
+            }
+            let key = (row.from_file.clone(), head_of(row));
+            renamed.contains(&key) || !row.to_name.contains("::") && imported.contains(&key)
+        })
+        .collect();
+    Ok((flags, capped))
 }
 
 /// `spelling` names `sym` as defined: its qualified name, or its bare name

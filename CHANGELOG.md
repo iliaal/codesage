@@ -5,9 +5,15 @@
 - `codesage rehearse`, `codesage review-inputs`, and MCP `review_rehearsal` raise a `removed-symbol-callers` objection when the patch removes, renames, or deletes a definition that indexed files outside the patch still reference, naming each definition and its caller files with `counts_floor: true`; it is high severity, or medium when every reference binds by name alone.
 - JavaScript/TypeScript imports through `tsconfig`/`jsconfig` `compilerOptions.paths` and `baseUrl` (`@/routes`), including `extends` chains, `${configDir}`, and solution-style `references`, resolve to indexed files in dependencies, impact, `find_references`, `trace`, and import cycles. Each index pass rereads the configs (schema migration `0033_js_aliases`).
 
+### Changed
+
+- `find-references` on a Rust spelling with no definition of its own, such as a `use … as` alias, now fills `to` for call and macro rows that a renamed or in-crate import binds, and reports `to_resolution.capped` when the screen would need more than 32 caller files for one spelling.
+
 ### Fixed
 
 - Calls, `new`, `extends`, and type uses through a renamed JavaScript/TypeScript import (`import { x as y }`, `const { x: y } = require(..)`) bind to the imported item in `trace`, `impact`, and `find_references`. Run `codesage index` to reparse JavaScript/TypeScript files.
+- Rust calls and macro invocations through renamed in-crate imports (`use crate::f as g; g()`, `super::`/`self::`, grouped and nested lists, `pub use … as` re-exports, `#[macro_export]` macros) now bind in `trace`, `impact`, and `find-references`; a renamed function import no longer hides a same-named macro.
+- Rust calls into a dependency's `#[macro_export]` macro (`dep::name!()`, `use dep::name as m; m!()`) now bind to the macro at the dependency's root.
 
 ## [0.52.0] - 2026-11-12
 

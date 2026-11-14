@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use codesage_parser::{parse::parse_file_tolerant, source::read_indexable_file};
-use codesage_protocol::{Language, Reference, Symbol, Visibility};
+use codesage_protocol::{Language, Reference, Symbol, SymbolKind, Visibility};
 use codesage_storage::Database;
 use tree_sitter::Node;
 
@@ -23,11 +23,37 @@ struct Surface {
     blocked: HashSet<String>,
     shadowed: HashSet<String>,
     uncertain_glob: bool,
-    uncertain_ranges: Vec<(tree_sitter::Point, tree_sitter::Point)>,
+    /// A top-level glob whose names are unknown; an explicit `use` of a name
+    /// still overrides it.
+    uncertain_module_glob: bool,
+    /// Names a top-level glob brings in; an explicit `use` overrides them.
+    glob_names: HashSet<String>,
+    /// Source spans whose names may be rewritten, and whether the span is a
+    /// macro invocation's scope (`true`) rather than an item under a
+    /// rewriting attribute (`false`).
+    uncertain_ranges: Vec<(tree_sitter::Point, tree_sitter::Point, bool)>,
     uncertain_names: HashSet<String>,
     proven_import_sites: HashSet<(u32, u32)>,
     import_bindings: HashMap<(u32, u32), String>,
     module_items: HashSet<(u32, u32)>,
+    /// Top-level names declared only by `macro_rules!`: a macro occupies its
+    /// own namespace, so it leaves a same-named `use` binding's function or
+    /// type reachable.
+    macro_only: HashSet<String>,
+    /// Top-level `macro_rules!` marked `#[macro_export]`, which Rust places
+    /// at the crate root whatever module defines them.
+    exported_macros: HashSet<String>,
+}
+
+/// Visibility a path walk requires of what it reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Reach {
+    /// From outside a dependency: modules, bindings, and definitions must be `pub`.
+    Outside,
+    /// Inside a dependency after a `use` redirect: definitions must be `pub`.
+    Redirected,
+    /// Inside the caller's own crate, where every item is reachable.
+    Internal,
 }
 
 #[derive(Clone)]
@@ -39,6 +65,7 @@ struct Use {
 
 pub(super) struct ExternalCrates {
     root: Option<PathBuf>,
+    contexts: HashMap<String, Vec<super::Module>>,
     library_callers: HashSet<String>,
     caller_roots: HashMap<String, Vec<String>>,
     manifests: HashMap<String, Option<Arc<toml::Value>>>,
@@ -262,12 +289,7 @@ impl ExternalCrates {
     }
 
     pub(super) fn new(db: &Database, modules: &HashMap<String, Vec<super::Module>>) -> Self {
-        let root = db.path().and_then(|path| {
-            let dir = path.parent()?;
-            (path.file_name()? == "index.db" && dir.file_name()? == ".codesage")
-                .then(|| dir.parent().map(Path::to_path_buf))
-                .flatten()
-        });
+        let root = project_root(db);
         let library_callers = modules
             .iter()
             .filter(|(_, contexts)| {
@@ -291,8 +313,14 @@ impl ExternalCrates {
                 )
             })
             .collect();
+        let contexts = modules
+            .iter()
+            .filter(|(_, contexts)| !contexts.is_empty())
+            .map(|(file, contexts)| (file.clone(), contexts.clone()))
+            .collect();
         Self {
             root,
+            contexts,
             library_callers,
             caller_roots,
             manifests: HashMap::new(),
@@ -345,7 +373,11 @@ impl ExternalCrates {
         spelling: &str,
     ) -> Result<Option<Vec<Symbol>>> {
         let (head, tail) = spelling.split_once("::").unwrap_or((spelling, ""));
-        if matches!(head, "crate" | "self" | "super") {
+        let relative = matches!(head, "crate" | "self" | "super");
+        // A spelled in-crate path already resolves through name lookup and
+        // module qualification; only a name no definition in the caller's
+        // crate carries (a re-export alias reached by path) needs the walk.
+        if relative && !self.unnamed(db, caller, last_segment(spelling))? {
             return Ok(None);
         }
         let Some((package, manifest)) = self.package(caller) else {
@@ -356,6 +388,15 @@ impl ExternalCrates {
         {
             return Ok(None);
         }
+        if relative {
+            let Some(source) = self.source(db, caller, true)? else {
+                return Ok(None);
+            };
+            if source.uncertain_names.contains(spelling) {
+                return Ok(None);
+            }
+            return self.crate_path(db, caller, spelling, false);
+        }
         let direct_library = if tail.is_empty() {
             None
         } else {
@@ -364,14 +405,21 @@ impl ExternalCrates {
         let Some(source) = self.source(db, caller, true)? else {
             return Ok(None);
         };
-        if source.locals.contains(head) || source.uncertain_glob {
-            return Ok(None);
-        }
+        let macro_shadowed = source.macro_only.contains(head);
         let bindings: Vec<_> = source
             .uses
             .iter()
             .filter(|binding| binding.name == head)
             .collect();
+        // An explicit `use` outranks what a module-level glob brings in.
+        let globbed = bindings.is_empty()
+            && (source.uncertain_module_glob || source.glob_names.contains(head));
+        if source.locals.contains(head) && !macro_shadowed
+            || source.uncertain_glob
+            || globbed && source.uncertain_module_glob
+        {
+            return Ok(None);
+        }
         let (library, path) = match bindings.as_slice() {
             [] => {
                 let Some(library) = direct_library else {
@@ -388,8 +436,24 @@ impl ExternalCrates {
                 let Some((name, rest)) = path.split_once("::") else {
                     return Ok(None);
                 };
+                if matches!(name, "crate" | "self" | "super") {
+                    let renamed = binding.name != last_segment(&binding.path);
+                    if !renamed && !self.unnamed(db, caller, last_segment(&path))?
+                        || source.shadowed.contains(head)
+                        || source.blocked.contains(head)
+                        || source.uncertain_names.contains(&binding.path)
+                        || source.uncertain_names.contains(spelling)
+                    {
+                        return Ok(None);
+                    }
+                    return self.crate_path(db, caller, &path, macro_shadowed);
+                }
+                // The path's own head may come from a glob even when the
+                // binding's name is explicit.
                 if source.locals.contains(name)
                     || source.shadowed.contains(name)
+                    || source.glob_names.contains(name)
+                    || source.uncertain_module_glob
                     || source.blocked.contains(name)
                     || source.uncertain_names.contains(&binding.path)
                     || source
@@ -408,18 +472,158 @@ impl ExternalCrates {
         };
         if source.blocked.contains(head)
             || source.shadowed.contains(head)
+            || globbed
             || source.uncertain_names.contains(spelling)
         {
             return Ok(Some(Vec::new()));
         }
-        Ok(Some(unique(self.export(
+        let mut resolved = self.export(
             db,
             &library,
             &library,
             &path,
-            true,
+            Reach::Outside,
             &mut HashSet::new(),
-        )?)))
+        )?;
+        if macro_shadowed {
+            // The same-file `macro_rules!` keeps the macro namespace; with no
+            // other namespace's item imported, name resolution binds it.
+            resolved.retain(|symbol| symbol.kind != SymbolKind::Macro);
+            if resolved.is_empty() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(unique(resolved)))
+    }
+
+    /// No indexed Rust definition named `name` belongs to a crate `caller`
+    /// is part of. A definition whose crate is unknown counts as shared.
+    fn unnamed(&self, db: &Database, caller: &str, name: &str) -> Result<bool> {
+        let roots: Vec<&str> = self
+            .contexts
+            .get(caller)
+            .into_iter()
+            .flatten()
+            .map(|context| context.root_file.as_str())
+            .collect();
+        Ok(!db.find_symbols(name, None)?.iter().any(|symbol| {
+            symbol.file_path.ends_with(".rs")
+                && self.contexts.get(&symbol.file_path).is_none_or(|contexts| {
+                    roots.is_empty()
+                        || contexts
+                            .iter()
+                            .any(|context| roots.contains(&context.root_file.as_str()))
+                })
+        }))
+    }
+
+    /// Directory holding the file modules `file` declares; a crate root's is
+    /// the root's own directory (`src/` for `src/main.rs`, `src/bin/x/` for
+    /// `src/bin/x/main.rs`).
+    fn child_directory(&self, file: &str, root: &str) -> String {
+        if file == root
+            && let Some(context) = self
+                .contexts
+                .get(root)
+                .and_then(|contexts| contexts.iter().find(|context| context.root_file == root))
+        {
+            return context.root_dir.clone();
+        }
+        module_directory(file)
+    }
+
+    /// Definitions an in-crate `crate::` / `self::` / `super::` path names
+    /// from `caller`, walked through the caller's own crate the way a
+    /// dependency's export surface is walked, without its `pub` requirement.
+    /// An empty walk still answers: a definition outside the crate cannot be
+    /// what the path names. `None` only when the caller's module context is
+    /// unknown, or when a same-file `macro_rules!` keeps the spelling's macro
+    /// namespace and the walk found nothing else.
+    fn crate_path(
+        &mut self,
+        db: &Database,
+        caller: &str,
+        path: &str,
+        macro_shadowed: bool,
+    ) -> Result<Option<Vec<Symbol>>> {
+        let Some(contexts) = self.contexts.get(caller).cloned() else {
+            return Ok(None);
+        };
+        let segments: Vec<&str> = path.split("::").collect();
+        let mut found: Vec<Symbol> = Vec::new();
+        for context in contexts {
+            let Some(absolute) = absolute_path(&context.path, &segments) else {
+                return Ok(None);
+            };
+            let symbols = self.export(
+                db,
+                &context.root_file,
+                &context.root_file,
+                &absolute,
+                Reach::Internal,
+                &mut HashSet::new(),
+            )?;
+            extend_unique(&mut found, symbols);
+        }
+        if macro_shadowed {
+            found.retain(|symbol| symbol.kind != SymbolKind::Macro);
+            if found.is_empty() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(unique(found)))
+    }
+
+    /// `#[macro_export]` macros named `name` defined anywhere in the crate
+    /// rooted at `root`, which Rust places at that root.
+    fn exported_macros(&mut self, db: &Database, root: &str, name: &str) -> Result<Vec<Symbol>> {
+        let mut exported = Vec::new();
+        for symbol in db.find_symbols(name, Some(SymbolKind::Macro))? {
+            codesage_protocol::work::checkpoint()?;
+            if !symbol.file_path.ends_with(".rs")
+                || !self
+                    .contexts
+                    .get(&symbol.file_path)
+                    .is_some_and(|contexts| {
+                        contexts.iter().any(|context| context.root_file == root)
+                    })
+            {
+                continue;
+            }
+            if self.exported_macro(db, &symbol)? == Some(true) {
+                exported.push(symbol);
+            }
+        }
+        Ok(exported)
+    }
+
+    /// Whether `symbol`, a macro, is `#[macro_export]`ed; `None` when its
+    /// source cannot be read within the resolver's limits.
+    pub(super) fn exported_macro(
+        &mut self,
+        db: &Database,
+        symbol: &Symbol,
+    ) -> Result<Option<bool>> {
+        if symbol.kind != SymbolKind::Macro {
+            return Ok(Some(false));
+        }
+        if self.capped {
+            return Ok(None);
+        }
+        let Some(surface) = self.source(db, &symbol.file_path, false)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            surface.exported_macros.contains(&symbol.name)
+                && surface
+                    .definitions
+                    .get(&symbol.name)
+                    .is_some_and(|definitions| {
+                        definitions
+                            .iter()
+                            .any(|definition| definition.handle() == symbol.handle())
+                    }),
+        ))
     }
 
     fn read(&mut self, path: &str) -> Option<codesage_parser::source::IndexableSource> {
@@ -674,7 +878,7 @@ impl ExternalCrates {
                                 && !result
                                     .uncertain_ranges
                                     .iter()
-                                    .any(|(start, end)| *start <= position && position < *end)
+                                    .any(|(start, end, _)| *start <= position && position < *end)
                             {
                                 if let Some(binding) = module_import_binding(
                                     parsed.tree.root_node(),
@@ -708,11 +912,12 @@ impl ExternalCrates {
                     row: reference.line.saturating_sub(1) as usize,
                     column: reference.col as usize,
                 };
-                if surface
-                    .uncertain_ranges
-                    .iter()
-                    .any(|(start, end)| *start <= position && position < *end)
-                {
+                // An invocation's macro path resolves before its own expansion,
+                // but a rewriting attribute can still replace it.
+                let invoked = reference.kind == codesage_protocol::ReferenceKind::MacroCall;
+                if surface.uncertain_ranges.iter().any(|(start, end, scope)| {
+                    *start <= position && position < *end && !(invoked && *scope)
+                }) {
                     surface.uncertain_names.insert(reference.to_name);
                 }
             }
@@ -723,14 +928,16 @@ impl ExternalCrates {
         Ok(surface)
     }
 
+    /// Definitions `path` names inside `file`, a module of the crate rooted
+    /// at `root`, under the visibility `reach` requires.
     fn export(
         &mut self,
         db: &Database,
         root: &str,
         file: &str,
         path: &str,
-        public: bool,
-        visited: &mut HashSet<(String, String, bool)>,
+        reach: Reach,
+        visited: &mut HashSet<(String, String, Reach)>,
     ) -> Result<Vec<Symbol>> {
         codesage_protocol::work::checkpoint()?;
         if visited.len() >= 32
@@ -741,21 +948,29 @@ impl ExternalCrates {
             self.capped = true;
             return Ok(Vec::new());
         }
-        if !visited.insert((file.into(), path.into(), public)) {
+        if !visited.insert((file.into(), path.into(), reach)) {
             return Ok(Vec::new());
         }
         let Some(source) = self.source(db, file, false)? else {
             return Ok(Vec::new());
         };
         let (name, tail) = path.split_once("::").unwrap_or((path, ""));
+        let mut found = if tail.is_empty() && file == root {
+            self.exported_macros(db, root, name)?
+        } else {
+            Vec::new()
+        };
         if source.blocked.contains(name) {
-            return Ok(Vec::new());
+            return Ok(found);
         }
-        if let Some(is_public) = source.modules.get(name) {
-            if public && !is_public {
-                return Ok(Vec::new());
+        let module = source.modules.get(name).copied();
+        if let Some(is_public) = module
+            && !tail.is_empty()
+        {
+            if reach == Reach::Outside && !is_public {
+                return Ok(found);
             }
-            let directory = module_directory(file);
+            let directory = self.child_directory(file, root);
             let children = [
                 format!("{directory}{name}.rs"),
                 format!("{directory}{name}/mod.rs"),
@@ -767,26 +982,47 @@ impl ExternalCrates {
                 }
             }
             if let [child] = present.as_slice() {
-                return self.export(db, root, child, tail, true, visited);
+                let child = child.clone();
+                let reach = match reach {
+                    Reach::Internal => Reach::Internal,
+                    _ => Reach::Outside,
+                };
+                let symbols = self.export(db, root, &child, tail, reach, visited)?;
+                extend_unique(&mut found, symbols);
             }
-            return Ok(Vec::new());
+            return Ok(found);
         }
+        // A `macro_rules!` is addressable at its module's path only through a
+        // `use` of itself there (`pub(crate) use dual;`); an exported one is
+        // reached at the crate root above. A function or type beside a
+        // same-named module (`pub mod dual; pub fn dual()`) is reachable.
         if tail.is_empty()
             && let Some(definitions) = source.definitions.get(name)
         {
-            return Ok(definitions
+            let reexported = self_reexport(&source, name, reach);
+            let symbols = definitions
                 .iter()
-                .filter(|symbol| symbol.visibility == Some(Visibility::Public))
+                .filter(|symbol| {
+                    if symbol.kind == SymbolKind::Macro {
+                        return reexported;
+                    }
+                    reach == Reach::Internal || symbol.visibility == Some(Visibility::Public)
+                })
                 .cloned()
-                .collect());
+                .collect();
+            extend_unique(&mut found, symbols);
+            return Ok(found);
+        }
+        if module.is_some() {
+            return Ok(found);
         }
         let bindings: Vec<_> = source
             .uses
             .iter()
-            .filter(|binding| binding.name == name && (!public || binding.public))
+            .filter(|binding| binding.name == name && (reach != Reach::Outside || binding.public))
             .collect();
         if bindings.len() != 1 {
-            return Ok(Vec::new());
+            return Ok(found);
         }
         let mut redirect = bindings[0].path.clone();
         if !tail.is_empty() {
@@ -797,20 +1033,105 @@ impl ExternalCrates {
             (root.to_string(), path.to_string())
         } else if let Some(path) = redirect.strip_prefix("self::") {
             (file.to_string(), path.to_string())
+        } else if reach == Reach::Internal && redirect.starts_with("super::") {
+            let mut contexts = self
+                .contexts
+                .get(file)
+                .into_iter()
+                .flatten()
+                .filter(|context| context.root_file == root);
+            let (Some(context), None) = (contexts.next(), contexts.next()) else {
+                return Ok(found);
+            };
+            let segments: Vec<&str> = redirect.split("::").collect();
+            let Some(absolute) = absolute_path(&context.path, &segments) else {
+                return Ok(found);
+            };
+            (root.to_string(), absolute)
         } else if redirect.starts_with("super::") || redirect.starts_with("::") {
-            return Ok(Vec::new());
+            return Ok(found);
         } else {
             (file.to_string(), redirect)
         };
-        self.export(db, root, &start_file, &redirect, false, visited)
+        let reach = match reach {
+            Reach::Internal => Reach::Internal,
+            _ => Reach::Redirected,
+        };
+        let symbols = self.export(db, root, &start_file, &redirect, reach, visited)?;
+        extend_unique(&mut found, symbols);
+        Ok(found)
     }
 }
 
-fn unique(mut symbols: Vec<Symbol>) -> Vec<Symbol> {
-    if symbols.len() != 1 {
-        symbols.clear();
+/// One definition per namespace: macros resolve apart from functions and
+/// types, so a path naming both (`fn dual` beside an exported `dual!`) keeps
+/// each, while two candidates in one namespace stay unresolved.
+fn unique(symbols: Vec<Symbol>) -> Vec<Symbol> {
+    let (macros, items): (Vec<_>, Vec<_>) = symbols
+        .into_iter()
+        .partition(|symbol| symbol.kind == SymbolKind::Macro);
+    [items, macros]
+        .into_iter()
+        .filter(|group| group.len() == 1)
+        .flatten()
+        .collect()
+}
+
+/// `segments` (led by `crate`, `self`, or one or more `super`) as a path
+/// from the crate root, for a module at `module` below that root.
+fn absolute_path(module: &[String], segments: &[&str]) -> Option<String> {
+    let mut parts: Vec<&str> = module.iter().map(String::as_str).collect();
+    let mut rest = segments;
+    match rest.first() {
+        Some(&"crate") => {
+            parts.clear();
+            rest = &rest[1..];
+        }
+        Some(&"self") => rest = &rest[1..],
+        Some(&"super") => {
+            while rest.first() == Some(&"super") {
+                parts.pop()?;
+                rest = &rest[1..];
+            }
+        }
+        _ => return None,
     }
-    symbols
+    if rest.is_empty() {
+        return None;
+    }
+    parts.extend(rest);
+    Some(parts.join("::"))
+}
+
+/// `surface` re-exports its own `name` (`use name;`, `pub(crate) use
+/// self::name;`) visibly enough for `reach`.
+fn self_reexport(surface: &Surface, name: &str, reach: Reach) -> bool {
+    surface.uses.iter().any(|binding| {
+        binding.name == name
+            && (binding.path == name || binding.path == format!("self::{name}"))
+            && (reach != Reach::Outside || binding.public)
+    })
+}
+
+fn extend_unique(found: &mut Vec<Symbol>, symbols: Vec<Symbol>) {
+    for symbol in symbols {
+        if !found.iter().any(|known| known.handle() == symbol.handle()) {
+            found.push(symbol);
+        }
+    }
+}
+
+fn last_segment(path: &str) -> &str {
+    path.rsplit("::").next().unwrap_or(path)
+}
+
+pub(super) fn project_root(db: &Database) -> Option<PathBuf> {
+    db.path().and_then(|path| {
+        let dir = path.parent()?;
+        (path.file_name()? == "index.db" && dir.file_name()? == ".codesage")
+            .then(|| dir.parent().map(Path::to_path_buf))
+            .flatten()
+    })
 }
 
 fn conventional_library(package: &str, manifest: &toml::Value) -> Option<String> {
@@ -865,9 +1186,20 @@ fn surface(
     let symbols = symbols?;
     let mut surface = Surface::default();
     let mut attributed = false;
+    let mut exported = false;
+    let mut linted = false;
+    let mut macro_names = HashSet::new();
+    let mut item_names = HashSet::new();
     for item in node.named_children(&mut node.walk()) {
         if item.kind() == "attribute_item" {
-            attributed |= !matches!(text(item, bytes).strip_prefix("#[doc"), Some(tail) if tail.starts_with('(') || tail.starts_with(" ="));
+            let attribute = text(item, bytes);
+            if is_macro_export(attribute) {
+                exported = true;
+            } else if is_lint_attribute(attribute) {
+                linted = true;
+            } else {
+                attributed |= !matches!(attribute.strip_prefix("#[doc"), Some(tail) if tail.starts_with('(') || tail.starts_with(" ="));
+            }
             continue;
         }
         if item.kind().ends_with("comment") {
@@ -880,7 +1212,7 @@ fn surface(
             if let Some(argument) = item.child_by_field_name("argument") {
                 let mut uses = Vec::new();
                 use_bindings(argument, bytes, public, &mut uses);
-                if attributed {
+                if attributed || exported {
                     surface
                         .blocked
                         .extend(uses.into_iter().map(|binding| binding.name));
@@ -893,6 +1225,18 @@ fn surface(
             surface.locals.insert(name.clone());
             if public {
                 surface.public_locals.insert(name.clone());
+            }
+            let is_macro = item.kind() == "macro_definition";
+            if is_macro {
+                macro_names.insert(name.clone());
+            } else {
+                item_names.insert(name.clone());
+            }
+            // `#[macro_export]` relocates a macro and a lint level only
+            // changes diagnostics; neither rewrites the macro.
+            let attributed = attributed || (exported || linted) && !is_macro;
+            if is_macro && exported && !attributed {
+                surface.exported_macros.insert(name.clone());
             }
             if attributed || item.kind() == "mod_item" && item.child_by_field_name("body").is_some()
             {
@@ -916,7 +1260,13 @@ fn surface(
             }
         }
         attributed = false;
+        exported = false;
+        linted = false;
     }
+    surface.macro_only = macro_names
+        .into_iter()
+        .filter(|name| !item_names.contains(name))
+        .collect();
     if !caller {
         return Ok(surface);
     }
@@ -937,10 +1287,20 @@ fn surface(
             surface.shadowed.insert(text(name, bytes).into());
         }
         if item.kind() == "use_wildcard" {
-            if let Some(bindings) = relative_glob_bindings(item, node, bytes) {
-                surface.shadowed.extend(bindings);
-            } else {
-                surface.uncertain_glob = true;
+            let mut declaration = item.parent();
+            while declaration.is_some_and(|parent| parent.kind() != "use_declaration") {
+                declaration = declaration.and_then(|parent| parent.parent());
+            }
+            // Only a glob among the file's own items yields to an explicit
+            // `use`; one inside a function or block shadows it there.
+            let top_level = declaration
+                .and_then(|declaration| declaration.parent())
+                .is_some_and(|parent| parent.id() == node.id());
+            match (relative_glob_bindings(item, node, bytes), top_level) {
+                (Some(bindings), true) => surface.glob_names.extend(bindings),
+                (Some(bindings), false) => surface.shadowed.extend(bindings),
+                (None, true) => surface.uncertain_module_glob = true,
+                (None, false) => surface.uncertain_glob = true,
             }
         }
         if item.kind() == "macro_invocation"
@@ -948,7 +1308,7 @@ fn surface(
         {
             surface
                 .uncertain_ranges
-                .push((scope.start_position(), scope.end_position()));
+                .push((scope.start_position(), scope.end_position(), true));
         }
         if item.kind() == "attribute_item" && attribute_can_rewrite(text(item, bytes)) {
             let mut next = item.next_named_sibling();
@@ -960,7 +1320,7 @@ fn surface(
             if let Some(next) = next {
                 surface
                     .uncertain_ranges
-                    .push((next.start_position(), next.end_position()));
+                    .push((next.start_position(), next.end_position(), false));
             }
         }
         if let Some(pattern) = item.child_by_field_name("pattern") {
@@ -977,6 +1337,73 @@ fn surface(
         pending.extend(item.named_children(&mut item.walk()));
     }
     Ok(surface)
+}
+
+fn is_macro_export(attribute: &str) -> bool {
+    let inner = attribute
+        .strip_prefix("#[")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .map(str::trim)
+        .unwrap_or_default();
+    inner == "macro_export"
+        || inner
+            .strip_prefix("macro_export")
+            .is_some_and(|rest| rest.trim_start().starts_with('('))
+}
+
+/// `#[allow(..)]`, `#[expect(..)]`, `#[warn(..)]`, `#[deny(..)]`,
+/// `#[forbid(..)]`, or a `#[cfg_attr(predicate, ..)]` whose attributes are
+/// all of those.
+fn is_lint_attribute(attribute: &str) -> bool {
+    let Some(inner) = attribute
+        .strip_prefix("#[")
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let lint = |meta: &str| {
+        let meta = meta.trim();
+        ["allow", "expect", "warn", "deny", "forbid"]
+            .iter()
+            .any(|level| {
+                meta.strip_prefix(level)
+                    .is_some_and(|rest| rest.trim_start().starts_with('('))
+            })
+    };
+    let inner = inner.trim();
+    if let Some(arguments) = inner
+        .strip_prefix("cfg_attr")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let parts = top_level_arguments(arguments);
+        return parts.len() >= 2 && parts[1..].iter().all(|part| lint(part));
+    }
+    lint(inner)
+}
+
+/// `arguments` split at commas outside parentheses and brackets.
+fn top_level_arguments(arguments: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (index, c) in arguments.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&arguments[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = &arguments[start..];
+    if !last.trim().is_empty() {
+        parts.push(last);
+    }
+    parts
 }
 
 fn text<'a>(node: Node<'_>, bytes: &'a [u8]) -> &'a str {
@@ -1264,9 +1691,10 @@ fn use_bindings(node: Node<'_>, bytes: &[u8], public: bool, out: &mut Vec<Use>) 
                     node.child_by_field_name("path"),
                     node.child_by_field_name("alias"),
                 ) {
+                    let path = format!("{prefix}{}", text(path, bytes));
                     out.push(Use {
                         name: text(alias, bytes).into(),
-                        path: format!("{prefix}{}", text(path, bytes)),
+                        path: path.strip_suffix("::self").unwrap_or(&path).to_string(),
                         public,
                     });
                 }

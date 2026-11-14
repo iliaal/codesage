@@ -132,7 +132,10 @@ pub(crate) struct WalkCache {
 }
 
 impl WalkCache {
-    fn rust_modules(&mut self, db: &Database) -> Result<Arc<crate::rust_modules::RustModules>> {
+    pub(crate) fn rust_modules(
+        &mut self,
+        db: &Database,
+    ) -> Result<Arc<crate::rust_modules::RustModules>> {
         if let Some(modules) = &self.rust_modules {
             return Ok(Arc::clone(modules));
         }
@@ -164,7 +167,8 @@ impl WalkCache {
             }
             return Ok(Arc::clone(rows));
         }
-        let raw = crate::construction::references_for_symbol(db, sym)?;
+        let raw =
+            crate::construction::references_for_symbol(db, sym, &mut || self.rust_modules(db))?;
         let rows = Arc::new(resolve_references_to_symbol(db, sym, raw, Some(self))?);
         let bytes = rows.iter().fold(
             rows.capacity()
@@ -1381,7 +1385,9 @@ fn build_impact_summary(entries: &[ImpactEntry]) -> ImpactSummary {
 pub(crate) fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> {
     // Source references may use a bare spelling even for qualified definitions.
     // Tail lookup admits both; import-aware resolution filters candidates below.
-    let raw = crate::construction::references_for_symbol(db, sym)?;
+    let raw = crate::construction::references_for_symbol(db, sym, &mut || {
+        Ok(Arc::new(crate::rust_modules::RustModules::load(db)?))
+    })?;
     resolve_references_to_symbol(db, sym, raw, None)
 }
 
