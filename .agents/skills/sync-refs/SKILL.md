@@ -1,11 +1,11 @@
 ---
-name: sweep-refs
-description: Refresh CodeSage reference mirrors, assess upstream changes, and create or update recommendation beads after auditing current CodeSage code. Use for a reference-tool sweep, optionally since YYYY-MM-DD.
+name: sync-refs
+description: Refresh CodeSage reference mirrors, assess upstream changes, and create or update recommendation beads after auditing current CodeSage code. Use to sync or sweep reference tools, optionally since YYYY-MM-DD.
 ---
 
 # Reference sweep
 
-This is the canonical workflow for Codex `$sweep-refs` and Claude `/sweep-refs`.
+This is the canonical workflow for Codex `$sync-refs` and Claude `/sync-refs`. Ledger labels keep their historical `sweep` names (`source:sweep-refs`, `sweep:*`, `sweep-key:*`); do not rename them.
 The Claude command only links here. Work from the CodeSage repository root; mirrors
 live in `~/ai/codesage_ref/`. Accept no argument, `YYYY-MM-DD`, or
 `since YYYY-MM-DD`; validate the calendar date and reject malformed or future
