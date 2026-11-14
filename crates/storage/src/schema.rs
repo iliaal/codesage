@@ -797,6 +797,7 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ),
     ("0032_refs_import_edges", migrate_0032_refs_import_edges),
     ("0033_js_aliases", migrate_0033_js_aliases),
+    ("0034_php_nocase_lookups", migrate_0034_php_nocase_lookups),
 ];
 
 /// The reference kinds that can form a file-level import edge, as a SQL list.
@@ -842,6 +843,25 @@ fn migrate_0033_js_aliases(conn: &Connection) -> rusqlite::Result<()> {
          );",
     )
 }
+
+/// PHP class, namespace, function, and method names are case-insensitive, so
+/// PHP-shaped lookups compare with `COLLATE NOCASE`; SQLite uses an index for
+/// that comparison only when the index carries the same collation. The refs
+/// index is partial on names containing a backslash (PHP-qualified rows), so
+/// other languages pay nothing; a query uses it only when it repeats
+/// [`PHP_QUALIFIED_REF_SQL`] term for term.
+fn migrate_0034_php_nocase_lookups(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_symbols_qualified_nocase
+             ON symbols(qualified_name COLLATE NOCASE);
+         CREATE INDEX IF NOT EXISTS idx_symbols_name_nocase ON symbols(name COLLATE NOCASE);
+         CREATE INDEX IF NOT EXISTS idx_refs_php_name_nocase
+             ON refs(to_name COLLATE NOCASE) WHERE {PHP_QUALIFIED_REF_SQL};"
+    ))
+}
+
+/// The partial-index predicate of `idx_refs_php_name_nocase`.
+pub(crate) const PHP_QUALIFIED_REF_SQL: &str = "instr(to_name, '\\') > 0";
 
 fn migrate_0027_symbol_signatures(conn: &Connection) -> rusqlite::Result<()> {
     for column in ["signature", "arity", "parameters", "return_type"] {

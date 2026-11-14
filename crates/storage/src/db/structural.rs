@@ -758,16 +758,36 @@ impl Database {
         }
     }
 
+    /// Definitions named `name`: by qualified name when `name` is qualified,
+    /// otherwise by bare name. A PHP-shaped qualified name (one containing
+    /// a backslash) matches case-insensitively, as PHP resolves it.
     pub fn find_symbols(&self, name: &str, kind: Option<SymbolKind>) -> Result<Vec<Symbol>> {
-        let name_column = if name.contains('\\') || name.contains('.') || name.contains("::") {
-            "s.qualified_name"
+        let condition = if name.contains('\\') {
+            "s.qualified_name = ?1 COLLATE NOCASE"
+        } else if name.contains('.') || name.contains("::") {
+            "s.qualified_name = ?1"
         } else {
-            "s.name"
+            "s.name = ?1"
         };
+        self.symbols_where(condition, name, kind)
+    }
+
+    /// Definitions whose bare name equals `name` ignoring ASCII case, for
+    /// languages whose class names are case-insensitive (PHP).
+    pub fn find_symbols_named_ignore_case(&self, name: &str) -> Result<Vec<Symbol>> {
+        self.symbols_where("s.name = ?1 COLLATE NOCASE", name, None)
+    }
+
+    fn symbols_where(
+        &self,
+        condition: &str,
+        name: &str,
+        kind: Option<SymbolKind>,
+    ) -> Result<Vec<Symbol>> {
         let signature = self.symbol_signature_projection()?;
         let sql = format!("SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale, s.visibility, s.is_test, {signature}
               FROM symbols s JOIN files f ON s.file_id = f.id
-              WHERE {name_column} = ?1");
+              WHERE {condition}");
 
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![name], row_to_symbol)?;
@@ -824,7 +844,18 @@ impl Database {
         let is_qualified =
             to_name.contains('\\') || to_name.contains("::") || to_name.contains('/');
 
-        let mut refs = if is_qualified {
+        let mut refs = if to_name.contains('\\') {
+            // PHP names are case-insensitive; see `idx_refs_php_name_nocase`.
+            self.query_refs(
+                &format!(
+                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
+                 FROM refs r JOIN files f ON r.from_file_id = f.id
+                 WHERE r.to_name = ?1 COLLATE NOCASE AND {}",
+                crate::schema::PHP_QUALIFIED_REF_SQL
+            ),
+                params![to_name],
+            )?
+        } else if is_qualified {
             self.query_refs(
                 &format!(
                 "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}

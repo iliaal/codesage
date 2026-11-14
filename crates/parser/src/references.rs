@@ -167,6 +167,15 @@ fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         // nullable / union / intersection / DNF arms, typed property, variadic,
         // closure and arrow-function return types
         15..=22 => Some(ReferenceKind::TypeHint),
+        23 => Some(ReferenceKind::Instantiation), // new \A\B
+        // scope of a static call, constant, `::class`, or static property
+        // access, recorded like pattern 3's bare scope
+        24..=26 => Some(ReferenceKind::Call),
+        27 | 28 => Some(ReferenceKind::Inheritance), // extends / implements \A\B
+        29 => Some(ReferenceKind::TraitUse),         // use \A\SomeTrait; inside class
+        30 => Some(ReferenceKind::TypeHint),         // namespace\Rel\Thing type hint
+        // interface / anonymous-class extends, enum / anonymous-class implements
+        31 | 32 => Some(ReferenceKind::Inheritance),
         _ => None,
     }
 }
@@ -696,6 +705,17 @@ fn tree_references(
         {
             continue;
         }
+        // Patterns 10-22 record no catch types, so the relative-name arm
+        // does not either.
+        if language == Language::Php
+            && m.pattern_index == 30
+            && node
+                .parent()
+                .and_then(|named| named.parent())
+                .is_some_and(|list| list.kind() == "type_list")
+        {
+            continue;
+        }
         pending.push(Pending {
             pattern: m.pattern_index,
             node,
@@ -810,6 +830,10 @@ fn tree_references(
             }
             Language::Rust => rust_grouped_use_prefix(&ref_node, source)
                 .map_or_else(|| stripped.to_string(), |p| format!("{p}::{stripped}")),
+            Language::Php if kind != ReferenceKind::Import => {
+                crate::php_names::resolve_class_name(&ref_node, &root, source)
+                    .unwrap_or_else(|| stripped.to_string())
+            }
             Language::Php => php_group_use_prefix(&ref_node, source)
                 .map_or_else(|| stripped.to_string(), |p| format!("{p}\\{stripped}")),
             Language::Python if matches!(p.pattern, 1 | 6) => {

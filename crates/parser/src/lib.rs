@@ -5,6 +5,7 @@ pub mod extract;
 pub mod fingerprint;
 pub mod header;
 pub mod parse;
+mod php_names;
 pub mod position;
 mod preproc;
 mod preproc_arms;

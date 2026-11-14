@@ -914,6 +914,13 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
         }
         return Ok(resolved);
     }
+    if let Some(global) = php_global_class_name(caller_file, to_name) {
+        return Ok(db
+            .find_symbols_named_ignore_case(global)?
+            .into_iter()
+            .filter(|symbol| names_php_global_class(symbol, global))
+            .collect());
+    }
     // Gate before any strategy runs: a candidate the caller cannot name must
     // not resurface through a looser tier (lone-candidate return, case fold,
     // import evidence). The lone-candidate shortcut keys on the pre-gate
@@ -1037,6 +1044,29 @@ pub(crate) fn imports_name_symbol(
     import_refs.iter().any(|imp| {
         prepared_import_targets_symbol(&ImportRef::new(imp), importer, to_name, symbol, modules)
     })
+}
+
+/// The class a PHP reference spelled `\Name` names in the global namespace.
+/// The parser keeps the leading `\` only on fully qualified single-segment
+/// class names, so such a row means exactly the global `Name`, never a
+/// same-named class in some namespace.
+pub(crate) fn php_global_class_name<'a>(caller_file: &str, to_name: &'a str) -> Option<&'a str> {
+    let rest = to_name.strip_prefix('\\')?;
+    (!rest.is_empty()
+        && !rest.contains('\\')
+        && codesage_parser::detect::detect_language(std::path::Path::new(caller_file))
+            == Some(Language::Php))
+    .then_some(rest)
+}
+
+pub(crate) fn names_php_global_class(symbol: &Symbol, name: &str) -> bool {
+    symbol.qualified_name.eq_ignore_ascii_case(name)
+        && matches!(
+            symbol.kind,
+            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Trait | SymbolKind::Enum
+        )
+        && codesage_parser::detect::detect_language(std::path::Path::new(&symbol.file_path))
+            == Some(Language::Php)
 }
 
 pub(crate) fn reference_kind_admits(

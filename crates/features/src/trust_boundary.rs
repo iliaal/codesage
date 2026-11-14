@@ -33,8 +33,14 @@ pub fn derive_from_refs(refs: &[Reference], language: Language) -> Vec<TrustBoun
             continue;
         }
         let name = normalize_ref_name(&r.to_name, r.kind);
+        // The parser keeps a fully qualified global class as `\PDO`; the
+        // rules name it as `PDO`.
+        let name = match language {
+            Language::Php => name.strip_prefix('\\').unwrap_or(&name),
+            _ => &name,
+        };
         for table in tables {
-            apply_rules(table, &name, &mut acc);
+            apply_rules(table, name, &mut acc);
         }
     }
     acc.into_iter().collect()
@@ -331,6 +337,19 @@ mod tests {
         let b = derive_from_refs(&refs, Language::Php);
         assert!(b.contains(&TrustBoundary::Network));
         assert!(b.contains(&TrustBoundary::ExternalApi));
+    }
+
+    #[test]
+    fn php_fully_qualified_global_classes_match_exact_rules() {
+        let source = b"<?php\nnamespace App;\nclass Repo {\n  public function __construct(\\PDO $db) {}\n  public function f() { return \\SplFileObject::class; }\n}\n";
+        let tree = parse_file(source, Language::Php).unwrap();
+        let refs = extract_references(&tree, source, Language::Php, "Repo.php").unwrap();
+        assert!(refs.iter().any(|r| r.to_name == "\\PDO"), "{refs:?}");
+        assert_eq!(
+            derive_from_refs(&refs, Language::Php),
+            vec![TrustBoundary::Filesystem, TrustBoundary::Database]
+        );
+        assert!(derive_from_refs(&[call("\\\\PDO")], Language::Php).is_empty());
     }
 
     #[test]

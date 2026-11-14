@@ -41,6 +41,86 @@ fn php_group_use_emits_prefixed_imports() {
 }
 
 #[test]
+fn php_qualified_class_references_resolve_to_fully_qualified_names() {
+    let src = "<?php
+namespace App;
+use Lib\\Models;
+class Gate extends \\Base\\Root implements A\\Contract, Models\\Shape {
+    use \\Lib\\Traits\\Logs;
+    public function check() {
+        $a = new \\App\\A\\Foo();
+        $b = new A\\Foo();
+        $c = new namespace\\A\\Foo();
+        \\App\\A\\Foo::build();
+        Models\\Audit::query();
+        $k = \\Lib\\Kind::class . \\Lib\\Kind::NAME . \\Lib\\Kind::$cache;
+        throw new \\RuntimeException();
+    }
+}
+";
+    let refs = refs_from_source(src, Language::Php);
+    let mut rows: Vec<_> = refs
+        .iter()
+        .filter(|r| r.kind != ReferenceKind::Import && r.to_name.contains('\\'))
+        .map(|r| (r.line, r.kind, r.to_name.as_str()))
+        .collect();
+    rows.sort_by_key(|row| (row.0, row.2.to_string()));
+    assert_eq!(
+        rows,
+        [
+            (4, ReferenceKind::Inheritance, "App\\A\\Contract"),
+            (4, ReferenceKind::Inheritance, "Base\\Root"),
+            (4, ReferenceKind::Inheritance, "Lib\\Models\\Shape"),
+            (5, ReferenceKind::TraitUse, "Lib\\Traits\\Logs"),
+            (7, ReferenceKind::Instantiation, "App\\A\\Foo"),
+            (8, ReferenceKind::Instantiation, "App\\A\\Foo"),
+            (9, ReferenceKind::Instantiation, "App\\A\\Foo"),
+            (10, ReferenceKind::Call, "App\\A\\Foo"),
+            (11, ReferenceKind::Call, "Lib\\Models\\Audit"),
+            (12, ReferenceKind::Call, "Lib\\Kind"),
+            (12, ReferenceKind::Call, "Lib\\Kind"),
+            (12, ReferenceKind::Call, "Lib\\Kind"),
+            (13, ReferenceKind::Instantiation, "\\RuntimeException"),
+        ]
+    );
+}
+
+#[test]
+fn php_relative_type_hints_and_non_class_inheritance_are_recorded() {
+    let src = "<?php
+namespace App;
+interface Iface extends Base, \\Lib\\Contract, namespace\\Rel\\Parent_ {}
+enum E implements Plain, \\Lib\\Contract { case A; }
+$x = new class extends Base implements Plain, \\Lib\\Contract {};
+function f(namespace\\Rel\\Thing $t): ?namespace\\Rel\\Other {
+    try {} catch (namespace\\Rel\\Failure $e) {}
+}
+";
+    let refs = refs_from_source(src, Language::Php);
+    let mut rows: Vec<_> = refs
+        .iter()
+        .filter(|r| matches!(r.kind, ReferenceKind::Inheritance | ReferenceKind::TypeHint))
+        .map(|r| (r.line, r.kind, r.to_name.as_str()))
+        .collect();
+    rows.sort_by_key(|row| (row.0, row.2.to_string()));
+    assert_eq!(
+        rows,
+        [
+            (3, ReferenceKind::Inheritance, "App\\Rel\\Parent_"),
+            (3, ReferenceKind::Inheritance, "Base"),
+            (3, ReferenceKind::Inheritance, "Lib\\Contract"),
+            (4, ReferenceKind::Inheritance, "Lib\\Contract"),
+            (4, ReferenceKind::Inheritance, "Plain"),
+            (5, ReferenceKind::Inheritance, "Base"),
+            (5, ReferenceKind::Inheritance, "Lib\\Contract"),
+            (5, ReferenceKind::Inheritance, "Plain"),
+            (6, ReferenceKind::TypeHint, "App\\Rel\\Other"),
+            (6, ReferenceKind::TypeHint, "App\\Rel\\Thing"),
+        ]
+    );
+}
+
+#[test]
 fn python_relative_import_module_edge_is_captured() {
     let src = "from .models import User\nfrom . import helpers\n";
     let refs = refs_from_source(src, Language::Python);
@@ -124,10 +204,10 @@ $a2 = fn(): ArrowUnionA|ArrowUnionB => null;
             (5, "Plain"),
             (6, "NullRet"),
             (6, "Nullable"),
+            (7, "App\\UnionB"),
             (7, "RetA"),
             (7, "RetB"),
             (7, "UnionA"),
-            (7, "\\App\\UnionB"),
             (8, "Variadic"),
             (9, "InterA"),
             (9, "InterB"),

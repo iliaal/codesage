@@ -8,12 +8,16 @@
 ### Changed
 
 - `find-references` on a Rust spelling with no definition of its own, such as a `use … as` alias, now fills `to` for call and macro rows that a renamed or in-crate import binds, and reports `to_resolution.capped` when the screen would need more than 32 caller files for one spelling.
+- Schema migration `0034_php_nocase_lookups` adds the case-insensitive indexes PHP name lookups use; the first command that opens the index for writing, such as `codesage index`, builds them once.
 
 ### Fixed
 
 - Calls, `new`, `extends`, and type uses through a renamed JavaScript/TypeScript import (`import { x as y }`, `const { x: y } = require(..)`) bind to the imported item in `trace`, `impact`, and `find_references`. Run `codesage index` to reparse JavaScript/TypeScript files.
 - Rust calls and macro invocations through renamed in-crate imports (`use crate::f as g; g()`, `super::`/`self::`, grouped and nested lists, `pub use … as` re-exports, `#[macro_export]` macros) now bind in `trace`, `impact`, and `find-references`; a renamed function import no longer hides a same-named macro.
 - Rust calls into a dependency's `#[macro_export]` macro (`dep::name!()`, `use dep::name as m; m!()`) now bind to the macro at the dependency's root.
+- `find-references`, `impact`, `tests-for`, and MCP `recommend_tests` include PHP class references written with a namespace (`new \A\B()`, `A\B::m()`, `\A\B::class`, class `extends`/`implements \A\B`, trait `use`, type hints including `namespace\A` hints), bound case-insensitively to the fully qualified class PHP resolves from the file's namespace and `use` aliases.
+- PHP interface `extends`, enum `implements`, and anonymous-class `extends`/`implements` are recorded as inheritance references.
+- PHP trust-boundary rules match fully qualified global classes such as `\PDO` and `\SplFileObject`.
 
 ## [0.52.0] - 2026-11-12
 

@@ -189,6 +189,7 @@ pub(crate) fn references_for_symbol(
         let aliased = modules()?.alias_references(db, &symbol.name, &rows)?;
         rows.extend(aliased);
     }
+    extend_php_qualified_references(db, symbol, &mut rows)?;
     if let Some(owner) = Constructors::default().owner(db, symbol)? {
         rows.extend(
             db.find_references(&owner.name, None)?
@@ -208,6 +209,41 @@ pub(crate) fn rust_imports_name(rows: &[Reference], name: &str) -> bool {
             && row.from_file.ends_with(".rs")
             && row.to_name.rsplit("::").next() == Some(name)
     })
+}
+
+/// Add the rows that spell a PHP class by its qualified name in another
+/// ASCII case. PHP class names are case-insensitive and the parser stores
+/// qualified spellings fully qualified, so `\lib\USER` shares no bare tail
+/// with `User` but does share its qualified name.
+pub(crate) fn extend_php_qualified_references(
+    db: &Database,
+    symbol: &Symbol,
+    rows: &mut Vec<Reference>,
+) -> Result<()> {
+    if codesage_parser::detect::detect_language(std::path::Path::new(&symbol.file_path))
+        != Some(Language::Php)
+        || !matches!(
+            symbol.kind,
+            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Trait | SymbolKind::Enum
+        )
+    {
+        return Ok(());
+    }
+    let qualified = if symbol.qualified_name.contains('\\') {
+        symbol.qualified_name.clone()
+    } else {
+        format!("\\{}", symbol.qualified_name)
+    };
+    let seen: std::collections::HashSet<_> = rows
+        .iter()
+        .map(|r| (r.from_file.clone(), r.line, r.col, r.kind))
+        .collect();
+    rows.extend(
+        db.find_references(&qualified, None)?
+            .into_iter()
+            .filter(|r| !seen.contains(&(r.from_file.clone(), r.line, r.col, r.kind))),
+    );
+    Ok(())
 }
 
 pub(crate) fn same_symbol(left: &Symbol, right: &Symbol) -> bool {

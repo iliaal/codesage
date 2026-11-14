@@ -184,10 +184,13 @@ impl Database {
              CREATE UNIQUE INDEX temp.__overlay_symbols_id ON __overlay_symbols(id);
              CREATE INDEX temp.__overlay_symbols_name ON __overlay_symbols(name);
              CREATE INDEX temp.__overlay_symbols_qualified ON __overlay_symbols(qualified_name);
+             CREATE INDEX temp.__overlay_symbols_qualified_nocase ON __overlay_symbols(qualified_name COLLATE NOCASE);
+             CREATE INDEX temp.__overlay_symbols_name_nocase ON __overlay_symbols(name COLLATE NOCASE);
              CREATE INDEX temp.__overlay_symbols_file ON __overlay_symbols(file_id, qualified_name);
              CREATE UNIQUE INDEX temp.__overlay_refs_id ON __overlay_refs(id);
              CREATE INDEX temp.__overlay_refs_name ON __overlay_refs(to_name);
              CREATE INDEX temp.__overlay_refs_tail ON __overlay_refs(to_name_tail);
+             CREATE INDEX temp.__overlay_refs_php_name_nocase ON __overlay_refs(to_name COLLATE NOCASE) WHERE instr(to_name, '\\') > 0;
              CREATE INDEX temp.__overlay_refs_file ON __overlay_refs(from_file_id);
              CREATE UNIQUE INDEX temp.__overlay_python_key ON __overlay_python_bindings(file_id, kind, to_name, line, col);
              CREATE INDEX temp.__overlay_fingerprints_file ON __overlay_symbol_fingerprints(file_id);

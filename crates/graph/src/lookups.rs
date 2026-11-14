@@ -97,7 +97,16 @@ pub fn find_references_with_budget(
             .iter()
             .any(|s| s.name == spelling || s.qualified_name == spelling);
     let mut results = if as_written {
-        db.find_references(spelling, req.kind)?
+        let mut rows = db.find_references(spelling, req.kind)?;
+        if !is_qualified_symbol_name(spelling) {
+            for definition in &definitions {
+                crate::construction::extend_php_qualified_references(db, definition, &mut rows)?;
+            }
+            if let Some(k) = req.kind {
+                rows.retain(|row| row.kind == k);
+            }
+        }
+        rows
     } else {
         let names = distinct_sorted(definitions.iter().map(|s| s.name.as_str()));
         let mut rows = Vec::new();
@@ -107,6 +116,12 @@ pub fn find_references_with_budget(
             named.extend(db.find_symbols(name, None)?);
         }
         retain_definitions(&mut named, false);
+        for definition in &named {
+            crate::construction::extend_php_qualified_references(db, definition, &mut rows)?;
+        }
+        if let Some(k) = req.kind {
+            rows.retain(|row| row.kind == k);
+        }
         definitions = named;
         rows
     };
@@ -640,7 +655,16 @@ impl<'a> EvidenceCaches<'a> {
         spelling: &str,
         candidate: &Symbol,
     ) -> Result<bool> {
-        if is_qualified_symbol_name(spelling) && candidate.qualified_name == spelling {
+        if is_qualified_symbol_name(spelling)
+            && (candidate.qualified_name == spelling
+                || spelling.contains('\\')
+                    && candidate.qualified_name.eq_ignore_ascii_case(spelling))
+        {
+            return Ok(true);
+        }
+        if crate::bundle::php_global_class_name(caller_file, spelling)
+            .is_some_and(|name| crate::bundle::names_php_global_class(candidate, name))
+        {
             return Ok(true);
         }
         if candidate.file_path == caller_file {

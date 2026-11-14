@@ -72,3 +72,44 @@
 
 ; Pattern 22: arrow-function return type (fn(): Foo => ...)
 (arrow_function return_type: (named_type [(name) (qualified_name)] @ref))
+
+; Patterns 23-29: class references spelled with a namespace (`\A\B`, `A\B`,
+; `namespace\B`). references.rs resolves each to its fully qualified name.
+; Pattern 23: object creation (new \A\B)
+(object_creation_expression [(qualified_name) (relative_name)] @ref)
+
+; Pattern 24: static method call scope (\A\B::method())
+(scoped_call_expression scope: [(qualified_name) (relative_name)] @ref)
+
+; Pattern 25: class constant and ::class access (\A\B::CONST, \A\B::class)
+(class_constant_access_expression . [(qualified_name) (relative_name)] @ref)
+
+; Pattern 26: static property access scope (\A\B::$prop)
+(scoped_property_access_expression scope: [(qualified_name) (relative_name)] @ref)
+
+; Pattern 27: class extends (extends \A\B)
+(class_declaration (base_clause [(qualified_name) (relative_name)] @ref))
+
+; Pattern 28: class implements (implements \A\B, \C\D)
+(class_declaration (class_interface_clause [(qualified_name) (relative_name)] @ref))
+
+; Pattern 29: trait use in class body (use \A\SomeTrait;)
+(use_declaration [(qualified_name) (relative_name)] @ref)
+
+; Pattern 30: type hint spelled relative to the namespace (namespace\Rel\Thing),
+; in any position patterns 10-22 cover; catch types are skipped in references.rs.
+(named_type (relative_name) @ref)
+
+; Pattern 31: interface and anonymous-class extends (interface I extends \A\B,
+; new class extends Base)
+[
+  (interface_declaration (base_clause [(name) (qualified_name) (relative_name)] @ref))
+  (anonymous_class (base_clause [(name) (qualified_name) (relative_name)] @ref))
+]
+
+; Pattern 32: enum and anonymous-class implements (enum E implements \A\C,
+; new class implements Contract)
+[
+  (enum_declaration (class_interface_clause [(name) (qualified_name) (relative_name)] @ref))
+  (anonymous_class (class_interface_clause [(name) (qualified_name) (relative_name)] @ref))
+]
