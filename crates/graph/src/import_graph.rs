@@ -8,7 +8,9 @@ use anyhow::Result;
 use codesage_storage::Database;
 use codesage_storage::db::ImportPairs;
 
-use crate::bundle::resolved_path_import_candidates;
+use codesage_protocol::ReferenceKind;
+
+use crate::bundle::{JsAliases, resolved_path_import_candidates};
 
 /// Every cross-file import pair, partitioned by whether any load-time
 /// directive joins it. Pairs are sorted.
@@ -24,8 +26,10 @@ pub fn file_import_pairs(db: &Database) -> Result<ImportPairs> {
     }
     if !path_refs.is_empty() {
         let files: HashSet<String> = db.all_file_paths()?.into_iter().collect();
+        let aliases = JsAliases::load(db)?;
         for (from, spec, lazy_only) in path_refs {
             codesage_protocol::work::checkpoint()?;
+            let spec = aliases.effective(ReferenceKind::Import, &spec, &from)?;
             if let Some(to) = loaded_target(&spec, &from, &files) {
                 pairs.add(from, to, lazy_only);
             }

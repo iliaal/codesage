@@ -21,6 +21,7 @@ schemars.workspace = true
 toml = "1.1"
 tree-sitter.workspace = true
 tempfile = "3"
+jsonc-parser = { version = "0.34", features = ["preserve_order"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

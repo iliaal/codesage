@@ -222,6 +222,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0030_git_history_build",
         "0031_git_history_build_v2",
         "0032_refs_import_edges",
+        "0033_js_aliases",
     ];
     for migration in expected_migrations {
         let count: i64 = conn

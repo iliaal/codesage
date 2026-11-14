@@ -23,6 +23,7 @@ mod features;
 mod git_authors;
 mod git_hist;
 mod hash_cache;
+mod js_paths;
 mod overlay;
 mod python_memo;
 mod semantic;
@@ -117,6 +118,8 @@ pub struct Database {
     verified_sidecars: RefCell<semantic::SidecarMemo>,
     /// Python binding answers; see [`Database::python_memo_scope`].
     python_memo: RefCell<python_memo::PythonMemo>,
+    /// Recorded JS/TS path configs; see [`Database::js_path_configs`].
+    js_path_memo: RefCell<js_paths::JsPathMemo>,
 }
 
 pub struct ReadSnapshot<'a> {
@@ -773,6 +776,7 @@ impl Database {
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
             python_memo: Default::default(),
+            js_path_memo: Default::default(),
         })
     }
 
@@ -786,6 +790,7 @@ impl Database {
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
             python_memo: Default::default(),
+            js_path_memo: Default::default(),
         })
     }
 
@@ -801,6 +806,7 @@ impl Database {
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
             python_memo: Default::default(),
+            js_path_memo: Default::default(),
         })
     }
 
@@ -855,6 +861,7 @@ impl Database {
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
             python_memo: Default::default(),
+            js_path_memo: Default::default(),
         })
     }
 
@@ -949,6 +956,7 @@ impl Database {
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
             python_memo: Default::default(),
+            js_path_memo: Default::default(),
         };
         if let Some(fts_in_sync) = fts_in_sync {
             let mut verified = None;
@@ -1010,6 +1018,7 @@ impl Database {
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
             python_memo: Default::default(),
+            js_path_memo: Default::default(),
         };
         db.mark_sidecars_verified(
             &db.chunk_table,
@@ -1042,6 +1051,7 @@ impl Database {
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
             python_memo: Default::default(),
+            js_path_memo: Default::default(),
         })
     }
 
@@ -1124,6 +1134,7 @@ impl Database {
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
             python_memo: Default::default(),
+            js_path_memo: Default::default(),
         })
     }
 
@@ -2586,6 +2597,7 @@ mod tests {
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             verified_sidecars: Default::default(),
             python_memo: Default::default(),
+            js_path_memo: Default::default(),
         };
         if with_chunk {
             let embedding = make_embedding(0.1);

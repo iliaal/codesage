@@ -620,10 +620,15 @@ pub fn list_dependencies(db: &Database, file_path: &str) -> Result<DependencyEnt
 /// Resolve dependencies in input order, sharing one project-wide import query.
 pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec<DependencyEntry>> {
     let all_refs = db.file_import_references()?;
-    let pairs: Vec<_> = all_refs
+    let indexed: HashSet<String> = db.all_file_paths()?.into_iter().collect();
+    let aliases = crate::bundle::JsAliases::load(db)?;
+    let pairs = all_refs
         .iter()
-        .map(|row| (row.from_file.clone(), row.to_name.clone()))
-        .collect();
+        .map(|row| {
+            let spec = aliases.effective(row.kind, &row.to_name, &row.from_file)?;
+            Ok((row.from_file.clone(), spec.into_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let modules = crate::rust_modules::RustModules::from_imports(db, &pairs)?;
     let mut symbol_imports: HashMap<String, HashSet<String>> = HashMap::new();
     let mut symbols: HashMap<String, Vec<Symbol>> = HashMap::new();
@@ -649,7 +654,6 @@ pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec
             }
         }
     }
-    let indexed: HashSet<String> = db.all_file_paths()?.into_iter().collect();
     let probes = codesage_storage::db::PythonPackageProbes::default();
     let mut out = Vec::with_capacity(file_paths.len());
     for file_path in file_paths {

@@ -518,6 +518,9 @@ impl WalkCache {
 pub(crate) struct FileImports {
     rows: Vec<Reference>,
     shapes: Vec<FileImportShape>,
+    /// Rows of [`FileImportShape::JsPath`] by the project path their
+    /// specifier joins to, ascending.
+    js_targets: HashMap<String, Vec<usize>>,
     /// Files each Python row loads, by row index and filled on first use; empty
     /// when no row is Python. Every frontier file tests every Python row, so
     /// indexing by row avoids building and hashing an import-site key per row
@@ -534,6 +537,9 @@ enum FileImportShape {
     Python,
     /// The path matcher decides per target file.
     PathMatched,
+    /// A JavaScript/TypeScript relative specifier, or an alias stored with
+    /// its relative form; listed in `js_targets` by its joined path.
+    JsPath,
     /// The path matcher rejects this row for every target file.
     NoFile,
 }
@@ -541,17 +547,31 @@ enum FileImportShape {
 impl FileImports {
     fn load(db: &Database) -> Result<Self> {
         let rows = db.file_import_references()?;
+        let aliases = crate::bundle::JsAliases::load(db)?;
         let mut c_family = false;
         let mut shapes = Vec::with_capacity(rows.len());
-        for row in &rows {
+        let mut js_targets: HashMap<String, Vec<usize>> = HashMap::new();
+        for (index, row) in rows.iter().enumerate() {
             c_family |= matches!(
                 codesage_parser::detect::detect_language(std::path::Path::new(&row.from_file)),
                 Some(codesage_protocol::Language::C | codesage_protocol::Language::Cpp)
             );
+            let spec = aliases.effective(row.kind, &row.to_name, &row.from_file)?;
+            let spec = spec.as_ref();
             shapes.push(
                 if codesage_protocol::python::is_python_path(&row.from_file) {
                     FileImportShape::Python
-                } else if crate::bundle::import_ref_may_target_file(&row.to_name, &row.from_file) {
+                } else if crate::bundle::is_js_importer(&row.from_file)
+                    && (spec.starts_with("./") || spec.starts_with("../"))
+                {
+                    match crate::bundle::js_relative_join(spec, &row.from_file) {
+                        Some(joined) => {
+                            js_targets.entry(joined).or_default().push(index);
+                            FileImportShape::JsPath
+                        }
+                        None => FileImportShape::NoFile,
+                    }
+                } else if crate::bundle::import_ref_may_target_file(spec, &row.from_file) {
                     FileImportShape::PathMatched
                 } else {
                     FileImportShape::NoFile
@@ -567,8 +587,25 @@ impl FileImports {
             python_targets,
             rows,
             shapes,
+            js_targets,
             c_family,
         })
+    }
+
+    /// The `JsPath` rows whose specifier loads `file`, ascending.
+    fn js_rows_loading(&self, file: &str) -> Vec<usize> {
+        let mut rows: Vec<usize> = crate::bundle::js_joined_paths_loading(file)
+            .iter()
+            .filter_map(|joined| self.js_targets.get(joined).map(|rows| (joined, rows)))
+            .flat_map(|(joined, rows)| {
+                rows.iter().copied().filter(move |&row| {
+                    crate::bundle::js_joined_path_loads(joined, &self.rows[row].from_file, file)
+                })
+            })
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
     }
 
     fn python_targets(
@@ -964,6 +1001,7 @@ pub(crate) fn impact_analysis_walk_shared(
                 .and_then(|cache| cache.import_matches.get(file))
                 .cloned();
             let mut matches = Vec::new();
+            let js_rows = file_imports.js_rows_loading(file);
             for index in 0..cached_matches
                 .as_ref()
                 .map_or(file_imports.rows.len(), |rows| rows.len())
@@ -993,7 +1031,16 @@ pub(crate) fn impact_analysis_walk_shared(
                     continue;
                 }
                 if cached_matches.is_none()
-                    && shape != FileImportShape::Python
+                    && shape == FileImportShape::JsPath
+                    && js_rows.binary_search(&reference_index).is_err()
+                {
+                    continue;
+                }
+                if cached_matches.is_none()
+                    && matches!(
+                        shape,
+                        FileImportShape::PathMatched | FileImportShape::NoFile
+                    )
                     && (shape == FileImportShape::NoFile
                         || !import_ref_targets_file_with_indexed(
                             &r.to_name,

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
+use codesage_protocol::js_paths::lexical_join;
 use codesage_protocol::{
     ContextBundle, ExportRequest, Language, ReferenceKind, SearchRequest, SearchResult, Symbol,
     SymbolKind, SymbolSummary, TargetKind, TargetResolution, Visibility,
@@ -1166,7 +1167,9 @@ pub(crate) fn is_package_import(kind: ReferenceKind, from_file: &str, to_name: &
 pub(crate) fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>> {
     let mut refs = Vec::new();
     if let Some(file_id) = db.file_id_for_path(caller_file)? {
+        let aliases = JsAliases::load(db)?;
         for (to_name, kind) in db.refs_outgoing_for_file_id(file_id)? {
+            let to_name = aliases.effective(kind, &to_name, caller_file)?.into_owned();
             if is_package_import(kind, caller_file, &to_name) {
                 continue;
             }
@@ -1411,7 +1414,8 @@ pub(crate) fn import_ref_targets_file(
         });
     }
     // A bare JavaScript/TypeScript specifier (`lodash/fp`, `lib/b.js`) names a
-    // package or a `baseUrl`/`paths` mapping, neither of which is modelled.
+    // package here; callers rewrite a `baseUrl`/`paths` alias to its relative
+    // form first (`JsAliases::effective`).
     importer_dialect(importer_file) == ImporterDialect::CFamily
         && quoted_include_candidates(import_ref, importer_file)
             .iter()
@@ -1425,6 +1429,13 @@ enum ImporterDialect {
     TypeScript,
     CFamily,
     Other,
+}
+
+pub(crate) fn is_js_importer(importer_file: &str) -> bool {
+    matches!(
+        importer_dialect(importer_file),
+        ImporterDialect::JavaScript | ImporterDialect::TypeScript
+    )
 }
 
 fn importer_dialect(importer_file: &str) -> ImporterDialect {
@@ -1680,8 +1691,8 @@ fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bo
             None => false,
         };
     }
-    // A bare JavaScript/TypeScript specifier names a package or an unmodelled
-    // `baseUrl`/`paths` mapping, matching `import_ref_targets_file`.
+    // A bare JavaScript/TypeScript specifier names a package, matching
+    // `import_ref_targets_file`; aliases arrive already rewritten.
     if matches!(
         importer_dialect(caller_file),
         ImporterDialect::JavaScript | ImporterDialect::TypeScript
@@ -1693,31 +1704,242 @@ fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bo
     spec == sym_file || sym_file.ends_with(&format!("/{spec}"))
 }
 
-/// Joins `spec` onto `base`, resolving `.` and `..` textually. Returns `None`
-/// when the specifier escapes above the project root, which cannot name an
-/// indexed file.
-fn lexical_join(base: &str, spec: &str) -> Option<String> {
-    let mut parts: Vec<&str> = if base.is_empty() {
-        Vec::new()
-    } else {
-        base.split('/').collect()
-    };
-    for seg in spec.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            other => parts.push(other),
+/// The importer-relative form (`./x`, `../lib/y`) of a bare JavaScript or
+/// TypeScript import specifier that the importer's governing
+/// `tsconfig`/`jsconfig` maps through `compilerOptions.paths` or `baseUrl`:
+/// the first mapped path, in TypeScript's order, whose extension or
+/// directory-index candidates name a file `exists` accepts. Every
+/// relative-specifier consumer then resolves the alias as it resolves `./x`.
+pub(crate) fn js_mapped_specifier(
+    configs: &codesage_protocol::js_paths::JsPathConfigs,
+    spec: &str,
+    importer_file: &str,
+    exists: &mut dyn FnMut(&str) -> Result<bool>,
+) -> Result<Option<String>> {
+    let dialect = importer_dialect(importer_file);
+    if configs.maps_nothing()
+        || !matches!(
+            dialect,
+            ImporterDialect::JavaScript | ImporterDialect::TypeScript
+        )
+    {
+        return Ok(None);
+    }
+    if !codesage_protocol::js_paths::is_bare_specifier(spec) {
+        return Ok(None);
+    }
+    for path in configs.module_paths(spec, importer_file) {
+        if any_relative_candidate(&path, dialect, exists)? {
+            return Ok(Some(relative_specifier(
+                codesage_protocol::js_paths::parent_dir(importer_file),
+                &path,
+            )));
         }
     }
-    Some(parts.join("/"))
+    Ok(None)
 }
 
-fn relative_file_matches(resolved: &str, sym_file: &str, dialect: ImporterDialect) -> bool {
-    relative_file_candidates(resolved, dialect)
+/// Whether `exists` accepts any of [`relative_file_candidates`], tried in
+/// order through one reused buffer instead of the whole list.
+fn any_relative_candidate(
+    resolved: &str,
+    dialect: ImporterDialect,
+    exists: &mut dyn FnMut(&str) -> Result<bool>,
+) -> Result<bool> {
+    let order = match dialect {
+        ImporterDialect::TypeScript => &TS_EXTENSION_ORDER,
+        ImporterDialect::JavaScript => &JS_EXTENSION_ORDER,
+        ImporterDialect::CFamily | ImporterDialect::Other => return exists(resolved),
+    };
+    let segment_start = resolved.rfind('/').map_or(0, |i| i + 1);
+    if resolved[segment_start..]
+        .rfind('.')
+        .is_some_and(|dot| is_complete_module_extension(&resolved[segment_start + dot + 1..]))
+    {
+        for candidate in relative_file_candidates(resolved, dialect) {
+            if exists(&candidate)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    if exists(resolved)? {
+        return Ok(true);
+    }
+    let mut buffer = String::with_capacity(resolved.len() + 12);
+    for separator in [".", "/index."] {
+        for ext in order {
+            buffer.clear();
+            buffer.push_str(resolved);
+            buffer.push_str(separator);
+            buffer.push_str(ext);
+            if exists(&buffer)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// How import rows' JavaScript/TypeScript module specifiers resolve for one
+/// query: the mappings the last index pass stored, and, for files a
+/// working-tree overlay replaced since then, the governing configs applied
+/// on the spot.
+pub(crate) struct JsAliases<'db> {
+    db: &'db Database,
+    mappings: Arc<codesage_protocol::js_paths::JsImportMappings>,
+    overlay: HashSet<String>,
+    configs: std::cell::OnceCell<Arc<codesage_protocol::js_paths::JsPathConfigs>>,
+}
+
+impl<'db> JsAliases<'db> {
+    pub(crate) fn load(db: &'db Database) -> Result<Self> {
+        let overlay = if db.has_structural_overlay()? {
+            db.structural_overlay_paths()?.into_iter().collect()
+        } else {
+            HashSet::new()
+        };
+        Ok(Self {
+            db,
+            mappings: db.js_import_mappings()?,
+            overlay,
+            configs: std::cell::OnceCell::new(),
+        })
+    }
+
+    /// The specifier an import row resolves as: for a module specifier
+    /// (`Import`) the importer's config maps, its importer-relative form;
+    /// `spec` itself otherwise. Binding names never map.
+    pub(crate) fn effective<'a>(
+        &self,
+        kind: ReferenceKind,
+        spec: &'a str,
+        importer_file: &str,
+    ) -> Result<std::borrow::Cow<'a, str>> {
+        use std::borrow::Cow;
+        if kind != ReferenceKind::Import {
+            return Ok(Cow::Borrowed(spec));
+        }
+        if !self.overlay.contains(importer_file) {
+            return Ok(match self.mappings.get(importer_file, spec) {
+                Some(mapped) => Cow::Owned(mapped.to_string()),
+                None => Cow::Borrowed(spec),
+            });
+        }
+        let configs = match self.configs.get() {
+            Some(configs) => configs,
+            None => {
+                let loaded = self.db.js_path_configs()?;
+                self.configs.get_or_init(|| loaded)
+            }
+        };
+        let db = self.db;
+        Ok(
+            match js_mapped_specifier(configs, spec, importer_file, &mut |path| {
+                Ok(db.file_id_for_path(path)?.is_some())
+            })? {
+                Some(mapped) => Cow::Owned(mapped),
+                None => Cow::Borrowed(spec),
+            },
+        )
+    }
+}
+
+/// `./target` or `../../target` from directory `from_dir` to project path `to`.
+fn relative_specifier(from_dir: &str, to: &str) -> String {
+    let from: Vec<&str> = from_dir.split('/').filter(|s| !s.is_empty()).collect();
+    let to_parts: Vec<&str> = to.split('/').filter(|s| !s.is_empty()).collect();
+    let common = from
         .iter()
-        .any(|candidate| candidate == sym_file)
+        .zip(&to_parts)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let ups = from.len() - common;
+    let rest = to_parts[common..].join("/");
+    if ups == 0 {
+        format!("./{rest}")
+    } else {
+        format!("{}{rest}", "../".repeat(ups))
+    }
+}
+
+/// The project path a JavaScript/TypeScript relative specifier joins to from
+/// its importer, before extension and directory-index probing.
+pub(crate) fn js_relative_join(spec: &str, importer_file: &str) -> Option<String> {
+    lexical_join(
+        importer_file.rsplit_once('/').map_or("", |(dir, _)| dir),
+        spec,
+    )
+}
+
+/// Whether a relative specifier joined to `joined` in `importer_file` loads
+/// `target` under that importer's probing rules.
+pub(crate) fn js_joined_path_loads(joined: &str, importer_file: &str, target: &str) -> bool {
+    relative_file_matches(joined, target, importer_dialect(importer_file))
+}
+
+/// Every joined path whose probing can reach `target`: the target itself,
+/// the target without each module extension it ends with, its directory
+/// when it is an `index` file, and the emitted JavaScript names a
+/// TypeScript source stands for. A superset; [`js_joined_path_loads`]
+/// decides each.
+pub(crate) fn js_joined_paths_loading(target: &str) -> Vec<String> {
+    let mut out = vec![target.to_string()];
+    let (dir, name) = target.rsplit_once('/').unwrap_or(("", target));
+    for ext in TS_EXTENSION_ORDER {
+        if let Some(stem) = target.strip_suffix(ext).and_then(|s| s.strip_suffix('.')) {
+            out.push(stem.to_string());
+            for (source, emitted) in [
+                ("ts", "js"),
+                ("tsx", "js"),
+                ("d.ts", "js"),
+                ("tsx", "jsx"),
+                ("mts", "mjs"),
+                ("cts", "cjs"),
+            ] {
+                if ext == source {
+                    out.push(format!("{stem}.{emitted}"));
+                }
+            }
+        }
+        if name.strip_prefix("index.") == Some(ext) {
+            out.push(dir.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether `sym_file` is one of [`relative_file_candidates`] for `resolved`,
+/// decided without building the list: this runs once per import row per
+/// target file.
+fn relative_file_matches(resolved: &str, sym_file: &str, dialect: ImporterDialect) -> bool {
+    let order = match dialect {
+        ImporterDialect::TypeScript => &TS_EXTENSION_ORDER,
+        ImporterDialect::JavaScript => &JS_EXTENSION_ORDER,
+        ImporterDialect::CFamily | ImporterDialect::Other => return resolved == sym_file,
+    };
+    let segment_start = resolved.rfind('/').map_or(0, |i| i + 1);
+    if let Some(dot) = resolved[segment_start..].rfind('.')
+        && is_complete_module_extension(&resolved[segment_start + dot + 1..])
+    {
+        let dot = segment_start + dot;
+        return resolved == sym_file
+            || sym_file
+                .strip_prefix(&resolved[..dot])
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|ext| emitted_extension_sources(&resolved[dot + 1..]).contains(&ext));
+    }
+    let Some(rest) = sym_file.strip_prefix(resolved) else {
+        return false;
+    };
+    let ext = match (rest.strip_prefix("/index."), rest.strip_prefix('.')) {
+        (Some(ext), _) => ext,
+        (None, Some(ext)) => ext,
+        (None, None) => return rest.is_empty(),
+    };
+    order.contains(&ext)
 }
 
 /// The files a relative specifier, already joined onto the importer's
@@ -1823,6 +2045,41 @@ fn chunk_at_line(
 #[cfg(test)]
 mod import_path_tests {
     use super::*;
+
+    #[test]
+    fn joined_paths_loading_a_target_cover_every_candidate() {
+        for joined in [
+            "src/a",
+            "src/a.js",
+            "src/a.jsx",
+            "src/a.mjs",
+            "src/a.cjs",
+            "src/a.json",
+            "src/a.config",
+            "src/dir",
+            "a",
+        ] {
+            for dialect in [ImporterDialect::TypeScript, ImporterDialect::JavaScript] {
+                for candidate in relative_file_candidates(joined, dialect) {
+                    assert!(
+                        js_joined_paths_loading(&candidate).contains(&joined.to_string()),
+                        "{joined} -> {candidate}"
+                    );
+                    assert!(relative_file_matches(joined, &candidate, dialect));
+                }
+            }
+        }
+        assert!(!relative_file_matches(
+            "src/a",
+            "src/ab.ts",
+            ImporterDialect::TypeScript
+        ));
+        assert!(!relative_file_matches(
+            "src/a",
+            "src/a.foo.ts",
+            ImporterDialect::TypeScript
+        ));
+    }
 
     /// The cycle graph looks candidates up in the file set; `list_dependencies`
     /// tests each file with the predicate. Both must name the same targets.

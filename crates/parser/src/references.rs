@@ -325,6 +325,32 @@ fn js_ts_binding_pattern(language: Language, pattern: usize) -> bool {
     }
 }
 
+/// `(local, imported)` for a renamed JS/TS import binding: the imported name
+/// of `import { imported as local }` (pattern 8) or of the CommonJS
+/// `const { imported: local } = require(..)` (pattern 12). A renamed
+/// `default` import names no item by that name and is not an alias here.
+fn js_ts_import_alias(
+    language: Language,
+    pattern: usize,
+    imported: &Node,
+    source: &[u8],
+) -> Option<(String, String)> {
+    if !matches!(language, Language::JavaScript | Language::TypeScript) {
+        return None;
+    }
+    let parent = imported.parent()?;
+    let local = match (pattern, parent.kind()) {
+        (8, "import_specifier") => parent.child_by_field_name("alias")?,
+        (12, "pair_pattern") => parent
+            .child_by_field_name("value")
+            .filter(|value| value.kind() == "identifier")?,
+        _ => return None,
+    };
+    let imported = crate::parse::node_text_lossy(imported, source);
+    let local = crate::parse::node_text_lossy(&local, source);
+    (imported != "default" && imported != local).then_some((local, imported))
+}
+
 /// JS/TS patterns that capture a receiver as `@rhs` and only name a module
 /// export when that receiver is a same-file import binding: value
 /// destructuring (13-14), non-call member access (16), and the TS
@@ -679,11 +705,32 @@ fn tree_references(
 
     // Only imported receivers identify module exports; arbitrary object keys do not.
     let imports_js_ts = matches!(language, Language::JavaScript | Language::TypeScript);
+    let mut import_aliases: std::collections::HashMap<String, String> = if imports_js_ts {
+        pending
+            .iter()
+            .filter_map(|p| js_ts_import_alias(language, p.pattern, &p.node, source))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+    // A use recorded under the imported name would bind to a same-file
+    // declaration of that name (`import { render as base }` beside a local
+    // `render`), so such an alias keeps its own spelling and stays unbound.
+    if !import_aliases.is_empty() {
+        let declared: std::collections::HashSet<String> =
+            crate::extract::extract_symbols(tree, source, language, file_path)?
+                .into_iter()
+                .map(|symbol| symbol.name)
+                .collect();
+        import_aliases
+            .retain(|local, imported| !declared.contains(imported) && !declared.contains(local));
+    }
     let import_bindings: std::collections::HashSet<String> = if imports_js_ts {
         pending
             .iter()
             .filter(|p| js_ts_binding_pattern(language, p.pattern))
             .map(|p| crate::parse::node_text_lossy(&p.node, source))
+            .chain(import_aliases.keys().cloned())
             .collect()
     } else {
         std::collections::HashSet::new()
@@ -778,6 +825,22 @@ fn tree_references(
                 } else {
                     stripped.to_string()
                 }
+            }
+            // A use of a renamed import (`import { x as y }`, `const { x: y }
+            // = require(..)`) names the imported item, so `y()` binds as `x()`.
+            Language::JavaScript | Language::TypeScript
+                if matches!(
+                    kind,
+                    ReferenceKind::Call
+                        | ReferenceKind::Instantiation
+                        | ReferenceKind::Inheritance
+                        | ReferenceKind::TypeHint
+                ) && matches!(ref_node.kind(), "identifier" | "type_identifier") =>
+            {
+                import_aliases
+                    .get(stripped)
+                    .cloned()
+                    .unwrap_or_else(|| stripped.to_string())
             }
             _ => stripped.to_string(),
         };
@@ -1207,6 +1270,65 @@ function later() { (function* () { require('./nested'); })().next(); }
                 ("format", codesage_protocol::SymbolKind::Macro),
                 ("format", codesage_protocol::SymbolKind::Function),
             ]
+        );
+    }
+
+    #[test]
+    fn js_ts_renamed_imports_bind_uses_to_the_imported_name() {
+        for language in [Language::TypeScript, Language::JavaScript] {
+            let refs = refs_from_source(
+                "import { verifyToken as vt, default as Def, plain } from './jwt';\n\
+                 const { other: renamed } = require('./x');\n\
+                 vt(t); renamed(); plain(); new vt(); obj.vt(); vt.helper; Def();\n",
+                language,
+            );
+            let calls: Vec<_> = refs
+                .iter()
+                .filter(|r| matches!(r.kind, ReferenceKind::Call | ReferenceKind::Instantiation))
+                .map(|r| (r.to_name.as_str(), r.kind))
+                .collect();
+            assert_eq!(
+                calls,
+                [
+                    ("require", ReferenceKind::Call),
+                    ("verifyToken", ReferenceKind::Call),
+                    ("other", ReferenceKind::Call),
+                    ("plain", ReferenceKind::Call),
+                    ("verifyToken", ReferenceKind::Instantiation),
+                    ("vt", ReferenceKind::Call),
+                    ("Def", ReferenceKind::Call),
+                ],
+                "{language:?}"
+            );
+            assert!(
+                refs.iter()
+                    .any(|r| r.kind == ReferenceKind::ImportBinding && r.to_name == "helper"),
+                "member access off a renamed import is import-gated: {language:?}"
+            );
+        }
+        let refs = refs_from_source(
+            "import { render as baseRender, format as fmt } from './base';\n\
+             export function render() { return 7; }\n\
+             export function other() { return baseRender() + fmt(); }\n",
+            Language::TypeScript,
+        );
+        let calls: Vec<_> = refs
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .map(|r| r.to_name.as_str())
+            .collect();
+        assert_eq!(
+            calls,
+            ["baseRender", "format"],
+            "an alias whose imported name is declared in the same file is not renamed"
+        );
+        let refs = refs_from_source(
+            "import type { Props as P } from './types';\nlet p: P;\n",
+            Language::TypeScript,
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r.kind == ReferenceKind::TypeHint && r.to_name == "Props")
         );
     }
 

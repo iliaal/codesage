@@ -246,6 +246,7 @@ fn run_statewatcher_with_admission(
     let mut removal_fail_count: u32 = 0;
     let mut last_activity = Instant::now();
     let mut header_is_cpp = header_dialect_is_cpp(&config.db_path);
+    let mut js_config_inputs = js_path_config_inputs(&config.db_path);
     let mut deferred_since: Option<Instant> = None;
     let mut refresh = FilterRefresh::default();
 
@@ -383,7 +384,19 @@ fn run_statewatcher_with_admission(
                         );
                     }
 
+                    // A `tsconfig`/`jsconfig` edit, or one to a file a config
+                    // extends, changes how JS/TS aliases resolve; only an
+                    // index pass rereads the configs.
                     if !is_source_file(&rel) {
+                        if js_path_config_changed(&rel, &js_config_inputs)
+                            && !filter.is_ignored(path, false)
+                        {
+                            bulk_retry_at = Some(
+                                bulk_cooldown_until.map_or(Instant::now() + debounce, |until| {
+                                    until.max(Instant::now() + debounce)
+                                }),
+                            );
+                        }
                         continue;
                     }
 
@@ -464,6 +477,7 @@ fn run_statewatcher_with_admission(
                         startup_reconciled = true;
                         // A bulk pass may remove the last C++ file and revert header parsing.
                         header_is_cpp = header_dialect_is_cpp(&config.db_path);
+                        js_config_inputs = js_path_config_inputs(&config.db_path);
                         removed_prefixes.clear();
                     }
                     bulk_retry_at = apply_bulk_outcome(
@@ -578,6 +592,7 @@ fn run_statewatcher_with_admission(
             if outcome == WorkOutcome::Done {
                 startup_reconciled = true;
                 header_is_cpp = header_dialect_is_cpp(&config.db_path);
+                js_config_inputs = js_path_config_inputs(&config.db_path);
                 removed_prefixes.clear();
             }
             bulk_retry_at = apply_bulk_outcome(
@@ -1387,6 +1402,33 @@ fn purge_one_locked(config: &StateWatcherConfig, rel_str: &str) -> WorkOutcome {
         }
     };
     purge_index_rows(config, &[rel_str.to_string()])
+}
+
+fn js_path_config_changed(path: &Path, inputs: &HashSet<String>) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(codesage_protocol::js_paths::is_config_file_name)
+        || path.to_str().is_some_and(|path| inputs.contains(path))
+}
+
+/// Every recorded config file and every file a config extends or references.
+fn js_path_config_inputs(db_path: &Path) -> HashSet<String> {
+    let Ok(db) = Database::open_existing(db_path) else {
+        return HashSet::new();
+    };
+    let Ok(configs) = db.js_path_configs() else {
+        return HashSet::new();
+    };
+    configs
+        .configs()
+        .iter()
+        .flat_map(|config| {
+            std::iter::once(&config.path)
+                .chain(&config.extends)
+                .chain(&config.references)
+        })
+        .cloned()
+        .collect()
 }
 
 fn header_context_changed(path: &Path) -> bool {
@@ -3098,6 +3140,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn watcher_rereads_tsconfig_paths_after_a_config_only_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::create_dir_all(root.join("src/a")).unwrap();
+        std::fs::create_dir_all(root.join("src/b")).unwrap();
+        let tsconfig = |dir: &str| {
+            format!(r#"{{ "compilerOptions": {{ "paths": {{ "~/*": ["src/{dir}/*"] }} }} }}"#)
+        };
+        std::fs::write(root.join("tsconfig.json"), tsconfig("a")).unwrap();
+        std::fs::write(
+            root.join("main.ts"),
+            "import { x } from '~/x';\nexport const y = x;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/a/x.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(root.join("src/b/x.ts"), "export const x = 2;\n").unwrap();
+        let config = test_config(root);
+        let db = Database::open(&config.db_path).unwrap();
+        codesage_graph::full_index(root, &db, &[], false).unwrap();
+        let imports = |db: &Database| {
+            codesage_graph::list_dependencies(db, "main.ts")
+                .unwrap()
+                .imports
+        };
+        assert_eq!(imports(&db), ["file:src/a/x.ts"]);
+        let _watcher = RunningWatcher::start(config);
+        await_watcher_condition(|| {
+            read_status(root).is_some_and(|status| status.startup_reconciled)
+        });
+        std::fs::write(root.join("tsconfig.json"), tsconfig("b")).unwrap();
+        await_watcher_condition(|| imports(&db) == ["file:src/b/x.ts"]);
+    }
+
+    #[test]
+    fn watcher_rereads_paths_when_an_extended_file_without_a_config_name_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for dir in [".codesage", "config", "src/a", "src/b"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let base = |dir: &str| {
+            format!(r#"{{ "compilerOptions": {{ "paths": {{ "~/*": ["../src/{dir}/*"] }} }} }}"#)
+        };
+        std::fs::write(root.join("config/base.json"), base("a")).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "extends": "./config/base.json" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("main.ts"),
+            "import { x } from '~/x';\nexport const y = x;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/a/x.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(root.join("src/b/x.ts"), "export const x = 2;\n").unwrap();
+        let config = test_config(root);
+        let db = Database::open(&config.db_path).unwrap();
+        codesage_graph::full_index(root, &db, &[], false).unwrap();
+        let imports = |db: &Database| {
+            codesage_graph::list_dependencies(db, "main.ts")
+                .unwrap()
+                .imports
+        };
+        assert_eq!(imports(&db), ["file:src/a/x.ts"]);
+        let _watcher = RunningWatcher::start(config);
+        await_watcher_condition(|| {
+            read_status(root).is_some_and(|status| status.startup_reconciled)
+        });
+        std::fs::write(root.join("config/base.json"), base("b")).unwrap();
+        await_watcher_condition(|| imports(&db) == ["file:src/b/x.ts"]);
     }
 
     #[test]

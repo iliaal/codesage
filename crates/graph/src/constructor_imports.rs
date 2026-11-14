@@ -96,7 +96,9 @@ impl ConstructorImports {
             return Ok(None);
         }
         let mut resolved = None;
-        for file in crate::bundle::path_import_candidates(module, caller) {
+        let spec =
+            crate::bundle::JsAliases::load(db)?.effective(ReferenceKind::Import, module, caller)?;
+        for file in crate::bundle::path_import_candidates(&spec, caller) {
             checkpoint()?;
             if db.file_id_for_path(&file)?.is_some() {
                 let basename = file.rsplit('/').next().unwrap_or(&file);

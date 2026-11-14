@@ -304,7 +304,91 @@ fn index(
     let previous = header_routing_context(db)?;
     let discovery = discover_files_report_with_context(root, exclude_patterns, &cache, &previous)?;
     db.replace_file_hash_cache(&discovery.hash_cache)?;
-    index_discovery_report(root, db, &discovery, strategy, verbose)
+    let stats = index_discovery_report(root, db, &discovery, strategy, verbose)?;
+    let configs_changed = db.replace_js_path_configs(&crate::js_config::read_js_path_configs(
+        root,
+        discovery
+            .files
+            .iter()
+            .filter(|file| is_js_language(file.language))
+            .map(|file| file.path.as_str()),
+    ))?;
+    // Mappings depend only on the configs, the import rows, and the file
+    // set; a pass that changed none of them keeps the stored ones unless an
+    // earlier pass stopped between its writes and its remap.
+    if strategy == IndexStrategy::Full
+        || configs_changed
+        || stats.files_indexed > 0
+        || stats.files_removed > 0
+        || stats.files_failed > 0
+        || db.js_aliases_stale()?
+    {
+        refresh_js_import_mappings(db)?;
+    }
+    Ok(stats)
+}
+
+fn is_js_language(language: Language) -> bool {
+    matches!(language, Language::JavaScript | Language::TypeScript)
+}
+
+/// Map every bare JS/TS import specifier through its importer's governing
+/// config against the indexed file set and store the results, so queries
+/// resolve an alias with one lookup. Runs after every pass that can change
+/// the configs, the import rows, or the file set.
+fn refresh_js_import_mappings(db: &Database) -> Result<()> {
+    let configs = db.js_path_configs()?;
+    let mut rows = Vec::new();
+    if !configs.maps_nothing() {
+        let indexed: HashSet<String> = db.all_file_paths()?.into_iter().collect();
+        for (importer, spec, _) in db.path_import_refs()? {
+            codesage_protocol::work::checkpoint()?;
+            if let Some(mapped) =
+                crate::bundle::js_mapped_specifier(&configs, &spec, &importer, &mut |path| {
+                    Ok(indexed.contains(path))
+                })?
+            {
+                rows.push((importer, spec, mapped));
+            }
+        }
+        rows.sort();
+        rows.dedup();
+    }
+    db.replace_js_import_mappings(&rows)
+}
+
+/// Reread the configs after a single-file pass when an indexed JS/TS file
+/// sits in or below a directory whose config files are not all recorded,
+/// such as the first source file next to a new `tsconfig.json`.
+fn refresh_js_path_configs_for(root: &Path, db: &Database, files: &[FileInfo]) -> Result<bool> {
+    let dirs = crate::js_config::enclosing_dirs(
+        files
+            .iter()
+            .filter(|file| is_js_language(file.language))
+            .map(|file| file.path.as_str()),
+    );
+    if dirs.is_empty() {
+        return Ok(false);
+    }
+    let recorded = db.js_path_configs()?;
+    if crate::js_config::config_files_in(root, &dirs)
+        .iter()
+        .all(|path| recorded.is_input(path))
+    {
+        return Ok(false);
+    }
+    let indexed = db.all_files_with_id_and_language()?;
+    db.replace_js_path_configs(&crate::js_config::read_js_path_configs(
+        root,
+        indexed
+            .iter()
+            .filter(|(_, _, language)| is_js_language(*language))
+            .map(|(_, path, _)| path.as_str()),
+    ))
+}
+
+fn is_js_path(path: &str) -> bool {
+    codesage_parser::detect::detect_language(Path::new(path)).is_some_and(is_js_language)
 }
 
 pub(crate) fn header_routing_context(db: &Database) -> Result<Vec<FileInfo>> {
@@ -431,6 +515,7 @@ fn index_discovery_report(
         .map(|p| p.as_str())
         .collect();
     if !orphans.is_empty() {
+        db.mark_js_aliases_stale()?;
         db.execute_batch(|db| {
             for path in &orphans {
                 db.remove_file(path)?;
@@ -529,6 +614,9 @@ fn index_discovery_report(
         JavaTypeContext::default()
     };
 
+    if !to_parse.is_empty() {
+        db.mark_js_aliases_stale()?;
+    }
     for batch in to_parse.chunks(STRUCTURAL_INDEX_BATCH_SIZE) {
         let parsed = parse_batch(root, batch, &mut stats, &java_context);
 
@@ -545,6 +633,7 @@ fn index_discovery_report(
     // Full passes discard failed files' stale rows and hashes so later passes retry.
     // Incremental passes retain old rows across transient read failures.
     if strategy == IndexStrategy::Full && !stats.failed_paths.is_empty() {
+        db.mark_js_aliases_stale()?;
         db.execute_batch(|db| {
             for path in &stats.failed_paths {
                 db.remove_structural_file(path)?;
@@ -647,9 +736,18 @@ pub fn index_files(
             JavaTypeContext::default()
         }
     };
+    let js_touched = file_refs.iter().any(|file| is_js_language(file.language));
+    if js_touched {
+        db.mark_js_aliases_stale()?;
+    }
     for batch in file_refs.chunks(STRUCTURAL_INDEX_BATCH_SIZE) {
         let parsed = parse_batch(root, batch, &mut stats, &java_context);
         write_parsed_batch(db, &parsed, &mut stats)?;
+    }
+    // Only JS/TS rows and files feed the alias mappings; a pass over other
+    // languages keeps them unless an earlier pass left them stale.
+    if refresh_js_path_configs_for(root, db, files)? || js_touched || db.js_aliases_stale()? {
+        refresh_js_import_mappings(db)?;
     }
     if let Some(error) = context_error {
         return Err(error)
@@ -720,6 +818,12 @@ pub fn remove_files(db: &Database, paths: &[String]) -> Result<usize> {
     if paths.iter().any(|path| is_header_context_path(path)) {
         mark_header_context_stale(db)?;
     }
+    // A removed JS/TS file can leave an alias to fall through to a later
+    // substitution or stay unresolved.
+    let js_removed = paths.iter().any(|path| is_js_path(path));
+    if js_removed {
+        db.mark_js_aliases_stale()?;
+    }
     let mut removed = 0;
     db.execute_batch(|db| {
         for path in paths {
@@ -728,6 +832,9 @@ pub fn remove_files(db: &Database, paths: &[String]) -> Result<usize> {
         }
         Ok(())
     })?;
+    if js_removed || db.js_aliases_stale()? {
+        refresh_js_import_mappings(db)?;
+    }
     Ok(removed)
 }
 

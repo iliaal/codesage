@@ -391,6 +391,45 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_import_added_by_an_edit_resolves_through_the_overlay() {
+        let root = tempfile::tempdir().unwrap();
+        for (path, source) in [
+            (
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+            ),
+            ("main.ts", "export const m = 1;\n"),
+            ("src/b.ts", "export const b = 1;\n"),
+            ("src/c.ts", "export const c = 1;\n"),
+        ] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        let path = root.path().join("index.sqlite");
+        let db = Database::open(&path).unwrap();
+        crate::full_index(root.path(), &db, &[], false).unwrap();
+        drop(db);
+        std::fs::write(
+            root.path().join("main.ts"),
+            "import { b } from '@/b';\nimport { c } from './src/c';\nexport const m = b + c;\n",
+        )
+        .unwrap();
+        let db = Database::open_read_only(&path).unwrap();
+        let _snapshot = db.read_snapshot().unwrap();
+        let report = WorkingTreeOverlayCache::default().apply(root.path(), &db, Some(1));
+        assert_eq!(report.state, OverlayState::Overlay, "{report:?}");
+        let deps = crate::list_dependencies(&db, "main.ts").unwrap();
+        assert_eq!(deps.imports, ["file:src/b.ts", "file:src/c.ts"], "{deps:?}");
+        assert_eq!(
+            crate::list_dependencies(&db, "src/b.ts")
+                .unwrap()
+                .imported_by,
+            ["main.ts"]
+        );
+    }
+
+    #[test]
     fn edits_replace_definitions_references_and_hash_without_writing_main() {
         let (root, path) = indexed(&[(
             "src/lib.rs",

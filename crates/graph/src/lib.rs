@@ -14,6 +14,7 @@ pub mod hook_health;
 mod impact;
 mod import_graph;
 mod index;
+mod js_config;
 mod lookups;
 pub mod overlay;
 mod overview;

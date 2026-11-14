@@ -438,6 +438,7 @@ impl Builder<'_> {
         } else {
             None
         };
+        let js_paths = crate::bundle::JsAliases::load(self.db)?;
         for name in &raw.imports {
             codesage_protocol::work::checkpoint()?;
             let mut targets = BTreeSet::new();
@@ -461,8 +462,9 @@ impl Builder<'_> {
                         .into_iter()
                         .map(|s| s.file_path),
                 );
+                let spec = js_paths.effective(ReferenceKind::Import, name, path)?;
                 targets.extend(crate::bundle::resolved_path_import_candidates(
-                    name, path, &indexed,
+                    &spec, path, &indexed,
                 ));
             }
             targets.extend(modules.candidates(path, name).unwrap_or_default());

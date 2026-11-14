@@ -29,6 +29,7 @@ pub(crate) fn resolve_outgoing(
         RustImportEvidence::default()
     };
     let mut packages: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
+    let js_paths = crate::bundle::JsAliases::load(db)?;
     for name in raw.imports.iter().chain(&raw.test_imports) {
         let mut exclusively_self = true;
         for is_test in [false, true] {
@@ -58,6 +59,7 @@ pub(crate) fn resolve_outgoing(
                     &IndexedFiles {
                         paths: indexed,
                         python_probes: probes,
+                        js_paths: &js_paths,
                     },
                     &symbols,
                     &rows,
@@ -166,6 +168,7 @@ fn file_handle(file: String) -> Option<String> {
 struct IndexedFiles<'a> {
     paths: &'a HashSet<String>,
     python_probes: &'a PythonPackageProbes,
+    js_paths: &'a crate::bundle::JsAliases<'a>,
 }
 
 fn resolve_site(
@@ -251,8 +254,11 @@ fn resolve_site(
             }
         }
     } else {
+        let spec = indexed
+            .js_paths
+            .effective(row.kind, &row.to_name, &row.from_file)?;
         files.extend(crate::bundle::indexed_path_import_candidates(
-            &row.to_name,
+            &spec,
             &row.from_file,
             indexed.paths,
         ));

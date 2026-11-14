@@ -796,6 +796,7 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         migrate_0031_git_history_build_v2,
     ),
     ("0032_refs_import_edges", migrate_0032_refs_import_edges),
+    ("0033_js_aliases", migrate_0033_js_aliases),
 ];
 
 /// The reference kinds that can form a file-level import edge, as a SQL list.
@@ -816,6 +817,30 @@ fn migrate_0032_refs_import_edges(conn: &Connection) -> rusqlite::Result<()> {
              ON refs(kind, from_file_id, to_name, lazy, line, col, from_symbol)
              WHERE kind IN {IMPORT_EDGE_KINDS_SQL};"
     ))
+}
+
+/// JS/TS alias resolution: one row per `tsconfig*.json` / `jsconfig*.json`
+/// with its `extends` chain applied, each bare import specifier those
+/// configs map with the importer-relative specifier it resolves as, and a
+/// flag that marks the mappings stale until the next remap. Index passes
+/// replace the first two tables whole.
+fn migrate_0033_js_aliases(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS js_path_configs (
+             path TEXT PRIMARY KEY,
+             record TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS js_import_mappings (
+             importer TEXT NOT NULL,
+             spec TEXT NOT NULL,
+             mapped TEXT NOT NULL,
+             PRIMARY KEY (importer, spec)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS js_alias_state (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             stale INTEGER NOT NULL
+         );",
+    )
 }
 
 fn migrate_0027_symbol_signatures(conn: &Connection) -> rusqlite::Result<()> {
