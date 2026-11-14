@@ -827,10 +827,7 @@ fn is_reviewable_node_source(path: &str) -> bool {
         }
     }
     let basename = path.rsplit_once('/').map(|(_, tail)| tail).unwrap_or(path);
-    if basename.contains(".generated.") || basename.contains(".gen.") {
-        return false;
-    }
-    true
+    !(basename.contains(".generated.") || basename.contains(".gen."))
 }
 
 /// Resolve App Router directories to their public path. Organizational groups
@@ -1323,10 +1320,7 @@ fn is_reviewable_react_support_path(rel: &str) -> bool {
         return false;
     }
     let base = rel.rsplit('/').next().unwrap_or(rel);
-    if base.contains(".stories.") || base.contains(".story.") {
-        return false;
-    }
-    true
+    !(base.contains(".stories.") || base.contains(".story."))
 }
 
 fn react_component_name(rel: &str) -> String {
