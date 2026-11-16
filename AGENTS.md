@@ -17,7 +17,7 @@ cargo clippy --workspace                       # lint
 
 Run `bash scripts/sanity-check.sh` before `git push` when you've made code changes. It checks changelog/plugin metadata, Rust formatting and clippy, shell lint/format, workspace tests, and script/plugin regressions, stopping on the first failure. Pass `--cuda` to include CUDA clippy; the release workflow requires it. `--fast` skips workspace tests and script/plugin regressions while retaining the validation and lint gates; do not use it for releases.
 
-`cargo fmt --all` applies changes in place; CI runs `cargo fmt --all -- --check`, which only reports the diff and exits nonzero. The script catches an edit made after the last format run (as in commit `a43c51d`) before CI does. Run `cargo fmt --all` after the last hand edit and before the script: its first gate is the format check, and any diff stops the chain before clippy and tests run.
+`cargo fmt --all` applies changes in place; CI runs `cargo fmt --all --check`, which reports formatting differences and exits nonzero when any are found. The script catches an edit made after the last format run (as in commit `a43c51d`) before CI does. Run `cargo fmt --all` after the last hand edit and before the script. After changelog and plugin metadata validation, its format check stops the chain on any diff before clippy and tests run.
 
 ## Crate map
 
