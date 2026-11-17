@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- `codesage index` passes that parse more than 50 files take less time: a full structural pass over a 723-file project went from 4.80 s to 3.74 s median (-22% time) on 8 cores and from 6.07 s to 5.38 s (-11% time) on 2. Indexed rows are unchanged.
+
 ## [0.53.0] - 2026-11-14
 
 ### Added
