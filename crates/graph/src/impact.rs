@@ -531,6 +531,13 @@ pub(crate) struct FileImports {
     /// per frontier file. One pointer-sized slot per row of `rows`; the
     /// retained targets are charged to `WalkCache::MAX_PYTHON_TARGET_BYTES`.
     python_targets: Vec<std::sync::OnceLock<Arc<Vec<String>>>>,
+    /// Files each `PathMatched` row loads, by row index and filled on first
+    /// use; None when the row's match depends on the target file. Slot 0
+    /// serves walks without Rust modules, slot 1 walks with them. Every
+    /// frontier file tests every row, and walks share this through
+    /// [`WalkCache`], so a row's candidates are derived once instead of once
+    /// per frontier file. Empty when no row is `PathMatched`.
+    path_targets: [Vec<std::sync::OnceLock<Option<Vec<String>>>>; 2],
     /// Some importer is C or C++, so path matching needs the indexed paths.
     c_family: bool,
 }
@@ -587,13 +594,55 @@ impl FileImports {
         } else {
             Vec::new()
         };
+        let path_targets = if shapes.contains(&FileImportShape::PathMatched) {
+            std::array::from_fn(|_| rows.iter().map(|_| std::sync::OnceLock::new()).collect())
+        } else {
+            Default::default()
+        };
         Ok(Self {
             python_targets,
+            path_targets,
             rows,
             shapes,
             js_targets,
             c_family,
         })
+    }
+
+    /// Whether `PathMatched` row `index` loads `file`, as
+    /// [`import_ref_targets_file_with_indexed`] decides it.
+    fn path_row_loads(
+        &self,
+        index: usize,
+        file: &str,
+        modules: &crate::rust_modules::RustModules,
+        modules_loaded: bool,
+        indexed: &HashSet<String>,
+    ) -> bool {
+        let r = &self.rows[index];
+        let candidates = self.path_targets[usize::from(modules_loaded)]
+            .get(index)
+            .and_then(|slot| {
+                slot.get_or_init(|| {
+                    crate::bundle::import_ref_file_candidates(
+                        &r.to_name,
+                        &r.from_file,
+                        modules,
+                        indexed,
+                    )
+                })
+                .as_ref()
+            });
+        match candidates {
+            Some(candidates) => candidates.iter().any(|candidate| candidate == file),
+            None => import_ref_targets_file_with_indexed(
+                &r.to_name,
+                &r.from_file,
+                file,
+                modules,
+                indexed,
+            ),
+        }
     }
 
     /// The `JsPath` rows whose specifier loads `file`, ascending.
@@ -830,11 +879,11 @@ pub(crate) fn impact_analysis_walk_shared(
         });
     }
 
-    let rust_modules = if file_frontier.iter().any(|file| file.ends_with(".rs"))
+    let rust_modules_loaded = file_frontier.iter().any(|file| file.ends_with(".rs"))
         || seed_symbols
             .iter()
-            .any(|symbol| symbol.file_path.ends_with(".rs"))
-    {
+            .any(|symbol| symbol.file_path.ends_with(".rs"));
+    let rust_modules = if rust_modules_loaded {
         match cache.as_deref_mut() {
             Some(cache) => cache.rust_modules(db)?,
             None => Arc::new(crate::rust_modules::RustModules::load(db)?),
@@ -1046,11 +1095,11 @@ pub(crate) fn impact_analysis_walk_shared(
                         FileImportShape::PathMatched | FileImportShape::NoFile
                     )
                     && (shape == FileImportShape::NoFile
-                        || !import_ref_targets_file_with_indexed(
-                            &r.to_name,
-                            &r.from_file,
+                        || !file_imports.path_row_loads(
+                            reference_index,
                             file,
                             &rust_modules,
+                            rust_modules_loaded,
                             &indexed,
                         ))
                 {
@@ -1670,6 +1719,57 @@ mod tests {
             serde_json::to_value(actual).unwrap(),
             serde_json::to_value(expected).unwrap()
         );
+    }
+
+    #[test]
+    fn path_row_candidates_keep_walks_with_and_without_rust_modules_apart() {
+        let row = Reference {
+            from_file: "src/nested/child.rs".to_string(),
+            from_symbol: None,
+            to_name: "crate::api".to_string(),
+            kind: ReferenceKind::Import,
+            line: 1,
+            col: 0,
+            lazy: false,
+            to: None,
+            from_line: None,
+            is_test: false,
+        };
+        let loaded = crate::rust_modules::tests::candidate_context();
+        let unloaded = crate::rust_modules::RustModules::default();
+        let indexed = HashSet::new();
+        let targets = ["src/api.rs", "src/api/mod.rs", "src/lib.rs", "src/main.rs"];
+        for loaded_first in [false, true] {
+            let imports = FileImports {
+                rows: vec![row.clone()],
+                shapes: vec![FileImportShape::PathMatched],
+                path_targets: std::array::from_fn(|_| vec![std::sync::OnceLock::new()]),
+                ..FileImports::default()
+            };
+            let order = if loaded_first {
+                [(&loaded, true), (&unloaded, false)]
+            } else {
+                [(&unloaded, false), (&loaded, true)]
+            };
+            for (modules, modules_loaded) in order {
+                for target in targets {
+                    assert_eq!(
+                        imports.path_row_loads(0, target, modules, modules_loaded, &indexed),
+                        import_ref_targets_file_with_indexed(
+                            &row.to_name,
+                            &row.from_file,
+                            target,
+                            modules,
+                            &indexed
+                        ),
+                        "{target} with modules loaded: {modules_loaded}"
+                    );
+                }
+            }
+            // The crate's declared root is lib.rs; only the fallback admits main.rs.
+            assert!(imports.path_row_loads(0, "src/main.rs", &unloaded, false, &indexed));
+            assert!(!imports.path_row_loads(0, "src/main.rs", &loaded, true, &indexed));
+        }
     }
 
     fn setup_caller_import_project() -> Database {
