@@ -199,6 +199,13 @@ fn install_work_control(conn: &mut Connection) -> Result<()> {
                     .is_some_and(|nested| nested.reason().is_some())
         }),
     )?;
+    // Without QPSG, a plan that peeks at a bound `= ?` value marks the
+    // statement for reprepare on rebind, and rusqlite clears bindings each
+    // time a cached statement is returned, so every reuse recompiled it.
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
+        true,
+    )?;
     if controlled {
         conn.busy_timeout(std::time::Duration::from_millis(100))?;
     }
@@ -1343,6 +1350,20 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cached_statements_are_not_recompiled_on_reuse() {
+        let db = Database::open_in_memory().unwrap();
+        let sql = "SELECT f.path, r.line FROM refs r JOIN files f ON r.from_file_id = f.id \
+                   WHERE r.to_name_tail = ?1 OR r.to_name = ?1";
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            let mut stmt = db.conn.prepare_cached(sql).unwrap();
+            let rows = stmt.query_map([name], |_| Ok(())).unwrap().count();
+            assert_eq!(rows, 0);
+        }
+        let stmt = db.conn.prepare_cached(sql).unwrap();
+        assert_eq!(stmt.get_status(rusqlite::StatementStatus::RePrepare), 0);
+    }
+
     use super::*;
     use codesage_protocol::{
         FeatureConfidence, FeatureKind, FeatureRecord, FileInfo, Language, Reference, Symbol,
