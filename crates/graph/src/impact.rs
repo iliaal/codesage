@@ -119,7 +119,12 @@ pub(crate) struct WalkCache {
     import_matches: HashMap<String, Arc<Vec<usize>>>,
     rust_modules: Option<Arc<crate::rust_modules::RustModules>>,
     constructors: crate::construction::Constructors,
-    reference_candidates: Option<((String, String, ReferenceKind), Vec<Symbol>)>,
+    /// Candidates per (caller file, spelling, kind), charged to
+    /// `MAX_REFERENCE_BYTES` like `resolutions`.
+    reference_candidates: HashMap<(String, String, ReferenceKind), Vec<Symbol>>,
+    /// The last over-budget answer, so adjacent rows sharing a key still
+    /// resolve once.
+    last_reference_candidates: Option<((String, String, ReferenceKind), Vec<Symbol>)>,
     symbols_named: SymbolsNamed,
     #[cfg(test)]
     hits: usize,
@@ -129,6 +134,8 @@ pub(crate) struct WalkCache {
     resolution_loads: usize,
     #[cfg(test)]
     caller_import_loads: usize,
+    #[cfg(test)]
+    reference_candidate_loads: usize,
 }
 
 impl WalkCache {
@@ -196,6 +203,7 @@ impl WalkCache {
             + self.import_matches.len()
             + self.resolutions.len()
             + self.caller_imports.len()
+            + self.reference_candidates.len()
     }
 
     /// The indexed files one Python import row loads, and whether the caller
@@ -301,24 +309,37 @@ impl WalkCache {
             Some(resolved) => resolved,
             None => {
                 let key = (row.from_file.clone(), row.to_name.clone(), row.kind);
-                if self
-                    .reference_candidates
-                    .as_ref()
-                    .is_none_or(|(cached, _)| cached != &key)
+                if let Some(candidates) = self.reference_candidates.get(&key) {
+                    candidates.clone()
+                } else if let Some((last, candidates)) = &self.last_reference_candidates
+                    && last == &key
                 {
+                    candidates.clone()
+                } else {
+                    #[cfg(test)]
+                    {
+                        self.reference_candidate_loads += 1;
+                    }
                     let candidates = self.resolve_symbols_for_kind(
                         db,
                         &row.from_file,
                         &row.to_name,
                         Some(row.kind),
                     )?;
-                    self.reference_candidates = Some((key, candidates));
+                    let bytes = codesage_protocol::symbols_heap_bytes(&candidates)
+                        .saturating_add(std::mem::size_of_val(&key))
+                        .saturating_add(key.0.capacity())
+                        .saturating_add(key.1.capacity());
+                    if self.entry_count() < Self::MAX_SYMBOLS
+                        && bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes)
+                    {
+                        self.reference_bytes += bytes;
+                        self.reference_candidates.insert(key, candidates.clone());
+                    } else {
+                        self.last_reference_candidates = Some((key, candidates.clone()));
+                    }
+                    candidates
                 }
-                self.reference_candidates
-                    .as_ref()
-                    .expect("reference candidates initialized")
-                    .1
-                    .clone()
             }
         };
         self.constructors.append_targets(db, row, &mut resolved)?;
@@ -1712,6 +1733,81 @@ mod tests {
         symbols.sort_by(|a, b| a.file_path.cmp(&b.file_path));
         assert_eq!(symbols.len(), 2);
         (db, symbols)
+    }
+
+    #[test]
+    fn reference_candidates_resolve_each_key_once_within_the_reference_budget() {
+        let (db, _) = setup_resolution_project();
+        let mut rows = db.find_references("anchor", None).unwrap();
+        rows.sort_by(|a, b| (a.line, &a.from_file).cmp(&(b.line, &b.from_file)));
+        let files: Vec<&str> = rows.iter().map(|row| row.from_file.as_str()).collect();
+        assert_eq!(files, ["orphan.ts", "caller.ts", "orphan.ts", "caller.ts"]);
+        let cold: Vec<Vec<Symbol>> = rows
+            .iter()
+            .map(|row| WalkCache::default().resolve_reference(&db, row).unwrap())
+            .collect();
+        assert_eq!(cold[1].len(), 1);
+        assert_eq!(cold[1][0].file_path, "base.ts");
+        let charge = |row: &Reference, candidates: &Vec<Symbol>| {
+            codesage_protocol::symbols_heap_bytes(candidates)
+                + std::mem::size_of::<(String, String, ReferenceKind)>()
+                + row.from_file.len()
+                + row.to_name.len()
+        };
+
+        let warm_imports = |cache: &mut WalkCache| {
+            for file in ["caller.ts", "orphan.ts"] {
+                cache.caller_imports(&db, file).unwrap();
+            }
+            assert_eq!(cache.entry_count(), 2);
+        };
+
+        // Interleaved keys: each resolves once and stays retained.
+        let mut cache = WalkCache::default();
+        warm_imports(&mut cache);
+        let imports_bytes = cache.reference_bytes;
+        for (row, expected) in rows.iter().zip(&cold) {
+            assert_eq!(&cache.resolve_reference(&db, row).unwrap(), expected);
+        }
+        assert_eq!(cache.reference_candidate_loads, 2);
+        assert_eq!(cache.reference_candidates.len(), 2);
+        assert_eq!(cache.entry_count(), 4);
+        assert_eq!(
+            cache.reference_bytes - imports_bytes,
+            charge(&rows[0], &cold[0]) + charge(&rows[1], &cold[1])
+        );
+
+        // One free entry slot: only the first key is retained; the second
+        // lives in the last-answer slot, which a retained hit leaves intact.
+        let mut cache = WalkCache::default();
+        warm_imports(&mut cache);
+        for index in 0..WalkCache::MAX_SYMBOLS - 3 {
+            cache
+                .import_matches
+                .insert(index.to_string(), Arc::new(Vec::new()));
+        }
+        for (row, expected) in rows.iter().zip(&cold) {
+            assert_eq!(&cache.resolve_reference(&db, row).unwrap(), expected);
+        }
+        assert_eq!(cache.reference_candidates.len(), 1);
+        assert_eq!(cache.entry_count(), WalkCache::MAX_SYMBOLS);
+        assert_eq!(cache.reference_candidate_loads, 2);
+
+        // Over the byte budget nothing is retained; only an adjacent repeat
+        // of the same key reuses the last answer.
+        let mut cache = WalkCache {
+            reference_bytes: WalkCache::MAX_REFERENCE_BYTES,
+            ..WalkCache::default()
+        };
+        for index in [0, 2, 1, 3] {
+            assert_eq!(
+                cache.resolve_reference(&db, &rows[index]).unwrap(),
+                cold[index]
+            );
+        }
+        assert!(cache.reference_candidates.is_empty());
+        assert_eq!(cache.reference_bytes, WalkCache::MAX_REFERENCE_BYTES);
+        assert_eq!(cache.reference_candidate_loads, 2);
     }
 
     fn assert_same_references(actual: &[Reference], expected: &[Reference]) {
