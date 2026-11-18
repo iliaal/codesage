@@ -1603,6 +1603,70 @@ pub(crate) fn import_ref_targets_file_with_indexed(
     }
 }
 
+/// The files [`import_ref_targets_file_with_indexed`] accepts for a Rust or
+/// C/C++ importer, independent of the target: for those importers that
+/// predicate holds for `t` exactly when the result contains `t`. None for
+/// every other importer and for a Rust `../` specifier, whose match depends
+/// on the target. Lets a caller testing one row against many files derive
+/// the row's candidates once.
+pub(crate) fn import_ref_file_candidates(
+    import_ref: &str,
+    importer_file: &str,
+    modules: &crate::rust_modules::RustModules,
+    indexed: &HashSet<String>,
+) -> Option<Vec<String>> {
+    if importer_dialect(importer_file) == ImporterDialect::CFamily {
+        return Some(resolved_path_import_candidates(
+            import_ref,
+            importer_file,
+            indexed,
+        ));
+    }
+    if !importer_file.ends_with(".rs") {
+        return None;
+    }
+    // `import_ref_targets_file_with_modules`, then `import_ref_targets_file`.
+    if let Some(declaration) = import_ref.strip_prefix("./") {
+        let module = format!("self::{}", declaration.replace('/', "::"));
+        if let Some(candidates) = modules.candidates(importer_file, &module) {
+            return Some(candidates);
+        }
+    } else if import_ref.contains("::") {
+        let module = import_ref.strip_suffix("::*").unwrap_or(import_ref);
+        if let Some(mut candidates) = modules.candidates(importer_file, module) {
+            if !import_ref.ends_with("::*")
+                && let Some((parent, _)) = module.rsplit_once("::")
+                && let Some(parent_candidates) = modules.candidates(importer_file, parent)
+            {
+                candidates.extend(parent_candidates);
+            }
+            return Some(candidates);
+        }
+    }
+    if import_ref.starts_with("./") {
+        return Some(
+            rust_module_subtree(importer_file)
+                .and_then(|base| lexical_join(base.trim_end_matches('/'), import_ref))
+                .map(|path| vec![format!("{path}.rs"), format!("{path}/mod.rs")])
+                .unwrap_or_default(),
+        );
+    }
+    if import_ref.starts_with("../") {
+        return None;
+    }
+    if import_ref.contains("::") {
+        if let Some(module) = import_ref.strip_suffix("::*") {
+            return Some(rust_glob_module_candidates(module, importer_file));
+        }
+        let mut candidates = rust_module_candidates(import_ref, importer_file);
+        if let Some((module, _)) = import_ref.rsplit_once("::") {
+            candidates.extend(rust_module_candidates(module, importer_file));
+        }
+        return Some(candidates);
+    }
+    Some(Vec::new())
+}
+
 pub(crate) fn import_ref_targets_file_with_modules(
     import_ref: &str,
     importer_file: &str,
@@ -2079,7 +2143,7 @@ fn chunk_at_line(
 }
 
 #[cfg(test)]
-mod import_path_tests {
+pub(crate) mod import_path_tests {
     use super::*;
 
     #[test]
@@ -2469,6 +2533,112 @@ mod import_path_tests {
             "src/lib.rs",
             "src/io.rs"
         ));
+    }
+
+    /// Differential: wherever `import_ref_file_candidates` answers, its
+    /// candidates accept exactly the targets `import_ref_targets_file_with_indexed`
+    /// accepts. Returns how many (importer, ref) pairs it answered.
+    pub(crate) fn assert_file_candidates_match(
+        modules: &crate::rust_modules::RustModules,
+        importers: &[&str],
+        refs: &[&str],
+        targets: &[&str],
+    ) -> usize {
+        let indexed: HashSet<String> = targets.iter().map(|t| t.to_string()).collect();
+        let mut answered = 0;
+        for importer in importers {
+            for import in refs {
+                let Some(candidates) =
+                    import_ref_file_candidates(import, importer, modules, &indexed)
+                else {
+                    continue;
+                };
+                answered += 1;
+                for target in targets {
+                    assert_eq!(
+                        candidates.iter().any(|c| c == target),
+                        import_ref_targets_file_with_indexed(
+                            import, importer, target, modules, &indexed
+                        ),
+                        "{import} from {importer} against {target}: candidates {candidates:?}"
+                    );
+                }
+            }
+        }
+        answered
+    }
+
+    pub(crate) const CANDIDATE_TARGETS: &[&str] = &[
+        "src/util.rs",
+        "src/util/mod.rs",
+        "src/util/*.rs",
+        "src/*.rs",
+        "src/a/util.rs",
+        "src/a/util/mod.rs",
+        "src/lib.rs",
+        "src/main.rs",
+        "src/a.rs",
+        "src/api.rs",
+        "src/nested.rs",
+        "src/nested/mod.rs",
+        "src/nested/child.rs",
+        "src/nested/child/util.rs",
+        "src/other.rs",
+        "lib/b.rs",
+        "util.rs",
+        "util/mod.rs",
+        "crates/app/src/util.rs",
+        "tests/util.rs",
+        "src/util.h",
+        "util.h",
+        "include/util.h",
+        "src/include/util.h",
+        "src/a/util.h",
+        "src/a/b.h",
+        "src/util.ts",
+        "lib/b.js",
+    ];
+
+    #[test]
+    fn row_candidates_match_the_per_target_matcher() {
+        let importers = [
+            "src/a.rs",
+            "src/lib.rs",
+            "src/nested/child.rs",
+            "src/bin/tool/main.rs",
+            "tests/it.rs",
+            "crates/app/src/lib.rs",
+            "src/a.c",
+            "src/a/b.c",
+            "src/a.h",
+            "src/a.ts",
+            "app/A.php",
+        ];
+        let refs = [
+            "./util",
+            "./util/inner",
+            "../lib/b.rs",
+            "../util.h",
+            "crate::util",
+            "crate::util::helper",
+            "crate::util::*",
+            "crate",
+            "self::util",
+            "super::util",
+            "super::*",
+            "util::helper",
+            "util::*",
+            "std::io::Read",
+            "util.h",
+            "a/b.h",
+            "<util.h>",
+            "lodash",
+            "User",
+        ];
+        let modules = crate::rust_modules::RustModules::default();
+        let answered = assert_file_candidates_match(&modules, &importers, &refs, CANDIDATE_TARGETS);
+        // Every Rust and C/C++ pair answers except Rust importers' two `../` refs.
+        assert_eq!(answered, 9 * refs.len() - 2 * 6);
     }
 
     #[test]

@@ -730,13 +730,13 @@ fn module_files(path: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use codesage_protocol::{
         CallPathRequest, ExportRequest, ImpactOptions, ImpactRequest, ImpactTarget,
     };
 
-    fn candidate_context() -> RustModules {
+    pub(crate) fn candidate_context() -> RustModules {
         RustModules {
             modules: HashMap::from([(
                 "src/nested/child.rs".to_string(),
@@ -748,6 +748,42 @@ mod tests {
             )]),
             ..RustModules::default()
         }
+    }
+
+    #[test]
+    fn row_candidates_match_the_per_target_matcher_with_modules() {
+        let importers = ["src/nested/child.rs", "src/a.rs", "unknown.rs"];
+        let refs = [
+            "./util",
+            "../util.rs",
+            "crate",
+            "crate::api",
+            "crate::api::f",
+            "crate::api::*",
+            "self::util",
+            "super",
+            "super::util::f",
+            "super::super::super::x",
+            "other::x",
+            "util.h",
+        ];
+        let answered = crate::bundle::import_path_tests::assert_file_candidates_match(
+            &candidate_context(),
+            &importers,
+            &refs,
+            crate::bundle::import_path_tests::CANDIDATE_TARGETS,
+        );
+        assert_eq!(answered, importers.len() * (refs.len() - 1));
+        let capped = RustModules {
+            capped: true,
+            ..RustModules::default()
+        };
+        crate::bundle::import_path_tests::assert_file_candidates_match(
+            &capped,
+            &importers,
+            &refs,
+            crate::bundle::import_path_tests::CANDIDATE_TARGETS,
+        );
     }
 
     #[test]
