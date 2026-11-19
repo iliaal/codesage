@@ -156,13 +156,17 @@ For your own codebase, `bench/codesage-bench-runner <corpus.yaml>` takes a `proj
 
 ## 🚀 Getting started
 
-```bash
-# Build (add --features cuda on Linux for GPU)
-cargo build --release -p codesage
+First follow the build and runtime dependency steps for [Linux CPU](#cpu-setup-linux),
+[CUDA](#cuda-setup), or [macOS CoreML](#coreml-setup-macos). Put the built `codesage`
+binary on `PATH` before changing to your project directory; `cargo build` does
+not add it to `PATH`. `codesage init` writes `device = "gpu"`, so select the
+matching `[embedding].device` in `.codesage/config.toml` before indexing.
 
-# Initialize and index a project
+```bash
+# Initialize and index a project after platform setup
 cd /path/to/your/project
 codesage init
+# Set [embedding].device for your CPU, CUDA, or CoreML setup first
 codesage index
 
 # Search
