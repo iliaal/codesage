@@ -1270,9 +1270,13 @@ fn surface(
     if !caller {
         return Ok(surface);
     }
-    let mut pending: Vec<_> = node.named_children(&mut node.walk()).collect();
-    while let Some(item) = pending.pop() {
-        let nested = item.parent().is_some_and(|parent| parent.id() != node.id());
+    // Each entry carries whether its parent is a nested node rather than
+    // `node`; `Node::parent` re-walks the tree from the root on every call.
+    let mut pending: Vec<_> = node
+        .named_children(&mut node.walk())
+        .map(|item| (item, false))
+        .collect();
+    while let Some((item, nested)) = pending.pop() {
         if nested
             && item.kind() == "use_declaration"
             && let Some(argument) = item.child_by_field_name("argument")
@@ -1334,7 +1338,10 @@ fn surface(
                 pattern_bindings(pattern, bytes, &mut surface.shadowed);
             }
         }
-        pending.extend(item.named_children(&mut item.walk()));
+        pending.extend(
+            item.named_children(&mut item.walk())
+                .map(|child| (child, true)),
+        );
     }
     Ok(surface)
 }
