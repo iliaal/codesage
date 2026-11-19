@@ -174,17 +174,21 @@ pub(crate) fn file_is_test(path: &str, stored: bool, interpretation: Option<&str
             && codesage_parser::discover::is_test_like_path(path))
 }
 
-/// Skip and record unreadable or unparseable files; retain degraded parses.
-fn parse_batch(
+type ParseResults<'a> = Vec<(&'a FileInfo, Result<ParsedFile>)>;
+
+fn parse_batch<'a>(
     root: &Path,
-    batch: &[&FileInfo],
-    stats: &mut IndexStats,
+    batch: &[&'a FileInfo],
     java_context: &JavaTypeContext,
-) -> Vec<ParsedFile> {
-    let results: Vec<(&FileInfo, Result<ParsedFile>)> = batch
+) -> ParseResults<'a> {
+    batch
         .par_iter()
         .map(|f| (*f, parse_one(root, f, java_context)))
-        .collect();
+        .collect()
+}
+
+/// Skip and record unreadable or unparseable files; retain degraded parses.
+fn keep_parsed(results: ParseResults<'_>, stats: &mut IndexStats) -> Vec<ParsedFile> {
     let mut parsed = Vec::with_capacity(results.len());
     for (file, result) in results {
         match result {
@@ -221,6 +225,46 @@ fn write_one(db: &Database, p: &ParsedFile) -> Result<()> {
     db.replace_file_trust_boundaries(file_id, &p.boundaries)?;
     db.record_file_interpretation(file_id, STRUCTURAL_INTERPRETATION)?;
     Ok(())
+}
+
+/// Parse batch N+1 on a scoped thread while batch N is written, so the
+/// serial SQLite writes overlap the parallel parse. Batches are written, and
+/// failures recorded, in the same order as a sequential parse-then-write loop.
+fn parse_and_write(
+    root: &Path,
+    db: &Database,
+    files: &[&FileInfo],
+    stats: &mut IndexStats,
+    java_context: &JavaTypeContext,
+    verbose: bool,
+) -> Result<()> {
+    let mut batches = files.chunks(STRUCTURAL_INDEX_BATCH_SIZE);
+    let Some(first) = batches.next() else {
+        return Ok(());
+    };
+    std::thread::scope(|scope| {
+        let mut results = parse_batch(root, first, java_context);
+        loop {
+            let next = batches
+                .next()
+                .map(|batch| scope.spawn(move || parse_batch(root, batch, java_context)));
+            let parsed = keep_parsed(results, stats);
+            if verbose {
+                tracing::info!(
+                    parsed = parsed.len(),
+                    failed = stats.files_failed,
+                    "structural parse batch complete, writing to db"
+                );
+            }
+            write_parsed_batch(db, &parsed, stats)?;
+            let Some(next) = next else {
+                return Ok(());
+            };
+            results = next
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
+    })
 }
 
 fn count_written(stats: &mut IndexStats, p: &ParsedFile) {
@@ -617,18 +661,7 @@ fn index_discovery_report(
     if !to_parse.is_empty() {
         db.mark_js_aliases_stale()?;
     }
-    for batch in to_parse.chunks(STRUCTURAL_INDEX_BATCH_SIZE) {
-        let parsed = parse_batch(root, batch, &mut stats, &java_context);
-
-        if verbose {
-            tracing::info!(
-                parsed = parsed.len(),
-                failed = stats.files_failed,
-                "structural parse batch complete, writing to db"
-            );
-        }
-        write_parsed_batch(db, &parsed, &mut stats)?;
-    }
+    parse_and_write(root, db, &to_parse, &mut stats, &java_context, verbose)?;
 
     // Full passes discard failed files' stale rows and hashes so later passes retry.
     // Incremental passes retain old rows across transient read failures.
@@ -740,10 +773,7 @@ pub fn index_files(
     if js_touched {
         db.mark_js_aliases_stale()?;
     }
-    for batch in file_refs.chunks(STRUCTURAL_INDEX_BATCH_SIZE) {
-        let parsed = parse_batch(root, batch, &mut stats, &java_context);
-        write_parsed_batch(db, &parsed, &mut stats)?;
-    }
+    parse_and_write(root, db, &file_refs, &mut stats, &java_context, false)?;
     // Only JS/TS rows and files feed the alias mappings; a pass over other
     // languages keeps them unless an earlier pass left them stale.
     if refresh_js_path_configs_for(root, db, files)? || js_touched || db.js_aliases_stale()? {
@@ -1050,6 +1080,43 @@ mod tests {
             db.trust_boundaries_for_file_path("a.py").unwrap(),
             fresh.trust_boundaries_for_file_path("a.py").unwrap()
         );
+    }
+
+    #[test]
+    fn multi_batch_pass_writes_every_batch_and_records_failures_in_order() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let count = 2 * STRUCTURAL_INDEX_BATCH_SIZE + 7;
+        let failing = [3, STRUCTURAL_INDEX_BATCH_SIZE + 1, count - 1];
+        let files: Vec<_> = (0..count)
+            .map(|i| {
+                let path = format!("m{i:03}.py");
+                if failing.contains(&i) {
+                    unreadable(&path, Language::Python)
+                } else {
+                    let source = format!("def f{i}(): pass\n");
+                    file(root.path(), &path, Language::Python, source.as_bytes())
+                }
+            })
+            .collect();
+        let stats = index_files(root.path(), &db, &files, false).unwrap();
+        let expected_failed: Vec<_> = failing.iter().map(|i| format!("m{i:03}.py")).collect();
+        assert_eq!(stats.failed_paths, expected_failed);
+        assert_eq!(stats.files_indexed, count - failing.len());
+        for (i, info) in files.iter().enumerate() {
+            let names: Vec<_> = db
+                .symbols_for_file(&info.path)
+                .unwrap()
+                .into_iter()
+                .map(|symbol| symbol.name)
+                .collect();
+            let expected = if failing.contains(&i) {
+                Vec::new()
+            } else {
+                vec![format!("f{i}")]
+            };
+            assert_eq!(names, expected, "{}", info.path);
+        }
     }
 
     #[test]

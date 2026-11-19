@@ -4,7 +4,7 @@
 [![Tests](https://github.com/iliaal/codesage/actions/workflows/tests.yml/badge.svg)](https://github.com/iliaal/codesage/actions/workflows/tests.yml)
 [![Secret scan](https://github.com/iliaal/codesage/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/iliaal/codesage/actions/workflows/secret-scan.yml)
 [![Version](https://img.shields.io/github/v/release/iliaal/codesage)](https://github.com/iliaal/codesage/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Follow @iliaa](https://img.shields.io/badge/Follow-@iliaa-000000?style=flat&logo=x&logoColor=white)](https://x.com/intent/follow?screen_name=iliaa)
 
 ![CodeSage: structural and semantic code intelligence for AI agents](images/codesage-hero.jpg)
