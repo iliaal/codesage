@@ -113,8 +113,17 @@ pub(crate) struct WalkCache {
     file_imports: Option<Arc<FileImports>>,
     python_indexed: Option<Arc<HashSet<String>>>,
     python_probes: codesage_storage::db::PythonPackageProbes,
-    /// Estimated bytes of Python import targets retained in `file_imports`.
-    python_target_bytes: usize,
+    /// Estimated bytes of import targets retained for `file_imports`: Python
+    /// targets in `FileImports::python_targets` plus `path_targets`.
+    import_target_bytes: usize,
+    /// Candidate files of each `PathMatched` row of `file_imports`, by the
+    /// row's ordinal among those rows; the inner None means the row's match
+    /// depends on the target file. Table 0 serves walks without Rust modules,
+    /// table 1 walks with them, and each is allocated on the first lookup of
+    /// a walk that reads it. Slots and candidates are charged to
+    /// `MAX_IMPORT_TARGET_BYTES`; a table or answer that does not fit is not
+    /// kept, and its row is matched per target file instead.
+    path_targets: [Vec<Option<Option<Vec<String>>>>; 2],
     python_references: PythonReferences,
     import_matches: HashMap<String, Arc<Vec<usize>>>,
     rust_modules: Option<Arc<crate::rust_modules::RustModules>>,
@@ -146,7 +155,7 @@ impl WalkCache {
 
     const MAX_SYMBOLS: usize = 8192;
     const MAX_REFERENCE_BYTES: usize = 16 * 1024 * 1024;
-    const MAX_PYTHON_TARGET_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_IMPORT_TARGET_BYTES: usize = 16 * 1024 * 1024;
 
     #[cfg(test)]
     pub(crate) fn stats(&self) -> (usize, usize, usize) {
@@ -220,12 +229,75 @@ impl WalkCache {
                 .saturating_mul(std::mem::size_of::<String>()),
             |bytes, path| bytes.saturating_add(path.capacity()),
         );
-        let retain =
-            bytes <= Self::MAX_PYTHON_TARGET_BYTES.saturating_sub(self.python_target_bytes);
-        if retain {
-            self.python_target_bytes += bytes;
+        Ok((targets, self.charge_import_targets(bytes)))
+    }
+
+    /// Charge `bytes` of retained import targets, or refuse when they would
+    /// exceed `MAX_IMPORT_TARGET_BYTES`.
+    fn charge_import_targets(&mut self, bytes: usize) -> bool {
+        let fits = bytes <= Self::MAX_IMPORT_TARGET_BYTES.saturating_sub(self.import_target_bytes);
+        if fits {
+            self.import_target_bytes += bytes;
         }
-        Ok((targets, retain))
+        fits
+    }
+
+    /// Whether row `index` of `imports` loads `file`, as
+    /// [`import_ref_targets_file_with_indexed`] decides it. Every frontier
+    /// file tests every row, so a `PathMatched` row's candidates are derived
+    /// once per cache instead of once per frontier file.
+    fn path_row_loads(
+        &mut self,
+        imports: &FileImports,
+        index: usize,
+        file: &str,
+        modules: &crate::rust_modules::RustModules,
+        modules_loaded: bool,
+        indexed: &HashSet<String>,
+    ) -> bool {
+        let r = &imports.rows[index];
+        let loads = |candidates: Option<&Vec<String>>| match candidates {
+            Some(candidates) => candidates.iter().any(|candidate| candidate == file),
+            None => import_ref_targets_file_with_indexed(
+                &r.to_name,
+                &r.from_file,
+                file,
+                modules,
+                indexed,
+            ),
+        };
+        let FileImportShape::PathMatched(slot) = imports.shapes[index] else {
+            return loads(None);
+        };
+        let table = usize::from(modules_loaded);
+        if self.path_targets[table].is_empty()
+            && self.charge_import_targets(
+                imports
+                    .path_rows
+                    .saturating_mul(std::mem::size_of::<Option<Option<Vec<String>>>>()),
+            )
+        {
+            self.path_targets[table] = vec![None; imports.path_rows];
+        }
+        let slot = slot as usize;
+        if let Some(Some(kept)) = self.path_targets[table].get(slot) {
+            return loads(kept.as_ref());
+        }
+        let fresh =
+            crate::bundle::import_ref_file_candidates(&r.to_name, &r.from_file, modules, indexed);
+        let answer = loads(fresh.as_ref());
+        let bytes = fresh.as_ref().map_or(0, |candidates| {
+            candidates.iter().fold(
+                candidates
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+                |bytes, path| bytes.saturating_add(path.capacity()),
+            )
+        });
+        if slot < self.path_targets[table].len() && self.charge_import_targets(bytes) {
+            self.path_targets[table][slot] = Some(fresh);
+        }
+        answer
     }
 
     fn indexed_files(&mut self, db: &Database) -> Result<Arc<HashSet<String>>> {
@@ -529,15 +601,11 @@ pub(crate) struct FileImports {
     /// when no row is Python. Every frontier file tests every Python row, so
     /// indexing by row avoids building and hashing an import-site key per row
     /// per frontier file. One pointer-sized slot per row of `rows`; the
-    /// retained targets are charged to `WalkCache::MAX_PYTHON_TARGET_BYTES`.
+    /// retained targets are charged to `WalkCache::MAX_IMPORT_TARGET_BYTES`.
     python_targets: Vec<std::sync::OnceLock<Arc<Vec<String>>>>,
-    /// Files each `PathMatched` row loads, by row index and filled on first
-    /// use; None when the row's match depends on the target file. Slot 0
-    /// serves walks without Rust modules, slot 1 walks with them. Every
-    /// frontier file tests every row, and walks share this through
-    /// [`WalkCache`], so a row's candidates are derived once instead of once
-    /// per frontier file. Empty when no row is `PathMatched`.
-    path_targets: [Vec<std::sync::OnceLock<Option<Vec<String>>>>; 2],
+    /// Number of `PathMatched` rows, which `WalkCache::path_targets` keeps
+    /// one candidate slot for.
+    path_rows: usize,
     /// Some importer is C or C++, so path matching needs the indexed paths.
     c_family: bool,
 }
@@ -546,8 +614,9 @@ pub(crate) struct FileImports {
 enum FileImportShape {
     /// Resolved by module path through the Python binding probes.
     Python,
-    /// The path matcher decides per target file.
-    PathMatched,
+    /// The path matcher decides per target file. Carries the row's ordinal
+    /// among `PathMatched` rows, its slot in `WalkCache::path_targets`.
+    PathMatched(u32),
     /// A JavaScript/TypeScript relative specifier, or an alias stored with
     /// its relative form; listed in `js_targets` by its joined path.
     JsPath,
@@ -562,6 +631,7 @@ impl FileImports {
         let mut c_family = false;
         let mut shapes = Vec::with_capacity(rows.len());
         let mut js_targets: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut path_rows = 0usize;
         for (index, row) in rows.iter().enumerate() {
             c_family |= matches!(
                 codesage_parser::detect::detect_language(std::path::Path::new(&row.from_file)),
@@ -583,7 +653,10 @@ impl FileImports {
                         None => FileImportShape::NoFile,
                     }
                 } else if crate::bundle::import_ref_may_target_file(spec, &row.from_file) {
-                    FileImportShape::PathMatched
+                    path_rows += 1;
+                    FileImportShape::PathMatched(
+                        u32::try_from(path_rows - 1).expect("import rows fit in u32"),
+                    )
                 } else {
                     FileImportShape::NoFile
                 },
@@ -594,55 +667,14 @@ impl FileImports {
         } else {
             Vec::new()
         };
-        let path_targets = if shapes.contains(&FileImportShape::PathMatched) {
-            std::array::from_fn(|_| rows.iter().map(|_| std::sync::OnceLock::new()).collect())
-        } else {
-            Default::default()
-        };
         Ok(Self {
             python_targets,
-            path_targets,
+            path_rows,
             rows,
             shapes,
             js_targets,
             c_family,
         })
-    }
-
-    /// Whether `PathMatched` row `index` loads `file`, as
-    /// [`import_ref_targets_file_with_indexed`] decides it.
-    fn path_row_loads(
-        &self,
-        index: usize,
-        file: &str,
-        modules: &crate::rust_modules::RustModules,
-        modules_loaded: bool,
-        indexed: &HashSet<String>,
-    ) -> bool {
-        let r = &self.rows[index];
-        let candidates = self.path_targets[usize::from(modules_loaded)]
-            .get(index)
-            .and_then(|slot| {
-                slot.get_or_init(|| {
-                    crate::bundle::import_ref_file_candidates(
-                        &r.to_name,
-                        &r.from_file,
-                        modules,
-                        indexed,
-                    )
-                })
-                .as_ref()
-            });
-        match candidates {
-            Some(candidates) => candidates.iter().any(|candidate| candidate == file),
-            None => import_ref_targets_file_with_indexed(
-                &r.to_name,
-                &r.from_file,
-                file,
-                modules,
-                indexed,
-            ),
-        }
     }
 
     /// The `JsPath` rows whose specifier loads `file`, ascending.
@@ -1090,18 +1122,21 @@ pub(crate) fn impact_analysis_walk_shared(
                     continue;
                 }
                 if cached_matches.is_none()
-                    && matches!(
-                        shape,
-                        FileImportShape::PathMatched | FileImportShape::NoFile
-                    )
-                    && (shape == FileImportShape::NoFile
-                        || !file_imports.path_row_loads(
-                            reference_index,
-                            file,
-                            &rust_modules,
-                            rust_modules_loaded,
-                            &indexed,
-                        ))
+                    && match shape {
+                        FileImportShape::NoFile => true,
+                        FileImportShape::PathMatched(_) => !cache
+                            .as_deref_mut()
+                            .expect("walk cache initialized")
+                            .path_row_loads(
+                                &file_imports,
+                                reference_index,
+                                file,
+                                &rust_modules,
+                                rust_modules_loaded,
+                                &indexed,
+                            ),
+                        FileImportShape::Python | FileImportShape::JsPath => false,
+                    }
                 {
                     continue;
                 }
@@ -1739,13 +1774,14 @@ mod tests {
         let unloaded = crate::rust_modules::RustModules::default();
         let indexed = HashSet::new();
         let targets = ["src/api.rs", "src/api/mod.rs", "src/lib.rs", "src/main.rs"];
+        let imports = FileImports {
+            rows: vec![row.clone()],
+            shapes: vec![FileImportShape::PathMatched(0)],
+            path_rows: 1,
+            ..FileImports::default()
+        };
         for loaded_first in [false, true] {
-            let imports = FileImports {
-                rows: vec![row.clone()],
-                shapes: vec![FileImportShape::PathMatched],
-                path_targets: std::array::from_fn(|_| vec![std::sync::OnceLock::new()]),
-                ..FileImports::default()
-            };
+            let mut cache = WalkCache::default();
             let order = if loaded_first {
                 [(&loaded, true), (&unloaded, false)]
             } else {
@@ -1754,7 +1790,14 @@ mod tests {
             for (modules, modules_loaded) in order {
                 for target in targets {
                     assert_eq!(
-                        imports.path_row_loads(0, target, modules, modules_loaded, &indexed),
+                        cache.path_row_loads(
+                            &imports,
+                            0,
+                            target,
+                            modules,
+                            modules_loaded,
+                            &indexed
+                        ),
                         import_ref_targets_file_with_indexed(
                             &row.to_name,
                             &row.from_file,
@@ -1767,9 +1810,151 @@ mod tests {
                 }
             }
             // The crate's declared root is lib.rs; only the fallback admits main.rs.
-            assert!(imports.path_row_loads(0, "src/main.rs", &unloaded, false, &indexed));
-            assert!(!imports.path_row_loads(0, "src/main.rs", &loaded, true, &indexed));
+            assert!(cache.path_row_loads(&imports, 0, "src/main.rs", &unloaded, false, &indexed));
+            assert!(!cache.path_row_loads(&imports, 0, "src/main.rs", &loaded, true, &indexed));
         }
+    }
+
+    #[test]
+    fn loaded_path_rows_keep_their_own_candidates() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute_raw_for_tests(
+            "INSERT INTO files (id, path, language, content_hash) VALUES
+                (1, 'src/a.c', 'c', 'a'),
+                (2, 'src/b.c', 'c', 'b'),
+                (3, 'src/x.h', 'c', 'x'),
+                (4, 'src/y.h', 'c', 'y'),
+                (5, 'web/m.ts', 'typescript', 'm');
+             INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col) VALUES
+                (1, 'x.h', 'x.h', 'include', 1, 0),
+                (2, 'y.h', 'y.h', 'include', 1, 0),
+                (5, './n', 'n', 'import', 1, 0);",
+        )
+        .unwrap();
+        let imports = FileImports::load(&db).unwrap();
+        let modules = crate::rust_modules::RustModules::default();
+        let mut cache = WalkCache::default();
+        let indexed = cache.indexed_files(&db).unwrap();
+        let mut path_rows = 0;
+        for _ in 0..2 {
+            for target in ["src/x.h", "src/y.h"] {
+                for (index, shape) in imports.shapes.iter().enumerate() {
+                    let FileImportShape::PathMatched(_) = *shape else {
+                        continue;
+                    };
+                    path_rows += 1;
+                    let row = &imports.rows[index];
+                    assert_eq!(
+                        cache.path_row_loads(&imports, index, target, &modules, false, &indexed),
+                        import_ref_targets_file_with_indexed(
+                            &row.to_name,
+                            &row.from_file,
+                            target,
+                            &modules,
+                            &indexed
+                        ),
+                        "{} -> {target}",
+                        row.from_file
+                    );
+                }
+            }
+        }
+        assert_eq!(path_rows, 8);
+    }
+
+    #[test]
+    fn path_row_candidates_are_charged_to_the_import_target_budget() {
+        let row = |from_file: &str, to_name: &str| Reference {
+            from_file: from_file.to_string(),
+            from_symbol: None,
+            to_name: to_name.to_string(),
+            kind: ReferenceKind::Import,
+            line: 1,
+            col: 0,
+            lazy: false,
+            to: None,
+            from_line: None,
+            is_test: false,
+        };
+        // A JS row ahead of the path rows takes no slot and is matched per
+        // target; row 2 has no target-independent candidates.
+        let imports = FileImports {
+            rows: vec![
+                row("web/a.ts", "./b"),
+                row("src/a.c", "util.h"),
+                row("src/nested/child.rs", "../api"),
+            ],
+            shapes: vec![
+                FileImportShape::JsPath,
+                FileImportShape::PathMatched(0),
+                FileImportShape::PathMatched(1),
+            ],
+            path_rows: 2,
+            ..FileImports::default()
+        };
+        let modules = crate::rust_modules::RustModules::default();
+        let indexed: HashSet<String> = ["src/util.h".to_string()].into();
+        let slot_bytes = 2 * std::mem::size_of::<Option<Option<Vec<String>>>>();
+        let candidates =
+            crate::bundle::import_ref_file_candidates("util.h", "src/a.c", &modules, &indexed)
+                .expect("C includes have target-independent candidates");
+        let candidate_bytes = candidates.iter().fold(
+            candidates.capacity() * std::mem::size_of::<String>(),
+            |bytes, path| bytes + path.capacity(),
+        );
+        let lookups = |cache: &mut WalkCache| {
+            for target in ["src/util.h", "src/api.rs", "src/other.h", "web/b.ts"] {
+                for index in [0, 1, 2] {
+                    assert_eq!(
+                        cache.path_row_loads(&imports, index, target, &modules, false, &indexed),
+                        import_ref_targets_file_with_indexed(
+                            &imports.rows[index].to_name,
+                            &imports.rows[index].from_file,
+                            target,
+                            &modules,
+                            &indexed
+                        ),
+                        "row {index} -> {target}"
+                    );
+                }
+            }
+        };
+
+        // Room for everything: one table of two slots (only the walk's own
+        // table) plus row 1's candidates, charged once across lookups.
+        let mut cache = WalkCache::default();
+        lookups(&mut cache);
+        assert_eq!(cache.import_target_bytes, slot_bytes + candidate_bytes);
+        assert_eq!(cache.path_targets[0].len(), 2);
+        assert!(cache.path_targets[1].is_empty());
+        assert_eq!(cache.path_targets[0][0], Some(Some(candidates.clone())));
+        assert_eq!(cache.path_targets[0][1], Some(None));
+
+        // Room for the table but not the candidates: answers stay right and
+        // the candidates are not kept.
+        let mut cache = WalkCache {
+            import_target_bytes: WalkCache::MAX_IMPORT_TARGET_BYTES - slot_bytes,
+            ..WalkCache::default()
+        };
+        lookups(&mut cache);
+        assert_eq!(
+            cache.import_target_bytes,
+            WalkCache::MAX_IMPORT_TARGET_BYTES
+        );
+        assert_eq!(cache.path_targets[0][0], None);
+        assert_eq!(cache.path_targets[0][1], Some(None));
+
+        // No room for the table: nothing is kept.
+        let mut cache = WalkCache {
+            import_target_bytes: WalkCache::MAX_IMPORT_TARGET_BYTES - slot_bytes + 1,
+            ..WalkCache::default()
+        };
+        lookups(&mut cache);
+        assert_eq!(
+            cache.import_target_bytes,
+            WalkCache::MAX_IMPORT_TARGET_BYTES - slot_bytes + 1
+        );
+        assert!(cache.path_targets.iter().all(Vec::is_empty));
     }
 
     fn setup_caller_import_project() -> Database {
