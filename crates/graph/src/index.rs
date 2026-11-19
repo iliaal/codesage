@@ -238,16 +238,29 @@ fn parse_and_write(
     java_context: &JavaTypeContext,
     verbose: bool,
 ) -> Result<()> {
+    write_batches_while_parsing(db, files, stats, verbose, |batch| {
+        parse_batch(root, batch, java_context)
+    })
+}
+
+fn write_batches_while_parsing<'a>(
+    db: &Database,
+    files: &[&'a FileInfo],
+    stats: &mut IndexStats,
+    verbose: bool,
+    parse: impl Fn(&[&'a FileInfo]) -> ParseResults<'a> + Sync,
+) -> Result<()> {
     let mut batches = files.chunks(STRUCTURAL_INDEX_BATCH_SIZE);
     let Some(first) = batches.next() else {
         return Ok(());
     };
+    let parse = &parse;
     std::thread::scope(|scope| {
-        let mut results = parse_batch(root, first, java_context);
+        let mut results = parse(first);
         loop {
             let next = batches
                 .next()
-                .map(|batch| scope.spawn(move || parse_batch(root, batch, java_context)));
+                .map(|batch| scope.spawn(move || parse(batch)));
             let parsed = keep_parsed(results, stats);
             if verbose {
                 tracing::info!(
@@ -256,7 +269,14 @@ fn parse_and_write(
                     "structural parse batch complete, writing to db"
                 );
             }
-            write_parsed_batch(db, &parsed, stats)?;
+            if let Err(e) = write_parsed_batch(db, &parsed, stats) {
+                // The pass is aborting: drop the read-ahead batch, including a
+                // panic, so the scope exit cannot replace the database error.
+                if let Some(next) = next {
+                    let _ = next.join();
+                }
+                return Err(e);
+            }
             let Some(next) = next else {
                 return Ok(());
             };
@@ -1685,6 +1705,51 @@ mod tests {
             "the stored hash survives too"
         );
         assert!(db.symbols_for_file("a.c").unwrap().is_empty());
+    }
+
+    /// Batch 2 is parsed while batch 1 is written. When that write fails, a
+    /// panic in the read-ahead parse must not replace the database error.
+    #[test]
+    fn write_error_wins_over_a_panicking_read_ahead_parse() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let files: Vec<_> = (0..STRUCTURAL_INDEX_BATCH_SIZE + 1)
+            .map(|i| {
+                let source = format!("int f{i}(void) {{ return {i}; }}\n");
+                file(
+                    root.path(),
+                    &format!("m{i:03}.c"),
+                    Language::C,
+                    source.as_bytes(),
+                )
+            })
+            .collect();
+        let refs: Vec<_> = files.iter().collect();
+        db.execute_raw_for_tests(
+            "ALTER TABLE file_trust_boundaries RENAME TO file_trust_boundaries_off",
+        )
+        .unwrap();
+        let mut stats = IndexStats::default();
+        let read_ahead_ran = std::sync::atomic::AtomicBool::new(false);
+
+        let err = write_batches_while_parsing(&db, &refs, &mut stats, false, |batch| {
+            if batch.len() != STRUCTURAL_INDEX_BATCH_SIZE {
+                read_ahead_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            assert!(
+                batch.len() == STRUCTURAL_INDEX_BATCH_SIZE,
+                "read-ahead parse panicked"
+            );
+            parse_batch(root.path(), batch, &JavaTypeContext::default())
+        })
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("database error, aborting the pass"),
+            "{err:#}"
+        );
+        assert_eq!(stats.files_indexed, 0, "{stats:?}");
+        assert!(read_ahead_ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
