@@ -627,6 +627,11 @@ pub(crate) struct FileImports {
     /// Number of `PathMatched` rows, which `WalkCache::path_targets` keeps
     /// one candidate slot for.
     path_rows: usize,
+    /// Rows of [`FileImportShape::Python`] or [`FileImportShape::PathMatched`],
+    /// ascending: with [`FileImports::js_rows_loading`], the only rows a
+    /// frontier file can match. One index per such row, like `shapes`: at most
+    /// one `usize` per row of `rows`, uncharged like `shapes` and `rows`.
+    matchable: Vec<usize>,
     /// Some importer is C or C++, so path matching needs the indexed paths.
     c_family: bool,
 }
@@ -683,6 +688,17 @@ impl FileImports {
                 },
             );
         }
+        let matchable = shapes
+            .iter()
+            .enumerate()
+            .filter(|(_, shape)| {
+                matches!(
+                    shape,
+                    FileImportShape::Python | FileImportShape::PathMatched(_)
+                )
+            })
+            .map(|(index, _)| index)
+            .collect();
         let python_targets = if shapes.contains(&FileImportShape::Python) {
             rows.iter().map(|_| std::sync::OnceLock::new()).collect()
         } else {
@@ -691,11 +707,32 @@ impl FileImports {
         Ok(Self {
             python_targets,
             path_rows,
+            matchable,
             rows,
             shapes,
             js_targets,
             c_family,
         })
+    }
+
+    /// The rows `file` may match, ascending: every row of `matchable` and
+    /// the `JsPath` rows whose specifier loads `file`. No other row can.
+    fn rows_to_match(&self, file: &str) -> Vec<usize> {
+        let loading = self.js_rows_loading(file);
+        let mut rows = Vec::with_capacity(self.matchable.len() + loading.len());
+        let (mut a, mut b) = (0, 0);
+        while a < self.matchable.len() && b < loading.len() {
+            if self.matchable[a] < loading[b] {
+                rows.push(self.matchable[a]);
+                a += 1;
+            } else {
+                rows.push(loading[b]);
+                b += 1;
+            }
+        }
+        rows.extend_from_slice(&self.matchable[a..]);
+        rows.extend_from_slice(&loading[b..]);
+        rows
     }
 
     /// The `JsPath` rows whose specifier loads `file`, ascending.
@@ -1107,10 +1144,14 @@ pub(crate) fn impact_analysis_walk_shared(
                 .and_then(|cache| cache.import_matches.get(file))
                 .cloned();
             let mut matches = Vec::new();
-            let js_rows = file_imports.js_rows_loading(file);
+            // Rows no shape lets `file` match are never visited.
+            let candidates = match &cached_matches {
+                Some(_) => Vec::new(),
+                None => file_imports.rows_to_match(file),
+            };
             for index in 0..cached_matches
                 .as_ref()
-                .map_or(file_imports.rows.len(), |rows| rows.len())
+                .map_or(candidates.len(), |rows| rows.len())
             {
                 codesage_protocol::work::checkpoint()?;
                 if index % 256 == 0
@@ -1120,7 +1161,10 @@ pub(crate) fn impact_analysis_walk_shared(
                     budget_spent = true;
                     break;
                 }
-                let reference_index = cached_matches.as_ref().map_or(index, |rows| rows[index]);
+                let reference_index = match &cached_matches {
+                    Some(rows) => rows[index],
+                    None => candidates[index],
+                };
                 let r = &file_imports.rows[reference_index];
                 let shape = file_imports.shapes[reference_index];
                 if cached_matches.is_none()
@@ -1133,12 +1177,6 @@ pub(crate) fn impact_analysis_walk_shared(
                         )?
                         .iter()
                         .any(|target| target == file)
-                {
-                    continue;
-                }
-                if cached_matches.is_none()
-                    && shape == FileImportShape::JsPath
-                    && js_rows.binary_search(&reference_index).is_err()
                 {
                     continue;
                 }
@@ -1909,6 +1947,91 @@ mod tests {
             assert!(cache.path_row_loads(&imports, 0, "src/main.rs", &unloaded, false, &indexed));
             assert!(!cache.path_row_loads(&imports, 0, "src/main.rs", &loaded, true, &indexed));
         }
+    }
+
+    #[test]
+    fn rows_to_match_equals_the_full_scan_filter() {
+        let db = Database::open_in_memory().unwrap();
+        db.execute_raw_for_tests(
+            "INSERT INTO files (id, path, language, content_hash) VALUES
+                (1, 'py/a.py', 'python', 'a'),
+                (2, 'src/a.c', 'c', 'b'),
+                (3, 'web/m.ts', 'typescript', 'c'),
+                (4, 'web/n.ts', 'typescript', 'd'),
+                (5, 'web/lib/x.ts', 'typescript', 'e'),
+                (6, 'web/y.ts', 'typescript', 'f'),
+                (7, 'app/e.ts', 'typescript', 'g'),
+                (8, 'src/m.ts', 'typescript', 'h'),
+                (9, 'tail/p.py', 'python', 'i');
+             INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col) VALUES
+                (3, './lib/x', 'x', 'import', 1, 0),
+                (1, 'pkg.mod', 'mod', 'import', 1, 0),
+                (4, './lib/x', 'x', 'import', 1, 0),
+                (2, 'util.h', 'util.h', 'include', 1, 0),
+                (2, 'sub/other.h', 'other.h', 'include', 2, 0),
+                (3, './y', 'y', 'import', 2, 0),
+                (4, '../../../../out', 'out', 'import', 2, 0),
+                (6, './lib/x', 'x', 'import', 1, 0),
+                (4, 'react', 'react', 'import', 3, 0),
+                (1, 'pkg.other', 'other', 'import', 2, 0),
+                (7, '../web/lib/x', 'x', 'import', 1, 0),
+                (8, '../web/lib/x', 'x', 'import', 1, 0),
+                (9, 'pkg.tail', 'tail', 'import', 1, 0);",
+        )
+        .unwrap();
+        let imports = FileImports::load(&db).unwrap();
+        let count = |wanted: FileImportShape| {
+            imports
+                .shapes
+                .iter()
+                .filter(|shape| std::mem::discriminant(*shape) == std::mem::discriminant(&wanted))
+                .count()
+        };
+        // Every shape is present, so each arm of the filter is exercised.
+        assert!(count(FileImportShape::Python) >= 2);
+        assert!(count(FileImportShape::PathMatched(0)) >= 2);
+        assert!(count(FileImportShape::JsPath) >= 3);
+        assert!(count(FileImportShape::NoFile) >= 1);
+        let mut js_hits = 0;
+        for file in [
+            "web/lib/x.ts",
+            "web/y.ts",
+            "web/lib/x.js",
+            "py/a.py",
+            "src/util.h",
+            "elsewhere/z.ts",
+        ] {
+            let loading = imports.js_rows_loading(file);
+            js_hits += loading.len();
+            let scan: Vec<usize> = (0..imports.rows.len())
+                .filter(|&index| match imports.shapes[index] {
+                    FileImportShape::NoFile => false,
+                    FileImportShape::JsPath => loading.binary_search(&index).is_ok(),
+                    FileImportShape::Python | FileImportShape::PathMatched(_) => true,
+                })
+                .collect();
+            let rows = imports.rows_to_match(file);
+            assert_eq!(rows, scan, "{file}");
+            assert!(rows.windows(2).all(|pair| pair[0] < pair[1]), "{file}");
+        }
+        assert!(js_hits >= 4, "the JsPath arm and the merge saw {js_hits}");
+        // Rows with no shape that loads the file are skipped: a file nothing
+        // imports keeps only the Python and path rows.
+        let none = imports.rows_to_match("elsewhere/z.ts");
+        assert_eq!(none, imports.matchable);
+        assert!(none.len() < imports.rows.len());
+        // JsPath rows interleave with matchable rows in row order: one
+        // before the first, one between, one after the last.
+        let both = imports.rows_to_match("web/lib/x.ts");
+        let kinds: Vec<bool> = both
+            .iter()
+            .map(|&row| imports.shapes[row] == FileImportShape::JsPath)
+            .collect();
+        let first_matchable = kinds.iter().position(|js| !js).unwrap();
+        let last_matchable = kinds.iter().rposition(|js| !js).unwrap();
+        assert!(kinds[..first_matchable].contains(&true));
+        assert!(kinds[first_matchable..last_matchable].contains(&true));
+        assert!(kinds[last_matchable..].contains(&true));
     }
 
     #[test]
