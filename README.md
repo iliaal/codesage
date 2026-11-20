@@ -543,7 +543,15 @@ reranker = "cross-encoder/ms-marco-MiniLM-L6-v2"     # optional, remove to disab
 exclude_patterns = []
 ```
 
-Models download from HuggingFace the first time you use them.
+Models download from Hugging Face the first time you use them.
+`CODESAGE_HF_DOWNLOAD_TIMEOUT_SECS` sets how long CodeSage waits for each
+model artifact fetch or repository file-listing operation. Set it to a positive
+whole number of seconds. The default is 120 seconds per operation; an unset or
+blank value uses that default, and invalid text or zero logs a warning and falls
+back to it. Set it in the environment of the process that loads the model
+(before starting the daemon, if you use one). This bounds the caller's wait,
+not the whole indexing run or request: separate request deadlines can end the
+wait sooner, and a background download can continue after the caller times out.
 
 Built-in exclusions already cover vendored dependencies, build outputs, and caches. Your `exclude_patterns` add to those defaults. Tests are indexed structurally and semantically, then demoted during search. If you explicitly exclude tests, graph-based test recommendations and test-gap evidence lose those files.
 
