@@ -21,9 +21,7 @@ enum Target {
 }
 
 pub(super) fn routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
-    let import_re = Regex::new(
-        r"(?m)^\s*(?:from\s+django\.(?:urls|conf\.urls)\s+import\b|import\s+django\.(?:urls|conf\.urls)\b)",
-    )?;
+    let import_re = urls_import_regex()?;
     let call_re = Regex::new(r"^(path|re_path|url)\s*\(")?;
     let mut declarations = BTreeMap::new();
     let mut modules: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
@@ -42,10 +40,9 @@ pub(super) fn routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
                     .insert(&file.rel);
             }
         }
-        let source = route_source(&file.contents);
-        if !import_re.is_match(&source) {
+        let Some(source) = urls_route_source(&import_re, &file.contents) else {
             continue;
-        }
+        };
         let mut parsed = Vec::new();
         for body in super::django_urlpatterns_bodies(&source) {
             for entry in super::split_top_level_args(&body) {
@@ -99,6 +96,26 @@ pub(super) fn routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
         );
     }
     Ok(expansion.out.into_values().collect())
+}
+
+fn urls_import_regex() -> Result<Regex> {
+    Ok(Regex::new(
+        r"(?m)^\s*(?:from\s+django\.(?:urls|conf\.urls)\s+import\b|import\s+django\.(?:urls|conf\.urls)\b)",
+    )?)
+}
+
+/// The route source of `contents` when it imports `django.urls` or
+/// `django.conf.urls` outside comments and docstrings.
+fn urls_route_source(import_re: &Regex, contents: &str) -> Option<String> {
+    // Every `import_re` match contains `django.urls` or `django.conf.urls`,
+    // and `route_source` only blanks bytes to spaces, so a file without
+    // either literal cannot match. Skipping it avoids the blanking copy and
+    // the regex scan, which falls back to the slow engine on non-ASCII text.
+    if !contents.contains("django.urls") && !contents.contains("django.conf.urls") {
+        return None;
+    }
+    let source = route_source(contents);
+    import_re.is_match(&source).then_some(source)
 }
 
 struct Expansion<'a> {
@@ -278,6 +295,78 @@ mod tests {
             .into_iter()
             .filter(|seed| seed.source == "django-route")
             .collect()
+    }
+
+    #[test]
+    fn urls_route_source_matches_the_unfiltered_regex() {
+        let import_re = urls_import_regex().unwrap();
+        let leads = ["", " ", "\t", "x", "# ", "\"\"\"\n", "'''", "é "];
+        let heads = ["from ", "from\t", "import ", "fromdjango", "from é "];
+        let modules = [
+            "django.urls",
+            "django.conf.urls",
+            "django.url",
+            "django.conf.url",
+            "django.urlsx",
+            "django .urls",
+            "Django.urls",
+            "django.conf .urls",
+        ];
+        let tails = [
+            " import path",
+            "",
+            " ",
+            "x",
+            "é",
+            ".x",
+            " import\n",
+            "\"\"\"",
+        ];
+        let mut matched = 0;
+        for prelude in ["", "x = 1\n"] {
+            for lead in leads {
+                for head in heads {
+                    for module in modules {
+                        for tail in tails {
+                            let contents = format!("{prelude}{lead}{head}{module}{tail}\ny = 2\n");
+                            let source = route_source(&contents);
+                            let expected = import_re.is_match(&source).then_some(source);
+                            matched += usize::from(expected.is_some());
+                            assert_eq!(
+                                urls_route_source(&import_re, &contents),
+                                expected,
+                                "{contents:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(matched > 0);
+    }
+
+    #[test]
+    fn urls_import_forms_each_map_routes() {
+        let seeds = map(&[
+            (
+                "legacy.py",
+                "# Café\nfrom django.conf.urls import url\nurlpatterns = [url(r'^legacy/$', views.legacy)]\n",
+            ),
+            (
+                "modern.py",
+                "# naïve\nimport django.urls\nurlpatterns = [path('modern/', views.modern)]\n",
+            ),
+            (
+                "commented.py",
+                "# from django.urls import path\nurlpatterns = [path('commented/', views.commented)]\n",
+            ),
+        ]);
+        let mut routes: Vec<_> = seeds
+            .iter()
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        routes.sort_unstable();
+        assert_eq!(routes, ["/legacy/", "/modern/"], "{seeds:?}");
     }
 
     #[test]
