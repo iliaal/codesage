@@ -250,9 +250,12 @@ fn structural_row_emitting_tools_carry_handles() {
             assert!(row.get("from").is_none(), "omitted at file scope: {row}");
         } else {
             let from = assert_handle(row, "from", "sym:", "find_references");
-            assert_eq!(from, "sym:src/lib.rs#outer");
+            assert!(
+                from == "sym:src/lib.rs#outer" || from == "sym:tests/helper_test.rs#checks_inner",
+                "unexpected caller {from}: {row}"
+            );
             assert_eq!(row["to"], inner_handle, "{row}");
-            saw_caller = true;
+            saw_caller |= from == "sym:src/lib.rs#outer";
         }
     }
     assert!(saw_caller, "a call row from `outer`: {references}");
