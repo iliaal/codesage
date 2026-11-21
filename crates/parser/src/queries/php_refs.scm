@@ -113,3 +113,11 @@
   (enum_declaration (class_interface_clause [(name) (qualified_name) (relative_name)] @ref))
   (anonymous_class (class_interface_clause [(name) (qualified_name) (relative_name)] @ref))
 ]
+
+; Pattern 33: single-segment class import (use InvalidArgumentException;,
+; use Stringable as Text;): the imported name, not its alias, outside group
+; clauses and `use function` / `use const`. references.rs records it as
+; `\Name`, the global class it names.
+(namespace_use_declaration
+  !type
+  (namespace_use_clause !type . (name) @ref))

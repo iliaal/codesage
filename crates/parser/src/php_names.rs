@@ -125,6 +125,32 @@ fn alias_target(node: &Node, root: &Node, source: &[u8], alias: &str) -> Option<
     found
 }
 
+/// `(alias, fully qualified class)` for every class import in `source`, in
+/// any namespace block; `None` when `source` does not parse.
+pub fn file_class_imports(source: &[u8]) -> Option<Vec<(String, String)>> {
+    let tree = crate::parse::parse_file(source, codesage_protocol::Language::Php).ok()?;
+    let root = tree.root_node();
+    let mut imports = Vec::new();
+    let mut containers = vec![root];
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() == "namespace_definition"
+            && let Some(body) = child.child_by_field_name("body")
+        {
+            containers.push(body);
+        }
+    }
+    for container in containers {
+        let mut cursor = container.walk();
+        for child in container.children(&mut cursor) {
+            if child.kind() == "namespace_use_declaration" {
+                imports.extend(class_imports(&child, source));
+            }
+        }
+    }
+    Some(imports)
+}
+
 /// `(alias, fully qualified class)` for each class import in one `use`
 /// declaration, including group clauses.
 fn class_imports(declaration: &Node, source: &[u8]) -> Vec<(String, String)> {
@@ -240,6 +266,26 @@ mod tests {
                  use Lib\\{C, function D};\nnew A\\X(); new B\\Y(); new C\\Z(); new D\\W();\n"
             ),
             ["App\\A\\X", "App\\B\\Y", "Lib\\C\\Z", "App\\D\\W"]
+        );
+    }
+
+    #[test]
+    fn file_class_imports_lists_aliases_in_every_block() {
+        assert_eq!(
+            file_class_imports(
+                b"<?php\nnamespace One { use Lib\\Local\\Adapter as LocalAdapter; use Closure; }\n\
+                  namespace Two { use Lib\\{A, B as Bee}; use function Lib\\f; }\n"
+            )
+            .unwrap(),
+            [
+                (
+                    "LocalAdapter".to_string(),
+                    "Lib\\Local\\Adapter".to_string()
+                ),
+                ("Closure".to_string(), "Closure".to_string()),
+                ("A".to_string(), "Lib\\A".to_string()),
+                ("Bee".to_string(), "Lib\\B".to_string()),
+            ]
         );
     }
 

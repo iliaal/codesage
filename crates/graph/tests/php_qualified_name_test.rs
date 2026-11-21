@@ -9,7 +9,8 @@ fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, Database) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, source).unwrap();
     }
-    let db = Database::open_in_memory().unwrap();
+    std::fs::create_dir(root.path().join(".codesage")).unwrap();
+    let db = Database::open(&root.path().join(".codesage/index.db")).unwrap();
     let stats = full_index(root.path(), &db, &[], false).unwrap();
     assert_eq!(stats.files_indexed, files.len(), "{stats:?}");
     (root, db)
@@ -166,5 +167,116 @@ fn qualified_class_names_bind_case_insensitively() {
             "\\LEGACY".into(),
             Some("sym:Legacy.php#Legacy".to_string())
         )]
+    );
+}
+
+#[test]
+fn bare_class_names_bind_by_use_or_caller_namespace_not_by_uniqueness() {
+    let (_root, db) = project(&[
+        (
+            "A/Foo.php",
+            "<?php\nnamespace App\\A;\nclass Foo { public function __construct() {} }\n",
+        ),
+        (
+            "B/Caller.php",
+            "<?php\nnamespace App\\B;\nclass Caller { public function go() { return new Foo(); } }\n",
+        ),
+        (
+            "A/Sibling.php",
+            "<?php\nnamespace App\\A;\nclass Sibling extends Foo { public function go() { return new Foo(); } }\n",
+        ),
+        (
+            "Ctl/UsesFoo.php",
+            "<?php\nnamespace App\\Ctl;\nuse App\\A\\Foo;\nclass UsesFoo { public function go() { return new Foo(); } }\n",
+        ),
+        (
+            "Ctl/Other.php",
+            "<?php\nnamespace App\\A;\nuse Vendor\\Foo;\nclass Other { public function go() { return new Foo(); } }\n",
+        ),
+    ]);
+    assert_eq!(
+        impacted(&db, "App\\A\\Foo"),
+        ["A/Sibling.php", "Ctl/UsesFoo.php"]
+    );
+    assert_eq!(
+        impacted(&db, "sym:A/Foo.php#App\\A\\Foo\\__construct"),
+        ["A/Sibling.php", "Ctl/UsesFoo.php"]
+    );
+}
+
+#[test]
+fn a_global_use_names_the_global_class_over_a_namespaced_one() {
+    let (_root, db) = project(&[
+        (
+            "Testing/InvalidArgumentException.php",
+            "<?php\nnamespace App\\Testing;\nclass InvalidArgumentException extends \\Exception {}\n",
+        ),
+        (
+            "Auth/Gate.php",
+            "<?php\nnamespace App\\Auth;\nuse InvalidArgumentException;\nclass Gate { public function check() { throw new InvalidArgumentException('x'); } }\n",
+        ),
+        (
+            "Testing/Local.php",
+            "<?php\nnamespace App\\Testing;\nuse InvalidArgumentException;\nclass Local { public function check() { throw new InvalidArgumentException('x'); } }\n",
+        ),
+        (
+            "Testing/Plain.php",
+            "<?php\nnamespace App\\Testing;\nclass Plain { public function check() { throw new InvalidArgumentException('x'); } }\n",
+        ),
+    ]);
+    assert_eq!(
+        impacted(&db, "App\\Testing\\InvalidArgumentException"),
+        ["Testing/Plain.php"]
+    );
+    assert_eq!(
+        targets(&db, "\\InvalidArgumentException"),
+        [
+            (
+                "Auth/Gate.php".into(),
+                "\\InvalidArgumentException".into(),
+                None
+            ),
+            (
+                "Testing/Local.php".into(),
+                "\\InvalidArgumentException".into(),
+                None
+            ),
+        ]
+    );
+}
+
+#[test]
+fn same_named_classes_resolve_to_the_one_the_caller_namespace_names() {
+    let (_root, db) = project(&[
+        ("A/Foo.php", "<?php\nnamespace App\\A;\nclass Foo {}\n"),
+        ("B/Foo.php", "<?php\nnamespace App\\B;\nclass Foo {}\n"),
+        (
+            "B/Caller.php",
+            "<?php\nnamespace App\\B;\nclass Caller { public function go() { return new Foo(); } }\n",
+        ),
+    ]);
+    assert!(impacted(&db, "App\\A\\Foo").is_empty());
+    assert_eq!(impacted(&db, "App\\B\\Foo"), ["B/Caller.php"]);
+}
+
+#[test]
+fn a_renamed_use_leaves_its_last_segment_to_the_caller_namespace() {
+    let (_root, db) = project(&[
+        (
+            "Fs/LocalFilesystemAdapter.php",
+            "<?php\nnamespace Illuminate\\Filesystem;\nclass LocalFilesystemAdapter {}\n",
+        ),
+        (
+            "Fs/Manager.php",
+            "<?php\nnamespace Illuminate\\Filesystem;\nuse League\\Local\\LocalFilesystemAdapter as LocalAdapter;\nclass Manager { public function a() { return new LocalFilesystemAdapter(new LocalAdapter()); } }\n",
+        ),
+        (
+            "Fs/Plain.php",
+            "<?php\nnamespace Illuminate\\Filesystem;\nuse League\\Local\\LocalFilesystemAdapter;\nclass Plain { public function a() { return new LocalFilesystemAdapter(); } }\n",
+        ),
+    ]);
+    assert_eq!(
+        impacted(&db, "Illuminate\\Filesystem\\LocalFilesystemAdapter"),
+        ["Fs/Manager.php"]
     );
 }

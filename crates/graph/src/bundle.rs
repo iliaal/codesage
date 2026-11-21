@@ -966,6 +966,17 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
         language_admits(caller_file, caller_language, symbol)
             && reference_kind_admits(caller_file, kind, symbol)
     });
+    let mut php_bound = Vec::new();
+    if caller_language == Some(Language::Php) && !to_name.contains('\\') {
+        let classes;
+        (classes, all_candidates) = all_candidates
+            .into_iter()
+            .partition(|symbol| is_php_class_like(symbol));
+        php_bound = php_bare_class_bindings(db, caller_file, to_name, classes)?;
+        if all_candidates.is_empty() {
+            return Ok(php_bound);
+        }
+    }
     let total_candidates = all_candidates.len();
     let candidates: Vec<&Symbol> = all_candidates
         .into_iter()
@@ -1007,7 +1018,8 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
         }
     }
     if total_candidates <= 1 {
-        return Ok(owned(candidates));
+        php_bound.extend(owned(candidates));
+        return Ok(php_bound);
     }
     let import_refs = load_imports()?;
     let prepared: Vec<ImportRef<'_>> = import_refs.iter().map(|imp| ImportRef::new(imp)).collect();
@@ -1027,7 +1039,132 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
                     .any(|imp| prepared_import_targets_symbol(imp, importer, to_name, s, modules))
         })
         .collect();
-    Ok(owned(filtered))
+    php_bound.extend(owned(filtered));
+    Ok(php_bound)
+}
+
+fn is_php_class_like(symbol: &Symbol) -> bool {
+    matches!(
+        symbol.kind,
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Trait | SymbolKind::Enum
+    ) && codesage_parser::detect::detect_language(std::path::Path::new(&symbol.file_path))
+        == Some(Language::Php)
+}
+
+/// The PHP classes among `classes` that the bare class name `to_name` in
+/// `caller_file` names, by PHP's compile-time rule rather than name
+/// uniqueness: a `use` importing that name decides the class; without one,
+/// the name is the caller's namespace plus `to_name`. A class in the caller's
+/// own file always binds. A caller with no class, interface, trait, enum, or
+/// function definition has no known namespace, so only a `use` binds there.
+///
+/// Import rows carry no alias, so a `use` is matched by its last segment.
+/// When that import would refuse a class the namespace names, the caller's
+/// source decides whether the import is renamed (`use X\Foo as F;` leaves
+/// `Foo` to the namespace); unreadable source keeps the import's answer.
+fn php_bare_class_bindings(
+    db: &Database,
+    caller_file: &str,
+    to_name: &str,
+    classes: Vec<&Symbol>,
+) -> Result<Vec<Symbol>> {
+    if classes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names = |expected: &[String], class: &Symbol| {
+        expected
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&class.qualified_name))
+    };
+    let imported: Vec<String> = match db.file_id_for_path(caller_file)? {
+        Some(id) => db
+            .refs_outgoing_for_file_id(id)?
+            .into_iter()
+            .filter(|(name, kind)| {
+                *kind == ReferenceKind::Import
+                    && name
+                        .rsplit('\\')
+                        .next()
+                        .is_some_and(|tail| tail.eq_ignore_ascii_case(to_name))
+            })
+            .map(|(name, _)| name.trim_start_matches('\\').to_string())
+            .collect(),
+        None => Vec::new(),
+    };
+    let namespaced = php_names_in_caller_namespace(db, caller_file, to_name)?;
+    let expected = if imported.is_empty() {
+        namespaced
+    } else if classes
+        .iter()
+        .any(|class| names(&namespaced, class) && !names(&imported, class))
+    {
+        match php_source_class_imports(db, caller_file) {
+            Some(imports) => {
+                let aliased: Vec<String> = imports
+                    .into_iter()
+                    .filter(|(alias, _)| alias.eq_ignore_ascii_case(to_name))
+                    .map(|(_, target)| target)
+                    .collect();
+                if aliased.is_empty() {
+                    namespaced
+                } else {
+                    aliased
+                }
+            }
+            None => imported,
+        }
+    } else {
+        imported
+    };
+    Ok(classes
+        .into_iter()
+        .filter(|class| class.file_path == caller_file || names(&expected, class))
+        .cloned()
+        .collect())
+}
+
+/// `to_name` in each namespace that `caller_file`'s class-like and function
+/// definitions declare.
+fn php_names_in_caller_namespace(
+    db: &Database,
+    caller_file: &str,
+    to_name: &str,
+) -> Result<Vec<String>> {
+    let mut expected = Vec::new();
+    for symbol in db.symbols_for_file(caller_file)? {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Class
+                | SymbolKind::Interface
+                | SymbolKind::Trait
+                | SymbolKind::Enum
+                | SymbolKind::Function
+        ) {
+            continue;
+        }
+        let Some(namespace) = symbol.qualified_name.strip_suffix(symbol.name.as_str()) else {
+            continue;
+        };
+        let resolved = match namespace.strip_suffix('\\') {
+            Some(namespace) => format!("{namespace}\\{to_name}"),
+            None if namespace.is_empty() => to_name.to_string(),
+            None => continue,
+        };
+        if !expected.contains(&resolved) {
+            expected.push(resolved);
+        }
+    }
+    Ok(expected)
+}
+
+/// `(alias, class)` for every class `use` in `caller_file`'s source, or
+/// `None` when the index has no project root or the source cannot be read.
+fn php_source_class_imports(db: &Database, caller_file: &str) -> Option<Vec<(String, String)>> {
+    let root = crate::constructor_imports::project_root(db)?;
+    let source =
+        codesage_parser::source::read_indexable_file(root, std::path::Path::new(caller_file))
+            .ok()??;
+    codesage_parser::php_names::file_class_imports(&source.bytes)
 }
 
 /// Whether one of `import_refs` (the caller's import rows) names `symbol`

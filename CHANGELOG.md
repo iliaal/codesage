@@ -4,6 +4,11 @@
 
 - `codesage index` passes that parse more than 50 files take less time: a full structural pass over a 723-file project went from 4.80 s to 3.74 s median (-22% time) on 8 cores and from 6.07 s to 5.38 s (-11% time) on 2. Indexed rows are unchanged.
 
+### Fixed
+
+- `impact` and `find_references` bind a bare PHP class name only to the class its `use` or the caller's namespace names, never to a same-named class elsewhere because it is the only one indexed.
+- A single-segment PHP `use Name;` is recorded as an import of the global `\Name`; the next `codesage index` reparses existing files under `parser-queries=11`.
+
 ## [0.53.0] - 2026-11-14
 
 ### Added

@@ -176,6 +176,7 @@ fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         30 => Some(ReferenceKind::TypeHint),         // namespace\Rel\Thing type hint
         // interface / anonymous-class extends, enum / anonymous-class implements
         31 | 32 => Some(ReferenceKind::Inheritance),
+        33 => Some(ReferenceKind::Import), // use InvalidArgumentException;
         _ => None,
     }
 }
@@ -830,6 +831,7 @@ fn tree_references(
             }
             Language::Rust => rust_grouped_use_prefix(&ref_node, source)
                 .map_or_else(|| stripped.to_string(), |p| format!("{p}::{stripped}")),
+            Language::Php if p.pattern == 33 => format!("\\{stripped}"),
             Language::Php if kind != ReferenceKind::Import => {
                 crate::php_names::resolve_class_name(&ref_node, &root, source)
                     .unwrap_or_else(|| stripped.to_string())
