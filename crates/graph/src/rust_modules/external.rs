@@ -854,7 +854,7 @@ impl ExternalCrates {
             }),
             None => self.read(file),
         };
-        let mut surface = if let Some(source) = source
+        let surface = if let Some(source) = source
             && db.get_file_hash(file)?.as_deref() == Some(source.content_hash.as_str())
         {
             let parsed = parse_file_tolerant(&source.bytes, Language::Rust)?;
@@ -868,7 +868,8 @@ impl ExternalCrates {
                     )?;
                     result.module_items = module_item_positions(parsed.tree.root_node());
                     if caller {
-                        for row in db.references_in_file_range(file, 1, u32::MAX)? {
+                        let rows = db.references_in_file_range(file, 1, u32::MAX)?;
+                        for row in &rows {
                             codesage_protocol::work::checkpoint()?;
                             let position = tree_sitter::Point {
                                 row: row.line.saturating_sub(1) as usize,
@@ -883,7 +884,7 @@ impl ExternalCrates {
                                 if let Some(binding) = module_import_binding(
                                     parsed.tree.root_node(),
                                     &source.bytes,
-                                    &row,
+                                    row,
                                     &result.module_items,
                                 ) {
                                     result.import_bindings.insert((row.line, row.col), binding);
@@ -891,11 +892,31 @@ impl ExternalCrates {
                                 if import_namespace_proven(
                                     parsed.tree.root_node(),
                                     &source.bytes,
-                                    &row,
+                                    row,
                                 )? {
                                     result.proven_import_sites.insert((row.line, row.col));
                                 }
                             }
+                        }
+                        // Only a caller walk records uncertain ranges; this pass
+                        // reads the rows fetched above instead of querying again.
+                        if !result.uncertain_ranges.is_empty() {
+                            for reference in rows {
+                                let position = tree_sitter::Point {
+                                    row: reference.line.saturating_sub(1) as usize,
+                                    column: reference.col as usize,
+                                };
+                                // An invocation's macro path resolves before its own expansion,
+                                // but a rewriting attribute can still replace it.
+                                let invoked =
+                                    reference.kind == codesage_protocol::ReferenceKind::MacroCall;
+                                if result.uncertain_ranges.iter().any(|(start, end, scope)| {
+                                    *start <= position && position < *end && !(invoked && *scope)
+                                }) {
+                                    result.uncertain_names.insert(reference.to_name);
+                                }
+                            }
+                            result.uncertain_ranges.clear();
                         }
                     }
                     Ok::<_, anyhow::Error>(result)
@@ -904,25 +925,6 @@ impl ExternalCrates {
         } else {
             None
         };
-        if let Some(surface) = &mut surface
-            && !surface.uncertain_ranges.is_empty()
-        {
-            for reference in db.references_in_file_range(file, 1, u32::MAX)? {
-                let position = tree_sitter::Point {
-                    row: reference.line.saturating_sub(1) as usize,
-                    column: reference.col as usize,
-                };
-                // An invocation's macro path resolves before its own expansion,
-                // but a rewriting attribute can still replace it.
-                let invoked = reference.kind == codesage_protocol::ReferenceKind::MacroCall;
-                if surface.uncertain_ranges.iter().any(|(start, end, scope)| {
-                    *start <= position && position < *end && !(invoked && *scope)
-                }) {
-                    surface.uncertain_names.insert(reference.to_name);
-                }
-            }
-            surface.uncertain_ranges.clear();
-        }
         let surface = surface.map(Arc::new);
         self.sources.insert(key, surface.clone());
         Ok(surface)
@@ -1272,13 +1274,18 @@ fn surface(
     }
     // Each entry carries whether its parent is a nested node rather than
     // `node`; `Node::parent` re-walks the tree from the root on every call.
+    // `Node::kind` measures and validates the name on every call, and
+    // `child_by_field_name` scans the grammar's field names, so the walk
+    // reads each node's kind once and resolves the field id once.
+    let pattern_field = node.language().field_id_for_name("pattern");
     let mut pending: Vec<_> = node
         .named_children(&mut node.walk())
         .map(|item| (item, false))
         .collect();
     while let Some((item, nested)) = pending.pop() {
+        let kind = item.kind();
         if nested
-            && item.kind() == "use_declaration"
+            && kind == "use_declaration"
             && let Some(argument) = item.child_by_field_name("argument")
         {
             let mut bindings = Vec::new();
@@ -1287,10 +1294,10 @@ fn surface(
                 .shadowed
                 .extend(bindings.into_iter().map(|binding| binding.name));
         }
-        if nested && let Some(name) = declared_binding(item) {
+        if nested && let Some(name) = declared_binding_of(item, kind) {
             surface.shadowed.insert(text(name, bytes).into());
         }
-        if item.kind() == "use_wildcard" {
+        if kind == "use_wildcard" {
             let mut declaration = item.parent();
             while declaration.is_some_and(|parent| parent.kind() != "use_declaration") {
                 declaration = declaration.and_then(|parent| parent.parent());
@@ -1307,14 +1314,14 @@ fn surface(
                 (None, false) => surface.uncertain_glob = true,
             }
         }
-        if item.kind() == "macro_invocation"
+        if kind == "macro_invocation"
             && let Some(scope) = lexical_scope(item)
         {
             surface
                 .uncertain_ranges
                 .push((scope.start_position(), scope.end_position(), true));
         }
-        if item.kind() == "attribute_item" && attribute_can_rewrite(text(item, bytes)) {
+        if kind == "attribute_item" && attribute_can_rewrite(text(item, bytes)) {
             let mut next = item.next_named_sibling();
             while next.is_some_and(|node| {
                 node.kind() == "attribute_item" || node.kind().ends_with("comment")
@@ -1327,10 +1334,10 @@ fn surface(
                     .push((next.start_position(), next.end_position(), false));
             }
         }
-        if let Some(pattern) = item.child_by_field_name("pattern") {
+        if let Some(pattern) = pattern_field.and_then(|field| item.child_by_field_id(field.get())) {
             pattern_bindings(pattern, bytes, &mut surface.shadowed);
         }
-        if item.kind() == "closure_parameters" {
+        if kind == "closure_parameters" {
             for pattern in item
                 .named_children(&mut item.walk())
                 .filter(|child| child.kind() != "parameter")
@@ -1418,13 +1425,18 @@ fn text<'a>(node: Node<'_>, bytes: &'a [u8]) -> &'a str {
 }
 
 fn declared_binding(item: Node<'_>) -> Option<Node<'_>> {
-    if item.kind() == "extern_crate_declaration" {
+    declared_binding_of(item, item.kind())
+}
+
+/// [`declared_binding`] for a caller that already holds `item.kind()`.
+fn declared_binding_of<'tree>(item: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    if kind == "extern_crate_declaration" {
         return item
             .child_by_field_name("alias")
             .or_else(|| item.child_by_field_name("name"));
     }
     matches!(
-        item.kind(),
+        kind,
         "associated_type"
             | "const_item"
             | "const_parameter"
@@ -1717,5 +1729,44 @@ fn use_bindings(node: Node<'_>, bytes: &[u8], public: bool, out: &mut Vec<Use>) 
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The caller walk resolves the `pattern` field id once; it must find
+    /// the child `child_by_field_name("pattern")` finds, on every node of
+    /// this crate's own sources.
+    #[test]
+    fn pattern_field_id_finds_the_field_name_child() {
+        let mut files = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let (mut nodes, mut patterns) = (0, 0);
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let parsed = parse_file_tolerant(&bytes, Language::Rust).unwrap();
+            let root = parsed.tree.root_node();
+            let field = root.language().field_id_for_name("pattern").unwrap();
+            let mut pending = vec![root];
+            while let Some(node) = pending.pop() {
+                nodes += 1;
+                let by_name = node.child_by_field_name("pattern");
+                assert_eq!(node.child_by_field_id(field.get()), by_name, "{path:?}");
+                patterns += usize::from(by_name.is_some());
+                pending.extend(node.named_children(&mut node.walk()));
+            }
+        }
+        assert!(
+            nodes > 100_000 && patterns > 1_000,
+            "{nodes} nodes, {patterns} patterns"
+        );
     }
 }
