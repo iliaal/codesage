@@ -709,9 +709,10 @@ fn is_std_root(segment: &str) -> bool {
 
 /// Bare std macro names a file can rebind: a `macro_rules!` of that name, a
 /// `use` binding of that name not rooted at `std`, `core`, or `alloc`, or,
-/// for every name at once, a `#[macro_use]` attribute or a glob import from
-/// another crate. Crate-relative globs and macros reached through other files
-/// are not visible here.
+/// for every name at once, a `#[macro_use]` attribute or a glob of a crate
+/// root (`use other::*`) that is not a module the file declares.
+/// Crate-relative globs and macros reached through other files are not
+/// visible here.
 #[derive(Clone, Debug, Default)]
 pub struct RustStdMacroShadows {
     names: std::collections::HashSet<String>,
@@ -726,6 +727,8 @@ impl RustStdMacroShadows {
     }
 
     fn scan_into(&mut self, root: Node<'_>, source: &[u8]) {
+        let mut globs = Vec::new();
+        let mut modules = std::collections::HashSet::new();
         let mut cursor = root.walk();
         'walk: loop {
             let node = cursor.node();
@@ -746,9 +749,15 @@ impl RustStdMacroShadows {
                 }
                 "use_declaration" => {
                     if let Some(argument) = node.child_by_field_name("argument") {
-                        self.use_tree(argument, None, source);
+                        self.use_tree(argument, None, source, &mut globs);
                     }
                     false
+                }
+                "mod_item" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        modules.insert(crate::parse::node_text_lossy(&name, source));
+                    }
+                    true
                 }
                 "token_tree" => false,
                 _ => true,
@@ -762,6 +771,9 @@ impl RustStdMacroShadows {
                 }
             }
         }
+        if globs.iter().any(|root| !modules.contains(root)) {
+            self.all = true;
+        }
     }
 
     fn insert(&mut self, name: &str) {
@@ -770,7 +782,13 @@ impl RustStdMacroShadows {
         }
     }
 
-    fn use_tree(&mut self, node: Node<'_>, root: Option<&str>, source: &[u8]) {
+    fn use_tree(
+        &mut self,
+        node: Node<'_>,
+        root: Option<&str>,
+        source: &[u8],
+        globs: &mut Vec<String>,
+    ) {
         let first_segment = |node: &Node<'_>| {
             let text = crate::parse::node_text_lossy(node, source);
             text.trim_start_matches("::")
@@ -815,20 +833,27 @@ impl RustStdMacroShadows {
                     .unwrap_or_default();
                 let root = root.unwrap_or(head.as_str()).to_string();
                 if let Some(list) = node.child_by_field_name("list") {
-                    self.use_tree(list, Some(&root), source);
+                    self.use_tree(list, Some(&root), source, globs);
                 }
             }
             "use_list" => {
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
-                    self.use_tree(child, root, source);
+                    self.use_tree(child, root, source, globs);
                 }
             }
-            "use_wildcard" => {
-                let head = first_segment(&node);
-                let root = root.unwrap_or(head.as_str());
-                if !is_std_root(root) && !matches!(root, "crate" | "self" | "super" | "*") {
-                    self.all = true;
+            "use_wildcard" if root.is_none() => {
+                let text = crate::parse::node_text_lossy(&node, source);
+                let path = text
+                    .trim_start_matches("::")
+                    .trim_end_matches('*')
+                    .trim_end_matches("::");
+                let crate_root = !path.contains("::")
+                    && path.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                    && !is_std_root(path)
+                    && !matches!(path, "crate" | "self" | "super");
+                if crate_root {
+                    globs.push(path.to_string());
                 }
             }
             _ => {}
@@ -1889,6 +1914,12 @@ function later() { (function* () { require('./nested'); })().next(); }
         );
         assert!(calls("#[macro_use]\nmod m;\nfn f() { println!(\"{}\", e()); }\n").is_empty());
         assert!(calls("use other::*;\nfn f() { println!(\"{}\", e()); }\n").is_empty());
+        assert_eq!(
+            calls(
+                "mod params;\nuse params::*;\nuse rayon::prelude::*;\nuse Decision::*;\nfn f() { println!(\"{}\", h()); }\n"
+            ),
+            ["h"]
+        );
         assert_eq!(
             calls("use alloc::{vec, format};\nuse super::*;\nfn f() { let _ = vec![g()]; }\n"),
             ["g"]
