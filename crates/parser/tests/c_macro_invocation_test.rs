@@ -392,3 +392,23 @@ PHP_MINFO_FUNCTION(basic)
         ])
     );
 }
+
+#[test]
+fn a_dead_if_zero_arm_without_a_live_sibling_leaves_brace_tracking_unchanged() {
+    let source = "void before(void) {}
+#if 0
+void x(void) {
+#endif
+EXPORT_FUNC(PyA)
+int real(void) { return 0; }
+";
+    assert_eq!(
+        definitions(source, Language::C, "a.c"),
+        owned(&[("before", 1, 1), ("real", 6, 6)])
+    );
+    assert!(
+        calls(source, Language::C, "a.c")
+            .iter()
+            .any(|call| call.0 == "EXPORT_FUNC" && call.1 == 5)
+    );
+}

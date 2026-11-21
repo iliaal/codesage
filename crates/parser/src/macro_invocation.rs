@@ -382,7 +382,7 @@ impl<'a> Scan<'a> {
                     let current = std::mem::take(&mut self.frames);
                     let depth = group.start.len();
                     group.close_arm(current.clone());
-                    self.frames = group.first.unwrap_or(current);
+                    self.frames = group.first.unwrap_or(group.start);
                     if group.divergent {
                         self.suspended = Some(self.suspended.map_or(depth, |d| d.min(depth)));
                     }
