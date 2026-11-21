@@ -1278,6 +1278,8 @@ fn surface(
     // `child_by_field_name` scans the grammar's field names, so the walk
     // reads each node's kind once and resolves the field id once.
     let pattern_field = node.language().field_id_for_name("pattern");
+    let mut invocations = Vec::new();
+    let mut local_macros = HashSet::new();
     let mut pending: Vec<_> = node
         .named_children(&mut node.walk())
         .map(|item| (item, false))
@@ -1314,12 +1316,13 @@ fn surface(
                 (None, false) => surface.uncertain_glob = true,
             }
         }
-        if kind == "macro_invocation"
-            && let Some(scope) = lexical_scope(item)
+        if kind == "macro_invocation" {
+            invocations.push(item);
+        }
+        if kind == "macro_definition"
+            && let Some(name) = item.child_by_field_name("name")
         {
-            surface
-                .uncertain_ranges
-                .push((scope.start_position(), scope.end_position(), true));
+            local_macros.insert(text(name, bytes).to_string());
         }
         if kind == "attribute_item" && attribute_can_rewrite(text(item, bytes)) {
             let mut next = item.next_named_sibling();
@@ -1349,6 +1352,20 @@ fn surface(
             item.named_children(&mut item.walk())
                 .map(|child| (child, true)),
         );
+    }
+    // A std expression macro expands to an expression and binds nothing; the
+    // calls in its arguments are extracted as ordinary rows.
+    for invocation in invocations {
+        if !codesage_parser::references::is_rust_std_expression_macro(
+            invocation,
+            bytes,
+            &local_macros,
+        ) && let Some(scope) = lexical_scope(invocation)
+        {
+            surface
+                .uncertain_ranges
+                .push((scope.start_position(), scope.end_position(), true));
+        }
     }
     Ok(surface)
 }

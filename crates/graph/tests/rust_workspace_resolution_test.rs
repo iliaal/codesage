@@ -625,6 +625,8 @@ fn macro_invocations_that_can_change_the_callers_namespace_are_unresolved() {
         "macro_rules! shadow { () => { use other as api; } } shadow!(); fn main() { api::foo(); }",
         "macro_rules! shadow { () => { use other as api; } } fn main() { shadow!(); api::foo(); }",
         "#[rewrite] fn main() { api::foo(); }",
+        "macro_rules! assert { () => { use other as api; } } fn main() { assert!(); api::foo(); }",
+        "macro_rules! shadow { () => { use other as api; } } fn main() { shadow!(); assert!(api::foo() == ()); }",
     ];
     let mut false_edges = Vec::new();
     for caller in cases {
@@ -653,6 +655,48 @@ fn macro_invocations_that_can_change_the_callers_namespace_are_unresolved() {
     assert!(
         false_edges.is_empty(),
         "macro namespace edges: {false_edges:?}"
+    );
+}
+
+#[test]
+fn calls_inside_std_expression_macros_resolve_through_dependencies() {
+    let (_dir, db) = indexed(&[
+        ("Cargo.toml", "[workspace]\nmembers=['api','app']\n"),
+        (
+            "api/Cargo.toml",
+            "[package]\nname='api'\nversion='0.0.0'\nedition='2024'\n",
+        ),
+        (
+            "app/Cargo.toml",
+            "[package]\nname='app'\nversion='0.0.0'\nedition='2024'\n[dependencies]\napi={path='../api'}\n",
+        ),
+        (
+            "api/src/lib.rs",
+            "pub fn foo() -> i32 { 1 }\npub fn bar() -> i32 { 2 }\n",
+        ),
+        (
+            "app/src/main.rs",
+            "fn main() {\n    assert_eq!(api::foo(), 1);\n}\nfn other() {\n    let _v = std::vec![api::bar()];\n}\n",
+        ),
+    ]);
+    assert!(reaches(&db, "main", "sym:api/src/lib.rs#foo"));
+    assert!(reaches(&db, "other", "sym:api/src/lib.rs#bar"));
+    let refs = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "foo".into(),
+            kind: None,
+        },
+    )
+    .unwrap();
+    let rows: Vec<_> = refs
+        .results
+        .iter()
+        .map(|row| (row.from_file.as_str(), row.line, row.to.as_deref()))
+        .collect();
+    assert_eq!(
+        rows,
+        [("app/src/main.rs", 2, Some("sym:api/src/lib.rs#foo"))]
     );
 }
 

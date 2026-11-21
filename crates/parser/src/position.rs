@@ -3,7 +3,7 @@
 use tree_sitter::Node;
 
 /// Column at an absolute byte offset; invalid UTF-8 falls back to byte count.
-fn utf8_column_for_byte(source: &[u8], byte_offset: usize) -> u32 {
+pub(crate) fn utf8_column_for_byte(source: &[u8], byte_offset: usize) -> u32 {
     let byte_offset = byte_offset.min(source.len());
     let line_start = source[..byte_offset]
         .iter()

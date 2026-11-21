@@ -611,6 +611,22 @@ pub fn extract_references(
 ) -> Result<Vec<Reference>> {
     let dead = crate::preproc::DeadRegions::scan(tree.root_node(), source, language);
     let mut refs = tree_references(tree, source, language, file_path, &dead)?;
+    if language == Language::Rust {
+        let before = refs.len();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&crate::parse::ts_language(Language::Rust))?;
+        rust_macro_argument_refs(
+            tree.root_node(),
+            source,
+            file_path,
+            0,
+            &mut parser,
+            &mut refs,
+        )?;
+        if refs.len() > before {
+            refs.sort_by_key(|r| (r.line, r.col));
+        }
+    }
     if matches!(language, Language::C | Language::Cpp)
         && let Some(conditions) = crate::preproc_arms::blanked_conditions(source, &dead)
     {
@@ -638,6 +654,247 @@ pub fn extract_references(
         }
     }
     Ok(refs)
+}
+
+/// Nesting levels of std expression macros whose arguments are read; a
+/// call inside a deeper macro stays unindexed.
+const RUST_MACRO_ARGUMENT_DEPTH: usize = 4;
+const RUST_FRAGMENT_PREFIX: &str = "fn f(){(";
+const RUST_FRAGMENT_SUFFIX: &str = ");}";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RustMacroArguments {
+    All,
+    /// `vec![value; count]` separates its operands with `;`.
+    Repeat,
+    /// `matches!(scrutinee, pattern)`: the rest is a pattern, not expressions.
+    Scrutinee,
+}
+
+fn rust_std_expression_macro(name: &str) -> Option<RustMacroArguments> {
+    match name {
+        "format" | "write" | "writeln" | "print" | "println" | "eprint" | "eprintln" | "assert"
+        | "assert_eq" | "assert_ne" | "debug_assert" | "debug_assert_eq" | "debug_assert_ne"
+        | "panic" => Some(RustMacroArguments::All),
+        "vec" => Some(RustMacroArguments::Repeat),
+        "matches" => Some(RustMacroArguments::Scrutinee),
+        _ => None,
+    }
+}
+
+/// The argument mode of an invocation of an allowlisted std macro, spelled
+/// bare or through `std`, `core`, or `alloc`. A bare name the file
+/// redefines with `macro_rules!` is the local macro, whose input is opaque.
+fn rust_invocation_arguments(
+    invocation: Node,
+    source: &[u8],
+    local_macros: &std::collections::HashSet<String>,
+) -> Option<RustMacroArguments> {
+    let path = invocation.child_by_field_name("macro")?;
+    match path.kind() {
+        "identifier" => {
+            let name = crate::parse::node_text_lossy(&path, source);
+            if local_macros.contains(&name) {
+                return None;
+            }
+            rust_std_expression_macro(&name)
+        }
+        "scoped_identifier" => {
+            let prefix = crate::parse::node_text_lossy(&path.child_by_field_name("path")?, source);
+            let name = crate::parse::node_text_lossy(&path.child_by_field_name("name")?, source);
+            matches!(
+                prefix.as_str(),
+                "std" | "core" | "alloc" | "::std" | "::core" | "::alloc"
+            )
+            .then(|| rust_std_expression_macro(&name))
+            .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// Whether `invocation` is an allowlisted std expression macro whose
+/// arguments reference extraction reads. Such a macro expands to an
+/// expression and introduces no bindings; `local_macros` holds the
+/// `macro_rules!` names the file defines, which shadow a bare std name.
+pub fn is_rust_std_expression_macro(
+    invocation: Node<'_>,
+    source: &[u8],
+    local_macros: &std::collections::HashSet<String>,
+) -> bool {
+    rust_invocation_arguments(invocation, source, local_macros).is_some()
+}
+
+/// Byte ranges and starting rows of the top-level arguments of a macro's token tree.
+fn rust_macro_argument_ranges(
+    token_tree: Node,
+    mode: RustMacroArguments,
+) -> Vec<(usize, usize, usize)> {
+    let mut cursor = token_tree.walk();
+    let children: Vec<Node> = token_tree.children(&mut cursor).collect();
+    let mut ranges = Vec::new();
+    let mut segment: Option<(usize, usize, usize)> = None;
+    let inner = children
+        .get(1..children.len().saturating_sub(1))
+        .unwrap_or_default();
+    for child in inner {
+        let separator =
+            child.kind() == "," || (mode == RustMacroArguments::Repeat && child.kind() == ";");
+        if separator {
+            ranges.extend(segment.take());
+            if mode == RustMacroArguments::Scrutinee {
+                return ranges;
+            }
+        } else {
+            segment = Some(match segment {
+                Some((start, _, row)) => (start, child.end_byte(), row),
+                None => (
+                    child.start_byte(),
+                    child.end_byte(),
+                    child.start_position().row,
+                ),
+            });
+        }
+    }
+    ranges.extend(segment);
+    if mode == RustMacroArguments::Scrutinee {
+        ranges.truncate(1);
+    }
+    ranges
+}
+
+/// Whether `tree`, parsed from a fragment wrapped in `RUST_FRAGMENT_PREFIX`
+/// and `RUST_FRAGMENT_SUFFIX`, reads the fragment as exactly one expression.
+fn rust_fragment_is_one_expression(tree: &Tree, fragment_len: usize) -> bool {
+    let root = tree.root_node();
+    if root.has_error() || root.named_child_count() != 1 {
+        return false;
+    }
+    let Some(block) = root
+        .named_child(0)
+        .filter(|item| item.kind() == "function_item")
+        .and_then(|item| item.child_by_field_name("body"))
+    else {
+        return false;
+    };
+    if block.named_child_count() != 1 {
+        return false;
+    }
+    let Some(expression) = block
+        .named_child(0)
+        .filter(|statement| statement.kind() == "expression_statement")
+        .and_then(|statement| statement.named_child(0))
+    else {
+        return false;
+    };
+    expression.kind() == "parenthesized_expression"
+        && expression.start_byte() == RUST_FRAGMENT_PREFIX.len() - 1
+        && expression.end_byte() == RUST_FRAGMENT_PREFIX.len() + fragment_len + 1
+}
+
+/// Calls written inside the arguments of std expression macros, whose token
+/// trees the grammar leaves unparsed. Each argument is re-parsed on its own
+/// and read only when it is one error-free expression; rows keep their
+/// original line and column.
+fn rust_macro_argument_refs(
+    root: Node,
+    source: &[u8],
+    file_path: &str,
+    depth: usize,
+    parser: &mut tree_sitter::Parser,
+    refs: &mut Vec<Reference>,
+) -> Result<()> {
+    if depth >= RUST_MACRO_ARGUMENT_DEPTH {
+        return Ok(());
+    }
+    let mut invocations = Vec::new();
+    let mut local_macros = std::collections::HashSet::new();
+    let mut cursor = root.walk();
+    'walk: loop {
+        let node = cursor.node();
+        let descend = match node.kind() {
+            "macro_definition" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    local_macros.insert(crate::parse::node_text_lossy(&name, source));
+                }
+                false
+            }
+            "macro_invocation" => {
+                invocations.push(node);
+                false
+            }
+            "token_tree" | "attribute_item" | "inner_attribute_item" => false,
+            _ => true,
+        };
+        if descend && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    for invocation in invocations {
+        codesage_protocol::work::checkpoint()?;
+        let Some(mode) = rust_invocation_arguments(invocation, source, &local_macros) else {
+            continue;
+        };
+        let mut cursor = invocation.walk();
+        let Some(token_tree) = invocation
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "token_tree")
+        else {
+            continue;
+        };
+        for (start, end, row) in rust_macro_argument_ranges(token_tree, mode) {
+            let fragment = &source[start..end];
+            let mut wrapped = Vec::with_capacity(
+                RUST_FRAGMENT_PREFIX.len() + fragment.len() + RUST_FRAGMENT_SUFFIX.len(),
+            );
+            wrapped.extend_from_slice(RUST_FRAGMENT_PREFIX.as_bytes());
+            wrapped.extend_from_slice(fragment);
+            wrapped.extend_from_slice(RUST_FRAGMENT_SUFFIX.as_bytes());
+            let Some(tree) = parser.parse(&wrapped, None) else {
+                continue;
+            };
+            if !rust_fragment_is_one_expression(&tree, fragment.len()) {
+                continue;
+            }
+            let mut rows = tree_references(
+                &tree,
+                &wrapped,
+                Language::Rust,
+                file_path,
+                &crate::preproc::DeadRegions::default(),
+            )?;
+            rust_macro_argument_refs(
+                tree.root_node(),
+                &wrapped,
+                file_path,
+                depth + 1,
+                parser,
+                &mut rows,
+            )?;
+            let row_offset = row as u32;
+            let col = crate::position::utf8_column_for_byte(source, start);
+            let prefix_cols = RUST_FRAGMENT_PREFIX.len() as u32;
+            refs.extend(
+                rows.into_iter()
+                    .filter(|row| {
+                        matches!(row.kind, ReferenceKind::Call | ReferenceKind::MacroCall)
+                    })
+                    .map(|mut row| {
+                        if row.line == 1 {
+                            row.col = col + row.col.saturating_sub(prefix_cols);
+                        }
+                        row.line += row_offset;
+                        row
+                    }),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn tree_references(
@@ -1263,6 +1520,89 @@ function later() { (function* () { require('./nested'); })().next(); }
                 ("crate::format", ReferenceKind::Call, 7),
             ]
         );
+    }
+
+    fn rust_call_rows(source: &str) -> Vec<(String, ReferenceKind, u32, u32)> {
+        refs_from_source(source, Language::Rust)
+            .into_iter()
+            .filter(|reference| {
+                matches!(
+                    reference.kind,
+                    ReferenceKind::Call | ReferenceKind::MacroCall
+                )
+            })
+            .map(|reference| {
+                (
+                    reference.to_name,
+                    reference.kind,
+                    reference.line,
+                    reference.col,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rust_calls_inside_std_expression_macro_arguments_keep_their_positions() {
+        let rows = rust_call_rows(
+            "fn caller(s: &S) {\n    assert_eq!(compute(), 1);\n    let _v = vec![helper(2), s.method()];\n    println!(\"{}\", helper(3));\n    std::assert!(m::check(\n        helper(4)));\n    let _r = vec![helper(5); count()];\n    let _ = matches!(pick(), Some(x) if guard(x));\n    let é = format!(\"{}\", helper(6));\n    assert!(format!(\"{}\", nested()).is_empty());\n}\n",
+        );
+        let call = ReferenceKind::Call;
+        let mac = ReferenceKind::MacroCall;
+        let expected = [
+            ("assert_eq", mac, 2, 4),
+            ("compute", call, 2, 15),
+            ("vec", mac, 3, 13),
+            ("helper", call, 3, 18),
+            ("method", call, 3, 31),
+            ("println", mac, 4, 4),
+            ("helper", call, 4, 19),
+            ("std::assert", mac, 5, 4),
+            ("m::check", call, 5, 17),
+            ("helper", call, 6, 8),
+            ("vec", mac, 7, 13),
+            ("helper", call, 7, 18),
+            ("count", call, 7, 29),
+            ("matches", mac, 8, 12),
+            ("pick", call, 8, 21),
+            ("format", mac, 9, 12),
+            ("helper", call, 9, 26),
+            ("assert", mac, 10, 4),
+            ("format", mac, 10, 12),
+            ("nested", call, 10, 26),
+            ("is_empty", call, 10, 36),
+        ]
+        .map(|(name, kind, line, col)| (name.to_string(), kind, line, col));
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn rust_opaque_macro_input_produces_no_call_rows() {
+        let rows = rust_call_rows(
+            "macro_rules! dsl { ($e:expr) => { body_call($e) } }\nmacro_rules! assert { ($e:expr) => { println!(\"{}\", rule_call()) } }\nfn run() {\n    dsl!(user_call());\n    quote!(quoted_call());\n    stringify!(stringified_call());\n    cfg!(cfg_call());\n    assert!(shadowed_call());\n    crate::format!(\"{}\", crate_call());\n    core::assert!(qualified_call());\n    let _ = matches!(x, Some(pattern_call()));\n    println!(\"{}\", turbo::<A, B>());\n    println!(\"{}\", bad call(), split_call());\n}\n",
+        );
+        let names: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.1 == ReferenceKind::Call)
+            .map(|row| row.0.as_str())
+            .collect();
+        assert_eq!(names, ["qualified_call", "split_call"]);
+    }
+
+    #[test]
+    fn rust_macro_argument_nesting_is_bounded() {
+        let calls = |source: &str| -> Vec<String> {
+            rust_call_rows(source)
+                .into_iter()
+                .filter(|row| row.1 == ReferenceKind::Call)
+                .map(|row| row.0)
+                .collect()
+        };
+        assert_eq!(
+            calls("fn f() { vec![vec![vec![vec![four()]]]]; }\n"),
+            ["four"]
+        );
+        assert!(calls("fn f() { vec![vec![vec![vec![vec![five()]]]]]; }\n").is_empty());
     }
 
     #[test]
