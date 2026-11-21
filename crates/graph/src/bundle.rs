@@ -967,6 +967,7 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
         language_admits(caller_file, caller_language, symbol)
             && reference_kind_admits(caller_file, kind, symbol)
     });
+    let total_candidates = all_candidates.len();
     let mut php_bound = Vec::new();
     if caller_language == Some(Language::Php) && !to_name.contains('\\') {
         let classes;
@@ -982,7 +983,6 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
             return Ok(php_bound);
         }
     }
-    let total_candidates = all_candidates.len();
     let candidates: Vec<&Symbol> = all_candidates
         .into_iter()
         .filter(|s| {
@@ -1063,8 +1063,8 @@ fn is_php_class_like(symbol: &Symbol) -> bool {
 /// caller's namespace plus `to_name`. A class in the caller's own file always
 /// binds. The `use` clauses and namespaces come from the index's
 /// `php_names` rows, so a file changed or truncated on disk since indexing
-/// resolves as indexed. A file indexed before those rows existed falls back
-/// to its import rows (matched by last segment) and its definitions'
+/// resolves as indexed. A file not indexed under the current structural
+/// interpretation falls back to its import rows (matched by last segment) and its definitions'
 /// namespaces.
 fn php_bare_class_bindings(
     db: &Database,
@@ -1073,7 +1073,12 @@ fn php_bare_class_bindings(
     classes: Vec<&Symbol>,
     load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
 ) -> Result<Vec<Symbol>> {
-    let names = db.php_names_for_file(caller_file)?;
+    let names =
+        if db.file_interpretation_matches(caller_file, crate::index::STRUCTURAL_INTERPRETATION)? {
+            db.php_names_for_file(caller_file)?
+        } else {
+            Vec::new()
+        };
     let expected = if names.is_empty() {
         php_legacy_bare_class_names(db, caller_file, to_name, &load_imports()?)?
     } else {

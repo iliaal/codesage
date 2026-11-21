@@ -8,7 +8,7 @@
 ### Fixed
 
 - `impact` and `find_references` bind a bare PHP class name only to the class a class `use` with that alias, or the caller's namespace, names, not to a same-named class elsewhere because it is the only one indexed; a renamed `use X\Foo as F;` and `use function` no longer bind a bare `Foo`.
-- A single-segment PHP `use Name;` is recorded as an import of the global `\Name`, resolved by `dependencies` to an indexed global class and matched by trust-boundary rules; the next `codesage index` reparses existing files under `parser-queries=11;extraction=25`.
+- A single-segment PHP `use Name;` is recorded as an import of the global `\Name`, resolved by `dependencies` to an indexed global class (builtins such as `\Closure` and `\Exception` now appear under unresolved imports) and matched by trust-boundary rules; the next `codesage index` reparses existing files under `parser-queries=11;extraction=25`.
 
 ## [0.53.0] - 2026-11-14
 

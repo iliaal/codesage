@@ -1729,7 +1729,7 @@ impl Database {
                s.qualified_name = r.to_name
                OR (
                  f_from.language = 'php'
-                 AND r.to_name = '\\' || s.qualified_name
+                 AND r.to_name = '\\' || s.qualified_name COLLATE NOCASE
                  AND instr(s.qualified_name, '\\') = 0
                  AND s.kind IN ('class', 'interface', 'trait', 'enum')
                )

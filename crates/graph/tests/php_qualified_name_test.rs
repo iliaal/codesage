@@ -438,3 +438,74 @@ fn a_global_use_is_a_dependency_on_the_indexed_global_class() {
         ["B/Clos.php"]
     );
 }
+
+#[test]
+fn a_class_sharing_its_name_with_a_function_or_constant_keeps_both_ambiguous() {
+    let callers = [
+        (
+            "X/Caller.php",
+            "<?php\nnamespace App\\X;\nclass Caller { public function go() { Foo::build(); return new Foo(); } }\n",
+        ),
+        (
+            "Y/UsesIt.php",
+            "<?php\nnamespace App\\Y;\nuse App\\A\\Foo;\nclass UsesIt { public function go() { return new Foo(); } }\n",
+        ),
+    ];
+    for (other, handle) in [
+        (
+            ("helpers.php", "<?php\nfunction Foo() { return 1; }\n"),
+            "sym:helpers.php#Foo",
+        ),
+        (
+            (
+                "Enums/Store.php",
+                "<?php\nnamespace App\\Enums;\nenum Store { case Foo; }\n",
+            ),
+            "sym:Enums/Store.php#App\\Enums\\Store\\Foo",
+        ),
+    ] {
+        let (_root, db) = project(&[FOO, other, callers[0], callers[1]]);
+        assert!(impacted(&db, handle).is_empty(), "{handle}");
+        assert_eq!(instantiated_from(&db, "App\\A\\Foo"), ["Y/UsesIt.php"]);
+    }
+}
+
+#[test]
+fn a_file_rewritten_under_another_interpretation_ignores_its_php_name_rows() {
+    let (_root, db) = project(&[
+        FOO,
+        (
+            "N1/UseLead.php",
+            "<?php\nnamespace App\\N1;\nuse App\\A\\Foo;\nclass UseLead { public function go() { return new Foo(); } }\n",
+        ),
+    ]);
+    assert_eq!(instantiated_from(&db, "App\\A\\Foo"), ["N1/UseLead.php"]);
+    db.execute_raw_for_tests(
+        "DELETE FROM refs WHERE kind = 'import';
+         UPDATE files SET interpretation = 'older' WHERE path = 'N1/UseLead.php';",
+    )
+    .unwrap();
+    assert!(instantiated_from(&db, "App\\A\\Foo").is_empty());
+}
+
+#[test]
+fn a_lowercase_global_use_lists_the_importer_under_the_class_file() {
+    let (_root, db) = project(&[
+        (
+            "Exc.php",
+            "<?php\nclass InvalidArgumentException extends Exception {}\n",
+        ),
+        (
+            "B/Lower.php",
+            "<?php\nnamespace App\\B;\nuse invalidargumentexception;\nclass Lower {}\n",
+        ),
+    ]);
+    assert_eq!(
+        list_dependencies(&db, "B/Lower.php").unwrap().imports,
+        ["file:Exc.php"]
+    );
+    assert_eq!(
+        list_dependencies(&db, "Exc.php").unwrap().imported_by,
+        ["B/Lower.php"]
+    );
+}
