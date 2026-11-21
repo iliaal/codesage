@@ -252,7 +252,7 @@ impl WalkCache {
 
     /// Whether row `index` of `imports` loads `file`, as
     /// [`import_ref_targets_file_with_indexed`] decides it. Every frontier
-    /// file tests every row, so a `PathMatched` row's candidates are derived
+    /// file tests every `PathMatched` row, so a row's candidates are derived
     /// once per cache instead of once per frontier file.
     fn path_row_loads(
         &mut self,
@@ -610,7 +610,8 @@ impl WalkCache {
 }
 
 /// `file_import_references` rows with each importer's matcher shape read
-/// once, since a file-rooted walk tests every row against every frontier file.
+/// once, since a file-rooted walk tests each frontier file against every row
+/// [`FileImports::rows_to_match`] returns for it.
 #[derive(Debug, Default)]
 pub(crate) struct FileImports {
     rows: Vec<Reference>,
@@ -1182,7 +1183,9 @@ pub(crate) fn impact_analysis_walk_shared(
                 }
                 if cached_matches.is_none()
                     && match shape {
-                        FileImportShape::NoFile => true,
+                        FileImportShape::NoFile => {
+                            unreachable!("rows_to_match never returns a NoFile row")
+                        }
                         FileImportShape::PathMatched(_) => !cache
                             .as_deref_mut()
                             .expect("walk cache initialized")
