@@ -1992,6 +1992,7 @@ mod tests {
 
     fn make_reference(to_name: &str, kind: ReferenceKind) -> Reference {
         Reference {
+            macro_mask: 0,
             from_file: "test.php".to_string(),
             from_symbol: None,
             to_name: to_name.to_string(),

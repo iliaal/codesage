@@ -4,15 +4,14 @@
 
 - `codesage index` passes that parse more than 50 files take less time: a full structural pass over a 723-file project went from 4.80 s to 3.74 s median (-22% time) on 8 cores and from 6.07 s to 5.38 s (-11% time) on 2. Indexed rows are unchanged.
 - Schema migration `0035_php_names` adds a table of each PHP file's namespaces and `use` clauses; the first command that opens the index for writing creates it, and the next `codesage index` fills it.
+- Schema migration `0036_refs_macro_mask` adds a nullable `refs.macro_mask` column and index; `codesage index` fills it when it reparses Rust files.
 
 ### Fixed
 
 - `impact` and `find_references` bind a bare PHP class name only to the class a class `use` with that alias, or the caller's namespace, names, not to a same-named class elsewhere because it is the only one indexed; a renamed `use X\Foo as F;` and `use function` no longer bind a bare `Foo`.
-- A single-segment PHP `use Name;` is recorded as an import of the global `\Name`, resolved by `dependencies` to an indexed global class (builtins such as `\Closure` and `\Exception` now appear under unresolved imports) and matched by trust-boundary rules; the next `codesage index` reparses existing files under `parser-queries=11;extraction=25`.
-
-### Fixed
-
+- A single-segment PHP `use Name;` is recorded as an import of the global `\Name`, resolved by `dependencies` to an indexed global class (builtins such as `\Closure` and `\Exception` now appear under unresolved imports) and matched by trust-boundary rules.
 - Python imports under `if TYPE_CHECKING:` or `if typing.TYPE_CHECKING:` are marked `lazy` and no longer form import cycles in `risk`, `risk-diff`, `rehearse`, and `session-end` or reach tests in `tests-for`, MCP `recommend_tests`, and the `risk` test gap; `dependencies` and `impact` still list them.
+- Rust calls inside the arguments of std expression macros (`assert_eq!`, `format!`, `println!`, `vec!`, the `matches!` scrutinee, and the rest of the `format`/`write`/`print`/`assert`/`panic` family) produce reference rows that bind in `find-references`, `impact`, and `tests-for`, and no longer leave external-crate calls in the same block unresolved; reindex to pick them up.
 
 ## [0.53.0] - 2026-11-14
 

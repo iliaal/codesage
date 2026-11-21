@@ -884,6 +884,9 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
     modules: &crate::rust_modules::RustModules,
     kind: Option<ReferenceKind>,
 ) -> Result<Vec<Symbol>> {
+    if caller_file.ends_with(".rs") && modules.macro_shadowed(db, caller_file, to_name)? {
+        return Ok(Vec::new());
+    }
     if caller_file.ends_with(".rs")
         && let Some(mut resolved) = modules.external_definitions(db, caller_file, to_name)?
     {
@@ -3142,6 +3145,7 @@ mod context_export_tests {
 
     fn reference(to_name: &str, file_path: &str) -> Reference {
         Reference {
+            macro_mask: 0,
             from_file: file_path.to_string(),
             from_symbol: None,
             to_name: to_name.to_string(),
@@ -3168,6 +3172,7 @@ mod context_export_tests {
             })
             .unwrap();
         let mk = |to: &str, kind| Reference {
+            macro_mask: 0,
             from_file: "app/a.php".to_string(),
             from_symbol: None,
             to_name: to.to_string(),

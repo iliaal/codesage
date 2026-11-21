@@ -373,6 +373,10 @@ fn attach_handles(
         // Trivially same-file: the sole definition, spelled as it is defined.
         if let Some(only) = sole_definition
             && only.file_path == row.from_file
+            && !(row.from_file.ends_with(".rs")
+                && caches
+                    .modules(db)?
+                    .macro_shadowed(db, &row.from_file, &row.to_name)?)
             && spelling_names(&row.to_name, only)
             && crate::bundle::reference_kind_admits(&row.from_file, Some(row.kind), only)
         {
@@ -938,6 +942,7 @@ mod tests {
 
     fn reference(to_name: &str, file_path: &str) -> Reference {
         Reference {
+            macro_mask: 0,
             from_file: file_path.to_string(),
             from_symbol: None,
             to_name: to_name.to_string(),
@@ -960,6 +965,7 @@ mod tests {
         kind: ReferenceKind,
     ) -> Reference {
         Reference {
+            macro_mask: 0,
             lazy: false,
             type_checking: false,
             from_file: file_path.to_string(),

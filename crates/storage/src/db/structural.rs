@@ -106,7 +106,7 @@ fn import_include_refs_all_sql() -> String {
 
 fn file_import_references_sql() -> String {
     format!(
-        "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
+        "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}, r.macro_mask
          FROM refs r JOIN files f ON r.from_file_id = f.id
          WHERE r.kind IN {IMPORT_EDGE_KINDS_SQL} AND r.kind IN ('import', 'include')
          ORDER BY f.path, r.line, r.col, r.to_name"
@@ -475,8 +475,8 @@ impl Database {
 
     pub fn insert_references(&self, file_id: i64, refs: &[Reference]) -> Result<()> {
         let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO refs (from_file_id, from_symbol, to_name, to_name_tail, kind, line, col, lazy)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO refs (from_file_id, from_symbol, to_name, to_name_tail, kind, line, col, lazy, macro_mask)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
 
         for r in refs {
@@ -489,6 +489,7 @@ impl Database {
                 r.line,
                 r.col,
                 lazy_column(r),
+                (r.macro_mask != 0).then_some(i64::from(r.macro_mask)),
             ])?;
         }
         Ok(())
@@ -911,7 +912,7 @@ impl Database {
             // PHP names are case-insensitive; see `idx_refs_php_name_nocase`.
             self.query_refs(
                 &format!(
-                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
+                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}, r.macro_mask
                  FROM refs r JOIN files f ON r.from_file_id = f.id
                  WHERE r.to_name = ?1 COLLATE NOCASE AND {}",
                 crate::schema::PHP_QUALIFIED_REF_SQL
@@ -921,7 +922,7 @@ impl Database {
         } else if is_qualified {
             self.query_refs(
                 &format!(
-                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
+                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}, r.macro_mask
                  FROM refs r JOIN files f ON r.from_file_id = f.id
                  WHERE r.to_name = ?1"
             ),
@@ -930,7 +931,7 @@ impl Database {
         } else {
             self.query_refs(
                 &format!(
-                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
+                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}, r.macro_mask
                  FROM refs r JOIN files f ON r.from_file_id = f.id
                  WHERE r.to_name_tail = ?1 OR r.to_name = ?1"
             ),
@@ -952,7 +953,7 @@ impl Database {
     ) -> Result<Vec<Reference>> {
         self.query_refs(
             &format!(
-                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}
+                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy, {REF_IS_TEST_SQL}, r.macro_mask
              FROM refs r JOIN files f ON r.from_file_id = f.id
              WHERE f.path = ?1 AND r.line BETWEEN ?2 AND ?3
              ORDER BY r.line, r.col"
@@ -961,8 +962,24 @@ impl Database {
         )
     }
 
+    /// Whether `refs.macro_mask` exists; an index older than migration
+    /// `0036_refs_macro_mask` opened read-only lacks it.
+    fn has_ref_macro_mask(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('refs') WHERE name = 'macro_mask')",
+            )?
+            .query_row([], |row| row.get(0))?)
+    }
+
     fn query_refs(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Reference>> {
-        let mut stmt = self.conn.prepare_cached(sql)?;
+        let sql = if self.has_ref_macro_mask()? {
+            std::borrow::Cow::Borrowed(sql)
+        } else {
+            std::borrow::Cow::Owned(sql.replacen(", r.macro_mask\n", ", NULL\n", 1))
+        };
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params, |row| {
             let kind_str: String = row.get(3)?;
             Ok(Reference {
@@ -977,6 +994,9 @@ impl Database {
                 to: None,
                 from_line: None,
                 is_test: row.get::<_, i64>(7)? != 0,
+                macro_mask: row
+                    .get::<_, Option<i64>>(8)?
+                    .map_or(0, |mask| u16::try_from(mask).unwrap_or(u16::MAX)),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1061,6 +1081,7 @@ impl Database {
         let mut pairs = BTreeMap::new();
         for (from, module, line, col, lazy) in rows {
             let row = Reference {
+                macro_mask: 0,
                 from_file: from.clone(),
                 from_symbol: None,
                 to_name: module,
@@ -1166,6 +1187,7 @@ impl Database {
         let mut pending: Vec<_> = sites
             .iter()
             .map(|site| Reference {
+                macro_mask: 0,
                 from_file: site.file.clone(),
                 from_symbol: None,
                 to_name: site.to_name.clone(),
@@ -2086,6 +2108,31 @@ impl Database {
         &self,
         names: &[String],
     ) -> Result<std::collections::HashMap<String, u32>> {
+        self.reference_counts_for_names_excluding(names, &[])
+    }
+
+    /// Paths of files holding a reference whose `macro_mask` shares a bit
+    /// with `mask`.
+    pub fn files_with_macro_mask(&self, mask: u16) -> Result<Vec<String>> {
+        if !self.has_ref_macro_mask()? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT f.path FROM refs r JOIN files f ON f.id = r.from_file_id
+             WHERE r.macro_mask IS NOT NULL AND (r.macro_mask & ?1) <> 0
+             ORDER BY f.path",
+        )?;
+        let rows = stmt.query_map(params![i64::from(mask)], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// [`Self::reference_counts_for_names`] without the rows of each
+    /// `(path, mask)` file whose `macro_mask` shares a bit with `mask`.
+    pub fn reference_counts_for_names_excluding(
+        &self,
+        names: &[String],
+        shadowed: &[(String, u16)],
+    ) -> Result<std::collections::HashMap<String, u32>> {
         use std::collections::HashMap;
         let mut out: HashMap<String, u32> = HashMap::with_capacity(names.len());
         if names.is_empty() {
@@ -2098,14 +2145,33 @@ impl Database {
         // Count (name, file, line) sites: an import's module and binding can both
         // name the same symbol at different columns. Omitting column avoids that
         // double count but also collapses multiple real calls on one line.
+        let shadowed = if shadowed.is_empty() || !self.has_ref_macro_mask()? {
+            &[][..]
+        } else {
+            shadowed
+        };
+        let shadow_json = serde_json::to_string(shadowed)?;
+        let (with, keep) = if shadowed.is_empty() {
+            (String::new(), String::new())
+        } else {
+            (
+                format!(
+                    "WITH shadow(path, mask) AS (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?{})) ",
+                    names.len() + 1
+                ),
+                " AND NOT EXISTS (SELECT 1 FROM shadow s JOIN files sf ON sf.path = s.path
+                    WHERE sf.id = refs.from_file_id AND (COALESCE(refs.macro_mask, 0) & s.mask) <> 0)"
+                    .to_string(),
+            )
+        };
         let sql = format!(
-            "SELECT name, COUNT(*) AS c FROM (
+            "{with}SELECT name, COUNT(*) AS c FROM (
                 SELECT DISTINCT name, from_file_id, line FROM (
                     SELECT to_name AS name, from_file_id, line FROM refs
-                    WHERE to_name IN ({ph})
+                    WHERE to_name IN ({ph}){keep}
                     UNION ALL
                     SELECT to_name_tail AS name, from_file_id, line FROM refs
-                    WHERE to_name_tail IN ({ph}) AND to_name_tail <> to_name
+                    WHERE to_name_tail IN ({ph}) AND to_name_tail <> to_name{keep}
                 )
             ) GROUP BY name",
             ph = placeholders.join(",")
@@ -2113,10 +2179,13 @@ impl Database {
         let mut stmt = self.conn.prepare(&sql)?;
         // Bind the same name list once: SQLite reuses the param indices across
         // both halves of the UNION because we use positional `?N` references.
-        let params: Vec<&dyn rusqlite::types::ToSql> = names
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = names
             .iter()
             .map(|p| p as &dyn rusqlite::types::ToSql)
             .collect();
+        if !shadowed.is_empty() {
+            params.push(&shadow_json);
+        }
         let rows = stmt.query_map(params.as_slice(), |row| {
             let name: String = row.get(0)?;
             let c: i64 = row.get(1)?;
@@ -2372,6 +2441,7 @@ mod tests {
         };
         let id = db.upsert_file(&file).unwrap();
         let row = Reference {
+            macro_mask: 0,
             from_file: file.path.clone(),
             from_symbol: Some("run".into()),
             to_name: "patch".into(),

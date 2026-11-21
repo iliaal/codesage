@@ -49,6 +49,41 @@ pub(crate) struct RustModules {
     reexports: Mutex<HashMap<String, Arc<HashSet<String>>>>,
 }
 
+/// [`RustModules::shadowed_reference_files`] for a request that holds no
+/// module map; empty without loading one when no indexed Rust `macro_rules!`
+/// carries an allowlisted std name.
+pub(crate) fn shadowed_reference_files(db: &Database) -> Result<Vec<(String, u16)>> {
+    let mut any = false;
+    for name in codesage_parser::references::rust_std_expression_macro_names() {
+        if db
+            .find_symbols(name, Some(SymbolKind::Macro))?
+            .iter()
+            .any(|symbol| symbol.file_path.ends_with(".rs"))
+        {
+            any = true;
+            break;
+        }
+    }
+    if !any {
+        return Ok(Vec::new());
+    }
+    RustModules::load(db)?.shadowed_reference_files(db)
+}
+
+/// Whether two files share a crate root in `modules`; `None` when either
+/// file has no known module context.
+fn same_crate_in(modules: &HashMap<String, Vec<Module>>, left: &str, right: &str) -> Option<bool> {
+    let left = modules.get(left)?;
+    let right = modules.get(right)?;
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+    Some(
+        left.iter()
+            .any(|a| right.iter().any(|b| a.root_file == b.root_file)),
+    )
+}
+
 #[derive(Default)]
 pub(crate) struct RustImportEvidence {
     pub bindings: HashMap<(u32, u32), String>,
@@ -109,6 +144,38 @@ impl RustModules {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .is_some_and(|external| external.capped)
+    }
+
+    /// Files whose argument-derived rows a `macro_rules!` in their own crate
+    /// can shadow, each with the shadowing `macro_mask` bits.
+    pub(crate) fn shadowed_reference_files(&self, db: &Database) -> Result<Vec<(String, u16)>> {
+        let mut external = self
+            .external
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        external
+            .get_or_insert_with(|| external::ExternalCrates::new(db, &self.modules))
+            .shadowed_reference_files(db)
+    }
+
+    /// Whether name-based binding must leave `spelling` in `caller` unbound;
+    /// see `ExternalCrates::macro_shadowed`.
+    pub(crate) fn macro_shadowed(
+        &self,
+        db: &Database,
+        caller: &str,
+        spelling: &str,
+    ) -> Result<bool> {
+        if !caller.ends_with(".rs") {
+            return Ok(false);
+        }
+        let mut external = self
+            .external
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        external
+            .get_or_insert_with(|| external::ExternalCrates::new(db, &self.modules))
+            .macro_shadowed(db, caller, spelling)
     }
 
     pub(crate) fn external_definitions(
@@ -480,15 +547,7 @@ impl RustModules {
         if self.capped {
             return None;
         }
-        let left = self.modules.get(left)?;
-        let right = self.modules.get(right)?;
-        if left.is_empty() || right.is_empty() {
-            return None;
-        }
-        Some(
-            left.iter()
-                .any(|a| right.iter().any(|b| a.root_file == b.root_file)),
-        )
+        same_crate_in(&self.modules, left, right)
     }
 
     pub(crate) fn module_contains(&self, definition: &str, caller: &str) -> Option<bool> {

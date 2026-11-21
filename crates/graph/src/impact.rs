@@ -1905,6 +1905,7 @@ mod tests {
     #[test]
     fn path_row_candidates_keep_walks_with_and_without_rust_modules_apart() {
         let row = Reference {
+            macro_mask: 0,
             from_file: "src/nested/child.rs".to_string(),
             from_symbol: None,
             to_name: "crate::api".to_string(),
@@ -2097,6 +2098,7 @@ mod tests {
     #[test]
     fn path_row_candidates_are_charged_to_the_import_target_budget() {
         let row = |from_file: &str, to_name: &str| Reference {
+            macro_mask: 0,
             from_file: from_file.to_string(),
             from_symbol: None,
             to_name: to_name.to_string(),
@@ -2917,6 +2919,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, n)| Reference {
+                macro_mask: 0,
                 from_file: "Caller.php".to_string(),
                 from_symbol: None,
                 to_name: n.clone(),
@@ -2934,6 +2937,7 @@ mod tests {
         // different column: distinct rows, the same edge.
         for (i, n) in names.iter().enumerate().take(5) {
             refs.push(Reference {
+                macro_mask: 0,
                 from_file: "Caller.php".to_string(),
                 from_symbol: None,
                 to_name: n.clone(),

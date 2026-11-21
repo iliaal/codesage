@@ -951,6 +951,7 @@ mod tests {
                 db.insert_references(
                     id,
                     &[Reference {
+                        macro_mask: 0,
                         from_file: path,
                         from_symbol: Some(name),
                         to_name: "pay0".to_string(),

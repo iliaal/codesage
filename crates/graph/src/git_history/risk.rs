@@ -3081,6 +3081,7 @@ mod tests {
         )
         .unwrap();
         let imp = |from: &str, to: &str| Reference {
+            macro_mask: 0,
             from_line: None,
             is_test: false,
             to: None,
@@ -3172,6 +3173,7 @@ mod tests {
         db.insert_symbols(ids("lone.php"), &[sym("Lone", "App\\Lone", "lone.php")])
             .unwrap();
         let imp = |from: &str, to: &str| Reference {
+            macro_mask: 0,
             from_file: from.to_string(),
             from_symbol: None,
             to_name: to.to_string(),

@@ -225,6 +225,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0033_js_aliases",
         "0034_php_nocase_lookups",
         "0035_php_names",
+        "0036_refs_macro_mask",
     ];
     for migration in expected_migrations {
         let count: i64 = conn
@@ -256,6 +257,120 @@ fn fresh_db_records_migrations_exactly_once() {
         expected_migrations.len() as i64,
         "second init_db must not re-apply migrations"
     );
+}
+
+#[test]
+fn a_053_index_gains_a_nullable_macro_mask_and_keeps_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let conn = Connection::open(&path).unwrap();
+    init_db(&conn).unwrap();
+    conn.execute_batch(
+        "DROP INDEX idx_refs_macro_mask;
+         ALTER TABLE refs DROP COLUMN macro_mask;
+         DELETE FROM schema_migrations WHERE name = '0036_refs_macro_mask';
+         INSERT INTO files (id, path, language, content_hash) VALUES (1, 'src/lib.rs', 'rust', 'h');
+         INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col)
+         VALUES (1, 'helper', 'helper', 'call', 3, 4);",
+    )
+    .unwrap();
+    drop(conn);
+    let db = codesage_storage::Database::open(&path).unwrap();
+    let rows = db
+        .references_in_file_range("src/lib.rs", 1, u32::MAX)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].to_name.as_str(), rows[0].macro_mask),
+        ("helper", 0)
+    );
+    drop(db);
+    let conn = Connection::open(&path).unwrap();
+    let mask: Option<i64> = conn
+        .query_row("SELECT macro_mask FROM refs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mask, None);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = '0036_refs_macro_mask'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
+    let index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_refs_macro_mask'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index, 1);
+}
+
+#[test]
+fn a_pre_0036_index_opened_read_only_reads_references_without_masks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let conn = Connection::open(&path).unwrap();
+    init_db(&conn).unwrap();
+    conn.execute_batch(
+        "DROP INDEX idx_refs_macro_mask;
+         ALTER TABLE refs DROP COLUMN macro_mask;
+         DELETE FROM schema_migrations WHERE name = '0036_refs_macro_mask';
+         INSERT INTO files (id, path, language, content_hash) VALUES (1, 'src/lib.rs', 'rust', 'h');
+         INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col)
+         VALUES (1, 'helper', 'helper', 'call', 3, 4);",
+    )
+    .unwrap();
+    drop(conn);
+    let db = codesage_storage::Database::open_read_only(&path).unwrap();
+    let rows = db
+        .references_in_file_range("src/lib.rs", 1, u32::MAX)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].macro_mask, 0);
+    assert_eq!(db.find_references("helper", None).unwrap().len(), 1);
+    assert!(db.files_with_macro_mask(u16::MAX).unwrap().is_empty());
+    let counts = db
+        .reference_counts_for_names_excluding(
+            &["helper".to_string()],
+            &[("src/lib.rs".to_string(), u16::MAX)],
+        )
+        .unwrap();
+    assert_eq!(counts["helper"], 1);
+}
+
+#[test]
+fn reference_counts_exclude_masked_rows_for_any_number_of_shadowed_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = codesage_storage::Database::open(&path).unwrap();
+    drop(db);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "INSERT INTO files (id, path, language, content_hash) VALUES (1, 'src/a.rs', 'rust', 'h');
+         INSERT INTO files (id, path, language, content_hash) VALUES (2, 'src/b.rs', 'rust', 'h');
+         INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col, macro_mask)
+         VALUES (1, 'helper', 'helper', 'call', 3, 4, 128);
+         INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col, macro_mask)
+         VALUES (2, 'helper', 'helper', 'call', 3, 4, 128);",
+    )
+    .unwrap();
+    drop(conn);
+    let db = codesage_storage::Database::open(&path).unwrap();
+    let mut shadowed: Vec<(String, u16)> = (0..20_000)
+        .map(|n| (format!("src/other{n}.rs"), 128))
+        .collect();
+    shadowed.push(("src/a.rs".to_string(), 128));
+    let counts = db
+        .reference_counts_for_names_excluding(&["helper".to_string()], &shadowed)
+        .unwrap();
+    assert_eq!(counts["helper"], 1);
+    let counts = db
+        .reference_counts_for_names_excluding(&["helper".to_string()], &[("src/a.rs".into(), 1)])
+        .unwrap();
+    assert_eq!(counts["helper"], 2);
 }
 
 #[test]
@@ -1039,6 +1154,7 @@ fn sample_symbol() -> codesage_protocol::Symbol {
 
 fn sample_reference(kind: codesage_protocol::ReferenceKind) -> codesage_protocol::Reference {
     codesage_protocol::Reference {
+        macro_mask: 0,
         from_file: "src/sample.rs".to_string(),
         from_symbol: None,
         to_name: "bar".to_string(),

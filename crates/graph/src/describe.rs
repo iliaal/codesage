@@ -407,7 +407,10 @@ impl Builder<'_> {
     fn symbols(&mut self, path: &str) -> Result<Value> {
         let mut symbols = self.db.symbols_for_file(path)?;
         let names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
-        let counts = self.db.reference_counts_for_names(&names)?;
+        let counts = self.db.reference_counts_for_names_excluding(
+            &names,
+            &crate::rust_modules::shadowed_reference_files(self.db)?,
+        )?;
         symbols.sort_by(|a, b| {
             counts
                 .get(&b.name)
@@ -649,7 +652,7 @@ impl Builder<'_> {
         self.section("hotness", self.expansion("describe", json!({"target": Handle::file(&symbol.file_path).map(|h| h.to_string()), "detail": "full", "sections": ["symbols"]})), budget, |b| {
             let symbols = b.db.symbols_for_file(&symbol.file_path)?;
             let names = symbols.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
-            let counts = b.db.reference_counts_for_names(&names)?;
+            let counts = b.db.reference_counts_for_names_excluding(&names, &crate::rust_modules::shadowed_reference_files(b.db)?)?;
             let fan_in = counts.get(&symbol.name).copied().unwrap_or(0);
             let rank = 1 + symbols.iter().filter(|s| counts.get(&s.name).copied().unwrap_or(0) > fan_in).count();
             Ok(json!({"rank_in_file": rank, "symbols": symbols.len(), "fan_in": fan_in, "counts_floor": true}))
@@ -736,7 +739,7 @@ impl Builder<'_> {
             let symbols_by_file = b.db.symbols_for_files(&paths)?;
             let names = symbols_by_file.values().flatten().map(|symbol| symbol.name.clone()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
             let mut counts = HashMap::new();
-            for batch in names.chunks(500) { counts.extend(b.db.reference_counts_for_names(batch)?); }
+            let shadowed = crate::rust_modules::shadowed_reference_files(b.db)?; for batch in names.chunks(500) { counts.extend(b.db.reference_counts_for_names_excluding(batch, &shadowed)?); }
             let mut rows = Vec::new();
             for (path, symbols) in symbols_by_file {
                 let names = symbols.iter().map(|s| &s.name).collect::<BTreeSet<_>>();

@@ -1484,6 +1484,7 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
     .unwrap();
 
     let mk_ref = |to: &str, line: u32| Reference {
+        macro_mask: 0,
         from_file: "caller.rs".into(),
         from_symbol: None,
         to_name: to.into(),
@@ -1583,6 +1584,7 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
     // Calls to the smallest symbol distinguish ref-count ranking from length alone.
     let refs: Vec<Reference> = (0..30)
         .map(|i| Reference {
+            macro_mask: 0,
             from_file: "caller.rs".into(),
             from_symbol: None,
             to_name: "sym_00".into(),
@@ -1723,6 +1725,7 @@ mod resolution_fixture {
         line: u32,
     ) -> Reference {
         Reference {
+            macro_mask: 0,
             from_file: from_file.into(),
             from_symbol: from_symbol.map(str::to_string),
             to_name: to_name.into(),
