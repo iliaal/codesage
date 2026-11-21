@@ -1,4 +1,4 @@
-use codesage_graph::{find_references, full_index, impact_analysis};
+use codesage_graph::{find_references, full_index, impact_analysis, list_dependencies};
 use codesage_protocol::{FindReferencesRequest, ImpactRequest, ImpactTarget};
 use codesage_storage::Database;
 
@@ -29,6 +29,31 @@ fn impacted(db: &Database, target: &str) -> Vec<String> {
     )
     .unwrap()
     .into_iter()
+    .map(|entry| entry.file_path)
+    .collect();
+    files.sort();
+    files
+}
+
+fn instantiated_from(db: &Database, target: &str) -> Vec<String> {
+    let mut files: Vec<String> = impact_analysis(
+        db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: target.into(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap()
+    .into_iter()
+    .filter(|entry| {
+        entry
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == codesage_protocol::ReferenceKind::Instantiation)
+    })
     .map(|entry| entry.file_path)
     .collect();
     files.sort();
@@ -320,4 +345,96 @@ fn a_file_without_definitions_resolves_in_the_namespace_its_source_declares() {
     ]);
     assert_eq!(impacted(&db, "Legacy"), ["bin/script.php"]);
     assert_eq!(impacted(&db, "App\\A\\Foo"), ["bin/imports.php"]);
+}
+
+#[test]
+fn a_renamed_or_function_use_does_not_decide_the_name_it_renames_away_from() {
+    let (_root, db) = project(&[
+        FOO,
+        (
+            "N/RenamedUse.php",
+            "<?php\nnamespace App\\N;\nuse App\\A\\Foo as F;\nclass RenamedUse { public function go() { return new Foo(); } }\n",
+        ),
+        (
+            "C/UseFn.php",
+            "<?php\nnamespace App\\C;\nuse function App\\A\\Foo;\nclass UseFn { public function go() { return new Foo(); } }\n",
+        ),
+        ("X/Foo.php", "<?php\nnamespace X;\nclass Foo {}\n"),
+        (
+            "N/Foo.php",
+            "<?php\nnamespace N;\nuse X\\Foo as Base;\nclass Foo extends Base { public function m() { return new Foo(); } }\n",
+        ),
+        (
+            "N/Uses.php",
+            "<?php\nnamespace N;\nuse X\\Foo as Base;\nclass Uses { public function m() { return new Foo(); } }\n",
+        ),
+    ]);
+    assert!(instantiated_from(&db, "App\\A\\Foo").is_empty());
+    assert!(instantiated_from(&db, "X\\Foo").is_empty());
+    assert_eq!(instantiated_from(&db, "N\\Foo"), ["N/Uses.php"]);
+}
+
+#[test]
+fn a_caller_truncated_after_indexing_resolves_as_indexed() {
+    let (root, db) = project(&[
+        (
+            "A/VeryLongClassNameHere.php",
+            "<?php\nnamespace App\\A;\nclass VeryLongClassNameHere {}\n",
+        ),
+        (
+            "A/Stale.php",
+            "<?php\nnamespace App\\A;\nclass Stale { public function go() { return new VeryLongClassNameHere(); } }\n",
+        ),
+    ]);
+    let before = impacted(&db, "App\\A\\VeryLongClassNameHere");
+    assert_eq!(before, ["A/Stale.php"]);
+    let rows = targets(&db, "VeryLongClassNameHere");
+    std::fs::write(root.path().join("A/Stale.php"), "<?php").unwrap();
+    assert_eq!(impacted(&db, "App\\A\\VeryLongClassNameHere"), before);
+    assert_eq!(targets(&db, "VeryLongClassNameHere"), rows);
+}
+
+#[test]
+fn a_file_indexed_without_php_name_rows_falls_back_to_import_rows_and_definitions() {
+    let (_root, db) = project(&[
+        FOO,
+        (
+            "A/Sibling.php",
+            "<?php\nnamespace App\\A;\nclass Sibling { public function go() { return new Foo(); } }\n",
+        ),
+        (
+            "B/Caller.php",
+            "<?php\nnamespace App\\B;\nclass Caller { public function go() { return new Foo(); } }\n",
+        ),
+        (
+            "Ctl/UsesFoo.php",
+            "<?php\nnamespace App\\Ctl;\nuse App\\A\\Foo;\nclass UsesFoo { public function go() { return new Foo(); } }\n",
+        ),
+    ]);
+    db.execute_raw_for_tests("DELETE FROM php_names;").unwrap();
+    assert_eq!(
+        impacted(&db, "App\\A\\Foo"),
+        ["A/Sibling.php", "Ctl/UsesFoo.php"]
+    );
+}
+
+#[test]
+fn a_global_use_is_a_dependency_on_the_indexed_global_class() {
+    let (_root, db) = project(&[
+        (
+            "Exc.php",
+            "<?php\nclass InvalidArgumentException extends Exception {}\n",
+        ),
+        (
+            "B/Clos.php",
+            "<?php\nnamespace App\\B;\nuse InvalidArgumentException;\nclass Clos { public function go() { throw new InvalidArgumentException(); } }\n",
+        ),
+    ]);
+    let caller = list_dependencies(&db, "B/Clos.php").unwrap();
+    assert_eq!(caller.imports, ["file:Exc.php"]);
+    assert!(caller.unresolved_imports.is_empty(), "{caller:?}");
+    assert_eq!(
+        list_dependencies(&db, "Exc.php").unwrap().imported_by,
+        ["B/Clos.php"]
+    );
 }

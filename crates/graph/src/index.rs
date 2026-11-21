@@ -24,6 +24,7 @@ pub(crate) struct ParsedFile {
     pub(crate) symbols: Vec<Symbol>,
     pub(crate) refs: Vec<Reference>,
     pub(crate) python_bindings: PythonBindings,
+    pub(crate) php_names: Vec<codesage_protocol::php::PhpName>,
     pub(crate) fingerprints: Vec<FunctionFingerprint>,
     pub(crate) boundaries: Vec<TrustBoundary>,
     /// The tree carried `ERROR` / `MISSING` nodes; everything outside them
@@ -81,6 +82,11 @@ pub(crate) fn parse_source(
     } else {
         PythonBindings::default()
     };
+    let php_names = if info.language == codesage_protocol::Language::Php {
+        codesage_parser::php_names::extract_php_names(&tree.root_node(), source)
+    } else {
+        Vec::new()
+    };
     codesage_protocol::work::checkpoint()?;
     let fingerprints = file_fingerprints_cancellable(&tree, source, info.language)?;
     let boundaries = derive_from_tree_with_context(
@@ -97,6 +103,7 @@ pub(crate) fn parse_source(
         symbols,
         refs,
         python_bindings,
+        php_names,
         fingerprints,
         boundaries,
         degraded,
@@ -221,6 +228,7 @@ fn write_one(db: &Database, p: &ParsedFile) -> Result<()> {
     db.insert_symbols(file_id, &p.symbols)?;
     db.insert_references(file_id, &p.refs)?;
     db.insert_python_bindings(file_id, &p.python_bindings)?;
+    db.insert_php_names(file_id, &p.php_names)?;
     db.insert_fingerprints(file_id, &fingerprint_inputs(p))?;
     db.replace_file_trust_boundaries(file_id, &p.boundaries)?;
     db.record_file_interpretation(file_id, STRUCTURAL_INTERPRETATION)?;

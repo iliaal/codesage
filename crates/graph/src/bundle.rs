@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use codesage_protocol::js_paths::lexical_join;
+use codesage_protocol::php::PhpNameKind;
 use codesage_protocol::{
     ContextBundle, ExportRequest, Language, ReferenceKind, SearchRequest, SearchResult, Symbol,
     SymbolKind, SymbolSummary, TargetKind, TargetResolution, Visibility,
@@ -975,7 +976,7 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
         php_bound = if classes.is_empty() {
             Vec::new()
         } else {
-            php_bare_class_bindings(db, caller_file, to_name, classes, &load_imports()?)?
+            php_bare_class_bindings(db, caller_file, to_name, classes, load_imports)?
         };
         if all_candidates.is_empty() {
             return Ok(php_bound);
@@ -1057,32 +1058,71 @@ fn is_php_class_like(symbol: &Symbol) -> bool {
 
 /// The PHP classes among `classes` that the bare class name `to_name` in
 /// `caller_file` names, by PHP's compile-time rule rather than name
-/// uniqueness: a `use` importing that name decides the class; without one,
-/// the name is the caller's namespace plus `to_name`. A class in the caller's
-/// own file always binds.
-///
-/// Import rows carry no alias, so a `use` is matched by its last segment,
-/// and the caller's source settles the two cases that matching gets wrong:
-/// when that `use` would refuse a class the namespace names (`use X\Foo as
-/// F;` leaves `Foo` to the namespace), and when the namespace binds a class
-/// the source may rename over (`use X\Bar as Foo;`). Unreadable source keeps
-/// the row-based answer.
+/// uniqueness: a class `use` binding that name (explicitly, or by its last
+/// segment when not renamed) decides the class; without one, the name is the
+/// caller's namespace plus `to_name`. A class in the caller's own file always
+/// binds. The `use` clauses and namespaces come from the index's
+/// `php_names` rows, so a file changed or truncated on disk since indexing
+/// resolves as indexed. A file indexed before those rows existed falls back
+/// to its import rows (matched by last segment) and its definitions'
+/// namespaces.
 fn php_bare_class_bindings(
     db: &Database,
     caller_file: &str,
     to_name: &str,
     classes: Vec<&Symbol>,
-    imports: &[String],
+    load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
 ) -> Result<Vec<Symbol>> {
-    if classes.is_empty() {
-        return Ok(Vec::new());
-    }
-    let names = |expected: &[String], class: &Symbol| {
-        class.file_path == caller_file
-            || expected
+    let names = db.php_names_for_file(caller_file)?;
+    let expected = if names.is_empty() {
+        php_legacy_bare_class_names(db, caller_file, to_name, &load_imports()?)?
+    } else {
+        let imported: Vec<String> = names
+            .iter()
+            .filter(|name| {
+                name.kind == PhpNameKind::Class && name.name.eq_ignore_ascii_case(to_name)
+            })
+            .map(|name| name.target.clone())
+            .collect();
+        if imported.is_empty() {
+            names
                 .iter()
-                .any(|name| name.eq_ignore_ascii_case(&class.qualified_name))
+                .filter(|name| name.kind == PhpNameKind::Namespace)
+                .map(|name| php_join(&name.name, to_name))
+                .collect()
+        } else {
+            imported
+        }
     };
+    Ok(classes
+        .into_iter()
+        .filter(|class| {
+            class.file_path == caller_file
+                || expected
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&class.qualified_name))
+        })
+        .cloned()
+        .collect())
+}
+
+fn php_join(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        name.to_string()
+    } else {
+        format!("{namespace}\\{name}")
+    }
+}
+
+/// [`php_bare_class_bindings`]'s names for a file without `php_names` rows:
+/// an import row ending in `to_name`, otherwise `to_name` in each namespace
+/// the file's class-like and function definitions declare.
+fn php_legacy_bare_class_names(
+    db: &Database,
+    caller_file: &str,
+    to_name: &str,
+    imports: &[String],
+) -> Result<Vec<String>> {
     let imported: Vec<String> = imports
         .iter()
         .filter(|name| {
@@ -1094,51 +1134,9 @@ fn php_bare_class_bindings(
         })
         .map(|name| name.trim_start_matches('\\').to_string())
         .collect();
-    let expected = if imported.is_empty() {
-        let namespaced = php_names_in_caller_namespace(db, caller_file, to_name)?;
-        if classes
-            .iter()
-            .any(|class| class.file_path != caller_file && names(&namespaced, class))
-        {
-            match php_alias_targets(db, caller_file, to_name, true) {
-                Some(aliased) if !aliased.is_empty() => aliased,
-                _ => namespaced,
-            }
-        } else {
-            namespaced
-        }
-    } else if classes.iter().all(|class| names(&imported, class)) {
-        imported
-    } else {
-        let namespaced = php_names_in_caller_namespace(db, caller_file, to_name)?;
-        if classes
-            .iter()
-            .any(|class| names(&namespaced, class) && !names(&imported, class))
-        {
-            match php_alias_targets(db, caller_file, to_name, false) {
-                Some(aliased) if aliased.is_empty() => namespaced,
-                Some(aliased) => aliased,
-                None => imported,
-            }
-        } else {
-            imported
-        }
-    };
-    Ok(classes
-        .into_iter()
-        .filter(|class| names(&expected, class))
-        .cloned()
-        .collect())
-}
-
-/// `to_name` in each namespace that `caller_file`'s class-like and function
-/// definitions declare, or, for a file with none, that its source declares;
-/// empty when neither tells.
-fn php_names_in_caller_namespace(
-    db: &Database,
-    caller_file: &str,
-    to_name: &str,
-) -> Result<Vec<String>> {
+    if !imported.is_empty() {
+        return Ok(imported);
+    }
     let mut expected = Vec::new();
     for symbol in db.symbols_for_file(caller_file)? {
         if !matches!(
@@ -1155,7 +1153,7 @@ fn php_names_in_caller_namespace(
             continue;
         };
         let resolved = match namespace.strip_suffix('\\') {
-            Some(namespace) => format!("{namespace}\\{to_name}"),
+            Some(namespace) => php_join(namespace, to_name),
             None if namespace.is_empty() => to_name.to_string(),
             None => continue,
         };
@@ -1163,77 +1161,7 @@ fn php_names_in_caller_namespace(
             expected.push(resolved);
         }
     }
-    if expected.is_empty()
-        && let Some(root) = crate::constructor_imports::project_root(db)
-        && let Ok(Some(source)) =
-            codesage_parser::source::read_indexable_file(root, std::path::Path::new(caller_file))
-        && let Some(namespaces) = codesage_parser::php_names::file_namespaces(&source.bytes)
-    {
-        expected = namespaces
-            .into_iter()
-            .map(|namespace| {
-                if namespace.is_empty() {
-                    to_name.to_string()
-                } else {
-                    format!("{namespace}\\{to_name}")
-                }
-            })
-            .collect();
-    }
     Ok(expected)
-}
-
-/// The classes the caller's source imports under the name `to_name`, or
-/// `None` when the index has no project root or the source cannot be read
-/// or parsed. With `explicit_only`, only a renaming `use … as to_name`
-/// counts, and a source that never spells `as to_name` skips the parse.
-fn php_alias_targets(
-    db: &Database,
-    caller_file: &str,
-    to_name: &str,
-    explicit_only: bool,
-) -> Option<Vec<String>> {
-    let root = crate::constructor_imports::project_root(db)?;
-    let source =
-        codesage_parser::source::read_indexable_file(root, std::path::Path::new(caller_file))
-            .ok()??;
-    if explicit_only && !spells_php_alias(&source.bytes, to_name) {
-        return Some(Vec::new());
-    }
-    Some(
-        codesage_parser::php_names::file_class_imports(&source.bytes)?
-            .into_iter()
-            .filter(|(alias, _)| alias.eq_ignore_ascii_case(to_name))
-            .map(|(_, target)| target)
-            .collect(),
-    )
-}
-
-/// Whether `source` holds `as`, whitespace, then `name` as a whole word,
-/// ignoring ASCII case: the shape every renaming `use` clause has.
-fn spells_php_alias(source: &[u8], name: &str) -> bool {
-    let ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80;
-    let name = name.as_bytes();
-    if name.is_empty() {
-        return false;
-    }
-    (0..source.len().saturating_sub(name.len()) + 1).any(|start| {
-        source[start..start + name.len()].eq_ignore_ascii_case(name)
-            && source.get(start + name.len()).is_none_or(|&b| !ident(b))
-            && {
-                let before = &source[..start];
-                let gap = before
-                    .iter()
-                    .rev()
-                    .take_while(|b| b.is_ascii_whitespace())
-                    .count();
-                gap > 0
-                    && before[..before.len() - gap]
-                        .rsplit(|&b| !ident(b))
-                        .next()
-                        .is_some_and(|word| word.eq_ignore_ascii_case(b"as"))
-            }
-    })
 }
 
 /// Whether one of `import_refs` (the caller's import rows) names `symbol`
@@ -3112,6 +3040,7 @@ mod overlay_source_tests {
                     symbols: &[definition],
                     references: &[],
                     python_bindings: &PythonBindings::default(),
+                    php_names: &[],
                     fingerprints: &[],
                     trust_boundaries: &[],
                     interpretation: "current",

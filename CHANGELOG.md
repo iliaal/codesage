@@ -3,11 +3,12 @@
 ### Changed
 
 - `codesage index` passes that parse more than 50 files take less time: a full structural pass over a 723-file project went from 4.80 s to 3.74 s median (-22% time) on 8 cores and from 6.07 s to 5.38 s (-11% time) on 2. Indexed rows are unchanged.
+- Schema migration `0035_php_names` adds a table of each PHP file's namespaces and `use` clauses; the first command that opens the index for writing creates it, and the next `codesage index` fills it.
 
 ### Fixed
 
-- `impact` and `find_references` bind a bare PHP class name only to the class its `use` or the caller's namespace names, never to a same-named class elsewhere because it is the only one indexed.
-- A single-segment PHP `use Name;` is recorded as an import of the global `\Name`, listed by `dependencies` and matched by trust-boundary rules; the next `codesage index` reparses existing files under `parser-queries=11`.
+- `impact` and `find_references` bind a bare PHP class name only to the class a class `use` with that alias, or the caller's namespace, names, not to a same-named class elsewhere because it is the only one indexed; a renamed `use X\Foo as F;` and `use function` no longer bind a bare `Foo`.
+- A single-segment PHP `use Name;` is recorded as an import of the global `\Name`, resolved by `dependencies` to an indexed global class and matched by trust-boundary rules; the next `codesage index` reparses existing files under `parser-queries=11;extraction=25`.
 
 ## [0.53.0] - 2026-11-14
 

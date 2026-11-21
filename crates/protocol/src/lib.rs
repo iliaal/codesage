@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub mod describe;
 pub mod handle;
 pub mod js_paths;
+pub mod php;
 pub mod python;
 mod python_stdlib;
 pub mod signature;

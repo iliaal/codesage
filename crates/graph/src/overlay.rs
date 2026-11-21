@@ -361,6 +361,7 @@ pub(crate) fn install_parsed_overlay(
             symbols: &parsed.symbols,
             references: &parsed.refs,
             python_bindings: &parsed.python_bindings,
+            php_names: &parsed.php_names,
             fingerprints,
             trust_boundaries: &parsed.boundaries,
             interpretation: STRUCTURAL_INTERPRETATION,

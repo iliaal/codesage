@@ -6,6 +6,7 @@
 //! when one names it, otherwise it is relative to the current namespace.
 //! Bare names stay as written; their binding is the resolver's job.
 
+use codesage_protocol::php::{PhpName, PhpNameKind};
 use tree_sitter::Node;
 
 use crate::parse::node_text_lossy;
@@ -125,62 +126,77 @@ fn alias_target(node: &Node, root: &Node, source: &[u8], alias: &str) -> Option<
     found
 }
 
-/// The namespaces `source` declares, `""` for the global one; `[""]` when it
-/// declares none. `None` when `source` does not parse.
-pub fn file_namespaces(source: &[u8]) -> Option<Vec<String>> {
-    let tree = crate::parse::parse_file(source, codesage_protocol::Language::Php).ok()?;
-    let root = tree.root_node();
-    let mut namespaces = Vec::new();
+/// The namespaces `root` declares and every `use` clause in them, as the
+/// index stores them: a file that declares no namespace gets one row for the
+/// global namespace, so every indexed PHP file has at least one row.
+pub fn extract_php_names(root: &Node, source: &[u8]) -> Vec<PhpName> {
+    let mut names = Vec::new();
+    let mut containers = vec![*root];
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         if child.kind() == "namespace_definition" {
-            let name = child
-                .child_by_field_name("name")
-                .map(|name| node_text_lossy(&name, source))
-                .unwrap_or_default();
-            if !namespaces.contains(&name) {
-                namespaces.push(name);
+            names.push(PhpName {
+                kind: PhpNameKind::Namespace,
+                name: child
+                    .child_by_field_name("name")
+                    .map(|name| node_text_lossy(&name, source))
+                    .unwrap_or_default(),
+                target: String::new(),
+                line: line_of(&child),
+            });
+            if let Some(body) = child.child_by_field_name("body") {
+                containers.push(body);
             }
         }
     }
-    if namespaces.is_empty() {
-        namespaces.push(String::new());
-    }
-    Some(namespaces)
-}
-
-/// `(alias, fully qualified class)` for every class import in `source`, in
-/// any namespace block; `None` when `source` does not parse.
-pub fn file_class_imports(source: &[u8]) -> Option<Vec<(String, String)>> {
-    let tree = crate::parse::parse_file(source, codesage_protocol::Language::Php).ok()?;
-    let root = tree.root_node();
-    let mut imports = Vec::new();
-    let mut containers = vec![root];
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if child.kind() == "namespace_definition"
-            && let Some(body) = child.child_by_field_name("body")
-        {
-            containers.push(body);
-        }
+    if names.is_empty() {
+        names.push(PhpName {
+            kind: PhpNameKind::Namespace,
+            name: String::new(),
+            target: String::new(),
+            line: 1,
+        });
     }
     for container in containers {
         let mut cursor = container.walk();
         for child in container.children(&mut cursor) {
             if child.kind() == "namespace_use_declaration" {
-                imports.extend(class_imports(&child, source));
+                names.extend(use_clauses(&child, source));
             }
         }
     }
-    Some(imports)
+    names
+}
+
+fn line_of(node: &Node) -> u32 {
+    u32::try_from(node.start_position().row)
+        .unwrap_or(u32::MAX - 1)
+        .saturating_add(1)
 }
 
 /// `(alias, fully qualified class)` for each class import in one `use`
 /// declaration, including group clauses.
 fn class_imports(declaration: &Node, source: &[u8]) -> Vec<(String, String)> {
-    if declaration.child_by_field_name("type").is_some() {
-        return Vec::new();
-    }
+    use_clauses(declaration, source)
+        .into_iter()
+        .filter(|name| name.kind == PhpNameKind::Class)
+        .map(|name| (name.name, name.target))
+        .collect()
+}
+
+fn use_kind(node: &Node) -> Option<PhpNameKind> {
+    node.child_by_field_name("type")
+        .map(|kind| match kind.kind() {
+            "function" => PhpNameKind::Function,
+            _ => PhpNameKind::Const,
+        })
+}
+
+/// Each clause of one `use` declaration, including group clauses, with the
+/// alias it binds (explicit, or the last segment) and its `use function` /
+/// `use const` kind.
+fn use_clauses(declaration: &Node, source: &[u8]) -> Vec<PhpName> {
+    let declared = use_kind(declaration);
     let mut prefix = None;
     let mut clauses = Vec::new();
     let mut cursor = declaration.walk();
@@ -201,9 +217,9 @@ fn class_imports(declaration: &Node, source: &[u8]) -> Vec<(String, String)> {
     }
     let mut imports = Vec::new();
     for clause in clauses {
-        if clause.child_by_field_name("type").is_some() {
-            continue;
-        }
+        let kind = declared
+            .or_else(|| use_kind(&clause))
+            .unwrap_or(PhpNameKind::Class);
         let alias = clause.child_by_field_name("alias");
         let mut walker = clause.walk();
         let Some(target) = clause
@@ -225,7 +241,12 @@ fn class_imports(declaration: &Node, source: &[u8]) -> Vec<(String, String)> {
             Some(alias) => node_text_lossy(&alias, source),
             None => target.rsplit('\\').next().unwrap_or(&target).to_string(),
         };
-        imports.push((alias, target));
+        imports.push(PhpName {
+            kind,
+            name: alias,
+            target,
+            line: line_of(&clause),
+        });
     }
     imports
 }
@@ -294,35 +315,43 @@ mod tests {
     }
 
     #[test]
-    fn file_class_imports_lists_aliases_in_every_block() {
+    fn php_names_record_namespaces_and_use_clauses_with_their_kind() {
+        let source = b"<?php\nnamespace One { use Lib\\Local\\Adapter as LocalAdapter; use Closure; }\n\
+                       namespace Two { use Lib\\{A, B as Bee, function g}; use function Lib\\f; use const Lib\\C; }\n";
+        let tree = crate::parse::parse_file(source, codesage_protocol::Language::Php).unwrap();
+        let rows: Vec<_> = extract_php_names(&tree.root_node(), source)
+            .into_iter()
+            .map(|n| (n.kind.as_str(), n.name, n.target, n.line))
+            .collect();
+        let row = |kind, name: &str, target: &str, line| {
+            (kind, name.to_string(), target.to_string(), line)
+        };
         assert_eq!(
-            file_class_imports(
-                b"<?php\nnamespace One { use Lib\\Local\\Adapter as LocalAdapter; use Closure; }\n\
-                  namespace Two { use Lib\\{A, B as Bee}; use function Lib\\f; }\n"
-            )
-            .unwrap(),
+            rows,
             [
-                (
-                    "LocalAdapter".to_string(),
-                    "Lib\\Local\\Adapter".to_string()
-                ),
-                ("Closure".to_string(), "Closure".to_string()),
-                ("A".to_string(), "Lib\\A".to_string()),
-                ("Bee".to_string(), "Lib\\B".to_string()),
+                row("namespace", "One", "", 2),
+                row("namespace", "Two", "", 3),
+                row("class", "LocalAdapter", "Lib\\Local\\Adapter", 2),
+                row("class", "Closure", "Closure", 2),
+                row("class", "A", "Lib\\A", 3),
+                row("class", "Bee", "Lib\\B", 3),
+                row("function", "g", "Lib\\g", 3),
+                row("function", "f", "Lib\\f", 3),
+                row("const", "C", "Lib\\C", 3),
             ]
         );
-    }
-
-    #[test]
-    fn file_namespaces_lists_each_declared_namespace() {
-        assert_eq!(file_namespaces(b"<?php\nnew Foo();\n").unwrap(), [""]);
+        let global = b"<?php\nuse App\\Foo;\nnew Foo();\n";
+        let tree = crate::parse::parse_file(global, codesage_protocol::Language::Php).unwrap();
+        let rows: Vec<_> = extract_php_names(&tree.root_node(), global)
+            .into_iter()
+            .map(|n| (n.kind.as_str(), n.name, n.line))
+            .collect();
         assert_eq!(
-            file_namespaces(b"<?php\nnamespace A\\B;\nnew Foo();\nnamespace C;\n").unwrap(),
-            ["A\\B", "C"]
-        );
-        assert_eq!(
-            file_namespaces(b"<?php\nnamespace A { }\nnamespace { }\n").unwrap(),
-            ["A", ""]
+            rows,
+            [
+                ("namespace", String::new(), 1),
+                ("class", "Foo".to_string(), 2)
+            ]
         );
     }
 

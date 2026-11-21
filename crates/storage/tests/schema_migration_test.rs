@@ -224,6 +224,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0032_refs_import_edges",
         "0033_js_aliases",
         "0034_php_nocase_lookups",
+        "0035_php_names",
     ];
     for migration in expected_migrations {
         let count: i64 = conn
