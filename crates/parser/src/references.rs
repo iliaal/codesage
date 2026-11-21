@@ -725,6 +725,51 @@ pub fn is_rust_std_expression_macro(
     rust_invocation_arguments(invocation, source, local_macros).is_some()
 }
 
+/// Whether an invocation's token tree holds a token that can bind a name
+/// (`let`, `use`, an item keyword, `match` or `for` patterns, closure
+/// parameters). The surface walk cannot see such bindings inside a token
+/// tree, so a caller must treat the enclosing scope as unresolvable.
+pub fn rust_macro_arguments_can_bind(invocation: Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = invocation.walk();
+    let Some(token_tree) = invocation
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "token_tree")
+    else {
+        return false;
+    };
+    let mut pending = vec![token_tree];
+    while let Some(node) = pending.pop() {
+        if node.child_count() == 0 {
+            if matches!(
+                node.utf8_text(source).unwrap_or("|"),
+                "|" | "||"
+                    | "let"
+                    | "use"
+                    | "fn"
+                    | "mod"
+                    | "struct"
+                    | "enum"
+                    | "union"
+                    | "trait"
+                    | "impl"
+                    | "static"
+                    | "const"
+                    | "type"
+                    | "extern"
+                    | "macro_rules"
+                    | "match"
+                    | "for"
+            ) {
+                return true;
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.children(&mut cursor));
+    }
+    false
+}
+
 /// Byte ranges and starting rows of the top-level arguments of a macro's token tree.
 fn rust_macro_argument_ranges(
     token_tree: Node,

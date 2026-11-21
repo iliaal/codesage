@@ -1354,14 +1354,16 @@ fn surface(
         );
     }
     // A std expression macro expands to an expression and binds nothing; the
-    // calls in its arguments are extracted as ordinary rows.
+    // calls in its arguments are extracted as ordinary rows, unless the
+    // arguments themselves can bind a name the walk cannot see.
     for invocation in invocations {
-        if !codesage_parser::references::is_rust_std_expression_macro(
-            invocation,
-            bytes,
-            &local_macros,
-        ) && let Some(scope) = lexical_scope(invocation)
-        {
+        let transparent =
+            codesage_parser::references::is_rust_std_expression_macro(
+                invocation,
+                bytes,
+                &local_macros,
+            ) && !codesage_parser::references::rust_macro_arguments_can_bind(invocation, bytes);
+        if !transparent && let Some(scope) = lexical_scope(invocation) {
             surface
                 .uncertain_ranges
                 .push((scope.start_position(), scope.end_position(), true));

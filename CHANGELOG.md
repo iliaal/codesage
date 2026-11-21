@@ -6,7 +6,7 @@
 
 ### Fixed
 
-- Rust calls inside the arguments of std expression macros (`assert_eq!`, `format!`, `println!`, `vec!`, the `matches!` scrutinee, and the rest of the `format`/`write`/`print`/`assert`/`panic` family) produce reference rows that bind in `find-references`, `impact`, and `tests-for`; reindex to pick them up.
+- Rust calls inside the arguments of std expression macros (`assert_eq!`, `format!`, `println!`, `vec!`, the `matches!` scrutinee, and the rest of the `format`/`write`/`print`/`assert`/`panic` family) produce reference rows that bind in `find-references`, `impact`, and `tests-for`, and no longer leave external-crate calls in the same block unresolved; reindex to pick them up.
 
 ## [0.53.0] - 2026-11-14
 

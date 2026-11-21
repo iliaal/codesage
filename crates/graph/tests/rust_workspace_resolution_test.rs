@@ -627,6 +627,11 @@ fn macro_invocations_that_can_change_the_callers_namespace_are_unresolved() {
         "#[rewrite] fn main() { api::foo(); }",
         "macro_rules! assert { () => { use other as api; } } fn main() { assert!(); api::foo(); }",
         "macro_rules! shadow { () => { use other as api; } } fn main() { shadow!(); assert!(api::foo() == ()); }",
+        "fn main() { assert!({ use other as api; api::foo() } == ()); }",
+        "use api::foo; fn main() { let v = [0]; assert!(v.iter().all(|foo| foo())); }",
+        "use api::foo; fn main() { assert!(match 1 { foo => foo() }); }",
+        "use api::foo; fn main() { assert!({ let foo = || (); foo() } == ()); }",
+        "use api::foo; fn main() { let v = [0]; v.iter().all(|foo| foo()); }",
     ];
     let mut false_edges = Vec::new();
     for caller in cases {
