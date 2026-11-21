@@ -125,6 +125,30 @@ fn alias_target(node: &Node, root: &Node, source: &[u8], alias: &str) -> Option<
     found
 }
 
+/// The namespaces `source` declares, `""` for the global one; `[""]` when it
+/// declares none. `None` when `source` does not parse.
+pub fn file_namespaces(source: &[u8]) -> Option<Vec<String>> {
+    let tree = crate::parse::parse_file(source, codesage_protocol::Language::Php).ok()?;
+    let root = tree.root_node();
+    let mut namespaces = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() == "namespace_definition" {
+            let name = child
+                .child_by_field_name("name")
+                .map(|name| node_text_lossy(&name, source))
+                .unwrap_or_default();
+            if !namespaces.contains(&name) {
+                namespaces.push(name);
+            }
+        }
+    }
+    if namespaces.is_empty() {
+        namespaces.push(String::new());
+    }
+    Some(namespaces)
+}
+
 /// `(alias, fully qualified class)` for every class import in `source`, in
 /// any namespace block; `None` when `source` does not parse.
 pub fn file_class_imports(source: &[u8]) -> Option<Vec<(String, String)>> {
@@ -286,6 +310,19 @@ mod tests {
                 ("A".to_string(), "Lib\\A".to_string()),
                 ("Bee".to_string(), "Lib\\B".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn file_namespaces_lists_each_declared_namespace() {
+        assert_eq!(file_namespaces(b"<?php\nnew Foo();\n").unwrap(), [""]);
+        assert_eq!(
+            file_namespaces(b"<?php\nnamespace A\\B;\nnew Foo();\nnamespace C;\n").unwrap(),
+            ["A\\B", "C"]
+        );
+        assert_eq!(
+            file_namespaces(b"<?php\nnamespace A { }\nnamespace { }\n").unwrap(),
+            ["A", ""]
         );
     }
 

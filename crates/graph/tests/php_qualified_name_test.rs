@@ -280,3 +280,44 @@ fn a_renamed_use_leaves_its_last_segment_to_the_caller_namespace() {
         ["Fs/Manager.php"]
     );
 }
+
+#[test]
+fn a_renaming_use_overrides_a_same_namespace_class() {
+    let (_root, db) = project(&[
+        (
+            "Queue/QueueManager.php",
+            "<?php\nnamespace Illuminate\\Queue;\nclass QueueManager {}\n",
+        ),
+        (
+            "Queue/Worker.php",
+            "<?php\nnamespace Illuminate\\Queue;\nuse Illuminate\\Contracts\\Queue\\Factory as QueueManager;\nclass Worker { public function __construct(QueueManager $manager) {} }\n",
+        ),
+        (
+            "Queue/Listener.php",
+            "<?php\nnamespace Illuminate\\Queue;\nclass Listener { public function __construct(QueueManager $manager) {} }\n",
+        ),
+    ]);
+    assert_eq!(
+        impacted(&db, "Illuminate\\Queue\\QueueManager"),
+        ["Queue/Listener.php"]
+    );
+}
+
+#[test]
+fn a_file_without_definitions_resolves_in_the_namespace_its_source_declares() {
+    let (_root, db) = project(&[
+        ("Legacy.php", "<?php\nclass Legacy {}\n"),
+        FOO,
+        ("bin/script.php", "<?php\nnew Legacy();\nnew Foo();\n"),
+        (
+            "bin/namespaced.php",
+            "<?php\nnamespace App\\B;\nnew Legacy();\nnew Foo();\n",
+        ),
+        (
+            "bin/imports.php",
+            "<?php\nnamespace App\\B;\nuse App\\A\\Foo;\nnew Foo();\n",
+        ),
+    ]);
+    assert_eq!(impacted(&db, "Legacy"), ["bin/script.php"]);
+    assert_eq!(impacted(&db, "App\\A\\Foo"), ["bin/imports.php"]);
+}

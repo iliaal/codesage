@@ -7,7 +7,7 @@
 ### Fixed
 
 - `impact` and `find_references` bind a bare PHP class name only to the class its `use` or the caller's namespace names, never to a same-named class elsewhere because it is the only one indexed.
-- A single-segment PHP `use Name;` is recorded as an import of the global `\Name`; the next `codesage index` reparses existing files under `parser-queries=11`.
+- A single-segment PHP `use Name;` is recorded as an import of the global `\Name`, listed by `dependencies` and matched by trust-boundary rules; the next `codesage index` reparses existing files under `parser-queries=11`.
 
 ## [0.53.0] - 2026-11-14
 
