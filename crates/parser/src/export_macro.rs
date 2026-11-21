@@ -26,7 +26,7 @@ const SUFFIXES: [&[u8]; 5] = [
 
 /// Longest argument list a macro may carry (`FOO_DEPRECATED("...")`); a
 /// longer parenthesized run is not treated as macro arguments.
-pub(crate) const MAX_ARGS_BYTES: usize = 512;
+const MAX_ARGS_BYTES: usize = 512;
 
 const CLASS_KEYS: [&[u8]; 4] = [b"class", b"struct", b"union", b"enum"];
 
