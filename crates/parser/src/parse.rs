@@ -211,8 +211,8 @@ fn repair_macro_invocations(
 }
 
 /// Names of function definitions outside any function body. With
-/// `repairs`, a name the repairs remove on purpose is left out: one inside a
-/// blanked annotation, or the macro of an invocation a `;` now terminates.
+/// `repairs`, a definition the repairs remove on purpose is left out: one
+/// named inside a blanked annotation, or one whose head a `;` now splits.
 fn top_level_definition_names<'s>(
     tree: &Tree,
     source: &'s [u8],
@@ -224,7 +224,12 @@ fn top_level_definition_names<'s>(
             && !has_ancestor(node, "compound_statement")
             && let Some(name) = definition_name(node)
             && let Some(text) = source.get(name.byte_range())
-            && !repairs.is_some_and(|repairs| repairs.removes(name.byte_range(), source))
+            && !repairs.is_some_and(|repairs| {
+                let body = node
+                    .child_by_field_name("body")
+                    .map_or(node.end_byte(), |body| body.start_byte());
+                repairs.removes(node.start_byte()..body, name.byte_range())
+            })
         {
             names.insert(text);
         }

@@ -382,7 +382,15 @@ pub fn extract_symbols(
         };
 
         let is_test = crate::test_marks::symbol_is_test(&def_node, source, language, test_ctx);
-        let signature = crate::signature::extract(def_node, source, language, &name);
+        // A C function-defining macro head has no source signature of its own.
+        let signature = if language == Language::C
+            && def_node.kind() == "function_definition"
+            && name_node.kind() == "type_identifier"
+        {
+            None
+        } else {
+            crate::signature::extract(def_node, source, language, &name)
+        };
 
         let symbol = Symbol {
             name,
@@ -617,7 +625,9 @@ pub(crate) fn definition_capture<'tree>(
 /// body, is a function-defining macro, named by its argument as the
 /// parenthesized form `PHP_FUNCTION(name) {` already is. A C definition
 /// cannot leave its only parameter unnamed, and a K&R definition declares
-/// its parameters before the body.
+/// its parameters before the body. A macro-shaped argument is a parameter
+/// list macro instead (`static int NOP_HANDLER(HANDLER_ARGS) {`), and the
+/// all-caps function keeps its name.
 fn c_macro_head_name<'tree>(definition: Node<'tree>, source: &[u8]) -> Option<Node<'tree>> {
     if definition.kind() != "function_definition"
         || definition
@@ -644,8 +654,11 @@ fn c_macro_head_name<'tree>(definition: Node<'tree>, source: &[u8]) -> Option<No
     let name = parameter.child_by_field_name("type")?;
     (parameter.kind() == "parameter_declaration"
         && parameter.named_child_count() == 1
-        && name.kind() == "type_identifier")
-        .then_some(name)
+        && name.kind() == "type_identifier"
+        && !name
+            .utf8_text(source)
+            .is_ok_and(|text| crate::macro_invocation::macro_shaped(text.as_bytes())))
+    .then_some(name)
 }
 
 fn cpp_callable_capture(declarator: Node<'_>, has_body: bool) -> Option<(Node<'_>, SymbolKind)> {

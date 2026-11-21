@@ -156,10 +156,11 @@ fn incremental_removes_deleted_files() {
 fn full_index_keeps_a_file_whose_parse_recovered_from_unknown_macros() {
     let (dir, db) = setup_project();
     // php-src style: function-like macros at file scope that the C grammar
-    // cannot parse without the preprocessor. Tree-sitter recovers around them.
+    // cannot parse without the preprocessor, beside a line no repair can
+    // parse. Tree-sitter recovers around both.
     std::fs::write(
         dir.path().join("ext.c"),
-        b"ZEND_BEGIN_ARG_INFO_EX(arginfo_mul, 0, 0, 2)\nZEND_END_ARG_INFO()\n\nint mul(int a, int b) {\n    return a * b;\n}\n",
+        b"ZEND_BEGIN_ARG_INFO_EX(arginfo_mul, 0, 0, 2)\nZEND_END_ARG_INFO()\n\nstatic int broken = ;\n\nint mul(int a, int b) {\n    return a * b;\n}\n",
     )
     .unwrap();
 

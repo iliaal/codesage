@@ -25,7 +25,7 @@
 //! `PHP_FUNCTION(f)\n{`) is never changed, and neither is a declaration whose
 //! head is a single all-caps function name (`static zend_long SEED(void)`).
 
-use crate::export_macro::{Kind, Lexer, MAX_ARGS_BYTES, Token};
+use crate::export_macro::{Kind, Lexer, Token};
 use anyhow::Result;
 
 /// Tokens between cancellation checks.
@@ -43,36 +43,21 @@ impl Repairs {
         self.blanks.is_empty() && self.insertions.is_empty()
     }
 
-    /// Whether the name at `range` is one the repairs take away: it lies in
-    /// a blanked annotation, or it is the macro of an invocation, `NAME` or
-    /// `NAME(...)`, that an inserted `;` terminates.
-    pub(crate) fn removes(&self, range: std::ops::Range<usize>, source: &[u8]) -> bool {
-        if self
-            .blanks
+    /// Whether the repairs take away the definition whose head (definition
+    /// start to body) and name span these ranges: its name lies in a blanked
+    /// annotation, or a `;` is inserted inside its head, splitting it.
+    pub(crate) fn removes(
+        &self,
+        head: std::ops::Range<usize>,
+        name: std::ops::Range<usize>,
+    ) -> bool {
+        self.blanks
             .iter()
-            .any(|&(start, end)| range.start < end && start < range.end)
-        {
-            return true;
-        }
-        let mut end = range.end;
-        if source.get(end) == Some(&b'(') {
-            let mut depth = 0usize;
-            let window = &source[end..source.len().min(end + MAX_ARGS_BYTES + 1)];
-            for (offset, byte) in window.iter().enumerate() {
-                match byte {
-                    b'(' => depth += 1,
-                    b')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end += offset + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        self.insertions.binary_search(&end).is_ok()
+            .any(|&(start, end)| name.start < end && start < name.end)
+            || self
+                .insertions
+                .iter()
+                .any(|offset| head.start <= *offset && *offset <= head.end)
     }
 
     /// `source` with the blanks applied and the `;` bytes inserted.

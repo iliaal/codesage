@@ -198,6 +198,11 @@ static inline long GENERATE_SEED(void)
 {
 \treturn helper(4);
 }
+
+static int ZEND_NOP_SPEC_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+\treturn helper(5);
+}
 ";
     assert_eq!(
         definitions(c, Language::C, "n.c"),
@@ -206,6 +211,20 @@ static inline long GENERATE_SEED(void)
             ("OnUpdateBool", 8, 11),
             ("intlcal_to_date_time", 13, 16),
             ("GENERATE_SEED", 18, 21),
+            ("ZEND_NOP_SPEC_HANDLER", 23, 26),
         ])
     );
+    let tree = parse_file(c.as_bytes(), Language::C).unwrap();
+    let symbols = extract_symbols(&tree, c.as_bytes(), Language::C, "n.c").unwrap();
+    let signature = |name: &str| {
+        symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap()
+            .signature
+            .is_some()
+    };
+    assert!(!signature("OnUpdateBool"));
+    assert!(!signature("phar_is_file"));
+    assert!(signature("GENERATE_SEED"));
 }
