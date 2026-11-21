@@ -31,6 +31,18 @@ const REF_IS_TEST_SQL: &str = "(f.is_test <> 0 OR COALESCE( \
         WHERE s.file_id = r.from_file_id AND s.qualified_name = r.from_symbol), \
      0) <> 0)";
 
+/// `refs.lazy` value for a [`Reference::type_checking`] row. Every reader that
+/// only asks whether a row is lazy tests `lazy <> 0` or `MIN(lazy) = 0`.
+pub(crate) const LAZY_TYPE_CHECKING: i64 = 2;
+
+pub(crate) fn lazy_column(r: &Reference) -> i64 {
+    if r.type_checking {
+        LAZY_TYPE_CHECKING
+    } else {
+        i64::from(r.lazy)
+    }
+}
+
 /// CROSS JOIN pins refs as the outer loop. Left to the planner, this
 /// whole-graph query scanned every symbol and probed refs by name, visiting
 /// each call site of a common short name before the kind filter dropped it.
@@ -472,7 +484,7 @@ impl Database {
                 r.kind.as_str(),
                 r.line,
                 r.col,
-                i64::from(r.lazy),
+                lazy_column(r),
             ])?;
         }
         Ok(())
@@ -910,6 +922,7 @@ impl Database {
                 line: row.get(4)?,
                 col: row.get(5)?,
                 lazy: row.get::<_, i64>(6)? != 0,
+                type_checking: row.get::<_, i64>(6)? == LAZY_TYPE_CHECKING,
                 to: None,
                 from_line: None,
                 is_test: row.get::<_, i64>(7)? != 0,
@@ -921,13 +934,14 @@ impl Database {
     /// Distinct cross-file load-time import/include/inheritance/trait-use
     /// edges, plus Python module paths. Match qualified names or short
     /// names unique to one file in other languages. A pair whose directives are all lazy
-    /// (function-body or TypeScript type-only imports) is excluded; see
+    /// (function-body, TypeScript type-only, or Python `TYPE_CHECKING` imports) is excluded; see
     /// [`Self::lazy_import_pairs`].
     pub fn enumerate_file_import_edges(&self) -> Result<Vec<(String, String)>> {
         Ok(self.enumerate_file_import_pairs()?.eager)
     }
 
-    /// Cross-file pairs connected only by lazy (function-body or type-only) import
+    /// Cross-file pairs connected only by lazy (function-body, type-only, or Python
+    /// `TYPE_CHECKING`) import
     /// directives. These are the edges `enumerate_file_import_edges` drops.
     pub fn lazy_import_pairs(&self) -> Result<Vec<(String, String)>> {
         Ok(self.enumerate_file_import_pairs()?.lazy_only)
@@ -1003,6 +1017,7 @@ impl Database {
                 line,
                 col,
                 lazy,
+                type_checking: false,
                 is_test: false,
                 to: None,
                 from_line: None,
@@ -1107,6 +1122,7 @@ impl Database {
                 line: site.line,
                 col: site.col,
                 lazy: false,
+                type_checking: false,
                 is_test: false,
                 to: None,
                 from_line: None,
@@ -2306,6 +2322,7 @@ mod tests {
             line: 4,
             col: 2,
             lazy: false,
+            type_checking: false,
             is_test: false,
             to: None,
             from_line: None,

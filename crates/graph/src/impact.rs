@@ -97,6 +97,9 @@ pub(crate) struct WalkOutcome {
     pub edge_counts: HashMap<String, u32>,
     /// Symbol seeds, or one for a file-only root with a resolved import edge.
     pub seed_count: usize,
+    /// An edge came from a [`Reference::type_checking`] row, so a
+    /// `runtime_only` walk could return fewer entries.
+    pub type_checking_edges: bool,
 }
 
 pub(crate) type DefinitionKey = (String, String, u32, u32, SymbolKind);
@@ -923,15 +926,18 @@ pub(crate) fn impact_analysis_walk_budgeted(
     max_frontier: usize,
     budget: Option<&mut WalkBudget>,
 ) -> Result<WalkOutcome> {
-    impact_analysis_walk_shared(db, req, max_frontier, budget, None)
+    impact_analysis_walk_shared(db, req, max_frontier, budget, None, false)
 }
 
+/// `runtime_only` skips edges from rows that never execute
+/// ([`Reference::type_checking`]); the cache stays shareable across modes.
 pub(crate) fn impact_analysis_walk_shared(
     db: &Database,
     req: &ImpactRequest,
     max_frontier: usize,
     mut budget: Option<&mut WalkBudget>,
     cache: Option<&mut WalkCache>,
+    runtime_only: bool,
 ) -> Result<WalkOutcome> {
     let mut local_cache = WalkCache::default();
     let mut cache = Some(cache.unwrap_or(&mut local_cache));
@@ -944,6 +950,7 @@ pub(crate) fn impact_analysis_walk_shared(
             capped: true,
             edge_counts: HashMap::new(),
             seed_count: 0,
+            type_checking_edges: false,
         });
     }
     // One resolution decides both seeds and origin: a union across several
@@ -966,6 +973,7 @@ pub(crate) fn impact_analysis_walk_shared(
             capped: false,
             edge_counts: HashMap::new(),
             seed_count: 0,
+            type_checking_edges: false,
         });
     }
 
@@ -1027,6 +1035,7 @@ pub(crate) fn impact_analysis_walk_shared(
     let mut frontier: Vec<Symbol> = seed_symbols;
     let mut visited_symbols: HashSet<DefinitionKey> = HashSet::new();
     let mut frontier_capped = false;
+    let mut type_checking_edges = false;
 
     for depth in 1..=req.depth as u32 {
         codesage_protocol::work::checkpoint()?;
@@ -1090,9 +1099,10 @@ pub(crate) fn impact_analysis_walk_shared(
             codesage_protocol::work::checkpoint()?;
             for r in refs.iter() {
                 codesage_protocol::work::checkpoint()?;
-                if origin_files.contains(&r.from_file) {
+                if origin_files.contains(&r.from_file) || (runtime_only && r.type_checking) {
                     continue;
                 }
+                type_checking_edges |= r.type_checking;
                 let entry = file_reasons
                     .entry(r.from_file.clone())
                     .or_insert_with(|| (depth, Vec::new(), HashSet::new()));
@@ -1202,9 +1212,10 @@ pub(crate) fn impact_analysis_walk_shared(
                 if cache.is_some() && cached_matches.is_none() {
                     matches.push(reference_index);
                 }
-                if origin_files.contains(&r.from_file) {
+                if origin_files.contains(&r.from_file) || (runtime_only && r.type_checking) {
                     continue;
                 }
+                type_checking_edges |= r.type_checking;
                 seed_count = seed_count.max(1);
                 let entry = file_reasons
                     .entry(r.from_file.clone())
@@ -1355,6 +1366,7 @@ pub(crate) fn impact_analysis_walk_shared(
         capped: frontier_capped || cache.as_ref().is_some_and(|cache| cache.context_capped()),
         edge_counts,
         seed_count,
+        type_checking_edges,
     })
 }
 
@@ -1900,6 +1912,7 @@ mod tests {
             line: 1,
             col: 0,
             lazy: false,
+            type_checking: false,
             to: None,
             from_line: None,
             is_test: false,
@@ -2091,6 +2104,7 @@ mod tests {
             line: 1,
             col: 0,
             lazy: false,
+            type_checking: false,
             to: None,
             from_line: None,
             is_test: false,
@@ -2555,7 +2569,7 @@ mod tests {
         for frontier in [1, MAX_FRONTIER, 8192] {
             let plain = impact_analysis_walk_budgeted(&db, &request, frontier, None).unwrap();
             let shared =
-                impact_analysis_walk_shared(&db, &request, frontier, None, Some(&mut cache))
+                impact_analysis_walk_shared(&db, &request, frontier, None, Some(&mut cache), false)
                     .unwrap();
             assert_same_walk(&plain, &shared);
             for steps in [0, 1, 3, 10, usize::MAX] {
@@ -2570,6 +2584,7 @@ mod tests {
                     frontier,
                     Some(&mut shared_budget),
                     Some(&mut cache),
+                    false,
                 )
                 .unwrap();
                 assert_same_walk(&plain, &shared);
@@ -2583,9 +2598,15 @@ mod tests {
         );
         let hits = cache.hits;
         let mut budget = WalkBudget::new(usize::MAX, Some(Instant::now()));
-        let expired =
-            impact_analysis_walk_shared(&db, &request, 8192, Some(&mut budget), Some(&mut cache))
-                .unwrap();
+        let expired = impact_analysis_walk_shared(
+            &db,
+            &request,
+            8192,
+            Some(&mut budget),
+            Some(&mut cache),
+            false,
+        )
+        .unwrap();
         assert!(expired.capped);
         assert!(expired.entries.is_empty());
         assert_eq!(
@@ -2598,7 +2619,8 @@ mod tests {
         };
         let plain = impact_analysis_walk_budgeted(&db, &request, 8192, None).unwrap();
         let uncached =
-            impact_analysis_walk_shared(&db, &request, 8192, None, Some(&mut full_cache)).unwrap();
+            impact_analysis_walk_shared(&db, &request, 8192, None, Some(&mut full_cache), false)
+                .unwrap();
         assert_same_walk(&plain, &uncached);
         assert!(full_cache.references.is_empty());
     }
@@ -2795,6 +2817,7 @@ mod tests {
             MAX_FRONTIER,
             Some(&mut budget),
             Some(&mut cache),
+            false,
         )
         .unwrap();
         assert_eq!(admitted.entries.len(), 2);
@@ -2808,6 +2831,7 @@ mod tests {
             MAX_FRONTIER,
             Some(&mut budget),
             Some(&mut cache),
+            false,
         )
         .unwrap();
         assert!(cut.capped);
@@ -2900,6 +2924,7 @@ mod tests {
                 line: 10 + i as u32,
                 col: 0,
                 lazy: false,
+                type_checking: false,
                 to: None,
                 from_line: None,
                 is_test: false,
@@ -2916,6 +2941,7 @@ mod tests {
                 line: 10 + i as u32,
                 col: 8,
                 lazy: false,
+                type_checking: false,
                 to: None,
                 from_line: None,
                 is_test: false,

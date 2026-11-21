@@ -695,6 +695,7 @@ fn reachable_test_files(
             REACH_FRONTIER,
             Some(&mut budget),
             cache.as_deref_mut(),
+            true,
         )?;
         pool = pool.saturating_sub(share.saturating_sub(budget.remaining));
         if outcome.capped {
@@ -1113,6 +1114,7 @@ mod tests {
             line,
             col: 4,
             lazy: false,
+            type_checking: false,
             to: None,
             from_line: None,
             is_test: false,

@@ -326,7 +326,7 @@ fn build_rehearsal(
         }
         if c.lazy_edges > 0 {
             evidence.push(format!(
-                "lazy_edges: {} (lazy import pair(s), function-body or type-only, touching this cycle, excluded from cycle detection)",
+                "lazy_edges: {} (lazy import pair(s), function-body, type-only, or Python TYPE_CHECKING, touching this cycle, excluded from cycle detection)",
                 c.lazy_edges
             ));
         }
@@ -958,6 +958,7 @@ mod tests {
                         line: 2,
                         col: 0,
                         lazy: false,
+                        type_checking: false,
                         to: None,
                         from_line: None,
                         is_test: false,

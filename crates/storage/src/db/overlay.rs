@@ -296,7 +296,7 @@ impl Database {
                     reference.kind.as_str(),
                     reference.line,
                     reference.col,
-                    reference.lazy
+                    super::structural::lazy_column(reference)
                 ])?;
             }
             let mut bindings = self.conn.prepare(
@@ -592,6 +592,7 @@ mod tests {
             line: 2,
             col: 4,
             lazy: false,
+            type_checking: false,
             is_test: false,
             to: None,
             from_line: None,
@@ -669,7 +670,15 @@ mod tests {
             &[StructuralOverlayFile {
                 file: &info,
                 symbols: &[changed.clone()],
-                references: &[reference("dirty.py", "current", "clean")],
+                references: &[
+                    reference("dirty.py", "current", "clean"),
+                    Reference {
+                        kind: ReferenceKind::Import,
+                        lazy: true,
+                        type_checking: true,
+                        ..reference("dirty.py", "current", "guarded")
+                    },
+                ],
                 python_bindings: &bindings,
                 fingerprints: &[FingerprintInput {
                     name: "current",
@@ -706,6 +715,10 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].from_file, "dirty.py");
         assert!(refs[0].is_test);
+        assert!(!refs[0].lazy && !refs[0].type_checking);
+        let guarded = db.find_references("guarded", None).unwrap();
+        assert_eq!(guarded.len(), 1);
+        assert!(guarded[0].lazy && guarded[0].type_checking, "{guarded:?}");
         let old_refs = db.find_references("old", None).unwrap();
         assert_eq!(old_refs.len(), 1);
         assert_eq!(old_refs[0].from_file, "clean.py");
