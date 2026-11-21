@@ -171,6 +171,12 @@ impl Database {
                 [path],
             )?;
         }
+        // An index opened read-only before migration 0036 has no refs.macro_mask.
+        let refs_macro_mask: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('refs', 'main') WHERE name = 'macro_mask')",
+            [],
+            |row| row.get(0),
+        )?;
         // An index opened read-only before migration 0035 has no php_names.
         let php_names_table: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE name = 'php_names' AND type = 'table')",
@@ -296,29 +302,50 @@ impl Database {
                         .and_then(|signature| signature.returns.as_ref()),
                 ])?;
             }
-            let mut references = self.conn.prepare(
+            let mut references = self.conn.prepare(if refs_macro_mask {
                 "INSERT INTO temp.__overlay_refs
                  (id, from_file_id, from_symbol, to_name, to_name_tail, kind, line, col, lazy, macro_mask)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?;
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            } else {
+                "INSERT INTO temp.__overlay_refs
+                 (id, from_file_id, from_symbol, to_name, to_name_tail, kind, line, col, lazy)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+            })?;
             for reference in replacement.references {
                 codesage_protocol::work::checkpoint()?;
                 ensure!(
                     reference.from_file == replacement.file.path,
                     "overlay reference has a different file"
                 );
-                references.execute(params![
-                    next_id(&mut reference_id)?,
-                    id,
-                    reference.from_symbol,
-                    reference.to_name,
-                    name_tail(&reference.to_name),
-                    reference.kind.as_str(),
-                    reference.line,
-                    reference.col,
-                    super::structural::lazy_column(reference),
-                    (reference.macro_mask != 0).then_some(i64::from(reference.macro_mask))
-                ])?;
+                let reference_id_value = next_id(&mut reference_id)?;
+                let tail = name_tail(&reference.to_name);
+                let lazy = super::structural::lazy_column(reference);
+                if refs_macro_mask {
+                    references.execute(params![
+                        reference_id_value,
+                        id,
+                        reference.from_symbol,
+                        reference.to_name,
+                        tail,
+                        reference.kind.as_str(),
+                        reference.line,
+                        reference.col,
+                        lazy,
+                        (reference.macro_mask != 0).then_some(i64::from(reference.macro_mask))
+                    ])?;
+                } else {
+                    references.execute(params![
+                        reference_id_value,
+                        id,
+                        reference.from_symbol,
+                        reference.to_name,
+                        tail,
+                        reference.kind.as_str(),
+                        reference.line,
+                        reference.col,
+                        lazy
+                    ])?;
+                }
             }
             let mut bindings = self.conn.prepare(
                 "INSERT INTO temp.__overlay_python_bindings
@@ -826,6 +853,47 @@ mod tests {
                 .any(|line| line.contains("__overlay_symbols_name")),
             "{plan:?}"
         );
+    }
+
+    #[test]
+    fn overlay_installs_on_a_pre_0036_index_opened_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.db");
+        seed(&path);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX idx_refs_macro_mask;
+                 ALTER TABLE refs DROP COLUMN macro_mask;
+                 DELETE FROM schema_migrations WHERE name = '0036_refs_macro_mask';
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        let db = Database::open_read_only(&path).unwrap();
+        let _snapshot = db.read_snapshot().unwrap();
+        let info = file("dirty.py", "edited");
+        db.install_structural_overlay(
+            &["dirty.py".into()],
+            &[StructuralOverlayFile {
+                file: &info,
+                symbols: &[symbol("dirty.py", "current")],
+                references: &[Reference {
+                    macro_mask: 128,
+                    ..reference("dirty.py", "current", "clean")
+                }],
+                python_bindings: &PythonBindings::default(),
+                php_names: &[],
+                fingerprints: &[],
+                trust_boundaries: &[],
+                interpretation: "current",
+                source: "def current():\n    clean()\n",
+            }],
+        )
+        .unwrap();
+        let refs = db.find_references("clean", None).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].from_file, "dirty.py");
+        assert_eq!(refs[0].macro_mask, 0);
     }
 
     #[test]
