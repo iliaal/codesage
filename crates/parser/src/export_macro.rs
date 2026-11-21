@@ -26,7 +26,7 @@ const SUFFIXES: [&[u8]; 5] = [
 
 /// Longest argument list a macro may carry (`FOO_DEPRECATED("...")`); a
 /// longer parenthesized run is not treated as macro arguments.
-const MAX_ARGS_BYTES: usize = 512;
+pub(crate) const MAX_ARGS_BYTES: usize = 512;
 
 const CLASS_KEYS: [&[u8]; 4] = [b"class", b"struct", b"union", b"enum"];
 
@@ -311,7 +311,7 @@ fn ident_is(t: Option<&Token>, source: &[u8], words: &[&[u8]]) -> bool {
 
 /// Index just past a candidate's optional `( ... )` argument list, or `None`
 /// when the list is unbalanced or longer than [`MAX_ARGS_BYTES`].
-fn after_args(tokens: &[Token], i: usize) -> Option<usize> {
+pub(crate) fn after_args(tokens: &[Token], i: usize) -> Option<usize> {
     let open = i + 1;
     if tokens.get(open).map(|t| t.kind) != Some(Kind::Punct(b'(')) {
         return Some(open);

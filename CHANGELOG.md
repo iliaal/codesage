@@ -4,6 +4,10 @@
 
 - `codesage index` passes that parse more than 50 files take less time: a full structural pass over a 723-file project went from 4.80 s to 3.74 s median (-22% time) on 8 cores and from 6.07 s to 5.38 s (-11% time) on 2. Indexed rows are unchanged.
 
+### Fixed
+
+- C/C++ macro invocations no longer index as phantom functions that drop or swallow the real definition: trailing annotations (`void f() LOCKS_REQUIRED(mu) {`), attribute macros before the name (`void printflike(1, 2) log(...)`), semicolonless statement and file-scope macro runs (`Z_PARAM_LONG(x)`, `EXPORT_FUNC(PyA)`), and brace-initialized invocations now leave the real function its name, body, and calls, and a C head such as `ZEND_API ZEND_INI_MH(OnUpdate) {` is named by its argument.
+
 ## [0.53.0] - 2026-11-14
 
 ### Added

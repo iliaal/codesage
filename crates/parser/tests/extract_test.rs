@@ -560,9 +560,7 @@ const UNKNOWN_TOPLEVEL_MACROS_C: &[u8] = b"ZEND_BEGIN_ARG_INFO_EX(arginfo_add, 0
 
 #[test]
 fn parse_file_tolerant_flags_a_tree_with_error_nodes_as_degraded() {
-    let parsed =
-        codesage_parser::parse::parse_file_tolerant(UNKNOWN_TOPLEVEL_MACROS_C, Language::C)
-            .unwrap();
+    let parsed = codesage_parser::parse::parse_file_tolerant(NTAPI_TYPEDEF_C, Language::C).unwrap();
     assert!(parsed.degraded);
     assert!(parsed.tree.root_node().has_error());
 }

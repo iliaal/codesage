@@ -134,11 +134,10 @@ pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTr
     let prepared = prepare_c_family(source, language)?;
     let input = prepared.as_deref().unwrap_or(source);
     let mut tree = parse_with_control(&mut parser, input)?;
-    if language == Language::C
-        && tree.root_node().has_error()
-        && let Some(recovered) = recover_c_statement_macros(&mut parser, &tree, input)?
+    if matches!(language, Language::C | Language::Cpp)
+        && let Some(repaired) = repair_macro_invocations(&mut parser, &tree, input)?
     {
-        tree = recovered;
+        tree = repaired;
     }
     if language == Language::Java {
         validate_java_depth(&tree)?;
@@ -168,112 +167,34 @@ fn parse_with_control(parser: &mut Parser, input: &[u8]) -> Result<Tree> {
     tree.ok_or_else(|| anyhow::anyhow!("tree-sitter parsing failed"))
 }
 
-fn recover_c_statement_macros(
+/// Reparse C/C++ with the repairs [`crate::macro_invocation::find`] locates,
+/// when the first parse is degraded or holds a function definition built
+/// from a macro invocation. The inserted `;` bytes are then removed from the
+/// tree, so its offsets, lines, and columns are those of `source` again:
+/// extractors always slice the original bytes.
+///
+/// The repaired tree is kept only when it has no more syntax errors than the
+/// first parse and still holds every definition the first parse named
+/// outside a function body, except the names the repairs remove on purpose. Error
+/// recovery elsewhere in the file (a brace opened inside `#ifdef`, say) can
+/// otherwise swallow a real definition that the first parse kept.
+fn repair_macro_invocations(
     parser: &mut Parser,
     tree: &Tree,
     source: &[u8],
 ) -> Result<Option<Tree>> {
-    let mut insertions = Vec::new();
-    let mut cursor = tree.walk();
-    loop {
-        codesage_protocol::work::checkpoint()?;
-        if let Some(end) = c_statement_macro_end(cursor.node(), source) {
-            insertions.push(end);
-        }
-        if cursor.goto_first_child() {
-            continue;
-        }
-        loop {
-            if cursor.goto_next_sibling() {
-                break;
-            }
-            if !cursor.goto_parent() {
-                return reparse_c_statement_macros(parser, source, &insertions);
-            }
-        }
-    }
-}
-
-fn c_statement_macro_end(
-    declaration: tree_sitter::Node<'_>,
-    source: &[u8],
-) -> Option<(usize, tree_sitter::Point)> {
-    use crate::export_macro::{Kind, Lexer};
-
-    if declaration.kind() != "declaration"
-        || !declaration.has_error()
-        || declaration.parent()?.kind() != "compound_statement"
-    {
-        return None;
-    }
-    let macro_type = declaration.child_by_field_name("type")?;
-    if macro_type.kind() != "macro_type_specifier"
-        || macro_type.has_error()
-        || macro_type.start_byte() != declaration.start_byte()
-    {
-        return None;
-    }
-    let name = macro_type.child_by_field_name("name")?;
-    let name = source.get(name.byte_range())?;
-    if !name.iter().any(u8::is_ascii_uppercase)
-        || !name
-            .iter()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
-    {
-        return None;
-    }
-    let before = source.get(..macro_type.start_byte())?;
-    let line_start = before
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |i| i + 1);
-    if !before[line_start..].iter().all(u8::is_ascii_whitespace) {
-        return None;
-    }
-    let after = source.get(macro_type.end_byte()..declaration.end_byte())?;
-    let next = Lexer::new(after).next()?;
-    if next.kind != Kind::Ident || !after[..next.start].contains(&b'\n') {
-        return None;
-    }
-    // A following statement keyword rules out a macro-wrapped type declaration.
-    if !matches!(
-        &after[next.start..next.end],
-        b"return"
-            | b"break"
-            | b"continue"
-            | b"goto"
-            | b"if"
-            | b"for"
-            | b"while"
-            | b"switch"
-            | b"do"
-    ) {
-        return None;
-    }
-    Some((macro_type.end_byte(), macro_type.end_position()))
-}
-
-fn reparse_c_statement_macros(
-    parser: &mut Parser,
-    source: &[u8],
-    insertions: &[(usize, tree_sitter::Point)],
-) -> Result<Option<Tree>> {
-    if insertions.is_empty() {
+    let repairs = crate::macro_invocation::find(source)?;
+    if repairs.is_empty() || !(tree.root_node().has_error() || macro_definition(tree)?) {
         return Ok(None);
     }
-    let mut prepared = Vec::with_capacity(source.len() + insertions.len());
-    let mut copied = 0;
-    for &(offset, _) in insertions {
-        prepared.extend_from_slice(&source[copied..offset]);
-        prepared.push(b';');
-        copied = offset;
+    let mut repaired = parse_with_control(parser, &repairs.apply(source))?;
+    if error_count(&repaired)? > error_count(tree)? {
+        return Ok(None);
     }
-    prepared.extend_from_slice(&source[copied..]);
-    let mut tree = parse_with_control(parser, &prepared)?;
-    // Extractors always slice the original bytes. Removing the inserted bytes
-    // from the tree restores their offsets, including CRLF and unindented lines.
-    for (delta, &(offset, point)) in insertions.iter().enumerate().rev() {
-        tree.edit(&tree_sitter::InputEdit {
+    let kept = top_level_definition_names(tree, source, Some(&repairs))?;
+    let points = insertion_points(source, &repairs.insertions);
+    for (delta, &(offset, point)) in points.iter().enumerate().rev() {
+        repaired.edit(&tree_sitter::InputEdit {
             start_byte: offset + delta,
             old_end_byte: offset + delta + 1,
             new_end_byte: offset + delta,
@@ -285,7 +206,158 @@ fn reparse_c_statement_macros(
             new_end_position: point,
         });
     }
-    Ok(Some(tree))
+    let names = top_level_definition_names(&repaired, source, None)?;
+    Ok(kept.is_subset(&names).then_some(repaired))
+}
+
+/// Names of function definitions outside any function body. With
+/// `repairs`, a name the repairs remove on purpose is left out: one inside a
+/// blanked annotation, or the macro of an invocation a `;` now terminates.
+fn top_level_definition_names<'s>(
+    tree: &Tree,
+    source: &'s [u8],
+    repairs: Option<&crate::macro_invocation::Repairs>,
+) -> Result<std::collections::HashSet<&'s [u8]>> {
+    let mut names = std::collections::HashSet::new();
+    walk(tree, |node| {
+        if node.kind() == "function_definition"
+            && !has_ancestor(node, "compound_statement")
+            && let Some(name) = definition_name(node)
+            && let Some(text) = source.get(name.byte_range())
+            && !repairs.is_some_and(|repairs| repairs.removes(name.byte_range(), source))
+        {
+            names.insert(text);
+        }
+        false
+    })?;
+    Ok(names)
+}
+
+fn has_ancestor(node: tree_sitter::Node, kind: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == kind {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+/// The identifier a definition's declarator chain ends in.
+fn definition_name(definition: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut node = definition.child_by_field_name("declarator")?;
+    loop {
+        node = match node.kind() {
+            "identifier"
+            | "field_identifier"
+            | "qualified_identifier"
+            | "destructor_name"
+            | "operator_name" => return Some(node),
+            "function_declarator" | "pointer_declarator" => {
+                node.child_by_field_name("declarator")?
+            }
+            _ => node.named_children(&mut node.walk()).find(|child| {
+                child.kind().ends_with("declarator") || child.kind() == "identifier"
+            })?,
+        };
+    }
+}
+
+/// Each insertion offset with its position in the inserted text: the row of
+/// the original offset, and its column shifted by the insertions earlier on
+/// the same row.
+fn insertion_points(source: &[u8], insertions: &[usize]) -> Vec<(usize, tree_sitter::Point)> {
+    let mut points = Vec::with_capacity(insertions.len());
+    let (mut row, mut line_start, mut scanned) = (0, 0, 0);
+    let mut previous_row = None;
+    let mut same_row = 0;
+    for &offset in insertions {
+        for (i, byte) in source[scanned..offset].iter().enumerate() {
+            if *byte == b'\n' {
+                row += 1;
+                line_start = scanned + i + 1;
+            }
+        }
+        scanned = offset;
+        same_row = if previous_row == Some(row) {
+            same_row + 1
+        } else {
+            0
+        };
+        previous_row = Some(row);
+        points.push((
+            offset,
+            tree_sitter::Point {
+                row,
+                column: offset - line_start + same_row,
+            },
+        ));
+    }
+    points
+}
+
+/// A function definition whose return type is a macro invocation, or whose
+/// declarator holds a call: a clean parse can still read a semicolonless
+/// `NAME(args)` run as one definition.
+fn macro_definition(tree: &Tree) -> Result<bool> {
+    let mut found = false;
+    walk(tree, |node| {
+        if node.kind() == "function_definition"
+            && (node
+                .child_by_field_name("type")
+                .is_some_and(|ty| ty.kind() == "macro_type_specifier")
+                || node
+                    .child_by_field_name("declarator")
+                    .is_some_and(|declarator| {
+                        declarator.kind() == "function_declarator"
+                            && declarator
+                                .named_children(&mut declarator.walk())
+                                .any(|child| child.kind() == "call_expression")
+                    }))
+        {
+            found = true;
+        }
+        found
+    })?;
+    Ok(found)
+}
+
+fn error_count(tree: &Tree) -> Result<usize> {
+    let mut count = 0;
+    walk(tree, |node| {
+        if node.is_error() || node.is_missing() {
+            count += 1;
+        }
+        false
+    })?;
+    Ok(count)
+}
+
+/// Visit every node in document order until `visit` returns true.
+fn walk(tree: &Tree, mut visit: impl FnMut(tree_sitter::Node) -> bool) -> Result<()> {
+    let mut cursor = tree.walk();
+    let mut visited = 0u32;
+    loop {
+        visited += 1;
+        if visited.is_multiple_of(4096) {
+            codesage_protocol::work::checkpoint()?;
+        }
+        if visit(cursor.node()) {
+            return Ok(());
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn validate_java_depth(tree: &Tree) -> Result<()> {
@@ -328,6 +400,12 @@ pub(crate) fn node_text_lossy(node: &tree_sitter::Node, source: &[u8]) -> String
 mod header_quality_tests {
     use super::*;
 
+    fn parse_file_with(source: &[u8], repairs: &crate::macro_invocation::Repairs) -> Tree {
+        let mut parser = Parser::new();
+        parser.set_language(&ts_language(Language::C)).unwrap();
+        parse_with_control(&mut parser, &repairs.apply(source)).unwrap()
+    }
+
     #[test]
     fn clean_probe_matches_full_parse_for_clean_and_recovery_inputs() {
         let large_clean = "static inline int convert(int x) { return x + 1; }\n".repeat(500);
@@ -364,6 +442,43 @@ mod header_quality_tests {
         ] {
             assert!(c_header_prefers_c(source.as_bytes()).unwrap(), "{source}");
         }
+    }
+
+    #[test]
+    fn retained_definitions_leave_out_only_what_the_repairs_remove() {
+        let source = b"int real(void) { return 0; }\nvoid printflike(1, 2) log_debug(void) {}\nint SEED(void) { return 1; }\nint outer(void) { int inner(void) { return 1; } return inner(); }\nEXPORT(a)\nEXPORT(b)\nEXPORT(c)\nint last(void) { return 0; }\n";
+        let position = |needle: &[u8]| {
+            source
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap()
+        };
+        let tree = parse_file_with(source, &crate::macro_invocation::Repairs::default());
+        let names = |repairs| -> std::collections::BTreeSet<&[u8]> {
+            top_level_definition_names(&tree, source, repairs)
+                .unwrap()
+                .into_iter()
+                .collect()
+        };
+        let all = names(None);
+        let blank = position(b"printflike(1, 2)");
+        let repairs = crate::macro_invocation::Repairs {
+            blanks: vec![(blank, blank + 16)],
+            insertions: vec![position(b"EXPORT(b)") + 9],
+        };
+        let kept = names(Some(&repairs));
+        assert_eq!(
+            all,
+            [
+                b"EXPORT".as_slice(),
+                b"SEED",
+                b"outer",
+                b"printflike",
+                b"real"
+            ]
+            .into()
+        );
+        assert_eq!(kept, [b"SEED".as_slice(), b"outer", b"real"].into());
     }
 
     #[test]
