@@ -706,6 +706,98 @@ fn calls_inside_std_expression_macros_resolve_through_dependencies() {
 }
 
 #[test]
+fn imported_and_nested_macros_that_rebind_std_names_keep_calls_unresolved() {
+    let (_dir, db) = indexed(&[
+        ("Cargo.toml", "[workspace]\nmembers=['api','other','app']\n"),
+        (
+            "api/Cargo.toml",
+            "[package]\nname='api'\nversion='0.0.0'\nedition='2021'\n",
+        ),
+        (
+            "other/Cargo.toml",
+            "[package]\nname='other'\nversion='0.0.0'\nedition='2021'\n",
+        ),
+        (
+            "app/Cargo.toml",
+            "[package]\nname='app'\nversion='0.0.0'\nedition='2021'\n[dependencies]\napi={path='../api'}\nother={path='../other'}\n",
+        ),
+        ("api/src/lib.rs", "pub fn foo() -> i32 { 1 }\n"),
+        (
+            "other/src/lib.rs",
+            "pub fn foo() -> i32 { 2 }\n#[macro_export]\nmacro_rules! assert { () => { use other as api; }; ($e:expr) => { () }; }\n",
+        ),
+        (
+            "app/src/bin/a.rs",
+            "macro_rules! shadow { () => { use other as api; } }\nfn main() {\n    println!(\"{}\", { shadow!(); api::foo() });\n}\n",
+        ),
+        (
+            "app/src/bin/h.rs",
+            "macro_rules! shadow { () => { use other as api; } }\nfn main() {\n    let s = format!(\"{}\", { shadow!(); api::foo() });\n    println!(\"{s}\");\n}\n",
+        ),
+        (
+            "app/src/bin/b.rs",
+            "use other::assert;\nfn main() {\n    assert!();\n    std::println!(\"{}\", api::foo());\n}\n",
+        ),
+        (
+            "app/src/bin/c.rs",
+            "#[macro_use]\nextern crate other;\nfn main() {\n    assert!();\n    println!(\"{}\", api::foo());\n}\n",
+        ),
+        (
+            "app/src/bin/g/m.rs",
+            "macro_rules! assert { () => { use other as api; } }\n",
+        ),
+        (
+            "app/src/bin/g/main.rs",
+            "#[macro_use]\nmod m;\nfn main() {\n    assert!();\n    println!(\"{}\", api::foo());\n}\n",
+        ),
+        (
+            "app/src/bin/e.rs",
+            "use other::assert;\nfn main() {\n    println!(\"{:?}\", assert!(api::foo()));\n}\n",
+        ),
+        (
+            "app/src/bin/e2.rs",
+            "macro_rules! assert { ($e:expr) => { () } }\nfn main() {\n    println!(\"{:?}\", assert!(api::foo()));\n}\n",
+        ),
+        (
+            "app/src/bin/ctl.rs",
+            "fn main() {\n    assert_eq!(api::foo(), 1);\n}\n",
+        ),
+        (
+            "app/src/bin/d.rs",
+            "fn main() {\n    assert_eq!(api::foo(), 1 // why\n    );\n}\n",
+        ),
+        (
+            "app/src/bin/f.rs",
+            "fn main() {\n    println!(\"{x}\", x = api::foo());\n}\n",
+        ),
+    ]);
+    let refs = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "foo".into(),
+            kind: None,
+        },
+    )
+    .unwrap();
+    let api = Some("sym:api/src/lib.rs#foo");
+    let mut bound: Vec<_> = refs
+        .results
+        .iter()
+        .filter(|row| row.to.as_deref() == api)
+        .map(|row| (row.from_file.as_str(), row.line))
+        .collect();
+    bound.sort_unstable();
+    assert_eq!(
+        bound,
+        [
+            ("app/src/bin/ctl.rs", 2),
+            ("app/src/bin/d.rs", 2),
+            ("app/src/bin/f.rs", 2),
+        ]
+    );
+}
+
+#[test]
 fn macros_in_unrelated_function_bodies_do_not_hide_qualified_calls() {
     let (_dir, db) = indexed(&[
         ("Cargo.toml", "[workspace]\nmembers=['api','app']\n"),

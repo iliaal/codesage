@@ -71,6 +71,7 @@ pub(super) struct ExternalCrates {
     manifests: HashMap<String, Option<Arc<toml::Value>>>,
     missing: HashSet<String>,
     sources: HashMap<(String, bool), Option<Arc<Surface>>>,
+    std_macro_names: Option<Arc<HashSet<String>>>,
     resolved: HashMap<(String, String), Option<Vec<Symbol>>>,
     reads: usize,
     bytes: usize,
@@ -326,6 +327,7 @@ impl ExternalCrates {
             manifests: HashMap::new(),
             missing: HashSet::new(),
             sources: HashMap::new(),
+            std_macro_names: None,
             resolved: HashMap::new(),
             reads: 0,
             bytes: 0,
@@ -840,6 +842,24 @@ impl ExternalCrates {
         Some((extern_name, conventional_library(&directory, &target)?))
     }
 
+    /// Std expression macro names that an indexed `macro_rules!` anywhere in
+    /// the project can rebind, through `#[macro_use]` modules or imports the
+    /// per-file scan cannot follow.
+    fn std_macro_shadows(&mut self, db: &Database) -> Result<Arc<HashSet<String>>> {
+        if let Some(names) = &self.std_macro_names {
+            return Ok(names.clone());
+        }
+        let mut names = HashSet::new();
+        for name in codesage_parser::references::rust_std_expression_macro_names() {
+            if !db.find_symbols(name, Some(SymbolKind::Macro))?.is_empty() {
+                names.insert((*name).to_string());
+            }
+        }
+        let names = Arc::new(names);
+        self.std_macro_names = Some(names.clone());
+        Ok(names)
+    }
+
     fn source(&mut self, db: &Database, file: &str, caller: bool) -> Result<Option<Arc<Surface>>> {
         let key = (file.to_string(), caller);
         if let Some(surface) = self.sources.get(&key) {
@@ -854,6 +874,7 @@ impl ExternalCrates {
             }),
             None => self.read(file),
         };
+        let project_macros = self.std_macro_shadows(db)?;
         let surface = if let Some(source) = source
             && db.get_file_hash(file)?.as_deref() == Some(source.content_hash.as_str())
         {
@@ -865,6 +886,7 @@ impl ExternalCrates {
                         &source.bytes,
                         db.symbols_for_file(file),
                         caller,
+                        &project_macros,
                     )?;
                     result.module_items = module_item_positions(parsed.tree.root_node());
                     if caller {
@@ -1184,6 +1206,7 @@ fn surface(
     bytes: &[u8],
     symbols: Result<Vec<Symbol>>,
     caller: bool,
+    project_macros: &HashSet<String>,
 ) -> Result<Surface> {
     let symbols = symbols?;
     let mut surface = Surface::default();
@@ -1279,7 +1302,6 @@ fn surface(
     // reads each node's kind once and resolves the field id once.
     let pattern_field = node.language().field_id_for_name("pattern");
     let mut invocations = Vec::new();
-    let mut local_macros = HashSet::new();
     let mut pending: Vec<_> = node
         .named_children(&mut node.walk())
         .map(|item| (item, false))
@@ -1319,11 +1341,6 @@ fn surface(
         if kind == "macro_invocation" {
             invocations.push(item);
         }
-        if kind == "macro_definition"
-            && let Some(name) = item.child_by_field_name("name")
-        {
-            local_macros.insert(text(name, bytes).to_string());
-        }
         if kind == "attribute_item" && attribute_can_rewrite(text(item, bytes)) {
             let mut next = item.next_named_sibling();
             while next.is_some_and(|node| {
@@ -1356,13 +1373,14 @@ fn surface(
     // A std expression macro expands to an expression and binds nothing; the
     // calls in its arguments are extracted as ordinary rows, unless the
     // arguments themselves can bind a name the walk cannot see.
+    let mut shadows = codesage_parser::references::RustStdMacroShadows::scan(node, bytes);
+    shadows.extend(project_macros.iter().cloned());
     for invocation in invocations {
         let transparent =
-            codesage_parser::references::is_rust_std_expression_macro(
-                invocation,
-                bytes,
-                &local_macros,
-            ) && !codesage_parser::references::rust_macro_arguments_can_bind(invocation, bytes);
+            codesage_parser::references::is_rust_std_expression_macro(invocation, bytes, &shadows)
+                && !codesage_parser::references::rust_macro_arguments_can_bind(
+                    invocation, bytes, &shadows,
+                );
         if !transparent && let Some(scope) = lexical_scope(invocation) {
             surface
                 .uncertain_ranges

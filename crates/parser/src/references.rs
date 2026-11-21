@@ -615,11 +615,13 @@ pub fn extract_references(
         let before = refs.len();
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&crate::parse::ts_language(Language::Rust))?;
+        let shadows = RustStdMacroShadows::scan(tree.root_node(), source);
         rust_macro_argument_refs(
             tree.root_node(),
             source,
             file_path,
             0,
+            &shadows,
             &mut parser,
             &mut refs,
         )?;
@@ -657,10 +659,31 @@ pub fn extract_references(
 }
 
 /// Nesting levels of std expression macros whose arguments are read; a
+/// Nesting levels of std expression macros whose arguments are read; a
 /// call inside a deeper macro stays unindexed.
 const RUST_MACRO_ARGUMENT_DEPTH: usize = 4;
 const RUST_FRAGMENT_PREFIX: &str = "fn f(){(";
-const RUST_FRAGMENT_SUFFIX: &str = ");}";
+const RUST_FRAGMENT_SUFFIX: &str = "\n);}";
+
+/// The std macros whose arguments are ordinary expressions.
+const RUST_STD_EXPRESSION_MACROS: &[&str] = &[
+    "format",
+    "write",
+    "writeln",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "panic",
+    "vec",
+    "matches",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RustMacroArguments {
@@ -673,41 +696,194 @@ enum RustMacroArguments {
 
 fn rust_std_expression_macro(name: &str) -> Option<RustMacroArguments> {
     match name {
-        "format" | "write" | "writeln" | "print" | "println" | "eprint" | "eprintln" | "assert"
-        | "assert_eq" | "assert_ne" | "debug_assert" | "debug_assert_eq" | "debug_assert_ne"
-        | "panic" => Some(RustMacroArguments::All),
         "vec" => Some(RustMacroArguments::Repeat),
         "matches" => Some(RustMacroArguments::Scrutinee),
+        _ if RUST_STD_EXPRESSION_MACROS.contains(&name) => Some(RustMacroArguments::All),
         _ => None,
     }
 }
 
-/// The argument mode of an invocation of an allowlisted std macro, spelled
-/// bare or through `std`, `core`, or `alloc`. A bare name the file
-/// redefines with `macro_rules!` is the local macro, whose input is opaque.
+fn is_std_root(segment: &str) -> bool {
+    matches!(segment, "std" | "core" | "alloc")
+}
+
+/// Bare std macro names a file can rebind: a `macro_rules!` of that name, a
+/// `use` binding of that name not rooted at `std`, `core`, or `alloc`, or,
+/// for every name at once, a `#[macro_use]` attribute or a glob import from
+/// another crate. Crate-relative globs and macros reached through other files
+/// are not visible here.
+#[derive(Clone, Debug, Default)]
+pub struct RustStdMacroShadows {
+    names: std::collections::HashSet<String>,
+    all: bool,
+}
+
+impl RustStdMacroShadows {
+    pub fn scan(root: Node<'_>, source: &[u8]) -> Self {
+        let mut shadows = Self::default();
+        shadows.scan_into(root, source);
+        shadows
+    }
+
+    fn scan_into(&mut self, root: Node<'_>, source: &[u8]) {
+        let mut cursor = root.walk();
+        'walk: loop {
+            let node = cursor.node();
+            let descend = match node.kind() {
+                "macro_definition" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        self.insert(&crate::parse::node_text_lossy(&name, source));
+                    }
+                    false
+                }
+                "attribute_item" | "inner_attribute_item" => {
+                    let text = crate::parse::node_text_lossy(&node, source);
+                    let inner = text.trim_start_matches(['#', '!', '[']).trim_start();
+                    if inner.starts_with("macro_use") {
+                        self.all = true;
+                    }
+                    false
+                }
+                "use_declaration" => {
+                    if let Some(argument) = node.child_by_field_name("argument") {
+                        self.use_tree(argument, None, source);
+                    }
+                    false
+                }
+                "token_tree" => false,
+                _ => true,
+            };
+            if descend && cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    break 'walk;
+                }
+            }
+        }
+    }
+
+    fn insert(&mut self, name: &str) {
+        if rust_std_expression_macro(name).is_some() {
+            self.names.insert(name.to_string());
+        }
+    }
+
+    fn use_tree(&mut self, node: Node<'_>, root: Option<&str>, source: &[u8]) {
+        let first_segment = |node: &Node<'_>| {
+            let text = crate::parse::node_text_lossy(node, source);
+            text.trim_start_matches("::")
+                .split("::")
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        match node.kind() {
+            "identifier" => {
+                let name = crate::parse::node_text_lossy(&node, source);
+                if !root.or(Some(name.as_str())).is_some_and(is_std_root) {
+                    self.insert(&name);
+                }
+            }
+            "scoped_identifier" => {
+                let head = first_segment(&node);
+                let root = root.unwrap_or(head.as_str());
+                if !is_std_root(root)
+                    && let Some(name) = node.child_by_field_name("name")
+                {
+                    self.insert(&crate::parse::node_text_lossy(&name, source));
+                }
+            }
+            "use_as_clause" => {
+                let head = node
+                    .child_by_field_name("path")
+                    .map(|path| first_segment(&path))
+                    .unwrap_or_default();
+                let root = root.unwrap_or(head.as_str());
+                if !is_std_root(root)
+                    && let Some(alias) = node.child_by_field_name("alias")
+                {
+                    self.insert(&crate::parse::node_text_lossy(&alias, source));
+                }
+            }
+            "scoped_use_list" => {
+                let head = node
+                    .child_by_field_name("path")
+                    .map(|path| first_segment(&path))
+                    .unwrap_or_default();
+                let root = root.unwrap_or(head.as_str()).to_string();
+                if let Some(list) = node.child_by_field_name("list") {
+                    self.use_tree(list, Some(&root), source);
+                }
+            }
+            "use_list" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    self.use_tree(child, root, source);
+                }
+            }
+            "use_wildcard" => {
+                let head = first_segment(&node);
+                let root = root.unwrap_or(head.as_str());
+                if !is_std_root(root) && !matches!(root, "crate" | "self" | "super" | "*") {
+                    self.all = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Adds names that rebind a std macro outside the file, such as indexed
+    /// `macro_rules!` definitions elsewhere in the project.
+    pub fn extend<I: IntoIterator<Item = String>>(&mut self, names: I) {
+        for name in names {
+            self.insert(&name);
+        }
+    }
+
+    fn shadows(&self, name: &str) -> bool {
+        self.all || self.names.contains(name)
+    }
+}
+
+/// The std expression macro names that `RustStdMacroShadows::extend` can record.
+pub fn rust_std_expression_macro_names() -> &'static [&'static str] {
+    RUST_STD_EXPRESSION_MACROS
+}
+
+/// The argument mode of a macro path, when it names an allowlisted std macro
+/// bare (and unshadowed) or through `std`, `core`, or `alloc`.
+fn rust_macro_path_arguments(
+    prefix: Option<&str>,
+    name: &str,
+    shadows: &RustStdMacroShadows,
+) -> Option<RustMacroArguments> {
+    match prefix {
+        None if shadows.shadows(name) => None,
+        None => rust_std_expression_macro(name),
+        Some(prefix) if is_std_root(prefix.trim_start_matches("::")) => {
+            rust_std_expression_macro(name)
+        }
+        Some(_) => None,
+    }
+}
+
 fn rust_invocation_arguments(
     invocation: Node,
     source: &[u8],
-    local_macros: &std::collections::HashSet<String>,
+    shadows: &RustStdMacroShadows,
 ) -> Option<RustMacroArguments> {
     let path = invocation.child_by_field_name("macro")?;
     match path.kind() {
         "identifier" => {
-            let name = crate::parse::node_text_lossy(&path, source);
-            if local_macros.contains(&name) {
-                return None;
-            }
-            rust_std_expression_macro(&name)
+            rust_macro_path_arguments(None, &crate::parse::node_text_lossy(&path, source), shadows)
         }
         "scoped_identifier" => {
             let prefix = crate::parse::node_text_lossy(&path.child_by_field_name("path")?, source);
             let name = crate::parse::node_text_lossy(&path.child_by_field_name("name")?, source);
-            matches!(
-                prefix.as_str(),
-                "std" | "core" | "alloc" | "::std" | "::core" | "::alloc"
-            )
-            .then(|| rust_std_expression_macro(&name))
-            .flatten()
+            rust_macro_path_arguments(Some(&prefix), &name, shadows)
         }
         _ => None,
     }
@@ -715,21 +891,25 @@ fn rust_invocation_arguments(
 
 /// Whether `invocation` is an allowlisted std expression macro whose
 /// arguments reference extraction reads. Such a macro expands to an
-/// expression and introduces no bindings; `local_macros` holds the
-/// `macro_rules!` names the file defines, which shadow a bare std name.
+/// expression and introduces no bindings.
 pub fn is_rust_std_expression_macro(
     invocation: Node<'_>,
     source: &[u8],
-    local_macros: &std::collections::HashSet<String>,
+    shadows: &RustStdMacroShadows,
 ) -> bool {
-    rust_invocation_arguments(invocation, source, local_macros).is_some()
+    rust_invocation_arguments(invocation, source, shadows).is_some()
 }
 
 /// Whether an invocation's token tree holds a token that can bind a name
 /// (`let`, `use`, an item keyword, `match` or `for` patterns, closure
-/// parameters). The surface walk cannot see such bindings inside a token
-/// tree, so a caller must treat the enclosing scope as unresolvable.
-pub fn rust_macro_arguments_can_bind(invocation: Node<'_>, source: &[u8]) -> bool {
+/// parameters) or a nested macro other than an allowlisted std one, whose
+/// expansion is unknown. The surface walk cannot see such bindings inside a
+/// token tree, so a caller must treat the enclosing scope as unresolvable.
+pub fn rust_macro_arguments_can_bind(
+    invocation: Node<'_>,
+    source: &[u8],
+    shadows: &RustStdMacroShadows,
+) -> bool {
     let mut cursor = invocation.walk();
     let Some(token_tree) = invocation
         .named_children(&mut cursor)
@@ -737,11 +917,23 @@ pub fn rust_macro_arguments_can_bind(invocation: Node<'_>, source: &[u8]) -> boo
     else {
         return false;
     };
+    let text = |node: &Node<'_>| node.utf8_text(source).unwrap_or("|");
     let mut pending = vec![token_tree];
-    while let Some(node) = pending.pop() {
-        if node.child_count() == 0 {
+    while let Some(tree) = pending.pop() {
+        let mut cursor = tree.walk();
+        let children: Vec<Node> = tree.children(&mut cursor).collect();
+        for (index, child) in children.iter().enumerate() {
+            if child.kind() == "token_tree" {
+                pending.push(*child);
+                continue;
+            }
+            if child.child_count() > 0 {
+                pending.push(*child);
+                continue;
+            }
+            let token = text(child);
             if matches!(
-                node.utf8_text(source).unwrap_or("|"),
+                token,
                 "|" | "||"
                     | "let"
                     | "use"
@@ -762,10 +954,37 @@ pub fn rust_macro_arguments_can_bind(invocation: Node<'_>, source: &[u8]) -> boo
             ) {
                 return true;
             }
-            continue;
+            let invoked = token == "!"
+                && children
+                    .get(index + 1)
+                    .is_some_and(|next| next.kind() == "token_tree")
+                && index > 0
+                && children[index - 1].kind() == "identifier";
+            if invoked {
+                let name = text(&children[index - 1]);
+                let qualified = index >= 2 && text(&children[index - 2]) == "::";
+                let prefix = qualified
+                    .then(|| index.checked_sub(3).map(|at| children[at]))
+                    .flatten();
+                let deeper = qualified
+                    && index
+                        .checked_sub(4)
+                        .is_some_and(|at| text(&children[at]) == "::")
+                    && index
+                        .checked_sub(5)
+                        .is_some_and(|at| children[at].kind() == "identifier");
+                let known = match (qualified, prefix) {
+                    (false, _) => rust_macro_path_arguments(None, name, shadows).is_some(),
+                    (true, Some(prefix)) if !deeper && prefix.kind() == "identifier" => {
+                        rust_macro_path_arguments(Some(text(&prefix)), name, shadows).is_some()
+                    }
+                    _ => false,
+                };
+                if !known {
+                    return true;
+                }
+            }
         }
-        let mut cursor = node.walk();
-        pending.extend(node.children(&mut cursor));
     }
     false
 }
@@ -834,7 +1053,7 @@ fn rust_fragment_is_one_expression(tree: &Tree, fragment_len: usize) -> bool {
     };
     expression.kind() == "parenthesized_expression"
         && expression.start_byte() == RUST_FRAGMENT_PREFIX.len() - 1
-        && expression.end_byte() == RUST_FRAGMENT_PREFIX.len() + fragment_len + 1
+        && expression.end_byte() == RUST_FRAGMENT_PREFIX.len() + fragment_len + 2
 }
 
 /// Calls written inside the arguments of std expression macros, whose token
@@ -846,6 +1065,7 @@ fn rust_macro_argument_refs(
     source: &[u8],
     file_path: &str,
     depth: usize,
+    shadows: &RustStdMacroShadows,
     parser: &mut tree_sitter::Parser,
     refs: &mut Vec<Reference>,
 ) -> Result<()> {
@@ -853,22 +1073,15 @@ fn rust_macro_argument_refs(
         return Ok(());
     }
     let mut invocations = Vec::new();
-    let mut local_macros = std::collections::HashSet::new();
     let mut cursor = root.walk();
     'walk: loop {
         let node = cursor.node();
         let descend = match node.kind() {
-            "macro_definition" => {
-                if let Some(name) = node.child_by_field_name("name") {
-                    local_macros.insert(crate::parse::node_text_lossy(&name, source));
-                }
-                false
-            }
             "macro_invocation" => {
                 invocations.push(node);
                 false
             }
-            "token_tree" | "attribute_item" | "inner_attribute_item" => false,
+            "macro_definition" | "token_tree" | "attribute_item" | "inner_attribute_item" => false,
             _ => true,
         };
         if descend && cursor.goto_first_child() {
@@ -880,9 +1093,10 @@ fn rust_macro_argument_refs(
             }
         }
     }
+    let prefix_cols = RUST_FRAGMENT_PREFIX.len() as u32;
     for invocation in invocations {
         codesage_protocol::work::checkpoint()?;
-        let Some(mode) = rust_invocation_arguments(invocation, source, &local_macros) else {
+        let Some(mode) = rust_invocation_arguments(invocation, source, shadows) else {
             continue;
         };
         let mut cursor = invocation.walk();
@@ -892,8 +1106,12 @@ fn rust_macro_argument_refs(
         else {
             continue;
         };
+        let mut column_mark: Option<(usize, usize, u32)> = None;
         for (start, end, row) in rust_macro_argument_ranges(token_tree, mode) {
             let fragment = &source[start..end];
+            if !fragment.iter().any(|&b| b == b'(' || b == b'!') {
+                continue;
+            }
             let mut wrapped = Vec::with_capacity(
                 RUST_FRAGMENT_PREFIX.len() + fragment.len() + RUST_FRAGMENT_SUFFIX.len(),
             );
@@ -906,6 +1124,8 @@ fn rust_macro_argument_refs(
             if !rust_fragment_is_one_expression(&tree, fragment.len()) {
                 continue;
             }
+            let mut inner_shadows = shadows.clone();
+            inner_shadows.scan_into(tree.root_node(), &wrapped);
             let mut rows = tree_references(
                 &tree,
                 &wrapped,
@@ -918,25 +1138,33 @@ fn rust_macro_argument_refs(
                 &wrapped,
                 file_path,
                 depth + 1,
+                &inner_shadows,
                 parser,
                 &mut rows,
             )?;
+            rows.retain(|row| matches!(row.kind, ReferenceKind::Call | ReferenceKind::MacroCall));
+            if rows.is_empty() {
+                continue;
+            }
+            let col = match column_mark {
+                Some((mark_row, mark_byte, mark_col)) if mark_row == row => {
+                    let between = &source[mark_byte..start];
+                    mark_col
+                        + std::str::from_utf8(between)
+                            .map_or(between.len(), |text| text.chars().count())
+                            as u32
+                }
+                _ => crate::position::utf8_column_for_byte(source, start),
+            };
+            column_mark = Some((row, start, col));
             let row_offset = row as u32;
-            let col = crate::position::utf8_column_for_byte(source, start);
-            let prefix_cols = RUST_FRAGMENT_PREFIX.len() as u32;
-            refs.extend(
-                rows.into_iter()
-                    .filter(|row| {
-                        matches!(row.kind, ReferenceKind::Call | ReferenceKind::MacroCall)
-                    })
-                    .map(|mut row| {
-                        if row.line == 1 {
-                            row.col = col + row.col.saturating_sub(prefix_cols);
-                        }
-                        row.line += row_offset;
-                        row
-                    }),
-            );
+            refs.extend(rows.into_iter().map(|mut reference| {
+                if reference.line == 1 {
+                    reference.col = col + reference.col.saturating_sub(prefix_cols);
+                }
+                reference.line += row_offset;
+                reference
+            }));
         }
     }
     Ok(())
@@ -1632,6 +1860,86 @@ function later() { (function* () { require('./nested'); })().next(); }
             .map(|row| row.0.as_str())
             .collect();
         assert_eq!(names, ["qualified_call", "split_call"]);
+    }
+
+    #[test]
+    fn rust_rebound_std_macro_names_stay_opaque() {
+        let calls = |source: &str| -> Vec<String> {
+            rust_call_rows(source)
+                .into_iter()
+                .filter(|row| row.1 == ReferenceKind::Call)
+                .map(|row| row.0)
+                .collect()
+        };
+        assert_eq!(
+            calls(
+                "use other::assert;\nfn f() { assert!(a()); println!(\"{:?}\", assert!(b())); std::assert!(c()); }\n"
+            ),
+            ["c"]
+        );
+        assert_eq!(
+            calls(
+                "macro_rules! assert { ($e:expr) => { () } }\nfn f() { println!(\"{:?}\", assert!(d())); }\n"
+            ),
+            Vec::<String>::new()
+        );
+        assert!(
+            calls("#[macro_use]\nextern crate other;\nfn f() { println!(\"{}\", e()); }\n")
+                .is_empty()
+        );
+        assert!(calls("#[macro_use]\nmod m;\nfn f() { println!(\"{}\", e()); }\n").is_empty());
+        assert!(calls("use other::*;\nfn f() { println!(\"{}\", e()); }\n").is_empty());
+        assert_eq!(
+            calls("use alloc::{vec, format};\nuse super::*;\nfn f() { let _ = vec![g()]; }\n"),
+            ["g"]
+        );
+    }
+
+    #[test]
+    fn rust_macro_argument_ending_in_a_line_comment_is_read() {
+        let rows = rust_call_rows("fn f() {\n    assert!(api::foo() == 1 // why\n    );\n}\n");
+        assert!(
+            rows.contains(&("api::foo".to_string(), ReferenceKind::Call, 2, 12)),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn rust_nested_user_macros_make_std_macro_arguments_binding() {
+        let can_bind = |source: &str| -> bool {
+            let tree = crate::parse::parse_file(source.as_bytes(), Language::Rust).unwrap();
+            let root = tree.root_node();
+            let shadows = super::RustStdMacroShadows::scan(root, source.as_bytes());
+            let mut pending = vec![root];
+            let mut found = Vec::new();
+            while let Some(node) = pending.pop() {
+                if node.kind() == "macro_invocation" {
+                    found.push(super::rust_macro_arguments_can_bind(
+                        node,
+                        source.as_bytes(),
+                        &shadows,
+                    ));
+                    continue;
+                }
+                let mut cursor = node.walk();
+                pending.extend(node.children(&mut cursor));
+            }
+            assert_eq!(found.len(), 1, "{source}");
+            found[0]
+        };
+        assert!(can_bind(
+            "fn f() { println!(\"{}\", { shadow!(); api::foo() }); }"
+        ));
+        assert!(can_bind("fn f() { println!(\"{}\", other::shadow!()); }"));
+        assert!(can_bind(
+            "use other::format;\nfn f() { println!(\"{}\", format!(\"x\")); }"
+        ));
+        assert!(!can_bind(
+            "fn f() { println!(\"{}\", format!(\"{}\", api::foo())); }"
+        ));
+        assert!(!can_bind(
+            "fn f() { println!(\"{}\", std::format!(\"{}\", a != b)); }"
+        ));
     }
 
     #[test]
