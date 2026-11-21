@@ -45,7 +45,10 @@ impl Repairs {
 
     /// Whether the repairs take away the definition whose head (definition
     /// start to body) and name span these ranges: its name lies in a blanked
-    /// annotation, or a `;` is inserted inside its head, splitting it.
+    /// annotation, or a `;` is inserted after its name inside its head, so
+    /// the name is the macro of a terminated invocation. A `;` before the
+    /// name (`ATTR(x)` / `int victim(void)`) leaves the definition to the
+    /// repaired parse, which must still hold it.
     pub(crate) fn removes(
         &self,
         head: std::ops::Range<usize>,
@@ -57,7 +60,7 @@ impl Repairs {
             || self
                 .insertions
                 .iter()
-                .any(|offset| head.start <= *offset && *offset <= head.end)
+                .any(|offset| name.end <= *offset && *offset <= head.end)
     }
 
     /// `source` with the blanks applied and the `;` bytes inserted.
@@ -235,6 +238,7 @@ pub(crate) fn find(source: &[u8]) -> Result<Repairs> {
             parens: Vec::new(),
         }],
         conditionals: Vec::new(),
+        suspended: None,
         prev: None,
         boundary: true,
         repairs: Repairs::default(),
@@ -249,14 +253,28 @@ pub(crate) fn find(source: &[u8]) -> Result<Repairs> {
     Ok(scan.repairs)
 }
 
+/// An open `#if` group.
+struct Conditional {
+    /// The frames at the `#if`, where every arm starts.
+    start: Vec<Frame>,
+    /// The frames at the end of the first live arm.
+    first: Option<Vec<Frame>>,
+    /// The current arm is `#if 0` or `#elif 0`.
+    dead_arm: bool,
+    /// Two live arms left different frame depths.
+    divergent: bool,
+}
+
 struct Scan<'a> {
     tokens: &'a [Token],
     source: &'a [u8],
     defines: Vec<&'a [u8]>,
     frames: Vec<Frame>,
-    /// Open `#if` groups: the frames at the `#if`, and at the end of its
-    /// first arm once an `#elif` or `#else` closes that arm.
-    conditionals: Vec<(Vec<Frame>, Option<Vec<Frame>>)>,
+    conditionals: Vec<Conditional>,
+    /// Frame depth at and below which no repair is made: an `#if` group
+    /// whose arms leave different depths makes the brace tracking of its
+    /// enclosing scope unreliable until that scope closes.
+    suspended: Option<usize>,
     /// Last significant token that was not blanked; directives are skipped.
     prev: Option<usize>,
     /// A statement or declaration starts at the next significant token.
@@ -316,8 +334,8 @@ impl<'a> Scan<'a> {
                     self.boundary = true;
                 }
             }
-            Kind::Ident if frame.parens.is_empty() => {
-                let scope = frame.scope;
+            Kind::Ident if frame.parens.is_empty() && !self.repairs_suspended() => {
+                let scope = self.frames.last().expect("file frame").scope;
                 let next = match scope {
                     Scope::Declarations => self
                         .semicolonless_declaration(i, at_start)
@@ -342,21 +360,46 @@ impl<'a> Scan<'a> {
     /// otherwise count one brace per arm.
     fn conditional(&mut self, directive: &[u8]) {
         let rest = trim_blanks(&directive[1..]);
-        let keyword = &rest[..rest.iter().take_while(|b| b.is_ascii_alphabetic()).count()];
+        let length = rest.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+        let (keyword, condition) = rest.split_at(length);
+        let literal_zero = condition_is_literal_zero(condition);
         match keyword {
-            b"if" | b"ifdef" | b"ifndef" => self.conditionals.push((self.frames.clone(), None)),
+            b"if" | b"ifdef" | b"ifndef" => self.conditionals.push(Conditional {
+                start: self.frames.clone(),
+                first: None,
+                dead_arm: keyword == b"if" && literal_zero,
+                divergent: false,
+            }),
             b"elif" | b"elifdef" | b"elifndef" | b"else" => {
-                if let Some((start, first)) = self.conditionals.last_mut() {
-                    let current = std::mem::replace(&mut self.frames, start.clone());
-                    first.get_or_insert(current);
+                if let Some(group) = self.conditionals.last_mut() {
+                    let current = std::mem::replace(&mut self.frames, group.start.clone());
+                    group.close_arm(current);
+                    group.dead_arm = keyword == b"elif" && literal_zero;
                 }
             }
             b"endif" => {
-                if let Some((_, Some(first))) = self.conditionals.pop() {
-                    self.frames = first;
+                if let Some(mut group) = self.conditionals.pop() {
+                    let current = std::mem::take(&mut self.frames);
+                    let depth = group.start.len();
+                    group.close_arm(current.clone());
+                    self.frames = group.first.unwrap_or(current);
+                    if group.divergent {
+                        self.suspended = Some(self.suspended.map_or(depth, |d| d.min(depth)));
+                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn repairs_suspended(&mut self) -> bool {
+        match self.suspended {
+            Some(depth) if self.frames.len() >= depth => true,
+            Some(_) => {
+                self.suspended = None;
+                false
+            }
+            None => false,
         }
     }
 
@@ -501,12 +544,23 @@ impl<'a> Scan<'a> {
         let follows = self.is_ident(next, &STATEMENT_KEYS)
             || (self.macro_shaped(next)
                 && (has_args || self.kind(next + 1) == Some(Kind::Punct(b'('))))
-            || (has_args && self.kind(next) == Some(Kind::Punct(b'}')));
+            || (has_args && self.kind(next) == Some(Kind::Punct(b'}')))
+            || (has_args && self.calls_on_its_own(next));
         if !follows {
             return None;
         }
         self.insert_after(end - 1);
         Some(end)
+    }
+
+    /// `name(`: a call statement, which a macro-wrapped type's declarator
+    /// (`TYPE(int)` / `value;`) never is.
+    fn calls_on_its_own(&self, i: usize) -> bool {
+        self.kind(i) == Some(Kind::Ident)
+            && !self.is_ident(i, &DECLARATION_KEYS)
+            && !self.is_ident(i, &OPERAND_KEYS)
+            && !self.is_ident(i, &[b"else"])
+            && self.kind(i + 1) == Some(Kind::Punct(b'('))
     }
 
     /// A declaration-position invocation `NAME(args)` alone on its line and
@@ -635,7 +689,10 @@ impl<'a> Scan<'a> {
     fn is_type_word(&self, i: usize) -> bool {
         match self.kind(i) {
             Some(Kind::Ident) => {
-                !self.is_ident(i, &QUALIFIER_KEYS) || self.is_ident(i, &PRIMITIVE_KEYS)
+                !(self.is_ident(i, &QUALIFIER_KEYS)
+                    || self.is_ident(i, &STATEMENT_KEYS)
+                    || self.is_ident(i, &[b"else"]))
+                    || self.is_ident(i, &PRIMITIVE_KEYS)
             }
             Some(Kind::Punct(b'*' | b'&' | b'>')) => true,
             _ => false,
@@ -710,6 +767,34 @@ fn matching_open(tokens: &[Token], close: usize) -> Option<usize> {
         }
     }
     None
+}
+
+impl Conditional {
+    /// Record the frames an arm ended with: the first live arm's become the
+    /// group's, and a later live arm at another depth makes the group
+    /// divergent. A dead `#if 0` arm counts for neither.
+    fn close_arm(&mut self, frames: Vec<Frame>) {
+        if self.dead_arm {
+            return;
+        }
+        match &self.first {
+            None => self.first = Some(frames),
+            Some(first) => self.divergent |= first.len() != frames.len(),
+        }
+    }
+}
+
+/// `#if 0`, with nothing but blanks or a comment after the `0`.
+fn condition_is_literal_zero(condition: &[u8]) -> bool {
+    let condition = trim_blanks(condition);
+    let Some(rest) = condition.strip_prefix(b"0") else {
+        return false;
+    };
+    let rest = trim_blanks(rest);
+    rest.is_empty()
+        || rest.starts_with(b"//")
+        || rest.starts_with(b"/*")
+        || rest.iter().all(u8::is_ascii_whitespace)
 }
 
 /// Names of function-like macros a `#define NAME(` directive introduces.

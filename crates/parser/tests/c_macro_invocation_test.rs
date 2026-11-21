@@ -324,3 +324,71 @@ int real(void) { return helper2(); }
         .collect();
     assert_eq!(exported, [10, 11]);
 }
+
+#[test]
+fn conditional_arms_at_different_depths_stop_repairs_in_their_scope() {
+    let source = "int helper(void) { return 0; }
+#ifndef ZTS
+#else
+static void g(int a) {
+#endif
+  if (a) {
+    helper();
+  } else if (a > 1) ZEND_ASSERT(a);
+  helper();
+}
+";
+    let found = calls(source, Language::C, "dead.c");
+    assert!(
+        found.contains(&("ZEND_ASSERT".to_string(), 8, 20)),
+        "{found:?}"
+    );
+    assert_eq!(
+        found
+            .iter()
+            .filter(|(name, _, _)| name == "helper")
+            .map(|(_, line, _)| *line)
+            .collect::<Vec<_>>(),
+        [7, 9]
+    );
+}
+
+#[test]
+fn macro_run_followed_by_a_lowercase_call_keeps_the_call() {
+    let source = "int helper(void) { return 0; }
+int f(void)
+{
+\tFOO_SUB(a)
+\tFOO_SUB(b)
+
+\t/* c */
+\tzval_ptr_dtor(&x);
+\treturn 0;
+}
+PHP_MINFO_FUNCTION(basic)
+{
+\tphp_info_print_table_start();
+\tBASIC_MINFO_SUBMODULE(dl)
+\tBASIC_MINFO_SUBMODULE(mail)
+\tphp_info_print_table_end();
+\tBASIC_MINFO_SUBMODULE(assert)
+}
+";
+    assert_eq!(
+        definitions(source, Language::C, "basic.c"),
+        owned(&[("helper", 1, 1), ("f", 2, 10), ("basic", 11, 18)])
+    );
+    assert_eq!(
+        calls(source, Language::C, "basic.c"),
+        owned(&[
+            ("FOO_SUB", 4, 1),
+            ("FOO_SUB", 5, 1),
+            ("zval_ptr_dtor", 8, 1),
+            ("php_info_print_table_start", 13, 1),
+            ("BASIC_MINFO_SUBMODULE", 14, 1),
+            ("BASIC_MINFO_SUBMODULE", 15, 1),
+            ("php_info_print_table_end", 16, 1),
+            ("BASIC_MINFO_SUBMODULE", 17, 1),
+        ])
+    );
+}

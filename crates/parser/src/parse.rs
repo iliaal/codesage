@@ -134,11 +134,8 @@ pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTr
     let prepared = prepare_c_family(source, language)?;
     let input = prepared.as_deref().unwrap_or(source);
     let mut tree = parse_with_control(&mut parser, input)?;
-    if matches!(language, Language::C | Language::Cpp)
-        && let Repair::Kept(repaired) =
-            repair_macro_invocations(&mut parser, &tree, input, language)?
-    {
-        tree = repaired;
+    if matches!(language, Language::C | Language::Cpp) {
+        tree = repair_macro_invocations(&mut parser, tree, input, language)?.into_tree();
     }
     if language == Language::Java {
         validate_java_depth(&tree)?;
@@ -168,17 +165,31 @@ fn parse_with_control(parser: &mut Parser, input: &[u8]) -> Result<Tree> {
     tree.ok_or_else(|| anyhow::anyhow!("tree-sitter parsing failed"))
 }
 
-/// What [`repair_macro_invocations`] did with a file.
+/// What [`repair_macro_invocations`] did with a file, carrying the tree to
+/// index.
 #[derive(Debug)]
 enum Repair {
     /// The first parse is clean and builds no definition from a macro, or
     /// nothing in the file needs a repair.
-    NotNeeded,
-    /// The repaired parse had more syntax errors than the first one.
-    MoreErrors,
-    /// The repaired parse lost a definition the first parse had.
-    LostDefinition,
+    NotNeeded(Tree),
+    /// The repaired parse had more syntax errors than the first one; the
+    /// tree is the first parse again.
+    MoreErrors(Tree),
+    /// The repaired parse lost a definition the first parse had; the tree is
+    /// the first parse again.
+    LostDefinition(Tree),
     Kept(Tree),
+}
+
+impl Repair {
+    fn into_tree(self) -> Tree {
+        match self {
+            Self::NotNeeded(tree)
+            | Self::MoreErrors(tree)
+            | Self::LostDefinition(tree)
+            | Self::Kept(tree) => tree,
+        }
+    }
 }
 
 /// Reparse C/C++ with the repairs [`crate::macro_invocation::find`] locates,
@@ -193,24 +204,31 @@ enum Repair {
 /// definitions the repairs remove on purpose. Error recovery elsewhere in the
 /// file (a brace opened inside `#ifdef`, say) can otherwise swallow a real
 /// definition that the first parse kept.
+///
+/// Only one tree is resident at a time: the first parse is summarized and
+/// dropped before the repaired parse, and parsed again when the repair is
+/// refused, which is rare.
 fn repair_macro_invocations(
     parser: &mut Parser,
-    tree: &Tree,
+    tree: Tree,
     source: &[u8],
     language: Language,
 ) -> Result<Repair> {
-    if !(tree.root_node().has_error() || macro_definition(tree)?) {
-        return Ok(Repair::NotNeeded);
+    if !(tree.root_node().has_error() || macro_definition(&tree)?) {
+        return Ok(Repair::NotNeeded(tree));
     }
     let repairs = crate::macro_invocation::find(source)?;
     if repairs.is_empty() {
-        return Ok(Repair::NotNeeded);
+        return Ok(Repair::NotNeeded(tree));
     }
+    let first_errors = error_count(&tree)?;
+    let kept = top_level_definition_names(&tree, source, language, Some(&repairs))?;
+    drop(tree);
     let mut repaired = parse_with_control(parser, &repairs.apply(source))?;
-    if error_count(&repaired)? > error_count(tree)? {
-        return Ok(Repair::MoreErrors);
+    if error_count(&repaired)? > first_errors {
+        drop(repaired);
+        return Ok(Repair::MoreErrors(parse_with_control(parser, source)?));
     }
-    let kept = top_level_definition_names(tree, source, language, Some(&repairs))?;
     let points = insertion_points(source, &repairs.insertions);
     for (delta, &(offset, point)) in points.iter().enumerate().rev() {
         repaired.edit(&tree_sitter::InputEdit {
@@ -230,7 +248,8 @@ fn repair_macro_invocations(
         .iter()
         .any(|(name, count)| names.get(name).is_none_or(|found| found < count))
     {
-        return Ok(Repair::LostDefinition);
+        drop(repaired);
+        return Ok(Repair::LostDefinition(parse_with_control(parser, source)?));
     }
     Ok(Repair::Kept(repaired))
 }
@@ -527,7 +546,7 @@ mod header_quality_tests {
         let mut parser = Parser::new();
         parser.set_language(&ts_language(language)).unwrap();
         let tree = parse_with_control(&mut parser, source).unwrap();
-        repair_macro_invocations(&mut parser, &tree, source, language).unwrap()
+        repair_macro_invocations(&mut parser, tree, source, language).unwrap()
     }
 
     #[test]
@@ -538,7 +557,7 @@ mod header_quality_tests {
             b"C23_ENUM(zend_ini_scanner_mode, uint8_t) {\n   ZEND_INI_SCANNER_TYPED  = 2,\n};\n";
         assert!(matches!(
             repair_outcome(source, Language::Cpp),
-            Repair::MoreErrors
+            Repair::MoreErrors(_)
         ));
         let mut parser = Parser::new();
         parser.set_language(&ts_language(Language::Cpp)).unwrap();
@@ -559,7 +578,7 @@ mod header_quality_tests {
         let source = b"\t\tZ_PARAM_STR_OR_NULL(service)\n\t\tZ_PARAM_ARRAY(zhints)\n\t\tZ_PARAM_ZVAL_OR_NULL(error_code)\n\tZEND_PARSE_PARAMETERS_END();\n\tmemset(&hints, 0, sizeof(hints));\n#if defined(PHP_WIN32)\n\t\t\tif (rp->ai_canonname != NULL) {\n}\n/* {{{ Creates and binds to a socket from a given addrinfo resource */\nPHP_FUNCTION(socket_addrinfo_bind)\n{\n";
         assert!(matches!(
             repair_outcome(source, Language::C),
-            Repair::LostDefinition
+            Repair::LostDefinition(_)
         ));
         let tree = parse_file(source, Language::C).unwrap();
         let symbols = crate::extract::extract_symbols(&tree, source, Language::C, "s.c").unwrap();
@@ -567,6 +586,24 @@ mod header_quality_tests {
             symbols
                 .iter()
                 .any(|symbol| symbol.name == "socket_addrinfo_bind"),
+            "{symbols:?}"
+        );
+    }
+
+    #[test]
+    fn a_semicolon_before_a_definitions_name_does_not_excuse_it() {
+        let source = b"ATTR_COLD(x)\nint victim(void)\n{\n\treturn helper();\n}\n";
+        let tree = parse_file_with(source, &crate::macro_invocation::Repairs::default());
+        let repairs = crate::macro_invocation::Repairs {
+            blanks: Vec::new(),
+            insertions: vec![b"ATTR_COLD(x)".len()],
+        };
+        let kept = top_level_definition_names(&tree, source, Language::C, Some(&repairs)).unwrap();
+        assert_eq!(kept.get(b"victim".as_slice()), Some(&1));
+        let tree = parse_file(source, Language::C).unwrap();
+        let symbols = crate::extract::extract_symbols(&tree, source, Language::C, "v.c").unwrap();
+        assert!(
+            symbols.iter().any(|symbol| symbol.name == "victim"),
             "{symbols:?}"
         );
     }
