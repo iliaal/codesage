@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result, ensure};
+use codesage_protocol::php::PhpName;
 use codesage_protocol::python::PythonBindings;
 use codesage_protocol::{FileInfo, Language, Reference, Symbol, TrustBoundary};
 use rusqlite::{OptionalExtension, params};
@@ -13,6 +14,7 @@ pub struct StructuralOverlayFile<'a> {
     pub symbols: &'a [Symbol],
     pub references: &'a [Reference],
     pub python_bindings: &'a PythonBindings,
+    pub php_names: &'a [PhpName],
     pub fingerprints: &'a [FingerprintInput<'a>],
     pub trust_boundaries: &'a [TrustBoundary],
     pub interpretation: &'a str,
@@ -24,6 +26,7 @@ const TABLES: &[(&str, &str)] = &[
     ("symbols", "file_id"),
     ("refs", "from_file_id"),
     ("python_bindings", "file_id"),
+    ("php_names", "file_id"),
     ("symbol_fingerprints", "file_id"),
     ("file_trust_boundaries", "file_id"),
 ];
@@ -168,7 +171,18 @@ impl Database {
                 [path],
             )?;
         }
-        for (table, _) in TABLES {
+        // An index opened read-only before migration 0035 has no php_names.
+        let php_names_table: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE name = 'php_names' AND type = 'table')",
+            [],
+            |row| row.get(0),
+        )?;
+        let tables: Vec<(&str, &str)> = TABLES
+            .iter()
+            .copied()
+            .filter(|(table, _)| php_names_table || *table != "php_names")
+            .collect();
+        for (table, _) in &tables {
             let rowid = if *table == "symbol_fingerprints" {
                 "rowid AS rowid, "
             } else {
@@ -198,6 +212,12 @@ impl Database {
              CREATE UNIQUE INDEX temp.__overlay_boundary_key ON __overlay_file_trust_boundaries(file_id, boundary);
              CREATE INDEX temp.__overlay_boundary ON __overlay_file_trust_boundaries(boundary);",
         )?;
+        if php_names_table {
+            self.conn.execute_batch(
+                "CREATE UNIQUE INDEX temp.__overlay_php_names_key
+                     ON __overlay_php_names(file_id, kind, name, target, line);",
+            )?;
+        }
         let mut file_id = self.overlay_max_id("files", "id")?;
         let mut symbol_id = self.overlay_max_id("symbols", "id")?;
         let mut reference_id = self.overlay_max_id("refs", "id")?;
@@ -336,6 +356,19 @@ impl Database {
                     serde_json::to_string(&binding.target)?
                 ])?;
             }
+            for name in replacement.php_names.iter().filter(|_| php_names_table) {
+                codesage_protocol::work::checkpoint()?;
+                self.conn.prepare_cached(
+                    "INSERT OR IGNORE INTO temp.__overlay_php_names (file_id, kind, name, target, line)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?.execute(params![
+                    id,
+                    name.kind.as_str(),
+                    name.name,
+                    name.target,
+                    name.line
+                ])?;
+            }
             for fingerprint in replacement.fingerprints {
                 codesage_protocol::work::checkpoint()?;
                 ensure!(
@@ -370,7 +403,7 @@ impl Database {
                 )?;
             }
         }
-        for (table, key) in TABLES {
+        for (table, key) in &tables {
             let rowid = if *table == "symbol_fingerprints" {
                 "rowid, "
             } else {
@@ -680,6 +713,7 @@ mod tests {
                     },
                 ],
                 python_bindings: &bindings,
+                php_names: &[],
                 fingerprints: &[FingerprintInput {
                     name: "current",
                     kind: "function",
@@ -808,6 +842,7 @@ mod tests {
                     symbols: &[symbol("dirty.py", "current")],
                     references: &[],
                     python_bindings: &PythonBindings::default(),
+                    php_names: &[],
                     fingerprints: &[FingerprintInput {
                         name: "current",
                         kind: "function",

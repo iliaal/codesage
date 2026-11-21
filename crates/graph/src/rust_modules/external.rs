@@ -1128,12 +1128,7 @@ fn last_segment(path: &str) -> &str {
 }
 
 pub(super) fn project_root(db: &Database) -> Option<PathBuf> {
-    db.path().and_then(|path| {
-        let dir = path.parent()?;
-        (path.file_name()? == "index.db" && dir.file_name()? == ".codesage")
-            .then(|| dir.parent().map(Path::to_path_buf))
-            .flatten()
-    })
+    crate::constructor_imports::project_root(db).map(Path::to_path_buf)
 }
 
 fn conventional_library(package: &str, manifest: &toml::Value) -> Option<String> {

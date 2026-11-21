@@ -263,6 +263,16 @@ fn resolve_site(
             indexed.paths,
         ));
         if files.is_empty()
+            && let Some(global) = crate::bundle::php_global_class_name(&row.from_file, &row.to_name)
+        {
+            files.extend(
+                db.find_symbols_named_ignore_case(global)?
+                    .into_iter()
+                    .filter(|symbol| crate::bundle::names_php_global_class(symbol, global))
+                    .map(|symbol| symbol.file_path),
+            );
+        }
+        if files.is_empty()
             && (row.from_file.ends_with(".php") || row.from_file.ends_with(".java"))
             && (row.to_name.contains('\\') || row.to_name.contains('.'))
         {

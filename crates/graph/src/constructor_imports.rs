@@ -167,7 +167,7 @@ fn js_language(file: &str) -> Option<Language> {
         .filter(|language| matches!(language, Language::JavaScript | Language::TypeScript))
 }
 
-fn project_root(db: &Database) -> Option<&Path> {
+pub(crate) fn project_root(db: &Database) -> Option<&Path> {
     let path = db.path()?;
     let directory = path.parent()?;
     (path.file_name()? == "index.db" && directory.file_name()? == ".codesage")

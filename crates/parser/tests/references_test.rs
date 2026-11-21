@@ -41,6 +41,31 @@ fn php_group_use_emits_prefixed_imports() {
 }
 
 #[test]
+fn php_single_segment_use_records_the_global_class() {
+    let src = "<?php
+namespace App;
+use InvalidArgumentException;
+use Stringable as Text;
+use function strlen;
+use const PHP_EOL;
+use Lib\\{Grouped};
+";
+    let imports: Vec<_> = refs_from_source(src, Language::Php)
+        .into_iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| (r.line, r.to_name))
+        .collect();
+    assert_eq!(
+        imports,
+        [
+            (3, "\\InvalidArgumentException".to_string()),
+            (4, "\\Stringable".to_string()),
+            (7, "Lib\\Grouped".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn php_qualified_class_references_resolve_to_fully_qualified_names() {
     let src = "<?php
 namespace App;

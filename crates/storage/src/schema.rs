@@ -798,6 +798,7 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ("0032_refs_import_edges", migrate_0032_refs_import_edges),
     ("0033_js_aliases", migrate_0033_js_aliases),
     ("0034_php_nocase_lookups", migrate_0034_php_nocase_lookups),
+    ("0035_php_names", migrate_0035_php_names),
 ];
 
 /// The reference kinds that can form a file-level import edge, as a SQL list.
@@ -858,6 +859,23 @@ fn migrate_0034_php_nocase_lookups(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_refs_php_name_nocase
              ON refs(to_name COLLATE NOCASE) WHERE {PHP_QUALIFIED_REF_SQL};"
     ))
+}
+
+/// PHP name-resolution facts captured at index time: each namespace a file
+/// declares and each `use` clause with the alias it binds and whether it
+/// imports a class, function, or constant. Reference rows store only an
+/// import's target, so bare class names resolve from these rows.
+fn migrate_0035_php_names(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS php_names (
+             file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+             kind TEXT NOT NULL,
+             name TEXT NOT NULL,
+             target TEXT NOT NULL,
+             line INTEGER NOT NULL,
+             PRIMARY KEY (file_id, kind, name, target, line)
+         ) WITHOUT ROWID;",
+    )
 }
 
 /// The partial-index predicate of `idx_refs_php_name_nocase`.

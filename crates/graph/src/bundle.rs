@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use codesage_protocol::js_paths::lexical_join;
+use codesage_protocol::php::PhpNameKind;
 use codesage_protocol::{
     ContextBundle, ExportRequest, Language, ReferenceKind, SearchRequest, SearchResult, Symbol,
     SymbolKind, SymbolSummary, TargetKind, TargetResolution, Visibility,
@@ -967,6 +968,21 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
             && reference_kind_admits(caller_file, kind, symbol)
     });
     let total_candidates = all_candidates.len();
+    let mut php_bound = Vec::new();
+    if caller_language == Some(Language::Php) && !to_name.contains('\\') {
+        let classes;
+        (classes, all_candidates) = all_candidates
+            .into_iter()
+            .partition(|symbol| is_php_class_like(symbol));
+        php_bound = if classes.is_empty() {
+            Vec::new()
+        } else {
+            php_bare_class_bindings(db, caller_file, to_name, classes, load_imports)?
+        };
+        if all_candidates.is_empty() {
+            return Ok(php_bound);
+        }
+    }
     let candidates: Vec<&Symbol> = all_candidates
         .into_iter()
         .filter(|s| {
@@ -1007,7 +1023,8 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
         }
     }
     if total_candidates <= 1 {
-        return Ok(owned(candidates));
+        php_bound.extend(owned(candidates));
+        return Ok(php_bound);
     }
     let import_refs = load_imports()?;
     let prepared: Vec<ImportRef<'_>> = import_refs.iter().map(|imp| ImportRef::new(imp)).collect();
@@ -1027,7 +1044,129 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
                     .any(|imp| prepared_import_targets_symbol(imp, importer, to_name, s, modules))
         })
         .collect();
-    Ok(owned(filtered))
+    php_bound.extend(owned(filtered));
+    Ok(php_bound)
+}
+
+fn is_php_class_like(symbol: &Symbol) -> bool {
+    matches!(
+        symbol.kind,
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Trait | SymbolKind::Enum
+    ) && codesage_parser::detect::detect_language(std::path::Path::new(&symbol.file_path))
+        == Some(Language::Php)
+}
+
+/// The PHP classes among `classes` that the bare class name `to_name` in
+/// `caller_file` names, by PHP's compile-time rule rather than name
+/// uniqueness: a class `use` binding that name (explicitly, or by its last
+/// segment when not renamed) decides the class; without one, the name is the
+/// caller's namespace plus `to_name`. A class in the caller's own file always
+/// binds. The `use` clauses and namespaces come from the index's
+/// `php_names` rows, so a file changed or truncated on disk since indexing
+/// resolves as indexed. A file not indexed under the current structural
+/// interpretation falls back to its import rows (matched by last segment) and its definitions'
+/// namespaces.
+fn php_bare_class_bindings(
+    db: &Database,
+    caller_file: &str,
+    to_name: &str,
+    classes: Vec<&Symbol>,
+    load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
+) -> Result<Vec<Symbol>> {
+    let names =
+        if db.file_interpretation_matches(caller_file, crate::index::STRUCTURAL_INTERPRETATION)? {
+            db.php_names_for_file(caller_file)?
+        } else {
+            Vec::new()
+        };
+    let expected = if names.is_empty() {
+        php_legacy_bare_class_names(db, caller_file, to_name, &load_imports()?)?
+    } else {
+        let imported: Vec<String> = names
+            .iter()
+            .filter(|name| {
+                name.kind == PhpNameKind::Class && name.name.eq_ignore_ascii_case(to_name)
+            })
+            .map(|name| name.target.clone())
+            .collect();
+        if imported.is_empty() {
+            names
+                .iter()
+                .filter(|name| name.kind == PhpNameKind::Namespace)
+                .map(|name| php_join(&name.name, to_name))
+                .collect()
+        } else {
+            imported
+        }
+    };
+    Ok(classes
+        .into_iter()
+        .filter(|class| {
+            class.file_path == caller_file
+                || expected
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&class.qualified_name))
+        })
+        .cloned()
+        .collect())
+}
+
+fn php_join(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        name.to_string()
+    } else {
+        format!("{namespace}\\{name}")
+    }
+}
+
+/// [`php_bare_class_bindings`]'s names for a file without `php_names` rows:
+/// an import row ending in `to_name`, otherwise `to_name` in each namespace
+/// the file's class-like and function definitions declare.
+fn php_legacy_bare_class_names(
+    db: &Database,
+    caller_file: &str,
+    to_name: &str,
+    imports: &[String],
+) -> Result<Vec<String>> {
+    let imported: Vec<String> = imports
+        .iter()
+        .filter(|name| {
+            name.contains('\\')
+                && name
+                    .rsplit('\\')
+                    .next()
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(to_name))
+        })
+        .map(|name| name.trim_start_matches('\\').to_string())
+        .collect();
+    if !imported.is_empty() {
+        return Ok(imported);
+    }
+    let mut expected = Vec::new();
+    for symbol in db.symbols_for_file(caller_file)? {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Class
+                | SymbolKind::Interface
+                | SymbolKind::Trait
+                | SymbolKind::Enum
+                | SymbolKind::Function
+        ) {
+            continue;
+        }
+        let Some(namespace) = symbol.qualified_name.strip_suffix(symbol.name.as_str()) else {
+            continue;
+        };
+        let resolved = match namespace.strip_suffix('\\') {
+            Some(namespace) => php_join(namespace, to_name),
+            None if namespace.is_empty() => to_name.to_string(),
+            None => continue,
+        };
+        if !expected.contains(&resolved) {
+            expected.push(resolved);
+        }
+    }
+    Ok(expected)
 }
 
 /// Whether one of `import_refs` (the caller's import rows) names `symbol`
@@ -2906,6 +3045,7 @@ mod overlay_source_tests {
                     symbols: &[definition],
                     references: &[],
                     python_bindings: &PythonBindings::default(),
+                    php_names: &[],
                     fingerprints: &[],
                     trust_boundaries: &[],
                     interpretation: "current",

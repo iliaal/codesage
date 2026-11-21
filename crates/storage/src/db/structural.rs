@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
 use codesage_protocol::handle::mark_overloads;
+use codesage_protocol::php::{PhpName, PhpNameKind};
 use codesage_protocol::python::{PythonBindingTarget, PythonBindings};
 use codesage_protocol::{
     CallableSignature, DependencyEntry, FileInfo, Handle, Language, RationaleEntry, Reference,
@@ -414,6 +415,9 @@ impl Database {
             .prepare_cached("DELETE FROM python_bindings WHERE file_id = ?1")?
             .execute(params![file_id])?;
         self.conn
+            .prepare_cached("DELETE FROM php_names WHERE file_id = ?1")?
+            .execute(params![file_id])?;
+        self.conn
             .prepare_cached("DELETE FROM symbol_fingerprints WHERE file_id = ?1")?
             .execute(params![file_id])?;
         self.conn
@@ -488,6 +492,53 @@ impl Database {
             ])?;
         }
         Ok(())
+    }
+
+    pub fn insert_php_names(&self, file_id: i64, names: &[PhpName]) -> Result<()> {
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT OR IGNORE INTO php_names (file_id, kind, name, target, line)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for name in names {
+            stmt.execute(params![
+                file_id,
+                name.kind.as_str(),
+                name.name,
+                name.target,
+                name.line
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// The PHP namespace and `use` rows indexed for `path`; empty for a file
+    /// indexed before they were recorded, or by an index without the table.
+    pub fn php_names_for_file(&self, path: &str) -> Result<Vec<PhpName>> {
+        let exists: bool = self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'php_names' AND type = 'table')",
+            )?
+            .query_row([], |row| row.get(0))?;
+        if !exists {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT p.kind, p.name, p.target, p.line FROM php_names p
+             JOIN files f ON f.id = p.file_id
+             WHERE f.path = ?1
+             ORDER BY p.line, p.kind, p.name",
+        )?;
+        let rows = stmt.query_map(params![path], |row| {
+            let kind: String = row.get(0)?;
+            Ok(PhpName {
+                kind: row_enum(&kind, PhpNameKind::parse, "PhpNameKind")?,
+                name: row.get(1)?,
+                target: row.get(2)?,
+                line: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn insert_python_bindings(&self, file_id: i64, bindings: &PythonBindings) -> Result<()> {
@@ -1692,6 +1743,12 @@ impl Database {
              JOIN files f_from ON r.from_file_id = f_from.id
              JOIN symbols s ON (
                s.qualified_name = r.to_name
+               OR (
+                 f_from.language = 'php'
+                 AND r.to_name = '\\' || s.qualified_name COLLATE NOCASE
+                 AND instr(s.qualified_name, '\\') = 0
+                 AND s.kind IN ('class', 'interface', 'trait', 'enum')
+               )
                OR (
                  s.name = r.to_name
                  AND NOT EXISTS (
