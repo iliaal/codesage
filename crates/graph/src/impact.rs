@@ -97,6 +97,9 @@ pub(crate) struct WalkOutcome {
     pub edge_counts: HashMap<String, u32>,
     /// Symbol seeds, or one for a file-only root with a resolved import edge.
     pub seed_count: usize,
+    /// An edge came from a [`Reference::type_checking`] row, so a
+    /// `runtime_only` walk could return fewer entries.
+    pub type_checking_edges: bool,
 }
 
 pub(crate) type DefinitionKey = (String, String, u32, u32, SymbolKind);
@@ -947,6 +950,7 @@ pub(crate) fn impact_analysis_walk_shared(
             capped: true,
             edge_counts: HashMap::new(),
             seed_count: 0,
+            type_checking_edges: false,
         });
     }
     // One resolution decides both seeds and origin: a union across several
@@ -969,6 +973,7 @@ pub(crate) fn impact_analysis_walk_shared(
             capped: false,
             edge_counts: HashMap::new(),
             seed_count: 0,
+            type_checking_edges: false,
         });
     }
 
@@ -1030,6 +1035,7 @@ pub(crate) fn impact_analysis_walk_shared(
     let mut frontier: Vec<Symbol> = seed_symbols;
     let mut visited_symbols: HashSet<DefinitionKey> = HashSet::new();
     let mut frontier_capped = false;
+    let mut type_checking_edges = false;
 
     for depth in 1..=req.depth as u32 {
         codesage_protocol::work::checkpoint()?;
@@ -1096,6 +1102,7 @@ pub(crate) fn impact_analysis_walk_shared(
                 if origin_files.contains(&r.from_file) || (runtime_only && r.type_checking) {
                     continue;
                 }
+                type_checking_edges |= r.type_checking;
                 let entry = file_reasons
                     .entry(r.from_file.clone())
                     .or_insert_with(|| (depth, Vec::new(), HashSet::new()));
@@ -1208,6 +1215,7 @@ pub(crate) fn impact_analysis_walk_shared(
                 if origin_files.contains(&r.from_file) || (runtime_only && r.type_checking) {
                     continue;
                 }
+                type_checking_edges |= r.type_checking;
                 seed_count = seed_count.max(1);
                 let entry = file_reasons
                     .entry(r.from_file.clone())
@@ -1358,6 +1366,7 @@ pub(crate) fn impact_analysis_walk_shared(
         capped: frontier_capped || cache.as_ref().is_some_and(|cache| cache.context_capped()),
         edge_counts,
         seed_count,
+        type_checking_edges,
     })
 }
 

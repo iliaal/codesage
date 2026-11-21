@@ -6,7 +6,7 @@
 
 ### Fixed
 
-- Python imports under `if TYPE_CHECKING:` or `if typing.TYPE_CHECKING:` are marked `lazy` and no longer form import cycles in `risk`, `risk-diff`, `rehearse`, and `session-end` or reach tests in `tests-for` and MCP `recommend_tests`; `dependencies` and `impact` still list them.
+- Python imports under `if TYPE_CHECKING:` or `if typing.TYPE_CHECKING:` are marked `lazy` and no longer form import cycles in `risk`, `risk-diff`, `rehearse`, and `session-end` or reach tests in `tests-for`, MCP `recommend_tests`, and the `risk` test gap; `dependencies` and `impact` still list them.
 
 ## [0.53.0] - 2026-11-14
 

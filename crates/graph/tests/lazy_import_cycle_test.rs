@@ -321,6 +321,17 @@ fn python_type_checking_import_closes_no_cycle_and_carries_no_test_reach() {
         .collect()
     };
     assert!(reach("pkg/types.py").is_empty());
+    let guarded_risk = assess_risk(&db, "pkg/types.py").unwrap();
+    assert!(guarded_risk.test_gap, "{guarded_risk:?}");
+    assert!(
+        !guarded_risk
+            .notes
+            .iter()
+            .any(|n| n.contains("reaches this file")),
+        "{:?}",
+        guarded_risk.notes
+    );
+    assert!(!assess_risk(&db, "pkg/plain.py").unwrap().test_gap);
     assert_eq!(
         reach("pkg/plain.py"),
         vec!["tests/test_svc2.py".to_string()]

@@ -882,21 +882,32 @@ fn assess_risk_with_context(
         .collect();
 
     // An unfiltered walk supplies both source-file pressure and reachable tests.
-    let outcome = impact_analysis_walk_shared(
-        db,
-        &ImpactRequest {
-            target: ImpactTarget::File {
-                path: file_path.to_string(),
-            },
-            depth: DEPENDENT_DEPTH,
-            source_only: false,
+    let request = ImpactRequest {
+        target: ImpactTarget::File {
+            path: file_path.to_string(),
         },
-        max_frontier,
-        None,
-        Some(&mut *cache),
-        false,
-    )
-    .with_context(|| format!("computing dependent_files for risk({file_path})"))?;
+        depth: DEPENDENT_DEPTH,
+        source_only: false,
+    };
+    let outcome =
+        impact_analysis_walk_shared(db, &request, max_frontier, None, Some(&mut *cache), false)
+            .with_context(|| format!("computing dependent_files for risk({file_path})"))?;
+    // No test executes a `TYPE_CHECKING` import, so a test reached through one
+    // is re-checked on a walk that skips those rows.
+    let runtime_tests = if outcome.type_checking_edges
+        && outcome
+            .entries
+            .iter()
+            .any(|e| e.category == FileCategory::Test)
+    {
+        Some(
+            impact_analysis_walk_shared(db, &request, max_frontier, None, Some(&mut *cache), true)
+                .with_context(|| format!("computing reachable tests for risk({file_path})"))?
+                .entries,
+        )
+    } else {
+        None
+    };
     let dependents = outcome.entries;
     let walk_capped = outcome.capped;
 
@@ -915,7 +926,9 @@ fn assess_risk_with_context(
     // Reachability can find tests for new helpers with no sibling or co-change history.
     let has_sibling_test = test_sibling_exists(db, file_path)
         .with_context(|| format!("checking sibling test for risk({file_path})"))?;
-    let dependent_test = dependents
+    let dependent_test = runtime_tests
+        .as_ref()
+        .unwrap_or(&dependents)
         .iter()
         .filter(|e| e.category == FileCategory::Test)
         .min_by_key(|e| e.distance);
