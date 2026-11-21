@@ -1503,6 +1503,8 @@ mod tests {
         \tZEND_ARG_INFO(0, a)\n\
         ZEND_END_ARG_INFO()\n\
         \n\
+        static int broken = ;\n\
+        \n\
         int add(int a, int b) {\n\
         \treturn a + b;\n\
         }\n";

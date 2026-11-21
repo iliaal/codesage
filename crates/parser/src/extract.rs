@@ -382,7 +382,15 @@ pub fn extract_symbols(
         };
 
         let is_test = crate::test_marks::symbol_is_test(&def_node, source, language, test_ctx);
-        let signature = crate::signature::extract(def_node, source, language, &name);
+        // A C function-defining macro head has no source signature of its own.
+        let signature = if language == Language::C
+            && def_node.kind() == "function_definition"
+            && name_node.kind() == "type_identifier"
+        {
+            None
+        } else {
+            crate::signature::extract(def_node, source, language, &name)
+        };
 
         let symbol = Symbol {
             name,
@@ -416,6 +424,9 @@ pub fn extract_symbols(
 /// - A C/C++ statement keyword can never name a function.
 /// - A definition whose return type is `else` is a dangling `else` arm,
 ///   whatever the following statement or macro is.
+/// - A definition whose return type is a macro invocation inside a function
+///   body is a run of statement macros such as `Z_PARAM_STR(s)
+///   Z_PARAM_LONG(n) { ... }`, in C as well as C++.
 /// - C++ has no nested functions, so a typeless definition directly inside a
 ///   function or lambda body is a statement such as `catch (...) {...}` or
 ///   `Q_FOREACH(x, list) {...}`; C keeps GNU nested functions.
@@ -440,13 +451,44 @@ pub(crate) fn is_recovered_statement(
     if def.kind() != "function_definition" {
         return false;
     }
-    if def
-        .child_by_field_name("type")
-        .is_some_and(|ty| ty.utf8_text(source) == Ok("else"))
-    {
+    let def_type = def.child_by_field_name("type");
+    if def_type.is_some_and(|ty| ty.utf8_text(source) == Ok("else")) {
+        return true;
+    }
+    if def_type.is_some_and(|ty| is_macro_invocation_type(ty, source)) && in_function_body(def) {
         return true;
     }
     language == Language::Cpp && nested_in_function_body(def, name, source)
+}
+
+/// A return type spelled as `NAME(args)`. `typeof(int)` and `_Atomic(int)`
+/// parse the same way but are real types, so a GNU nested function with one
+/// stays a definition.
+fn is_macro_invocation_type(ty: Node, source: &[u8]) -> bool {
+    ty.kind() == "macro_type_specifier"
+        && !ty
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+            .is_some_and(|name| matches!(name, "typeof" | "__typeof__" | "__typeof" | "_Atomic"))
+}
+
+/// Whether the innermost body enclosing `def` belongs to a function or lambda.
+fn in_function_body(def: &Node) -> bool {
+    let mut node = *def;
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "compound_statement"
+                if parent.parent().is_some_and(|owner| {
+                    matches!(owner.kind(), "function_definition" | "lambda_expression")
+                }) =>
+            {
+                return true;
+            }
+            "field_declaration_list" | "declaration_list" | "translation_unit" => return false,
+            _ => node = parent,
+        }
+    }
+    false
 }
 
 /// Only a typeless, non-template definition directly owned by a real function
@@ -544,6 +586,9 @@ pub(crate) fn definition_capture<'tree>(
     language: Language,
     source: &[u8],
 ) -> Option<(Node<'tree>, SymbolKind)> {
+    if language == Language::C {
+        return Some((c_macro_head_name(definition, source).unwrap_or(name), kind));
+    }
     if language != Language::Cpp {
         return Some((name, kind));
     }
@@ -584,6 +629,59 @@ pub(crate) fn definition_capture<'tree>(
         .then_some((name, kind)),
         _ => Some((name, kind)),
     }
+}
+
+/// `ZEND_API ZEND_INI_MH(OnUpdate) {`: a C definition with no return type, or
+/// a macro-shaped one (`U_CFUNC`), whose declarator is a macro-shaped name
+/// applied to one bare identifier and followed directly by the body, is a
+/// function-defining macro, named by its argument as the parenthesized form
+/// `PHP_FUNCTION(name) {` already is. A real return type keeps the
+/// function's own name: `int COUNT(Foo) {` (a C23 unnamed parameter) and
+/// `int SQUARE(x) {` (a K&R identifier list) are valid definitions. So does
+/// a macro-shaped argument, a parameter list macro
+/// (`static int NOP_HANDLER(HANDLER_ARGS) {`).
+pub(crate) fn c_macro_head_name<'tree>(
+    definition: Node<'tree>,
+    source: &[u8],
+) -> Option<Node<'tree>> {
+    if definition.kind() != "function_definition"
+        || definition
+            .named_children(&mut definition.walk())
+            .any(|child| child.kind() == "declaration")
+    {
+        return None;
+    }
+    if definition.child_by_field_name("type").is_some_and(|ty| {
+        ty.kind() != "type_identifier"
+            || !ty
+                .utf8_text(source)
+                .is_ok_and(|text| crate::macro_invocation::macro_shaped(text.as_bytes()))
+    }) {
+        return None;
+    }
+    let declarator = definition.child_by_field_name("declarator")?;
+    if declarator.kind() != "function_declarator" {
+        return None;
+    }
+    let head = declarator.child_by_field_name("declarator")?;
+    let parameters = declarator.child_by_field_name("parameters")?;
+    if head.kind() != "identifier"
+        || !head
+            .utf8_text(source)
+            .is_ok_and(|text| crate::macro_invocation::macro_shaped(text.as_bytes()))
+        || parameters.named_child_count() != 1
+    {
+        return None;
+    }
+    let parameter = parameters.named_child(0)?;
+    let name = parameter.child_by_field_name("type")?;
+    (parameter.kind() == "parameter_declaration"
+        && parameter.named_child_count() == 1
+        && name.kind() == "type_identifier"
+        && !name
+            .utf8_text(source)
+            .is_ok_and(|text| crate::macro_invocation::macro_shaped(text.as_bytes())))
+    .then_some(name)
 }
 
 fn cpp_callable_capture(declarator: Node<'_>, has_body: bool) -> Option<(Node<'_>, SymbolKind)> {

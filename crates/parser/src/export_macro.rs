@@ -311,7 +311,7 @@ fn ident_is(t: Option<&Token>, source: &[u8], words: &[&[u8]]) -> bool {
 
 /// Index just past a candidate's optional `( ... )` argument list, or `None`
 /// when the list is unbalanced or longer than [`MAX_ARGS_BYTES`].
-fn after_args(tokens: &[Token], i: usize) -> Option<usize> {
+pub(crate) fn after_args(tokens: &[Token], i: usize) -> Option<usize> {
     let open = i + 1;
     if tokens.get(open).map(|t| t.kind) != Some(Kind::Punct(b'(')) {
         return Some(open);

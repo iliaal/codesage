@@ -4,6 +4,7 @@ mod export_macro;
 pub mod extract;
 pub mod fingerprint;
 pub mod header;
+mod macro_invocation;
 pub mod parse;
 pub mod php_names;
 pub mod position;

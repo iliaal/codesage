@@ -13,6 +13,10 @@
 - Python imports under `if TYPE_CHECKING:` or `if typing.TYPE_CHECKING:` are marked `lazy` and no longer form import cycles in `risk`, `risk-diff`, `rehearse`, and `session-end` or reach tests in `tests-for`, MCP `recommend_tests`, and the `risk` test gap; `dependencies` and `impact` still list them.
 - Rust calls inside the arguments of std expression macros (`assert_eq!`, `format!`, `println!`, `vec!`, the `matches!` scrutinee, and the rest of the `format`/`write`/`print`/`assert`/`panic` family) produce reference rows that bind in `find-references`, `impact`, and `tests-for`, and no longer leave external-crate calls in the same block unresolved; reindex to pick them up.
 
+### Fixed
+
+- C/C++ macro invocations (trailing lock annotations, attribute macros, semicolonless `Z_PARAM_*` and file-scope runs, brace-initialized registrations) no longer index as phantom functions that drop or swallow the real definition, and C heads such as `ZEND_API ZEND_INI_MH(OnUpdate) {` are named by their argument.
+
 ## [0.53.0] - 2026-11-14
 
 ### Added
