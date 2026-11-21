@@ -899,8 +899,24 @@ impl Database {
         )
     }
 
+    /// Whether `refs.macro_mask` exists; an index older than migration
+    /// `0036_refs_macro_mask` opened read-only lacks it.
+    fn has_ref_macro_mask(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('refs') WHERE name = 'macro_mask')",
+            )?
+            .query_row([], |row| row.get(0))?)
+    }
+
     fn query_refs(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Reference>> {
-        let mut stmt = self.conn.prepare_cached(sql)?;
+        let sql = if self.has_ref_macro_mask()? {
+            std::borrow::Cow::Borrowed(sql)
+        } else {
+            std::borrow::Cow::Owned(sql.replacen(", r.macro_mask\n", ", NULL\n", 1))
+        };
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params, |row| {
             let kind_str: String = row.get(3)?;
             Ok(Reference {
@@ -2025,6 +2041,9 @@ impl Database {
     /// Paths of files holding a reference whose `macro_mask` shares a bit
     /// with `mask`.
     pub fn files_with_macro_mask(&self, mask: u16) -> Result<Vec<String>> {
+        if !self.has_ref_macro_mask()? {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.conn.prepare_cached(
             "SELECT DISTINCT f.path FROM refs r JOIN files f ON f.id = r.from_file_id
              WHERE r.macro_mask IS NOT NULL AND (r.macro_mask & ?1) <> 0
@@ -2053,17 +2072,20 @@ impl Database {
         // Count (name, file, line) sites: an import's module and binding can both
         // name the same symbol at different columns. Omitting column avoids that
         // double count but also collapses multiple real calls on one line.
+        let shadowed = if shadowed.is_empty() || !self.has_ref_macro_mask()? {
+            &[][..]
+        } else {
+            shadowed
+        };
+        let shadow_json = serde_json::to_string(shadowed)?;
         let (with, keep) = if shadowed.is_empty() {
             (String::new(), String::new())
         } else {
-            let values: Vec<String> = (0..shadowed.len())
-                .map(|i| {
-                    let at = names.len() + 2 * i + 1;
-                    format!("(?{at}, ?{})", at + 1)
-                })
-                .collect();
             (
-                format!("WITH shadow(path, mask) AS (VALUES {}) ", values.join(",")),
+                format!(
+                    "WITH shadow(path, mask) AS (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?{})) ",
+                    names.len() + 1
+                ),
                 " AND NOT EXISTS (SELECT 1 FROM shadow s JOIN files sf ON sf.path = s.path
                     WHERE sf.id = refs.from_file_id AND (COALESCE(refs.macro_mask, 0) & s.mask) <> 0)"
                     .to_string(),
@@ -2084,14 +2106,12 @@ impl Database {
         let mut stmt = self.conn.prepare(&sql)?;
         // Bind the same name list once: SQLite reuses the param indices across
         // both halves of the UNION because we use positional `?N` references.
-        let masks: Vec<i64> = shadowed.iter().map(|(_, mask)| i64::from(*mask)).collect();
         let mut params: Vec<&dyn rusqlite::types::ToSql> = names
             .iter()
             .map(|p| p as &dyn rusqlite::types::ToSql)
             .collect();
-        for ((path, _), mask) in shadowed.iter().zip(&masks) {
-            params.push(path);
-            params.push(mask);
+        if !shadowed.is_empty() {
+            params.push(&shadow_json);
         }
         let rows = stmt.query_map(params.as_slice(), |row| {
             let name: String = row.get(0)?;

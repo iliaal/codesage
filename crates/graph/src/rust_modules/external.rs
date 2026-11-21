@@ -867,8 +867,9 @@ impl ExternalCrates {
 
     /// Std expression macro names a `macro_rules!` in `caller`'s own crate can
     /// rebind there through `#[macro_use]` modules or textual scope, which
-    /// the per-file scan cannot follow. A definition whose crate is unknown
-    /// counts.
+    /// the per-file scan cannot follow. A definition in a file CodeSage cannot
+    /// place in a crate (a stray fixture, say) is ignored, so one such file
+    /// cannot unbind rows across the project.
     pub(super) fn caller_std_macros(
         &mut self,
         db: &Database,
@@ -880,7 +881,7 @@ impl ExternalCrates {
         let names: HashSet<String> = self
             .std_macro_definitions(db)?
             .iter()
-            .filter(|(file, _)| super::same_crate_in(&self.contexts, file, caller) != Some(false))
+            .filter(|(file, _)| super::same_crate_in(&self.contexts, file, caller) == Some(true))
             .map(|(_, name)| name.clone())
             .collect();
         let names = Arc::new(names);

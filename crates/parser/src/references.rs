@@ -665,7 +665,9 @@ const RUST_MACRO_ARGUMENT_DEPTH: usize = 4;
 const RUST_FRAGMENT_PREFIX: &str = "fn f(){(";
 const RUST_FRAGMENT_SUFFIX: &str = "\n);}";
 
-/// The std macros whose arguments are ordinary expressions.
+/// The std macros whose arguments are ordinary expressions. A name's position
+/// is its `Reference::macro_mask` bit, which `refs.macro_mask` stores, so
+/// reordering or inserting a name requires an extraction interpretation bump.
 const RUST_STD_EXPRESSION_MACROS: &[&str] = &[
     "format",
     "write",
@@ -2047,7 +2049,31 @@ function later() { (function* () { require('./nested'); })().next(); }
                 ("is_empty".to_string(), bit("assert")),
             ]
         );
-        assert_eq!(super::rust_std_expression_macro_names().len(), 16);
+        let table: Vec<(&str, u16)> = super::rust_std_expression_macro_names()
+            .iter()
+            .map(|name| (*name, bit(name)))
+            .collect();
+        assert_eq!(
+            table,
+            [
+                ("format", 1),
+                ("write", 2),
+                ("writeln", 4),
+                ("print", 8),
+                ("println", 16),
+                ("eprint", 32),
+                ("eprintln", 64),
+                ("assert", 128),
+                ("assert_eq", 256),
+                ("assert_ne", 512),
+                ("debug_assert", 1024),
+                ("debug_assert_eq", 2048),
+                ("debug_assert_ne", 4096),
+                ("panic", 8192),
+                ("vec", 16384),
+                ("matches", 32768),
+            ]
+        );
         assert_eq!(bit("quote"), 0);
     }
 

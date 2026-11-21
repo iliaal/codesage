@@ -980,6 +980,36 @@ fn a_use_renaming_a_macro_to_a_std_name_leaves_the_scope_unresolved() {
 }
 
 #[test]
+fn a_std_named_macro_exported_by_another_crate_does_not_shadow_the_caller() {
+    let (_dir, db) = api_other_app(&[
+        (
+            "other/src/lib.rs",
+            "pub fn foo() -> i32 { 2 }\n#[macro_export]\nmacro_rules! println { ($($e:tt)*) => { () }; }\n",
+        ),
+        (
+            "app/src/main.rs",
+            "fn main() {\n    println!(\"{}\", api::foo());\n}\n",
+        ),
+        (
+            "app/src/bin/q2.rs",
+            "fn main() {\n    println!(\"{}\", api::foo());\n}\n",
+        ),
+        (
+            "stray/fixture.rs",
+            "macro_rules! println { ($($e:tt)*) => { () }; }\n",
+        ),
+    ]);
+    let api = Some("sym:api/src/lib.rs#foo".to_string());
+    assert_eq!(
+        foo_bindings(&db, "foo"),
+        [
+            ("app/src/bin/q2.rs".into(), 2, api.clone()),
+            ("app/src/main.rs".into(), 2, api),
+        ]
+    );
+}
+
+#[test]
 fn c_defines_with_std_macro_names_do_not_shadow_rust_macros() {
     let (_dir, db) = api_other_app(&[
         ("other/src/lib.rs", "pub fn foo() -> i32 { 2 }\n"),
