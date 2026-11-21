@@ -455,10 +455,21 @@ pub(crate) fn is_recovered_statement(
     if def_type.is_some_and(|ty| ty.utf8_text(source) == Ok("else")) {
         return true;
     }
-    if def_type.is_some_and(|ty| ty.kind() == "macro_type_specifier") && in_function_body(def) {
+    if def_type.is_some_and(|ty| is_macro_invocation_type(ty, source)) && in_function_body(def) {
         return true;
     }
     language == Language::Cpp && nested_in_function_body(def, name, source)
+}
+
+/// A return type spelled as `NAME(args)`. `typeof(int)` and `_Atomic(int)`
+/// parse the same way but are real types, so a GNU nested function with one
+/// stays a definition.
+fn is_macro_invocation_type(ty: Node, source: &[u8]) -> bool {
+    ty.kind() == "macro_type_specifier"
+        && !ty
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+            .is_some_and(|name| matches!(name, "typeof" | "__typeof__" | "__typeof" | "_Atomic"))
 }
 
 /// Whether the innermost body enclosing `def` belongs to a function or lambda.
@@ -620,20 +631,32 @@ pub(crate) fn definition_capture<'tree>(
     }
 }
 
-/// `ZEND_API ZEND_INI_MH(OnUpdate) {`: a C definition whose declarator is a
-/// macro-shaped name applied to one bare identifier, followed directly by the
-/// body, is a function-defining macro, named by its argument as the
-/// parenthesized form `PHP_FUNCTION(name) {` already is. A C definition
-/// cannot leave its only parameter unnamed, and a K&R definition declares
-/// its parameters before the body. A macro-shaped argument is a parameter
-/// list macro instead (`static int NOP_HANDLER(HANDLER_ARGS) {`), and the
-/// all-caps function keeps its name.
-fn c_macro_head_name<'tree>(definition: Node<'tree>, source: &[u8]) -> Option<Node<'tree>> {
+/// `ZEND_API ZEND_INI_MH(OnUpdate) {`: a C definition with no return type, or
+/// a macro-shaped one (`U_CFUNC`), whose declarator is a macro-shaped name
+/// applied to one bare identifier and followed directly by the body, is a
+/// function-defining macro, named by its argument as the parenthesized form
+/// `PHP_FUNCTION(name) {` already is. A real return type keeps the
+/// function's own name: `int COUNT(Foo) {` (a C23 unnamed parameter) and
+/// `int SQUARE(x) {` (a K&R identifier list) are valid definitions. So does
+/// a macro-shaped argument, a parameter list macro
+/// (`static int NOP_HANDLER(HANDLER_ARGS) {`).
+pub(crate) fn c_macro_head_name<'tree>(
+    definition: Node<'tree>,
+    source: &[u8],
+) -> Option<Node<'tree>> {
     if definition.kind() != "function_definition"
         || definition
             .named_children(&mut definition.walk())
             .any(|child| child.kind() == "declaration")
     {
+        return None;
+    }
+    if definition.child_by_field_name("type").is_some_and(|ty| {
+        ty.kind() != "type_identifier"
+            || !ty
+                .utf8_text(source)
+                .is_ok_and(|text| crate::macro_invocation::macro_shaped(text.as_bytes()))
+    }) {
         return None;
     }
     let declarator = definition.child_by_field_name("declarator")?;

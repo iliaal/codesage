@@ -566,6 +566,15 @@ fn parse_file_tolerant_flags_a_tree_with_error_nodes_as_degraded() {
 }
 
 #[test]
+fn semicolonless_top_level_macros_parse_without_degradation() {
+    let parsed =
+        codesage_parser::parse::parse_file_tolerant(UNKNOWN_TOPLEVEL_MACROS_C, Language::C)
+            .unwrap();
+    assert!(!parsed.degraded);
+    assert!(!parsed.tree.root_node().has_error());
+}
+
+#[test]
 fn parse_file_tolerant_leaves_clean_source_undegraded() {
     let parsed = codesage_parser::parse::parse_file_tolerant(
         b"int add(int a, int b) { return a + b; }\n",

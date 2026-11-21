@@ -135,7 +135,8 @@ pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTr
     let input = prepared.as_deref().unwrap_or(source);
     let mut tree = parse_with_control(&mut parser, input)?;
     if matches!(language, Language::C | Language::Cpp)
-        && let Some(repaired) = repair_macro_invocations(&mut parser, &tree, input)?
+        && let Repair::Kept(repaired) =
+            repair_macro_invocations(&mut parser, &tree, input, language)?
     {
         tree = repaired;
     }
@@ -167,6 +168,19 @@ fn parse_with_control(parser: &mut Parser, input: &[u8]) -> Result<Tree> {
     tree.ok_or_else(|| anyhow::anyhow!("tree-sitter parsing failed"))
 }
 
+/// What [`repair_macro_invocations`] did with a file.
+#[derive(Debug)]
+enum Repair {
+    /// The first parse is clean and builds no definition from a macro, or
+    /// nothing in the file needs a repair.
+    NotNeeded,
+    /// The repaired parse had more syntax errors than the first one.
+    MoreErrors,
+    /// The repaired parse lost a definition the first parse had.
+    LostDefinition,
+    Kept(Tree),
+}
+
 /// Reparse C/C++ with the repairs [`crate::macro_invocation::find`] locates,
 /// when the first parse is degraded or holds a function definition built
 /// from a macro invocation. The inserted `;` bytes are then removed from the
@@ -175,23 +189,28 @@ fn parse_with_control(parser: &mut Parser, input: &[u8]) -> Result<Tree> {
 ///
 /// The repaired tree is kept only when it has no more syntax errors than the
 /// first parse and still holds every definition the first parse named
-/// outside a function body, except the names the repairs remove on purpose. Error
-/// recovery elsewhere in the file (a brace opened inside `#ifdef`, say) can
-/// otherwise swallow a real definition that the first parse kept.
+/// outside a function body, as many times as the first parse did, except the
+/// definitions the repairs remove on purpose. Error recovery elsewhere in the
+/// file (a brace opened inside `#ifdef`, say) can otherwise swallow a real
+/// definition that the first parse kept.
 fn repair_macro_invocations(
     parser: &mut Parser,
     tree: &Tree,
     source: &[u8],
-) -> Result<Option<Tree>> {
+    language: Language,
+) -> Result<Repair> {
+    if !(tree.root_node().has_error() || macro_definition(tree)?) {
+        return Ok(Repair::NotNeeded);
+    }
     let repairs = crate::macro_invocation::find(source)?;
-    if repairs.is_empty() || !(tree.root_node().has_error() || macro_definition(tree)?) {
-        return Ok(None);
+    if repairs.is_empty() {
+        return Ok(Repair::NotNeeded);
     }
     let mut repaired = parse_with_control(parser, &repairs.apply(source))?;
     if error_count(&repaired)? > error_count(tree)? {
-        return Ok(None);
+        return Ok(Repair::MoreErrors);
     }
-    let kept = top_level_definition_names(tree, source, Some(&repairs))?;
+    let kept = top_level_definition_names(tree, source, language, Some(&repairs))?;
     let points = insertion_points(source, &repairs.insertions);
     for (delta, &(offset, point)) in points.iter().enumerate().rev() {
         repaired.edit(&tree_sitter::InputEdit {
@@ -206,23 +225,31 @@ fn repair_macro_invocations(
             new_end_position: point,
         });
     }
-    let names = top_level_definition_names(&repaired, source, None)?;
-    Ok(kept.is_subset(&names).then_some(repaired))
+    let names = top_level_definition_names(&repaired, source, language, None)?;
+    if kept
+        .iter()
+        .any(|(name, count)| names.get(name).is_none_or(|found| found < count))
+    {
+        return Ok(Repair::LostDefinition);
+    }
+    Ok(Repair::Kept(repaired))
 }
 
-/// Names of function definitions outside any function body. With
-/// `repairs`, a definition the repairs remove on purpose is left out: one
-/// named inside a blanked annotation, or one whose head a `;` now splits.
+/// Names of function definitions outside any function body, with how many
+/// definitions carry each. With `repairs`, a definition the repairs remove
+/// on purpose is left out: one named inside a blanked annotation, or one
+/// whose head a `;` now splits.
 fn top_level_definition_names<'s>(
     tree: &Tree,
     source: &'s [u8],
+    language: Language,
     repairs: Option<&crate::macro_invocation::Repairs>,
-) -> Result<std::collections::HashSet<&'s [u8]>> {
-    let mut names = std::collections::HashSet::new();
+) -> Result<std::collections::HashMap<&'s [u8], usize>> {
+    let mut names = std::collections::HashMap::new();
     walk(tree, |node| {
         if node.kind() == "function_definition"
             && !has_ancestor(node, "compound_statement")
-            && let Some(name) = definition_name(node)
+            && let Some(name) = definition_name(node, source, language)
             && let Some(text) = source.get(name.byte_range())
             && !repairs.is_some_and(|repairs| {
                 let body = node
@@ -231,7 +258,7 @@ fn top_level_definition_names<'s>(
                 repairs.removes(node.start_byte()..body, name.byte_range())
             })
         {
-            names.insert(text);
+            *names.entry(text).or_insert(0) += 1;
         }
         false
     })?;
@@ -249,8 +276,18 @@ fn has_ancestor(node: tree_sitter::Node, kind: &str) -> bool {
     false
 }
 
-/// The identifier a definition's declarator chain ends in.
-fn definition_name(definition: tree_sitter::Node) -> Option<tree_sitter::Node> {
+/// The identifier a definition's declarator chain ends in, or the argument
+/// that names a C function-defining macro head, as symbol extraction reads it.
+fn definition_name<'tree>(
+    definition: tree_sitter::Node<'tree>,
+    source: &[u8],
+    language: Language,
+) -> Option<tree_sitter::Node<'tree>> {
+    if language == Language::C
+        && let Some(name) = crate::extract::c_macro_head_name(definition, source)
+    {
+        return Some(name);
+    }
     let mut node = definition.child_by_field_name("declarator")?;
     loop {
         node = match node.kind() {
@@ -460,9 +497,9 @@ mod header_quality_tests {
         };
         let tree = parse_file_with(source, &crate::macro_invocation::Repairs::default());
         let names = |repairs| -> std::collections::BTreeSet<&[u8]> {
-            top_level_definition_names(&tree, source, repairs)
+            top_level_definition_names(&tree, source, Language::C, repairs)
                 .unwrap()
-                .into_iter()
+                .into_keys()
                 .collect()
         };
         let all = names(None);
@@ -484,6 +521,63 @@ mod header_quality_tests {
             .into()
         );
         assert_eq!(kept, [b"SEED".as_slice(), b"outer", b"real"].into());
+    }
+
+    fn repair_outcome(source: &[u8], language: Language) -> Repair {
+        let mut parser = Parser::new();
+        parser.set_language(&ts_language(language)).unwrap();
+        let tree = parse_with_control(&mut parser, source).unwrap();
+        repair_macro_invocations(&mut parser, &tree, source, language).unwrap()
+    }
+
+    #[test]
+    fn repair_with_more_syntax_errors_keeps_the_first_parse() {
+        // Reduced from php-src Zend/zend_ini_scanner.h: the enum body reads as
+        // a brace initializer, and splitting it off breaks the parse.
+        let source =
+            b"C23_ENUM(zend_ini_scanner_mode, uint8_t) {\n   ZEND_INI_SCANNER_TYPED  = 2,\n};\n";
+        assert!(matches!(
+            repair_outcome(source, Language::Cpp),
+            Repair::MoreErrors
+        ));
+        let mut parser = Parser::new();
+        parser.set_language(&ts_language(Language::Cpp)).unwrap();
+        let first = parse_with_control(&mut parser, source).unwrap();
+        assert_eq!(
+            parse_file(source, Language::Cpp)
+                .unwrap()
+                .root_node()
+                .to_sexp(),
+            first.root_node().to_sexp()
+        );
+    }
+
+    #[test]
+    fn repair_that_loses_a_definition_keeps_the_first_parse() {
+        // Reduced from php-src ext/sockets/sockets.c: the brace opened under
+        // #if swallows the next function once the macro run is terminated.
+        let source = b"\t\tZ_PARAM_STR_OR_NULL(service)\n\t\tZ_PARAM_ARRAY(zhints)\n\t\tZ_PARAM_ZVAL_OR_NULL(error_code)\n\tZEND_PARSE_PARAMETERS_END();\n\tmemset(&hints, 0, sizeof(hints));\n#if defined(PHP_WIN32)\n\t\t\tif (rp->ai_canonname != NULL) {\n}\n/* {{{ Creates and binds to a socket from a given addrinfo resource */\nPHP_FUNCTION(socket_addrinfo_bind)\n{\n";
+        assert!(matches!(
+            repair_outcome(source, Language::C),
+            Repair::LostDefinition
+        ));
+        let tree = parse_file(source, Language::C).unwrap();
+        let symbols = crate::extract::extract_symbols(&tree, source, Language::C, "s.c").unwrap();
+        assert!(
+            symbols
+                .iter()
+                .any(|symbol| symbol.name == "socket_addrinfo_bind"),
+            "{symbols:?}"
+        );
+    }
+
+    #[test]
+    fn retained_definitions_count_each_definition_of_a_name() {
+        let source =
+            b"#if A\nint f(void) { return 0; }\n#else\nint f(void) { return 1; }\n#endif\n";
+        let tree = parse_file_with(source, &crate::macro_invocation::Repairs::default());
+        let names = top_level_definition_names(&tree, source, Language::C, None).unwrap();
+        assert_eq!(names.get(b"f".as_slice()), Some(&2));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 ### Fixed
 
-- C/C++ macro invocations no longer index as phantom functions that drop or swallow the real definition: trailing annotations (`void f() LOCKS_REQUIRED(mu) {`), attribute macros before the name (`void printflike(1, 2) log(...)`), semicolonless statement and file-scope macro runs (`Z_PARAM_LONG(x)`, `EXPORT_FUNC(PyA)`), and brace-initialized invocations now leave the real function its name, body, and calls, and a C head such as `ZEND_API ZEND_INI_MH(OnUpdate) {` is named by its argument.
+- C/C++ macro invocations (trailing lock annotations, attribute macros, semicolonless `Z_PARAM_*` and file-scope runs, brace-initialized registrations) no longer index as phantom functions that drop or swallow the real definition, and C heads such as `ZEND_API ZEND_INI_MH(OnUpdate) {` are named by their argument.
 
 ## [0.53.0] - 2026-11-14
 

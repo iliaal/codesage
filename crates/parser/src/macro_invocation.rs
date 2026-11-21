@@ -92,6 +92,7 @@ enum Scope {
     Other,
 }
 
+#[derive(Clone)]
 struct Frame {
     scope: Scope,
     /// First token of the current declaration or statement.
@@ -178,6 +179,10 @@ const OPERAND_KEYS: [&[u8]; 16] = [
     b"operator",
 ];
 
+/// What may stand between a function declarator's `)` and its body.
+const FUNCTION_SPECIFIER_KEYS: [&[u8]; 5] =
+    [b"const", b"volatile", b"override", b"final", b"noexcept"];
+
 const QUALIFIER_KEYS: [&[u8]; 17] = [
     b"const",
     b"volatile",
@@ -229,6 +234,7 @@ pub(crate) fn find(source: &[u8]) -> Result<Repairs> {
             start: 0,
             parens: Vec::new(),
         }],
+        conditionals: Vec::new(),
         prev: None,
         boundary: true,
         repairs: Repairs::default(),
@@ -248,6 +254,9 @@ struct Scan<'a> {
     source: &'a [u8],
     defines: Vec<&'a [u8]>,
     frames: Vec<Frame>,
+    /// Open `#if` groups: the frames at the `#if`, and at the end of its
+    /// first arm once an `#elif` or `#else` closes that arm.
+    conditionals: Vec<(Vec<Frame>, Option<Vec<Frame>>)>,
     /// Last significant token that was not blanked; directives are skipped.
     prev: Option<usize>,
     /// A statement or declaration starts at the next significant token.
@@ -259,6 +268,7 @@ impl<'a> Scan<'a> {
     fn step(&mut self, i: usize) -> usize {
         let t = self.tokens[i];
         if t.kind == Kind::Directive {
+            self.conditional(self.text(i));
             return i + 1;
         }
         let at_start = self.boundary;
@@ -323,6 +333,31 @@ impl<'a> Scan<'a> {
         }
         self.prev = Some(i);
         i + 1
+    }
+
+    /// Brace tracking follows the first arm of each `#if` group: every other
+    /// arm starts from the frames at the `#if`, and the group ends with the
+    /// frames the first arm left. Arms that each open a function head
+    /// (`#ifdef A` / `int f(void) {` / `#else` / `int f(int x) {`) would
+    /// otherwise count one brace per arm.
+    fn conditional(&mut self, directive: &[u8]) {
+        let rest = trim_blanks(&directive[1..]);
+        let keyword = &rest[..rest.iter().take_while(|b| b.is_ascii_alphabetic()).count()];
+        match keyword {
+            b"if" | b"ifdef" | b"ifndef" => self.conditionals.push((self.frames.clone(), None)),
+            b"elif" | b"elifdef" | b"elifndef" | b"else" => {
+                if let Some((start, first)) = self.conditionals.last_mut() {
+                    let current = std::mem::replace(&mut self.frames, start.clone());
+                    first.get_or_insert(current);
+                }
+            }
+            b"endif" => {
+                if let Some((_, Some(first))) = self.conditionals.pop() {
+                    self.frames = first;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn text(&self, i: usize) -> &'a [u8] {
@@ -555,7 +590,8 @@ impl<'a> Scan<'a> {
         Some(end)
     }
 
-    /// `) NAME(args)` after a declarator's parameter list, or
+    /// `) NAME(args)` after a declarator's parameter list, also behind its
+    /// qualifiers and specifiers (`) const NAME(args)`, `) && override`), or
     /// `type name NAME(args)` after a declarator name, before what can
     /// follow a declarator.
     fn trails_declarator(&self, prev: usize, end: usize) -> bool {
@@ -569,10 +605,22 @@ impl<'a> Scan<'a> {
             }
             _ => false,
         };
+        let frame_start = self.frames.last().expect("file frame").start;
+        let mut close = prev;
+        while close > frame_start
+            && (self.is_ident(close, &FUNCTION_SPECIFIER_KEYS)
+                || self.kind(close) == Some(Kind::Punct(b'&')))
+        {
+            close -= 1;
+        }
+        if close != prev {
+            return self.kind(close) == Some(Kind::Punct(b')'))
+                && self.closes_declarator_parameters(close)
+                && follows(true);
+        }
         match self.tokens[prev].kind {
             Kind::Punct(b')') => self.closes_declarator_parameters(prev) && follows(true),
             Kind::Ident => {
-                let frame_start = self.frames.last().expect("file frame").start;
                 !self.macro_shaped(prev)
                     && !self.is_ident(prev, &QUALIFIER_KEYS)
                     && !self.is_ident(prev, &PRIMITIVE_KEYS)

@@ -228,3 +228,99 @@ static int ZEND_NOP_SPEC_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
     assert!(!signature("phar_is_file"));
     assert!(signature("GENERATE_SEED"));
 }
+
+#[test]
+fn trailing_annotation_after_function_qualifiers_and_specifiers_is_blanked() {
+    let source = "void helper();
+class S {
+ public:
+  int get() const ABSL_SHARED_LOCKS_REQUIRED(mu_) { helper(); return 1; }
+  void over() override ABSL_LOCKS_EXCLUDED(mu_) { helper(); }
+  void nx() noexcept ABSL_LOCKS_EXCLUDED(mu_) { helper(); }
+  void fin() final ABSL_LOCKS_EXCLUDED(mu_) { helper(); }
+  void lref() & ABSL_LOCKS_EXCLUDED(mu_) { helper(); }
+  void rref() && ABSL_LOCKS_EXCLUDED(mu_) { helper(); }
+};
+int S2::get2() const ABSL_SHARED_LOCKS_REQUIRED(mu_) { helper(); return 2; }
+int S2::get3() const noexcept ABSL_SHARED_LOCKS_REQUIRED(mu_) { helper(); return 3; }
+";
+    assert_eq!(
+        definitions(source, Language::Cpp, "s.cc"),
+        owned(&[
+            ("S", 2, 10),
+            ("get", 4, 4),
+            ("over", 5, 5),
+            ("nx", 6, 6),
+            ("fin", 7, 7),
+            ("lref", 8, 8),
+            ("rref", 9, 9),
+            ("get2", 11, 11),
+            ("get3", 12, 12),
+        ])
+    );
+    let lines: Vec<u32> = calls(source, Language::Cpp, "s.cc")
+        .into_iter()
+        .filter(|(name, _, _)| name == "helper")
+        .map(|(_, line, _)| line)
+        .collect();
+    assert_eq!(lines, [4, 5, 6, 7, 8, 9, 11, 12]);
+}
+
+#[test]
+fn gnu_nested_functions_with_typeof_return_types_stay_definitions() {
+    let source = "int helper(void);
+void outer(void) {
+  typeof(int) inner(void) { return helper(); }
+  __typeof__(int) inner3(void) { return helper(); }
+  inner();
+}
+";
+    assert_eq!(
+        definitions(source, Language::C, "n.c"),
+        owned(&[("outer", 2, 6), ("inner", 3, 3), ("inner3", 4, 4)])
+    );
+}
+
+#[test]
+fn typed_all_caps_c_definitions_keep_their_own_name() {
+    let source = "int COUNT(Foo) { return helper(); }
+int SQUARE(x) { return x * x; }
+U_CFUNC PHP_FUNCTION(named_by_argument) { helper(); }
+";
+    assert_eq!(
+        definitions(source, Language::C, "c23.c"),
+        owned(&[
+            ("COUNT", 1, 1),
+            ("SQUARE", 2, 2),
+            ("named_by_argument", 3, 3),
+        ])
+    );
+}
+
+#[test]
+fn conditional_arms_that_each_open_a_function_count_one_brace() {
+    let source = "#ifdef A
+int f(void) {
+#else
+int f(int x) {
+#endif
+  Z_PARAM_LONG(x)
+  Z_PARAM_LONG(y)
+  return helper();
+}
+EXPORT_FUNC(PyA)
+EXPORT_FUNC(PyB)
+int real(void) { return helper2(); }
+";
+    let defined = definitions(source, Language::C, "arms.c");
+    assert!(
+        defined.contains(&("real".to_string(), 12, 12)),
+        "{defined:?}"
+    );
+    let exported: Vec<u32> = calls(source, Language::C, "arms.c")
+        .into_iter()
+        .filter(|(name, _, _)| name == "EXPORT_FUNC")
+        .map(|(_, line, _)| line)
+        .collect();
+    assert_eq!(exported, [10, 11]);
+}
