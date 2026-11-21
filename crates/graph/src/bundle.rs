@@ -883,6 +883,9 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
     modules: &crate::rust_modules::RustModules,
     kind: Option<ReferenceKind>,
 ) -> Result<Vec<Symbol>> {
+    if caller_file.ends_with(".rs") && modules.macro_shadowed(db, caller_file, to_name)? {
+        return Ok(Vec::new());
+    }
     if caller_file.ends_with(".rs")
         && let Some(mut resolved) = modules.external_definitions(db, caller_file, to_name)?
     {

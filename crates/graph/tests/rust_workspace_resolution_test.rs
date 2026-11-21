@@ -797,6 +797,142 @@ fn imported_and_nested_macros_that_rebind_std_names_keep_calls_unresolved() {
     );
 }
 
+fn foo_bindings(db: &Database, symbol: &str) -> Vec<(String, u32, Option<String>)> {
+    let mut rows: Vec<_> = find_references(
+        db,
+        &FindReferencesRequest {
+            symbol_name: symbol.into(),
+            kind: None,
+        },
+    )
+    .unwrap()
+    .results
+    .into_iter()
+    .filter(|row| row.kind == codesage_protocol::ReferenceKind::Call)
+    .map(|row| (row.from_file, row.line, row.to))
+    .collect();
+    rows.sort();
+    rows
+}
+
+fn api_other_app(files: &[(&'static str, &'static str)]) -> (tempfile::TempDir, Database) {
+    let mut all = vec![
+        ("Cargo.toml", "[workspace]\nmembers=['api','other','app']\n"),
+        (
+            "api/Cargo.toml",
+            "[package]\nname='api'\nversion='0.0.0'\nedition='2021'\n",
+        ),
+        (
+            "other/Cargo.toml",
+            "[package]\nname='other'\nversion='0.0.0'\nedition='2021'\n",
+        ),
+        (
+            "app/Cargo.toml",
+            "[package]\nname='app'\nversion='0.0.0'\nedition='2021'\n[dependencies]\napi={path='../api'}\nother={path='../other'}\n",
+        ),
+        ("api/src/lib.rs", "pub fn foo() -> i32 { 1 }\n"),
+    ];
+    all.extend_from_slice(files);
+    indexed(&all)
+}
+
+#[test]
+fn a_std_named_macro_from_another_file_leaves_its_arguments_unbound() {
+    let (_dir, db) = api_other_app(&[
+        ("other/src/lib.rs", "pub fn foo() -> i32 { 2 }\n"),
+        (
+            "app/src/main.rs",
+            "#[macro_use]\nmod macros;\nmod x;\nmod y;\nfn main() {\n    x::g();\n    println!(\"{}\", x::f());\n}\n",
+        ),
+        (
+            "app/src/macros.rs",
+            "macro_rules! assert { () => { use other as api; }; ($e:expr) => { () }; }\n",
+        ),
+        (
+            "app/src/x.rs",
+            "pub fn f() -> i32 {\n    assert!();\n    api::foo()\n}\npub fn helper() -> i32 { 1 }\npub fn g() {\n    assert!(helper());\n}\npub fn nested() -> i32 { 3 }\npub fn h() {\n    println!(\"{:?}\", assert!(nested()));\n}\n",
+        ),
+        (
+            "app/src/y.rs",
+            "pub fn k() -> i32 {\n    crate::x::helper()\n}\n",
+        ),
+    ]);
+    assert_eq!(foo_bindings(&db, "foo"), [("app/src/x.rs".into(), 3, None)]);
+    assert_eq!(
+        foo_bindings(&db, "helper"),
+        [
+            ("app/src/x.rs".into(), 7, None),
+            (
+                "app/src/y.rs".into(),
+                2,
+                Some("sym:app/src/x.rs#helper".into())
+            ),
+        ]
+    );
+    assert_eq!(
+        foo_bindings(&db, "nested"),
+        [("app/src/x.rs".into(), 11, None)]
+    );
+    assert!(!reaches(&db, "g", "sym:app/src/x.rs#helper"));
+    assert!(!reaches(&db, "h", "sym:app/src/x.rs#nested"));
+    assert!(reaches(&db, "k", "sym:app/src/x.rs#helper"));
+    let impact = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: "sym:app/src/x.rs#helper".into(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap();
+    let callers = serde_json::to_string(&impact).unwrap();
+    assert!(!callers.contains("x.rs#g"), "{callers}");
+}
+
+#[test]
+fn a_use_renaming_a_macro_to_a_std_name_leaves_the_scope_unresolved() {
+    let (_dir, db) = api_other_app(&[
+        (
+            "other/src/lib.rs",
+            "pub fn foo() -> i32 { 2 }\n#[macro_export]\nmacro_rules! check { () => { use other as api; } }\n",
+        ),
+        (
+            "app/src/main.rs",
+            "mod x;\nfn main() {\n    println!(\"{}\", x::f());\n}\n",
+        ),
+        (
+            "app/src/x.rs",
+            "use other::check as assert;\npub fn f() -> i32 {\n    assert!();\n    api::foo()\n}\n",
+        ),
+    ]);
+    assert_eq!(foo_bindings(&db, "foo"), [("app/src/x.rs".into(), 4, None)]);
+}
+
+#[test]
+fn c_defines_with_std_macro_names_do_not_shadow_rust_macros() {
+    let (_dir, db) = api_other_app(&[
+        ("other/src/lib.rs", "pub fn foo() -> i32 { 2 }\n"),
+        (
+            "csrc/x.c",
+            "#define vec 1\nint main(void) { return vec; }\n",
+        ),
+        (
+            "app/src/main.rs",
+            "fn main() {\n    let _v = vec![api::foo()];\n}\n",
+        ),
+    ]);
+    assert_eq!(
+        foo_bindings(&db, "foo"),
+        [(
+            "app/src/main.rs".into(),
+            2,
+            Some("sym:api/src/lib.rs#foo".into())
+        )]
+    );
+}
+
 #[test]
 fn macros_in_unrelated_function_bodies_do_not_hide_qualified_calls() {
     let (_dir, db) = indexed(&[

@@ -13,6 +13,11 @@ use super::RustImportEvidence;
 
 const RESOLUTION_BUDGET: Duration = Duration::from_secs(2);
 
+/// Caller files and bytes one resolver reads to locate invocations of a std
+/// macro name the project rebinds.
+const MAX_SHADOW_READS: usize = 64;
+const MAX_SHADOW_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Default)]
 struct Surface {
     locals: HashSet<String>,
@@ -72,6 +77,9 @@ pub(super) struct ExternalCrates {
     missing: HashSet<String>,
     sources: HashMap<(String, bool), Option<Arc<Surface>>>,
     std_macro_names: Option<Arc<HashSet<String>>>,
+    shadowed_spellings: HashMap<String, Option<Arc<HashSet<String>>>>,
+    shadow_reads: usize,
+    shadow_bytes: usize,
     resolved: HashMap<(String, String), Option<Vec<Symbol>>>,
     reads: usize,
     bytes: usize,
@@ -328,6 +336,9 @@ impl ExternalCrates {
             missing: HashSet::new(),
             sources: HashMap::new(),
             std_macro_names: None,
+            shadowed_spellings: HashMap::new(),
+            shadow_reads: 0,
+            shadow_bytes: 0,
             resolved: HashMap::new(),
             reads: 0,
             bytes: 0,
@@ -851,7 +862,11 @@ impl ExternalCrates {
         }
         let mut names = HashSet::new();
         for name in codesage_parser::references::rust_std_expression_macro_names() {
-            if !db.find_symbols(name, Some(SymbolKind::Macro))?.is_empty() {
+            if db
+                .find_symbols(name, Some(SymbolKind::Macro))?
+                .iter()
+                .any(|symbol| symbol.file_path.ends_with(".rs"))
+            {
                 names.insert((*name).to_string());
             }
         }
@@ -860,11 +875,13 @@ impl ExternalCrates {
         Ok(names)
     }
 
-    fn source(&mut self, db: &Database, file: &str, caller: bool) -> Result<Option<Arc<Surface>>> {
-        let key = (file.to_string(), caller);
-        if let Some(surface) = self.sources.get(&key) {
-            return Ok(surface.clone());
-        }
+    /// The file as the index holds it: an overlay's content, or the working
+    /// file when its hash still matches the indexed one.
+    fn indexed_source(
+        &mut self,
+        db: &Database,
+        file: &str,
+    ) -> Result<Option<codesage_parser::source::IndexableSource>> {
         // An overlaid file reads as the overlay holds it, so a request-local
         // view of other content still matches its own indexed hash.
         let source = match db.overlay_source(file)? {
@@ -874,10 +891,130 @@ impl ExternalCrates {
             }),
             None => self.read(file),
         };
+        Ok(match source {
+            Some(source)
+                if db.get_file_hash(file)?.as_deref() == Some(source.content_hash.as_str()) =>
+            {
+                Some(source)
+            }
+            _ => None,
+        })
+    }
+
+    /// The caller's source for [`Self::macro_shadowed`], read under its own
+    /// limits of `MAX_SHADOW_READS` files and `MAX_SHADOW_BYTES` so the check
+    /// never draws on the external-crate budget. Past either limit, or for a
+    /// file whose content no longer matches the index, the answer is `None`.
+    fn shadow_source(
+        &mut self,
+        db: &Database,
+        file: &str,
+    ) -> Result<Option<codesage_parser::source::IndexableSource>> {
+        let source = match db.overlay_source(file)? {
+            Some(content) => content.map(|content| codesage_parser::source::IndexableSource {
+                content_hash: codesage_parser::discover::content_hash(content.as_bytes()),
+                bytes: content.into_bytes(),
+            }),
+            None => {
+                if self.shadow_reads >= MAX_SHADOW_READS || self.shadow_bytes >= MAX_SHADOW_BYTES {
+                    return Ok(None);
+                }
+                self.shadow_reads += 1;
+                let Some(root) = self.root.as_deref() else {
+                    return Ok(None);
+                };
+                read_indexable_file(root, Path::new(file)).unwrap_or_default()
+            }
+        };
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        self.shadow_bytes += source.bytes.len();
+        Ok(
+            (db.get_file_hash(file)?.as_deref() == Some(source.content_hash.as_str()))
+                .then_some(source),
+        )
+    }
+
+    /// Whether `spelling` in `caller` must stay unbound because one of its
+    /// rows sits inside a bare invocation of a std macro name that an indexed
+    /// project `macro_rules!` can rebind. Reference extraction reads such
+    /// arguments as std macro arguments; the indexed macro may never evaluate
+    /// them. A caller whose source cannot be read fails closed for every
+    /// spelling.
+    pub(super) fn macro_shadowed(
+        &mut self,
+        db: &Database,
+        caller: &str,
+        spelling: &str,
+    ) -> Result<bool> {
+        let names = self.std_macro_shadows(db)?;
+        if names.is_empty() {
+            return Ok(false);
+        }
+        if let Some(spellings) = self.shadowed_spellings.get(caller) {
+            return Ok(spellings.as_ref().is_none_or(|set| set.contains(spelling)));
+        }
+        let rows = db.references_in_file_range(caller, 1, u32::MAX)?;
+        let spellings = if rows.iter().any(|row| {
+            row.kind == codesage_protocol::ReferenceKind::MacroCall && names.contains(&row.to_name)
+        }) {
+            match self.shadow_source(db, caller)? {
+                Some(source) => {
+                    let parsed = parse_file_tolerant(&source.bytes, Language::Rust)?;
+                    let spans =
+                        shadowed_invocation_spans(parsed.tree.root_node(), &source.bytes, &names);
+                    let line_starts: Vec<usize> = std::iter::once(0)
+                        .chain(
+                            source
+                                .bytes
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, byte)| **byte == b'\n')
+                                .map(|(at, _)| at + 1),
+                        )
+                        .collect();
+                    let byte_at = |line: u32, col: u32| -> Option<usize> {
+                        let start = *line_starts.get(line.checked_sub(1)? as usize)?;
+                        let rest = std::str::from_utf8(&source.bytes[start..]).ok()?;
+                        Some(
+                            start
+                                + rest
+                                    .char_indices()
+                                    .nth(col as usize)
+                                    .map_or(rest.len(), |(at, _)| at),
+                        )
+                    };
+                    Some(Arc::new(
+                        rows.into_iter()
+                            .filter(|row| {
+                                byte_at(row.line, row.col).is_none_or(|at| {
+                                    spans.iter().any(|(start, end)| *start < at && at < *end)
+                                })
+                            })
+                            .map(|row| row.to_name)
+                            .collect::<HashSet<_>>(),
+                    ))
+                }
+                None => None,
+            }
+        } else {
+            Some(Arc::new(HashSet::new()))
+        };
+        let shadowed = spellings.as_ref().is_none_or(|set| set.contains(spelling));
+        self.shadowed_spellings
+            .insert(caller.to_string(), spellings);
+        Ok(shadowed)
+    }
+
+    fn source(&mut self, db: &Database, file: &str, caller: bool) -> Result<Option<Arc<Surface>>> {
+        let key = (file.to_string(), caller);
+        if let Some(surface) = self.sources.get(&key) {
+            return Ok(surface.clone());
+        }
+        let source = self.indexed_source(db, file)?;
         let project_macros = self.std_macro_shadows(db)?;
-        let surface = if let Some(source) = source
-            && db.get_file_hash(file)?.as_deref() == Some(source.content_hash.as_str())
-        {
+        let surface = if let Some(source) = source {
             let parsed = parse_file_tolerant(&source.bytes, Language::Rust)?;
             (!parsed.degraded)
                 .then(|| {
@@ -1491,6 +1628,54 @@ fn declared_binding_of<'tree>(item: Node<'tree>, kind: &str) -> Option<Node<'tre
     )
     .then(|| item.child_by_field_name("name"))
     .flatten()
+}
+
+/// Start and end of each bare `name!(..)` invocation whose name is in
+/// `names`, outside `macro_rules!` bodies and token trees.
+fn shadowed_invocation_spans(
+    root: Node<'_>,
+    bytes: &[u8],
+    names: &HashSet<String>,
+) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "macro_invocation" => {
+                if let Some(path) = node.child_by_field_name("macro")
+                    && path.kind() == "identifier"
+                    && names.contains(text(path, bytes))
+                {
+                    spans.push((node.start_byte(), node.end_byte()));
+                } else {
+                    pending.extend(node.named_children(&mut node.walk()));
+                }
+            }
+            "token_tree" => {
+                let children: Vec<Node<'_>> = node.children(&mut node.walk()).collect();
+                for (index, child) in children.iter().enumerate() {
+                    let bare = index == 0 || text(children[index - 1], bytes) != "::";
+                    if child.kind() == "identifier"
+                        && bare
+                        && names.contains(text(*child, bytes))
+                        && children
+                            .get(index + 1)
+                            .is_some_and(|bang| text(*bang, bytes) == "!")
+                        && let Some(arguments) = children
+                            .get(index + 2)
+                            .filter(|tree| tree.kind() == "token_tree")
+                    {
+                        spans.push((child.start_byte(), arguments.end_byte()));
+                    } else if child.kind() == "token_tree" {
+                        pending.push(*child);
+                    }
+                }
+            }
+            "macro_definition" => {}
+            _ => pending.extend(node.named_children(&mut node.walk())),
+        }
+    }
+    spans
 }
 
 fn lexical_scope(mut node: Node<'_>) -> Option<Node<'_>> {

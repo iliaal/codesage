@@ -111,6 +111,26 @@ impl RustModules {
                 .is_some_and(|external| external.capped)
     }
 
+    /// Whether name-based binding must leave `spelling` in `caller` unbound;
+    /// see `ExternalCrates::macro_shadowed`.
+    pub(crate) fn macro_shadowed(
+        &self,
+        db: &Database,
+        caller: &str,
+        spelling: &str,
+    ) -> Result<bool> {
+        if !caller.ends_with(".rs") {
+            return Ok(false);
+        }
+        let mut external = self
+            .external
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        external
+            .get_or_insert_with(|| external::ExternalCrates::new(db, &self.modules))
+            .macro_shadowed(db, caller, spelling)
+    }
+
     pub(crate) fn external_definitions(
         &self,
         db: &Database,

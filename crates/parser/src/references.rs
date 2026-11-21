@@ -707,10 +707,26 @@ fn is_std_root(segment: &str) -> bool {
     matches!(segment, "std" | "core" | "alloc")
 }
 
+/// The std macros a glob import can rebind when used bare. rustc reports
+/// every other allowlisted name as ambiguous (E0659) when a glob also brings
+/// one in, and these six only in a `#![no_std]` crate.
+const RUST_GLOB_SHADOWABLE_MACROS: &[&str] =
+    &["vec", "format", "print", "println", "eprint", "eprintln"];
+
+/// `pretty_assertions` and `similar_asserts` replace `assert_eq!` and
+/// `assert_ne!` with macros that evaluate the same `$left:expr, $right:expr`
+/// arguments once inside a block, so their arguments read like std's.
+fn is_drop_in_assertion(root: &str, name: &str) -> bool {
+    matches!(root, "pretty_assertions" | "similar_asserts")
+        && matches!(name, "assert_eq" | "assert_ne")
+}
+
 /// Bare std macro names a file can rebind: a `macro_rules!` of that name, a
 /// `use` binding of that name not rooted at `std`, `core`, or `alloc`, or,
-/// for every name at once, a `#[macro_use]` attribute or a glob of a crate
-/// root (`use other::*`) that is not a module the file declares.
+/// for every name at once, a `#[macro_use]` attribute; for the six names in
+/// `RUST_GLOB_SHADOWABLE_MACROS`, a glob of a crate root (`use other::*`)
+/// that is not a module the file declares. `use` of the drop-in
+/// `pretty_assertions` or `similar_asserts` assertions does not shadow.
 /// Crate-relative globs and macros reached through other files are not
 /// visible here.
 #[derive(Clone, Debug, Default)]
@@ -772,7 +788,9 @@ impl RustStdMacroShadows {
             }
         }
         if globs.iter().any(|root| !modules.contains(root)) {
-            self.all = true;
+            for name in RUST_GLOB_SHADOWABLE_MACROS {
+                self.names.insert((*name).to_string());
+            }
         }
     }
 
@@ -801,7 +819,8 @@ impl RustStdMacroShadows {
         match node.kind() {
             "identifier" => {
                 let name = crate::parse::node_text_lossy(&node, source);
-                if !root.or(Some(name.as_str())).is_some_and(is_std_root) {
+                let root = root.unwrap_or(name.as_str());
+                if !is_std_root(root) && !is_drop_in_assertion(root, &name) {
                     self.insert(&name);
                 }
             }
@@ -811,7 +830,10 @@ impl RustStdMacroShadows {
                 if !is_std_root(root)
                     && let Some(name) = node.child_by_field_name("name")
                 {
-                    self.insert(&crate::parse::node_text_lossy(&name, source));
+                    let name = crate::parse::node_text_lossy(&name, source);
+                    if !is_drop_in_assertion(root, &name) {
+                        self.insert(&name);
+                    }
                 }
             }
             "use_as_clause" => {
@@ -1913,7 +1935,19 @@ function later() { (function* () { require('./nested'); })().next(); }
                 .is_empty()
         );
         assert!(calls("#[macro_use]\nmod m;\nfn f() { println!(\"{}\", e()); }\n").is_empty());
-        assert!(calls("use other::*;\nfn f() { println!(\"{}\", e()); }\n").is_empty());
+        assert_eq!(
+            calls(
+                "use other::*;\nfn f() { println!(\"{}\", e()); assert_eq!(k(), 1); vec![v()]; }\n"
+            ),
+            ["k"]
+        );
+        assert_eq!(
+            calls(
+                "use pretty_assertions::assert_eq;\nuse similar_asserts::assert_ne;\nuse other::assert_eq as unrelated;\nfn f() { assert_eq!(p(), 1); assert_ne!(s(), 2); }\n"
+            ),
+            ["p", "s"]
+        );
+        assert!(calls("use other::assert_eq;\nfn f() { assert_eq!(p(), 1); }\n").is_empty());
         assert_eq!(
             calls(
                 "mod params;\nuse params::*;\nuse rayon::prelude::*;\nuse Decision::*;\nfn f() { println!(\"{}\", h()); }\n"
