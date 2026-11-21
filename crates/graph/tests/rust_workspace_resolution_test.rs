@@ -889,6 +889,75 @@ fn a_std_named_macro_from_another_file_leaves_its_arguments_unbound() {
     .unwrap();
     let callers = serde_json::to_string(&impact).unwrap();
     assert!(!callers.contains("x.rs#g"), "{callers}");
+    let card = codesage_graph::describe(
+        _dir.path(),
+        &db,
+        "sym:app/src/x.rs#helper",
+        &codesage_graph::DescribeOptions {
+            sections: Some(vec!["hotness".into(), "references".into()]),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .card
+    .unwrap();
+    let card = serde_json::to_value(&card).unwrap();
+    assert_eq!(card["sections"]["hotness"]["data"]["fan_in"], 1, "{card}");
+    assert_eq!(
+        card["sections"]["references"]["data"]["callers_total"], 1,
+        "{card}"
+    );
+}
+
+#[test]
+fn rows_outside_a_shadowed_macro_bind_in_every_file_and_after_edits() {
+    let mut files: Vec<(String, String)> = vec![
+        (
+            "Cargo.toml".into(),
+            "[package]\nname='cap'\nversion='0.0.0'\nedition='2021'\n".into(),
+        ),
+        (
+            "src/macros.rs".into(),
+            "macro_rules! assert { ($e:expr) => { () }; }\n".into(),
+        ),
+    ];
+    let mut lib = String::from("#[macro_use]\nmod macros;\npub fn helper() -> i32 { 1 }\n");
+    for n in 0..70 {
+        lib.push_str(&format!("pub mod f{n:02};\n"));
+        files.push((
+            format!("src/f{n:02}.rs"),
+            format!(
+                "use crate::helper;\npub fn g{n}() -> i32 {{\n    assert!(true);\n    helper()\n}}\n"
+            ),
+        ));
+    }
+    files.push(("src/lib.rs".into(), lib));
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect();
+    let (dir, db) = indexed(&borrowed);
+    let bound = |db: &Database| {
+        codesage_graph::find_references_with_budget(
+            db,
+            &FindReferencesRequest {
+                symbol_name: "helper".into(),
+                kind: Some(codesage_protocol::ReferenceKind::Call),
+            },
+            std::time::Duration::from_secs(600),
+        )
+        .unwrap()
+        .results
+        .into_iter()
+        .filter(|row| row.to.as_deref() == Some("sym:src/lib.rs#helper"))
+        .count()
+    };
+    assert_eq!(bound(&db), 70);
+    let edited = dir.path().join("src/f00.rs");
+    let mut source = std::fs::read_to_string(&edited).unwrap();
+    source.push_str("// edited\n");
+    std::fs::write(&edited, source).unwrap();
+    assert_eq!(bound(&db), 70);
 }
 
 #[test]

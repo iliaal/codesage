@@ -1520,6 +1520,7 @@ mod tests {
     #[test]
     fn dedupe_refs_collapses_rows_sharing_the_unique_key() {
         let r = |to_name: &str, kind, line, col| Reference {
+            macro_mask: 0,
             from_file: "a.c".to_string(),
             from_symbol: None,
             to_name: to_name.to_string(),

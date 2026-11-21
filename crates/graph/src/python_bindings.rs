@@ -256,6 +256,7 @@ fn captured_self_import_load(
     let mut selected = None;
     for site in sites.iter().filter(|site| site.file == initializer) {
         let row = Reference {
+            macro_mask: 0,
             from_file: site.file.clone(),
             from_symbol: None,
             to_name: site.to_name.clone(),

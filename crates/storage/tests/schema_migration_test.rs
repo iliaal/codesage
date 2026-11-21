@@ -224,6 +224,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0032_refs_import_edges",
         "0033_js_aliases",
         "0034_php_nocase_lookups",
+        "0036_refs_macro_mask",
     ];
     for migration in expected_migrations {
         let count: i64 = conn
@@ -255,6 +256,55 @@ fn fresh_db_records_migrations_exactly_once() {
         expected_migrations.len() as i64,
         "second init_db must not re-apply migrations"
     );
+}
+
+#[test]
+fn a_053_index_gains_a_nullable_macro_mask_and_keeps_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let conn = Connection::open(&path).unwrap();
+    init_db(&conn).unwrap();
+    conn.execute_batch(
+        "DROP INDEX idx_refs_macro_mask;
+         ALTER TABLE refs DROP COLUMN macro_mask;
+         DELETE FROM schema_migrations WHERE name = '0036_refs_macro_mask';
+         INSERT INTO files (id, path, language, content_hash) VALUES (1, 'src/lib.rs', 'rust', 'h');
+         INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col)
+         VALUES (1, 'helper', 'helper', 'call', 3, 4);",
+    )
+    .unwrap();
+    drop(conn);
+    let db = codesage_storage::Database::open(&path).unwrap();
+    let rows = db
+        .references_in_file_range("src/lib.rs", 1, u32::MAX)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].to_name.as_str(), rows[0].macro_mask),
+        ("helper", 0)
+    );
+    drop(db);
+    let conn = Connection::open(&path).unwrap();
+    let mask: Option<i64> = conn
+        .query_row("SELECT macro_mask FROM refs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mask, None);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = '0036_refs_macro_mask'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
+    let index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_refs_macro_mask'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index, 1);
 }
 
 #[test]
@@ -1038,6 +1088,7 @@ fn sample_symbol() -> codesage_protocol::Symbol {
 
 fn sample_reference(kind: codesage_protocol::ReferenceKind) -> codesage_protocol::Reference {
     codesage_protocol::Reference {
+        macro_mask: 0,
         from_file: "src/sample.rs".to_string(),
         from_symbol: None,
         to_name: "bar".to_string(),

@@ -900,6 +900,15 @@ pub fn rust_std_expression_macro_names() -> &'static [&'static str] {
     RUST_STD_EXPRESSION_MACROS
 }
 
+/// The `Reference::macro_mask` bit of an allowlisted std macro name; zero
+/// for any other name.
+pub fn rust_std_macro_bit(name: &str) -> u16 {
+    RUST_STD_EXPRESSION_MACROS
+        .iter()
+        .position(|known| *known == name)
+        .map_or(0, |index| 1 << index)
+}
+
 /// The argument mode of a macro path, when it names an allowlisted std macro
 /// bare (and unshadowed) or through `std`, `core`, or `alloc`.
 fn rust_macro_path_arguments(
@@ -1146,6 +1155,12 @@ fn rust_macro_argument_refs(
         let Some(mode) = rust_invocation_arguments(invocation, source, shadows) else {
             continue;
         };
+        let bit = invocation
+            .child_by_field_name("macro")
+            .filter(|path| path.kind() == "identifier")
+            .map_or(0, |path| {
+                rust_std_macro_bit(&crate::parse::node_text_lossy(&path, source))
+            });
         let mut cursor = invocation.walk();
         let Some(token_tree) = invocation
             .named_children(&mut cursor)
@@ -1210,6 +1225,7 @@ fn rust_macro_argument_refs(
                     reference.col = col + reference.col.saturating_sub(prefix_cols);
                 }
                 reference.line += row_offset;
+                reference.macro_mask |= bit;
                 reference
             }));
         }
@@ -1465,6 +1481,7 @@ fn tree_references(
                 let module = crate::parse::node_text_lossy(&module, source);
                 let separator = if module.ends_with('.') { "" } else { "." };
                 refs.push(Reference {
+                    macro_mask: 0,
                     from_file: file_path.to_string(),
                     from_symbol: None,
                     to_name: format!("{module}{separator}{to_name}"),
@@ -1479,6 +1496,7 @@ fn tree_references(
             }
         }
         refs.push(Reference {
+            macro_mask: 0,
             from_file: file_path.to_string(),
             from_symbol: None,
             to_name,
@@ -2005,6 +2023,32 @@ function later() { (function* () { require('./nested'); })().next(); }
         assert!(!can_bind(
             "fn f() { println!(\"{}\", std::format!(\"{}\", a != b)); }"
         ));
+    }
+
+    #[test]
+    fn rust_macro_argument_rows_carry_the_bare_macro_chain() {
+        let bit = super::rust_std_macro_bit;
+        let masks: Vec<(String, u16)> = refs_from_source(
+            "fn f() {\n    out();\n    assert!(vec![inner()].is_empty());\n    std::assert!(qualified());\n    assert!(std::vec![mixed()].is_empty());\n}\n",
+            Language::Rust,
+        )
+        .into_iter()
+        .filter(|row| row.kind == ReferenceKind::Call)
+        .map(|row| (row.to_name, row.macro_mask))
+        .collect();
+        assert_eq!(
+            masks,
+            [
+                ("out".to_string(), 0),
+                ("inner".to_string(), bit("assert") | bit("vec")),
+                ("is_empty".to_string(), bit("assert")),
+                ("qualified".to_string(), 0),
+                ("mixed".to_string(), bit("assert")),
+                ("is_empty".to_string(), bit("assert")),
+            ]
+        );
+        assert_eq!(super::rust_std_expression_macro_names().len(), 16);
+        assert_eq!(bit("quote"), 0);
     }
 
     #[test]

@@ -1106,6 +1106,7 @@ mod tests {
 
     fn call(from_file: &str, from_symbol: Option<&str>, to_name: &str, line: u32) -> Reference {
         Reference {
+            macro_mask: 0,
             from_file: from_file.to_string(),
             from_symbol: from_symbol.map(str::to_string),
             to_name: to_name.to_string(),

@@ -135,6 +135,7 @@ fn indexed_references(db: &Database, id: i64) -> Result<Vec<Reference>> {
         .refs_outgoing_for_file_id(id)?
         .into_iter()
         .map(|(to_name, kind)| Reference {
+            macro_mask: 0,
             from_file: String::new(),
             from_symbol: None,
             to_name,
@@ -240,6 +241,7 @@ mod tests {
 
     fn imp(to: &str) -> Reference {
         Reference {
+            macro_mask: 0,
             from_file: String::new(),
             from_symbol: None,
             to_name: to.to_string(),
@@ -442,6 +444,7 @@ mod tests {
     #[test]
     fn inheritance_ref_kind_does_not_signal_boundary() {
         let r = Reference {
+            macro_mask: 0,
             from_file: String::new(),
             from_symbol: None,
             to_name: "reqwest::Client".to_string(),

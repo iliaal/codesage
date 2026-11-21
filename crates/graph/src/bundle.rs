@@ -3005,6 +3005,7 @@ mod context_export_tests {
 
     fn reference(to_name: &str, file_path: &str) -> Reference {
         Reference {
+            macro_mask: 0,
             from_file: file_path.to_string(),
             from_symbol: None,
             to_name: to_name.to_string(),
@@ -3030,6 +3031,7 @@ mod context_export_tests {
             })
             .unwrap();
         let mk = |to: &str, kind| Reference {
+            macro_mask: 0,
             from_file: "app/a.php".to_string(),
             from_symbol: None,
             to_name: to.to_string(),

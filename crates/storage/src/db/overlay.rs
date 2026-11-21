@@ -278,8 +278,8 @@ impl Database {
             }
             let mut references = self.conn.prepare(
                 "INSERT INTO temp.__overlay_refs
-                 (id, from_file_id, from_symbol, to_name, to_name_tail, kind, line, col, lazy)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (id, from_file_id, from_symbol, to_name, to_name_tail, kind, line, col, lazy, macro_mask)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for reference in replacement.references {
                 codesage_protocol::work::checkpoint()?;
@@ -296,7 +296,8 @@ impl Database {
                     reference.kind.as_str(),
                     reference.line,
                     reference.col,
-                    reference.lazy
+                    reference.lazy,
+                    (reference.macro_mask != 0).then_some(i64::from(reference.macro_mask))
                 ])?;
             }
             let mut bindings = self.conn.prepare(
@@ -585,6 +586,7 @@ mod tests {
 
     fn reference(path: &str, from: &str, to: &str) -> Reference {
         Reference {
+            macro_mask: 0,
             from_file: path.into(),
             from_symbol: Some(from.into()),
             to_name: to.into(),

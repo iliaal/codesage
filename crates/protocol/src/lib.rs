@@ -639,6 +639,13 @@ pub struct Reference {
     /// Filled by the graph layer, never stored or sent.
     #[serde(skip)]
     pub from_line: Option<u32>,
+    /// One bit per bare std expression macro (`assert!`, `vec!`, ...) whose
+    /// arguments the reference was read from, on the whole invocation chain;
+    /// zero for a reference written outside such arguments. Bit order is
+    /// `codesage_parser::references::rust_std_expression_macro_names`. Stored
+    /// in `refs.macro_mask`, never sent.
+    #[serde(skip)]
+    pub macro_mask: u16,
 }
 
 impl Reference {
@@ -4026,6 +4033,7 @@ mod tests {
     #[test]
     fn reference_wire_drops_column() {
         let r = Reference {
+            macro_mask: 0,
             from_file: "src/a.rs".to_string(),
             from_symbol: Some("a::run".to_string()),
             to_name: "open".to_string(),
@@ -4050,6 +4058,7 @@ mod tests {
     #[test]
     fn reference_wire_carries_from_and_to_handles() {
         let mut r = Reference {
+            macro_mask: 0,
             lazy: false,
             from_file: "src/a.rs".to_string(),
             from_symbol: Some("a::run".to_string()),

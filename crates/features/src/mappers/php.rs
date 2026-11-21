@@ -1202,6 +1202,7 @@ pub(crate) fn laravel_route_handler_refs(root: &Path) -> Result<Vec<Reference>> 
             continue;
         };
         refs.push(Reference {
+            macro_mask: 0,
             from_file: r.file.clone(),
             from_symbol: None,
             to_name: format!("{class}\\{action}"),

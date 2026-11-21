@@ -3,6 +3,7 @@
 ### Changed
 
 - `codesage index` passes that parse more than 50 files take less time: a full structural pass over a 723-file project went from 4.80 s to 3.74 s median (-22% time) on 8 cores and from 6.07 s to 5.38 s (-11% time) on 2. Indexed rows are unchanged.
+- Schema migration `0036_refs_macro_mask` adds a nullable `refs.macro_mask` column and index; `codesage index` fills it when it reparses Rust files.
 
 ### Fixed
 

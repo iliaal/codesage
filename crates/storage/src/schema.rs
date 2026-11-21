@@ -70,7 +70,8 @@ CREATE TABLE IF NOT EXISTS refs (
     kind TEXT NOT NULL,
     line INTEGER NOT NULL,
     col INTEGER NOT NULL,
-    lazy INTEGER NOT NULL DEFAULT 0
+    lazy INTEGER NOT NULL DEFAULT 0,
+    macro_mask INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_refs_to_name ON refs(to_name);
@@ -798,6 +799,7 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ("0032_refs_import_edges", migrate_0032_refs_import_edges),
     ("0033_js_aliases", migrate_0033_js_aliases),
     ("0034_php_nocase_lookups", migrate_0034_php_nocase_lookups),
+    ("0036_refs_macro_mask", migrate_0036_refs_macro_mask),
 ];
 
 /// The reference kinds that can form a file-level import edge, as a SQL list.
@@ -858,6 +860,25 @@ fn migrate_0034_php_nocase_lookups(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_refs_php_name_nocase
              ON refs(to_name COLLATE NOCASE) WHERE {PHP_QUALIFIED_REF_SQL};"
     ))
+}
+
+/// Adds `refs.macro_mask`: for a Rust reference read from the arguments of
+/// std expression macros, one bit per bare macro name on the invocation
+/// chain; NULL elsewhere. Existing rows stay NULL until `codesage index`
+/// reparses their file under the bumped extraction interpretation.
+fn migrate_0036_refs_macro_mask(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('refs') WHERE name = 'macro_mask')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch("ALTER TABLE refs ADD COLUMN macro_mask INTEGER;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_refs_macro_mask ON refs(from_file_id)
+             WHERE macro_mask IS NOT NULL;",
+    )
 }
 
 /// The partial-index predicate of `idx_refs_php_name_nocase`.
