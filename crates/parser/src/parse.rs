@@ -199,9 +199,9 @@ impl Repair {
 /// extractors always slice the original bytes.
 ///
 /// The repaired tree is kept only when it has no more syntax errors than the
-/// first parse and still holds every definition the first parse named
-/// outside a function body, as many times as the first parse did, except the
-/// definitions the repairs remove on purpose. Error recovery elsewhere in the
+/// first parse and still holds, at the same body, every definition the first
+/// parse had outside a function body, except the definitions the repairs
+/// remove on purpose. Error recovery elsewhere in the
 /// file (a brace opened inside `#ifdef`, say) can otherwise swallow a real
 /// definition that the first parse kept.
 ///
@@ -222,7 +222,7 @@ fn repair_macro_invocations(
         return Ok(Repair::NotNeeded(tree));
     }
     let first_errors = error_count(&tree)?;
-    let kept = top_level_definition_names(&tree, source, language, Some(&repairs))?;
+    let kept = top_level_definitions(&tree, source, language, Some(&repairs))?;
     drop(tree);
     let mut repaired = parse_with_control(parser, &repairs.apply(source))?;
     if error_count(&repaired)? > first_errors {
@@ -243,45 +243,46 @@ fn repair_macro_invocations(
             new_end_position: point,
         });
     }
-    let names = top_level_definition_names(&repaired, source, language, None)?;
-    if kept
-        .iter()
-        .any(|(name, count)| names.get(name).is_none_or(|found| found < count))
-    {
+    let found = top_level_definitions(&repaired, source, language, None)?;
+    if kept.keys().any(|body| !found.contains_key(body)) {
         drop(repaired);
         return Ok(Repair::LostDefinition(parse_with_control(parser, source)?));
     }
     Ok(Repair::Kept(repaired))
 }
 
-/// Names of function definitions outside any function body, with how many
-/// definitions carry each. With `repairs`, a definition the repairs remove
-/// on purpose is left out: one named inside a blanked annotation, or one
-/// whose head a `;` now splits.
-fn top_level_definition_names<'s>(
+/// Function definitions outside any function body, keyed by where their
+/// body starts, with their names. The body identifies a definition across
+/// the two parses even when the repair renames it (a phantom named after a
+/// macro becomes the function the body belongs to). With `repairs`, a
+/// definition the repairs remove on purpose is left out: one named inside a
+/// blanked annotation, or one whose name is followed, inside its head, by an
+/// inserted `;`, so that the name is the macro of a terminated invocation.
+fn top_level_definitions<'s>(
     tree: &Tree,
     source: &'s [u8],
     language: Language,
     repairs: Option<&crate::macro_invocation::Repairs>,
-) -> Result<std::collections::HashMap<&'s [u8], usize>> {
-    let mut names = std::collections::HashMap::new();
+) -> Result<std::collections::BTreeMap<usize, &'s [u8]>> {
+    let mut definitions = std::collections::BTreeMap::new();
     walk(tree, |node| {
         if node.kind() == "function_definition"
             && !has_ancestor(node, "compound_statement")
             && let Some(name) = definition_name(node, source, language)
             && let Some(text) = source.get(name.byte_range())
-            && !repairs.is_some_and(|repairs| {
-                let body = node
-                    .child_by_field_name("body")
-                    .map_or(node.end_byte(), |body| body.start_byte());
-                repairs.removes(node.start_byte()..body, name.byte_range())
-            })
         {
-            *names.entry(text).or_insert(0) += 1;
+            let body = node
+                .child_by_field_name("body")
+                .map_or(node.end_byte(), |body| body.start_byte());
+            if !repairs
+                .is_some_and(|repairs| repairs.removes(node.start_byte()..body, name.byte_range()))
+            {
+                definitions.insert(body, text);
+            }
         }
         false
     })?;
-    Ok(names)
+    Ok(definitions)
 }
 
 fn has_ancestor(node: tree_sitter::Node, kind: &str) -> bool {
@@ -516,9 +517,9 @@ mod header_quality_tests {
         };
         let tree = parse_file_with(source, &crate::macro_invocation::Repairs::default());
         let names = |repairs| -> std::collections::BTreeSet<&[u8]> {
-            top_level_definition_names(&tree, source, Language::C, repairs)
+            top_level_definitions(&tree, source, Language::C, repairs)
                 .unwrap()
-                .into_keys()
+                .into_values()
                 .collect()
         };
         let all = names(None);
@@ -598,8 +599,11 @@ mod header_quality_tests {
             blanks: Vec::new(),
             insertions: vec![b"ATTR_COLD(x)".len()],
         };
-        let kept = top_level_definition_names(&tree, source, Language::C, Some(&repairs)).unwrap();
-        assert_eq!(kept.get(b"victim".as_slice()), Some(&1));
+        let kept = top_level_definitions(&tree, source, Language::C, Some(&repairs)).unwrap();
+        assert_eq!(
+            kept.into_values().collect::<Vec<_>>(),
+            [b"victim".as_slice()]
+        );
         let tree = parse_file(source, Language::C).unwrap();
         let symbols = crate::extract::extract_symbols(&tree, source, Language::C, "v.c").unwrap();
         assert!(
@@ -609,12 +613,28 @@ mod header_quality_tests {
     }
 
     #[test]
+    fn repair_that_renames_a_phantom_keeps_its_body_and_is_kept() {
+        let source = b"ZEND_DECLARE_MODULE_GLOBALS(dl_test)\n\nPHP_FUNCTION(dl_test_test1)\n{\n\thelper();\n}\n";
+        assert!(matches!(
+            repair_outcome(source, Language::C),
+            Repair::Kept(_)
+        ));
+        let tree = parse_file(source, Language::C).unwrap();
+        let symbols = crate::extract::extract_symbols(&tree, source, Language::C, "d.c").unwrap();
+        let names: Vec<_> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
+        assert_eq!(names, ["dl_test_test1"]);
+    }
+
+    #[test]
     fn retained_definitions_count_each_definition_of_a_name() {
         let source =
             b"#if A\nint f(void) { return 0; }\n#else\nint f(void) { return 1; }\n#endif\n";
         let tree = parse_file_with(source, &crate::macro_invocation::Repairs::default());
-        let names = top_level_definition_names(&tree, source, Language::C, None).unwrap();
-        assert_eq!(names.get(b"f".as_slice()), Some(&2));
+        let definitions = top_level_definitions(&tree, source, Language::C, None).unwrap();
+        assert_eq!(
+            definitions.into_values().collect::<Vec<_>>(),
+            [b"f".as_slice(), b"f"]
+        );
     }
 
     #[test]
