@@ -1999,6 +1999,7 @@ mod tests {
             line: 1,
             col: 0,
             lazy: false,
+            type_checking: false,
             to: None,
             from_line: None,
             is_test: false,
@@ -2432,18 +2433,21 @@ mod tests {
                     line: 1,
                     col: 0,
                     lazy: false,
+                    type_checking: false,
                     ..make_reference("Before", ReferenceKind::Call)
                 },
                 Reference {
                     line: 3,
                     col: 0,
                     lazy: false,
+                    type_checking: false,
                     ..make_reference("Inside", ReferenceKind::Call)
                 },
                 Reference {
                     line: 8,
                     col: 0,
                     lazy: false,
+                    type_checking: false,
                     ..make_reference("After", ReferenceKind::Call)
                 },
             ],

@@ -1045,6 +1045,7 @@ fn sample_reference(kind: codesage_protocol::ReferenceKind) -> codesage_protocol
         line: 2,
         col: 4,
         lazy: false,
+        type_checking: false,
         to: None,
         from_line: None,
         is_test: false,

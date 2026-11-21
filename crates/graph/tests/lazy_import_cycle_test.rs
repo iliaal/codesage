@@ -3,8 +3,9 @@
 //! eager fixture hoists that import to module scope and must still cycle.
 
 use codesage_graph::{
-    assess_risk, assess_risk_diff, build_review_rehearsal, file_import_pairs, full_index,
-    impact_analysis, list_dependencies, session_end, session_start,
+    ReachabilityOptions, assess_risk, assess_risk_diff, build_review_rehearsal, file_import_pairs,
+    full_index, impact_analysis, list_dependencies, recommend_tests_with_reachability, session_end,
+    session_start,
 };
 use codesage_protocol::{ImpactRequest, ImpactTarget, ReferenceKind};
 use codesage_storage::Database;
@@ -222,4 +223,106 @@ fn javascript_require_in_a_function_body_is_a_lazy_path_edge_that_does_not_close
     }
     let diff = assess_risk_diff(&db, &["a.js".to_string(), "b.js".to_string()]).unwrap();
     assert!(diff.cycles_touching_patch.is_empty(), "{diff:?}");
+}
+
+fn index_files(files: &[(&str, &str)]) -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".codesage")).unwrap();
+    for (path, body) in files {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    let db = Database::open_in_memory().unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
+    (dir, db)
+}
+
+#[test]
+fn python_type_checking_import_closes_no_cycle_and_carries_no_test_reach() {
+    let guard = "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from pkg.types import T\nelse:\n    T = object\n";
+    let (_dir, db) = index_files(&[
+        ("cy/__init__.py", ""),
+        (
+            "cy/a.py",
+            "from cy import b\ndef fa():\n    return b.fb()\n",
+        ),
+        (
+            "cy/b.py",
+            "import typing\nif typing.TYPE_CHECKING:\n    from cy import a\ndef fb():\n    return 1\n",
+        ),
+        ("pkg/__init__.py", ""),
+        ("pkg/types.py", "class T:\n    pass\n"),
+        ("pkg/plain.py", "class P:\n    pass\n"),
+        (
+            "pkg/svc.py",
+            &format!("{guard}def serve(x):\n    return 1\n"),
+        ),
+        (
+            "pkg/svc2.py",
+            "from pkg.plain import P\ndef serve2(x):\n    return 1\n",
+        ),
+        (
+            "tests/test_svc.py",
+            "from pkg.svc import serve\ndef test_serve():\n    assert serve(1) == 1\n",
+        ),
+        (
+            "tests/test_svc2.py",
+            "from pkg.svc2 import serve2\ndef test_serve2():\n    assert serve2(1) == 1\n",
+        ),
+    ]);
+
+    let risk = assess_risk(&db, "cy/a.py").unwrap();
+    assert!(!risk.in_cycle, "{risk:?}");
+    assert_eq!(risk.lazy_edges, 1, "{risk:?}");
+
+    let guarded: Vec<_> = db
+        .find_references("T", None)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.from_file == "pkg/svc.py" && r.kind == ReferenceKind::ImportBinding)
+        .collect();
+    assert_eq!(guarded.len(), 1, "{guarded:?}");
+    assert!(guarded[0].lazy && guarded[0].type_checking, "{guarded:?}");
+    assert_eq!(serde_json::to_value(&guarded[0]).unwrap()["lazy"], true);
+
+    let deps = list_dependencies(&db, "pkg/svc.py").unwrap();
+    assert!(
+        deps.imports.iter().any(|i| i == "file:pkg/types.py"),
+        "{:?}",
+        deps.imports
+    );
+    let impact = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::File {
+                path: "pkg/types.py".to_string(),
+            },
+            depth: 2,
+            source_only: false,
+        },
+    )
+    .unwrap();
+    assert!(
+        impact.iter().any(|e| e.file_path == "tests/test_svc.py"),
+        "impact keeps the guarded edge: {impact:?}"
+    );
+
+    let reach = |input: &str| -> Vec<String> {
+        recommend_tests_with_reachability(
+            &db,
+            &[input.to_string()],
+            &ReachabilityOptions::default(),
+        )
+        .unwrap()
+        .reachable
+        .into_iter()
+        .map(|e| e.path)
+        .collect()
+    };
+    assert!(reach("pkg/types.py").is_empty());
+    assert_eq!(
+        reach("pkg/plain.py"),
+        vec!["tests/test_svc2.py".to_string()]
+    );
 }

@@ -958,6 +958,7 @@ mod tests {
                         line: 2,
                         col: 0,
                         lazy: false,
+                        type_checking: false,
                         to: None,
                         from_line: None,
                         is_test: false,

@@ -296,7 +296,7 @@ impl Database {
                     reference.kind.as_str(),
                     reference.line,
                     reference.col,
-                    reference.lazy
+                    super::structural::lazy_column(reference)
                 ])?;
             }
             let mut bindings = self.conn.prepare(
@@ -592,6 +592,7 @@ mod tests {
             line: 2,
             col: 4,
             lazy: false,
+            type_checking: false,
             is_test: false,
             to: None,
             from_line: None,

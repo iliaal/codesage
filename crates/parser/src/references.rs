@@ -524,6 +524,40 @@ fn import_is_lazy(node: &Node, source: &[u8], language: Language) -> bool {
     false
 }
 
+/// True when a Python import directive sits in the body of an `if` or
+/// `elif` whose condition is exactly `TYPE_CHECKING` or
+/// `typing.TYPE_CHECKING`, which is false at run time. The `else` or a
+/// later `elif` of that statement runs, so it is not covered.
+fn python_import_is_type_checking(node: &Node, source: &[u8]) -> bool {
+    let is_flag = |condition: &Node| match condition.kind() {
+        "identifier" => condition.utf8_text(source) == Ok("TYPE_CHECKING"),
+        "attribute" => {
+            condition
+                .child_by_field_name("object")
+                .is_some_and(|o| o.kind() == "identifier" && o.utf8_text(source) == Ok("typing"))
+                && condition
+                    .child_by_field_name("attribute")
+                    .is_some_and(|a| a.utf8_text(source) == Ok("TYPE_CHECKING"))
+        }
+        _ => false,
+    };
+    let mut child = *node;
+    while let Some(parent) = child.parent() {
+        if matches!(parent.kind(), "if_statement" | "elif_clause")
+            && parent
+                .child_by_field_name("consequence")
+                .is_some_and(|body| body.id() == child.id())
+            && parent
+                .child_by_field_name("condition")
+                .is_some_and(|condition| is_flag(&condition))
+        {
+            return true;
+        }
+        child = parent;
+    }
+    false
+}
+
 /// True when a TypeScript import/export row belongs to a directive the
 /// compiler erases, so it loads nothing at module load time:
 /// `import type ...`, `export type { .. } from`, `import type X = require(..)`,
@@ -870,11 +904,17 @@ fn tree_references(
         };
 
         let (row, col) = crate::position::node_start_utf8(&ref_node, source);
-        let lazy = matches!(
+        let directive = matches!(
             kind,
             ReferenceKind::Import | ReferenceKind::ImportBinding | ReferenceKind::Include
-        ) && (import_is_lazy(&ref_node, source, language)
-            || (language == Language::TypeScript && ts_import_is_type_only(&ref_node)));
+        );
+        let type_checking = directive
+            && language == Language::Python
+            && python_import_is_type_checking(&ref_node, source);
+        let lazy = directive
+            && (type_checking
+                || import_is_lazy(&ref_node, source, language)
+                || (language == Language::TypeScript && ts_import_is_type_only(&ref_node)));
         if language == Language::Python && kind == ReferenceKind::ImportBinding {
             let statement = ref_node.parent().and_then(|parent| {
                 if parent.kind() == "aliased_import" {
@@ -895,6 +935,7 @@ fn tree_references(
                     line: row + 1,
                     col,
                     lazy,
+                    type_checking,
                     to: None,
                     from_line: None,
                     is_test: false,
@@ -909,6 +950,7 @@ fn tree_references(
             line: row + 1,
             col,
             lazy,
+            type_checking,
             to: None,
             from_line: None,
             is_test: false,
@@ -1061,6 +1103,80 @@ mod tests {
         assert_eq!(lazy_flags(&refs, ".child"), vec![true]);
         // Binding row (lazy) plus the call row inside f (never lazy).
         assert_eq!(lazy_flags(&refs, "other"), vec![true, false]);
+    }
+
+    #[test]
+    fn python_type_checking_guard_bodies_are_lazy_and_never_load() {
+        let src = "import typing
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    import guarded
+    try:
+        from nested import n
+    except ImportError:
+        pass
+elif DEBUG:
+    import elif_body
+else:
+    import else_body
+if typing.TYPE_CHECKING:
+    from qualified import q
+if X:
+    import x_body
+elif TYPE_CHECKING:
+    import elif_guarded
+if DEBUG:
+    import debug
+if not TYPE_CHECKING:
+    import negated
+if t.TYPE_CHECKING:
+    import other_module
+";
+        let refs = refs_from_source(src, Language::Python);
+        let flags = |name: &str| -> Vec<(bool, bool)> {
+            refs.iter()
+                .filter(|r| r.to_name == name)
+                .map(|r| (r.lazy, r.type_checking))
+                .collect()
+        };
+        for name in [
+            "guarded",
+            "nested",
+            "nested.n",
+            "n",
+            "qualified.q",
+            "elif_guarded",
+        ] {
+            assert_eq!(flags(name), vec![(true, true)], "{name}");
+        }
+        for name in [
+            "typing",
+            "TYPE_CHECKING",
+            "elif_body",
+            "else_body",
+            "x_body",
+            "debug",
+            "negated",
+            "other_module",
+        ] {
+            let rows = flags(name);
+            assert!(
+                !rows.is_empty() && rows.iter().all(|row| *row == (false, false)),
+                "{name}: {rows:?}"
+            );
+        }
+        let in_function = refs_from_source(
+            "def f():
+    import inner
+",
+            Language::Python,
+        );
+        let inner: Vec<_> = in_function
+            .iter()
+            .filter(|r| r.to_name == "inner")
+            .map(|r| (r.lazy, r.type_checking))
+            .collect();
+        assert_eq!(inner, vec![(true, false)]);
     }
 
     #[test]

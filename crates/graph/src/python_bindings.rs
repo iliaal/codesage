@@ -263,6 +263,7 @@ fn captured_self_import_load(
             line: site.line,
             col: site.col,
             lazy: false,
+            type_checking: false,
             is_test: false,
             to: None,
             from_line: None,

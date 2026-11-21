@@ -1043,8 +1043,9 @@ fn migrate_0024_is_test(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// Adds `refs.lazy` (1 when the import directive sits inside a function
-/// body). Existing rows default to 0; the bumped structural interpretation
+/// Adds `refs.lazy` (nonzero when the import directive loads nothing at
+/// module load time; 2 marks a Python `if TYPE_CHECKING:` import, which never
+/// runs). Existing rows default to 0; the bumped structural interpretation
 /// reparses them on the next `codesage index`.
 fn migrate_0022_refs_lazy(conn: &Connection) -> rusqlite::Result<()> {
     let has_column: i64 = conn.query_row(

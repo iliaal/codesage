@@ -894,6 +894,7 @@ fn assess_risk_with_context(
         max_frontier,
         None,
         Some(&mut *cache),
+        false,
     )
     .with_context(|| format!("computing dependent_files for risk({file_path})"))?;
     let dependents = outcome.entries;
@@ -3077,6 +3078,7 @@ mod tests {
             line: 1,
             col: 0,
             lazy: false,
+            type_checking: false,
         };
         db.insert_references(ids("cyc_a.php"), &[imp("cyc_a.php", "App\\CycleB")])
             .unwrap();
@@ -3164,6 +3166,7 @@ mod tests {
             line: 1,
             col: 0,
             lazy: false,
+            type_checking: false,
             to: None,
             from_line: None,
             is_test: false,

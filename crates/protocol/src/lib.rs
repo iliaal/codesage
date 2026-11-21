@@ -613,7 +613,8 @@ pub struct Reference {
     /// method, or arrow-function body that is not immediately invoked (the
     /// module is loaded on use), or a TypeScript type-only directive the
     /// compiler erases (`import type`, `export type { .. } from`, a clause of
-    /// only `type` specifiers, or a binding's own `type` specifier).
+    /// only `type` specifiers, or a binding's own `type` specifier), or a
+    /// Python `TYPE_CHECKING`-guarded directive (see `type_checking`).
     /// Cycle detection drops a file pair whose import edges are all lazy;
     /// dependency listings, impact analysis, and call resolution keep them.
     /// A wrapper invoked where it is written (`(...)()`, `new`, `.call`,
@@ -623,6 +624,14 @@ pub struct Reference {
     /// PHP, Java, Go).
     #[serde(default, skip_serializing_if = "is_false")]
     pub lazy: bool,
+    /// True for a Python import directive inside the body of
+    /// `if TYPE_CHECKING:` or `if typing.TYPE_CHECKING:` (or an `elif` with
+    /// that exact condition), which never executes at run time. Such a row is
+    /// also `lazy`. Test reachability skips it; cycle detection drops it as a
+    /// lazy row; dependency listings and impact analysis keep it. Stored as
+    /// `refs.lazy = 2`; never sent over JSON.
+    #[serde(skip)]
+    pub type_checking: bool,
     /// True when the reference is made from test code: the enclosing
     /// definition (`from_symbol`) is a test symbol, or `from_file` is a test
     /// file. Derived at read time from the stored file and symbol flags,
@@ -4033,6 +4042,7 @@ mod tests {
             line: 12,
             col: 8,
             lazy: false,
+            type_checking: false,
             to: None,
             from_line: None,
             is_test: false,
@@ -4051,6 +4061,7 @@ mod tests {
     fn reference_wire_carries_from_and_to_handles() {
         let mut r = Reference {
             lazy: false,
+            type_checking: false,
             from_file: "src/a.rs".to_string(),
             from_symbol: Some("a::run".to_string()),
             to_name: "open".to_string(),

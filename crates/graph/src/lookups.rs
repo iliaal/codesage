@@ -945,6 +945,7 @@ mod tests {
             line: 5,
             col: 12,
             lazy: false,
+            type_checking: false,
             to: None,
             from_line: None,
             is_test: false,
@@ -960,6 +961,7 @@ mod tests {
     ) -> Reference {
         Reference {
             lazy: false,
+            type_checking: false,
             from_file: file_path.to_string(),
             from_symbol: from_symbol.map(str::to_string),
             to_name: to_name.to_string(),
