@@ -236,8 +236,9 @@ class RetrievalControlsTest(unittest.TestCase):
         self.assertEqual(pin["cuda_file"], "onnx/model_cuda_fp16.onnx")
         for invalid in (source.replace("const MODEL_PINS:", "const OTHER_PINS:"),
                         source.replace("revision: MS_MARCO_DERIVED_REVISION", "revision: MISSING"),
-                        source.replace("cuda_onnx: None", "cuda_onnx: new_selector()", 1),
+                        source.replace("cuda_onnx: Some(", "cuda_onnx: new_selector(", 1),
                         source + '\nconst MS_MARCO_DERIVED_REVISION: &str = "' + "0" * 40 + '";'):
+            self.assertNotEqual(invalid, source)
             with self.subTest(invalid=invalid[-80:]), self.assertRaises(controls.InvalidRun):
                 reranker_artifacts.model_pins(invalid)
 

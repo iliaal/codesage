@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 #[cfg(feature = "cuda")]
 use std::sync::Once;
-use std::sync::{Mutex, OnceLock, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -18,7 +18,6 @@ use ort::session::{Session, builder::GraphOptimizationLevel};
 use tokenizers::Tokenizer;
 use wait_timeout::ChildExt;
 
-use crate::chunk::DEFAULT_CHUNK_SIZE;
 use crate::config::{EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_coreml, wants_cuda};
 
 #[cfg(not(target_vendor = "apple"))]
@@ -632,9 +631,14 @@ struct GraphPin {
     sha256: &'static str,
 }
 
+/// Commit of the derived all-MiniLM-L6-v2 graphs (portable fp32 pooled plus an
+/// ORT-fused fp16 CUDA graph), built from upstream revision
+/// c9745ed1d9f207416be6d2e6f8de32d1f16199bf.
+const MINILM_DERIVED_REVISION: &str = "292b973de823b96bb970cd40b233c8075427110d";
+
 /// Commit of the derived jina-embeddings-v2-base-code graphs, built from
 /// upstream revision 516f4baf13dec4ddddda8631e019b5737c8bc250.
-const JINA_CODE_DERIVED_REVISION: &str = "732cbcc67d989d08c5ae9bdb04a69c34ecb60cb5";
+const JINA_CODE_DERIVED_REVISION: &str = "211266c1a2fdf1191f617611af2cbef9b7a96944";
 
 /// Commit of the ms-marco-MiniLM-L6-v2 graphs (upstream plus a fused fp16
 /// CUDA graph), built from upstream revision
@@ -644,12 +648,15 @@ const MS_MARCO_DERIVED_REVISION: &str = "3a8dae18b7a92308d7d63b834f3bfa01bab02d3
 const MODEL_PINS: &[ModelPin] = &[
     ModelPin {
         model: "sentence-transformers/all-MiniLM-L6-v2",
-        repo: "sentence-transformers/all-MiniLM-L6-v2",
-        revision: "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        repo: "IA0x00/all-MiniLM-L6-v2-codesage",
+        revision: MINILM_DERIVED_REVISION,
         tokenizer_sha256: "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
-        onnx_sha256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452",
+        onnx_sha256: "99154eb07d13eb3de6b2132a7f043195f53cc944f957f69710eed3dfcea62858",
         onnx_data_sha256: None,
-        cuda_onnx: None,
+        cuda_onnx: Some(GraphPin {
+            file: "onnx/model_cuda_fp16.onnx",
+            sha256: "f46f5f118a6473f8da23c6b2856c97680abd2836f993b16d8fa3e2499f3eee88",
+        }),
         max_seq_length: MAX_SEQ_LENGTH,
     },
     ModelPin {
@@ -670,11 +677,11 @@ const MODEL_PINS: &[ModelPin] = &[
         repo: "IA0x00/jina-embeddings-v2-base-code-codesage",
         revision: JINA_CODE_DERIVED_REVISION,
         tokenizer_sha256: "b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5",
-        onnx_sha256: "98ca3fc0def59e9fea861ca8888f805fd3cd10d429695ff53bd03ab053e8aee4",
+        onnx_sha256: "b38da98ce812d0f2c1057e734c138e058f3c4f0f2c7060855ef02f03bfb6f066",
         onnx_data_sha256: None,
         cuda_onnx: Some(GraphPin {
             file: "onnx/model_cuda_fp16.onnx",
-            sha256: "5d34291e0d44a01924d6709c631b141a875a7e9add7f118dde87050644cfc2ab",
+            sha256: "cc6736d11d8a73c174359e9263216ce55e98682763206ca3369860e8159dd59e",
         }),
         // ALiBi has no learned positions. Real C code in php-src runs a median
         // of 611 tokens per 1500-byte chunk; data tables are dropped by the
@@ -1164,10 +1171,16 @@ impl ModelAuthorization {
     }
 
     /// Validate before looking up a resident session, including after revocation.
-    /// Distinguish both project and pin policy even if artifact bytes coincide.
+    /// Pinned allowlisted models share one resident session across projects;
+    /// unpinned bypasses stay isolated per canonical project root so revoking
+    /// one project never shares a session with another.
     pub fn pool_key(&self, model: &str) -> Result<String> {
         validate_model_allowed(model, self.allow_any)?;
-        Ok(format!("{:?}|unpinned:{}", self.root, self.allow_any))
+        if self.allow_any {
+            Ok(format!("{:?}|unpinned:true", self.root))
+        } else {
+            Ok("pinned".to_string())
+        }
     }
 
     /// Bind all nested synchronous model/artifact/fingerprint operations to this
@@ -1547,7 +1560,7 @@ pub(crate) fn wants_token_type_ids<'a>(mut input_names: impl Iterator<Item = &'a
 /// libraries actually mapped (the silent-CPU-fallback guard). Returns the
 /// session, tokenizer, and whether the model takes a `token_type_ids` input.
 pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, Tokenizer, bool)> {
-    let loaded = load_onnx_session_with_provider(model, device)?;
+    let loaded = load_onnx_session_with_provider(model, device, false)?;
     Ok((loaded.session, loaded.tokenizer, loaded.has_token_type_ids))
 }
 
@@ -1589,8 +1602,13 @@ fn cpu_fallback_allowed_from_env() -> bool {
 }
 
 /// [`load_onnx_session`], also reporting the execution provider the session
-/// initialised on.
-pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Result<LoadedSession> {
+/// initialised on. Pass `same_as_requested_arena = true` only when the caller
+/// pairs CUDA inference with peak-first batching and idle arena shrinkage.
+pub(crate) fn load_onnx_session_with_provider(
+    model: &str,
+    device: &str,
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] same_as_requested_arena: bool,
+) -> Result<LoadedSession> {
     let allow_any = allow_any_model_from_env();
     validate_model_allowed(model, allow_any)?;
     let pin = load_pin(model, allow_any);
@@ -1658,10 +1676,15 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
         }))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     // ONNX Runtime's memory-efficient attention takes an additive bias only
-    // when the sequence length is a multiple of 8 tokens.
+    // when the sequence length is a multiple of 8 tokens. Preserve any
+    // model-configured pad ID/token for unpinned tokenizers.
+    let existing_pad = tokenizer.get_padding().cloned();
     tokenizer.with_padding(Some(tokenizers::PaddingParams {
         strategy: tokenizers::PaddingStrategy::BatchLongest,
         pad_to_multiple_of: Some(8),
+        pad_id: existing_pad.as_ref().map_or(0, |p| p.pad_id),
+        pad_type_id: existing_pad.as_ref().map_or(0, |p| p.pad_type_id),
+        pad_token: existing_pad.map_or_else(|| "[PAD]".to_string(), |p| p.pad_token),
         ..Default::default()
     }));
 
@@ -1669,8 +1692,7 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
 
     if graph_pin(pin, device).is_some() {
         // ORT_ENABLE_ALL adds CPU layout passes whose LayerNorm fusion fails on
-        // the fp16 graph's inserted casts; CUDA kernels gain nothing from them,
-        // and the CPU fallback must still load the graph.
+        // the fp16 graph's inserted casts; CUDA kernels gain nothing from them.
         builder = builder
             .with_optimization_level(GraphOptimizationLevel::Level2)
             .map_err(|e| anyhow::anyhow!("setting the graph optimization level: {e}"))?;
@@ -1680,8 +1702,16 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
         #[cfg(feature = "cuda")]
         {
             preload_native_libs();
+            let mut cuda = ort::ep::CUDA::default();
+            if same_as_requested_arena {
+                // Paired with peak-first batch execution in `BatchPlan`: allocating
+                // the largest batch first lets SameAsRequested split one peak block
+                // across all later smaller batches instead of doubling via power-of-two.
+                cuda =
+                    cuda.with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested);
+            }
             builder = builder
-                .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+                .with_execution_providers([cuda.build().error_on_failure()])
                 .map_err(|e| anyhow::anyhow!("CUDA provider failed to register: {e}"))?;
         }
     }
@@ -1698,34 +1728,78 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
         }
     }
 
-    let session = builder.commit_from_file(&model_path)?;
-
     // Linux CUDA fallback must fingerprint as CPU, never attest CUDA vectors.
     let configured = crate::fingerprint::configured_execution_provider(device);
     #[cfg(all(feature = "cuda", target_os = "linux"))]
-    let execution_provider = if want_cuda {
-        let (provider, fell_back) = effective_execution_provider(
-            configured,
-            require_cuda_libs_mapped(),
-            cpu_fallback_allowed_from_env(),
-        )?;
-        if fell_back {
-            tracing::warn!(
-                model,
-                configured_device = device,
-                execution_provider = provider,
-                "CODESAGE_ALLOW_CPU_FALLBACK: CUDA was requested but its libraries are not \
-                 mapped; this session runs on the CPU and fingerprints as a CPU setup"
-            );
+    let (session, execution_provider) = match builder.commit_from_file(&model_path) {
+        Ok(session) if want_cuda => {
+            let (provider, fell_back) = effective_execution_provider(
+                configured,
+                require_cuda_libs_mapped(),
+                cpu_fallback_allowed_from_env(),
+            )?;
+            if fell_back {
+                tracing::warn!(
+                    model,
+                    configured_device = device,
+                    execution_provider = provider,
+                    "CODESAGE_ALLOW_CPU_FALLBACK: CUDA was requested but its libraries are not \
+                     mapped; this session runs on the CPU and fingerprints as a CPU setup"
+                );
+            }
+            (session, provider)
         }
-        provider
-    } else {
-        configured
+        Ok(session) => (session, configured),
+        Err(commit_err) if want_cuda => {
+            // CUDA-only fused ops (such as Jina's BiasSplitGelu) fail inside
+            // commit_from_file when ORT silently falls back to CPU because CUDA
+            // libraries are absent. Surface the actionable CUDA setup error, or
+            // load the verified portable CPU graph when fallback is explicitly allowed.
+            let (provider, fell_back) = effective_execution_provider(
+                configured,
+                require_cuda_libs_mapped(),
+                cpu_fallback_allowed_from_env(),
+            )?;
+            if fell_back && graph_pin(pin, device).is_some() {
+                tracing::warn!(
+                    model,
+                    configured_device = device,
+                    execution_provider = provider,
+                    fallback_graph = ONNX_ARTIFACT,
+                    "CODESAGE_ALLOW_CPU_FALLBACK: CUDA was requested but its libraries are not \
+                     mapped; this session runs on the CPU and fingerprints as a CPU setup"
+                );
+                let portable_artifacts = resolve_model_artifacts_at(
+                    load_repo(model, allow_any),
+                    pin.map(|pin| pin.revision),
+                    ONNX_ARTIFACT,
+                    sidecar_expectation(model, allow_any),
+                )?;
+                let (_tok, portable_model_path) = if let Some(pin) = pin {
+                    verify_pinned_model_artifacts(
+                        model,
+                        pin,
+                        None,
+                        portable_artifacts.tokenizer,
+                        portable_artifacts.onnx,
+                        portable_artifacts.onnx_data,
+                    )?
+                } else {
+                    (portable_artifacts.tokenizer, portable_artifacts.onnx)
+                };
+                let cpu_session = Session::builder(&ort_environment()?)?
+                    .commit_from_file(&portable_model_path)?;
+                (cpu_session, provider)
+            } else {
+                return Err(commit_err.into());
+            }
+        }
+        Err(commit_err) => return Err(commit_err.into()),
     };
     #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     // CoreML registration errors are fatal, but ORT exposes no post-commit
     // provider query or mapping check. Attest the configured provider.
-    let execution_provider = configured;
+    let (session, execution_provider) = (builder.commit_from_file(&model_path)?, configured);
 
     let has_token_type_ids = wants_token_type_ids(session.inputs().iter().map(|i| i.name()));
 
@@ -1739,16 +1813,18 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
 
 pub struct Embedder {
     session: Session,
-    tokenizer: Tokenizer,
+    tokenizer: Arc<Tokenizer>,
+    pad_token_id: i64,
     dim: usize,
     pooling: PoolingStrategy,
     /// The graph emits one pooled vector per input ([batch, dim]) rather
     /// than token-level hidden states, so no host-side pooling runs.
     pre_pooled: bool,
-    max_seq_length: usize,
     has_token_type_ids: bool,
     batch_size: NonZeroUsize,
     execution_provider: &'static str,
+    /// True after a large CUDA batch expanded the BFC arena beyond single-query needs.
+    arena_dirty: bool,
 }
 
 impl Embedder {
@@ -1760,10 +1836,15 @@ impl Embedder {
         tracing::info!(model = %config.model, "loading embedding model");
         let LoadedSession {
             session,
-            tokenizer,
+            mut tokenizer,
             has_token_type_ids,
             execution_provider,
-        } = load_onnx_session_with_provider(&config.model, &config.device)?;
+        } = load_onnx_session_with_provider(&config.model, &config.device, true)?;
+        // Pad directly when assembling tensor buffers so `BatchPlanner` can
+        // tokenize once without per-encoding padding allocations and plan on
+        // exact token counts.
+        let pad_token_id = tokenizer.get_padding().map_or(0i64, |p| p.pad_id as i64);
+        tokenizer.with_padding(None);
         let dim = detect_dim(&session)?;
         let pooling = config.pooling_strategy();
         let pre_pooled = output_rank(&session) == Some(2);
@@ -1789,14 +1870,15 @@ impl Embedder {
 
         Ok(Self {
             session,
-            tokenizer,
+            tokenizer: Arc::new(tokenizer),
+            pad_token_id,
             dim,
             pooling,
             pre_pooled,
-            max_seq_length: max_seq_length(&config.model),
             has_token_type_ids,
             batch_size,
             execution_provider,
+            arena_dirty: false,
         })
     }
 
@@ -1810,8 +1892,70 @@ impl Embedder {
         self.execution_provider
     }
 
+    /// Whether a large CUDA batch has expanded the device arena since the last shrink.
+    pub fn needs_arena_shrink(&self) -> bool {
+        self.execution_provider == "cuda" && self.arena_dirty
+    }
+
+    /// Release unused CUDA and CPU BFC arena blocks back to the device and OS
+    /// while keeping the resident session warm for subsequent queries.
+    pub fn shrink_arena(&mut self) -> Result<()> {
+        if !self.needs_arena_shrink() {
+            return Ok(());
+        }
+        const SHRINK_SEQ_LEN: usize = 8;
+        let input_ids = vec![self.pad_token_id; SHRINK_SEQ_LEN];
+        let mut attention_mask = vec![0i64; SHRINK_SEQ_LEN];
+        attention_mask[0] = 1;
+        let ids_tensor = ort::value::Tensor::from_array(([1, SHRINK_SEQ_LEN], input_ids))?;
+        let mask_tensor = ort::value::Tensor::from_array(([1, SHRINK_SEQ_LEN], attention_mask))?;
+        let inputs = if self.has_token_type_ids {
+            let type_tensor =
+                ort::value::Tensor::from_array(([1, SHRINK_SEQ_LEN], vec![0i64; SHRINK_SEQ_LEN]))?;
+            ort::inputs![
+                "input_ids" => ids_tensor,
+                "token_type_ids" => type_tensor,
+                "attention_mask" => mask_tensor,
+            ]
+        } else {
+            ort::inputs![
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+            ]
+        };
+        crate::run_control::run_session_shrinking(
+            &mut self.session,
+            inputs,
+            "gpu:0;cpu:0",
+            |_| Ok(()),
+        )?;
+        self.arena_dirty = false;
+        Ok(())
+    }
+
+    /// Cheap lock-free planner sharing this embedder's tokenizer and batch cap.
+    pub fn planner(&self) -> BatchPlanner {
+        self.planner_with_limit(self.batch_size)
+    }
+
+    /// [`Embedder::planner`] with an explicit per-call `batch_size` cap, so
+    /// projects sharing one pooled session still honor their own batch limits.
+    pub fn planner_with_limit(&self, batch_size: NonZeroUsize) -> BatchPlanner {
+        let limit = batch_size.get();
+        BatchPlanner {
+            tokenizer: Arc::clone(&self.tokenizer),
+            batch_size: limit,
+            max_batch_tokens: max_batch_tokens_for(self.dim, limit),
+        }
+    }
+
     pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
-        let batch = self.embed_batch(&[text])?;
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let mut stats = EmbedStats::default();
+        let batch = self.embed_encoded_batch(&[&encoding], &mut stats)?;
         Ok(batch.into_iter().next().unwrap())
     }
 
@@ -1830,26 +1974,18 @@ impl Embedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let plan = self.plan_batches(texts);
-        plan.run(texts, stats, |batch, stats| {
-            self.embed_planned_batch(batch, stats)
-        })
+        let plan = self.plan_batches(texts)?;
+        plan.run_encoded(stats, |batch, stats| self.embed_encoded_batch(batch, stats))
     }
 
-    /// Split `texts` the way [`Embedder::embed_batch`] would, for a caller
-    /// that drives the batches itself through [`BatchPlan::run`] and
-    /// [`Embedder::embed_planned_batch`].
-    pub fn plan_batches(&self, texts: &[&str]) -> BatchPlan {
-        let batch_size = self.batch_size.get();
-        BatchPlan::new(
-            texts,
-            batch_size,
-            self.max_seq_length * BYTES_PER_TOKEN_CEILING,
-            batch_size * DEFAULT_CHUNK_SIZE,
-        )
+    /// Tokenize and split `texts` the way [`Embedder::embed_batch`] does, for
+    /// callers driving the batches through [`BatchPlan::run_encoded`] and
+    /// [`Embedder::embed_encoded_batch`].
+    pub fn plan_batches(&self, texts: &[&str]) -> Result<BatchPlan> {
+        self.planner().plan(texts)
     }
 
-    /// Run inference on one batch of a [`BatchPlan`], in the order given.
+    /// Run inference on one raw-text batch of a [`BatchPlan`], in the order given.
     pub fn embed_planned_batch(
         &mut self,
         texts: &[&str],
@@ -1859,25 +1995,29 @@ impl Embedder {
             .tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let refs: Vec<&tokenizers::Encoding> = encodings.iter().collect();
+        self.embed_encoded_batch(&refs, stats)
+    }
 
-        let batch_size = encodings.len();
-        let seq_len = encodings[0].get_ids().len();
-
-        let mut input_ids = Vec::with_capacity(batch_size * seq_len);
-        let mut attention_mask = Vec::with_capacity(batch_size * seq_len);
-        let mut tokens = 0usize;
-
-        for enc in &encodings {
-            input_ids.extend(enc.get_ids().iter().map(|&id| id as i64));
-            attention_mask.extend(enc.get_attention_mask().iter().map(|&m| m as i64));
-            tokens += enc.get_attention_mask().iter().filter(|&&m| m != 0).count();
+    /// Run inference on one pre-tokenized batch of a [`BatchPlan`].
+    pub fn embed_encoded_batch(
+        &mut self,
+        encodings: &[&tokenizers::Encoding],
+        stats: &mut EmbedStats,
+    ) -> Result<Vec<Vec<f32>>> {
+        if encodings.is_empty() {
+            return Ok(Vec::new());
         }
+        let batch_size = encodings.len();
+        let (seq_len, input_ids, attention_mask, tokens) =
+            assemble_encoded_batch(encodings, self.pad_token_id)?;
+        let total_elems = input_ids.len();
 
         let ids_tensor = ort::value::Tensor::from_array(([batch_size, seq_len], input_ids))?;
         let mask_tensor = ort::value::Tensor::from_array(([batch_size, seq_len], attention_mask))?;
 
         let inputs = if self.has_token_type_ids {
-            let token_type_ids = vec![0i64; batch_size * seq_len];
+            let token_type_ids = vec![0i64; total_elems];
             let type_tensor =
                 ort::value::Tensor::from_array(([batch_size, seq_len], token_type_ids))?;
             ort::inputs![
@@ -1892,15 +2032,97 @@ impl Embedder {
             ]
         };
 
+        // Mark dirty before inference so failed or cancelled large CUDA runs
+        // still release any arena blocks they allocated once idle.
+        if self.execution_provider == "cuda" && total_elems > 1024 {
+            self.arena_dirty = true;
+        }
         let (dim, pooling, pre_pooled) = (self.dim, self.pooling, self.pre_pooled);
         let embeddings = crate::run_control::run_session(&mut self.session, inputs, |outputs| {
             let (_shape, hidden) = outputs[0].try_extract_tensor::<f32>()?;
-            pool_hidden(hidden, &encodings, seq_len, dim, pooling, pre_pooled)
+            pool_hidden(hidden, encodings, seq_len, dim, pooling, pre_pooled)
         })?;
         stats.tokens += tokens;
-        stats.padded_tokens += batch_size * seq_len;
+        stats.padded_tokens += total_elems;
         Ok(embeddings)
     }
+}
+
+fn assemble_encoded_batch(
+    encodings: &[&tokenizers::Encoding],
+    pad_token_id: i64,
+) -> Result<(usize, Vec<i64>, Vec<i64>, usize)> {
+    let batch_size = encodings.len();
+    let max_len = encodings.iter().map(|e| e.len()).max().unwrap_or(0);
+    // ONNX Runtime's memory-efficient attention takes an additive bias only
+    // when the sequence length is a multiple of 8 tokens.
+    let seq_len = round_up_8(max_len);
+    ensure!(
+        seq_len > 0,
+        "cannot embed a batch whose tokenized encodings are all empty"
+    );
+
+    let total_elems = batch_size
+        .checked_mul(seq_len)
+        .context("embedding batch tensor size overflow")?;
+    let mut input_ids = Vec::with_capacity(total_elems);
+    let mut attention_mask = Vec::with_capacity(total_elems);
+    let mut tokens = 0usize;
+
+    for enc in encodings {
+        let ids = enc.get_ids();
+        let mask = enc.get_attention_mask();
+        ensure!(
+            ids.len() == mask.len() && ids.len() <= seq_len,
+            "tokenizer encoding lengths mismatch: ids={} mask={} seq_len={seq_len}",
+            ids.len(),
+            mask.len()
+        );
+        input_ids.extend(ids.iter().map(|&id| id as i64));
+        input_ids.resize(input_ids.len() + (seq_len - ids.len()), pad_token_id);
+        attention_mask.extend(mask.iter().map(|&m| m as i64));
+        attention_mask.resize(attention_mask.len() + (seq_len - mask.len()), 0);
+        tokens += mask.iter().filter(|&&m| m != 0).count();
+    }
+
+    Ok((seq_len, input_ids, attention_mask, tokens))
+}
+
+/// Lock-free batch planner sharing an [`Embedder`]'s tokenizer and token budget.
+#[derive(Clone)]
+pub struct BatchPlanner {
+    tokenizer: Arc<Tokenizer>,
+    batch_size: usize,
+    max_batch_tokens: usize,
+}
+
+impl BatchPlanner {
+    /// Tokenize `texts` once and group them into length-tight, descending batches.
+    pub fn plan(&self, texts: &[&str]) -> Result<BatchPlan> {
+        if texts.is_empty() {
+            return Ok(BatchPlan::empty());
+        }
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts.to_vec(), true)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        Ok(BatchPlan::from_encodings(
+            encodings,
+            self.batch_size,
+            self.max_batch_tokens,
+        ))
+    }
+}
+
+fn round_up_8(len: usize) -> usize {
+    len.div_ceil(8).saturating_mul(8)
+}
+
+/// Activation memory scales with hidden dimension: 8,192 tokens at dim>=768
+/// (Jina) and 16,384 tokens at dim<=384 (MiniLM) for default batch_size=64.
+fn max_batch_tokens_for(dim: usize, batch_size: usize) -> usize {
+    let tokens_per_slot = if dim >= 768 { 128 } else { 256 };
+    batch_size.saturating_mul(tokens_per_slot)
 }
 
 /// Work one [`Embedder::embed_batch_with_stats`] call performed.
@@ -1919,7 +2141,7 @@ pub struct EmbedStats {
 
 fn pool_hidden(
     hidden: &[f32],
-    encodings: &[tokenizers::Encoding],
+    encodings: &[&tokenizers::Encoding],
     seq_len: usize,
     dim: usize,
     pooling: PoolingStrategy,
@@ -1970,6 +2192,9 @@ fn pool_hidden(
                 let mut vec = vec![0.0f32; dim];
                 let mut mask_sum = 0.0f32;
                 for (j, &m) in mask.iter().enumerate() {
+                    if m == 0 {
+                        continue;
+                    }
                     let m = m as f32;
                     mask_sum += m;
                     let offset = (i * seq_len + j) * dim;
@@ -1985,6 +2210,7 @@ fn pool_hidden(
                 vec
             }
             PoolingStrategy::Cls => {
+                ensure!(seq_len > 0, "cannot CLS-pool an empty token sequence");
                 let offset = i * seq_len * dim;
                 hidden[offset..offset + dim].to_vec()
             }
@@ -1996,52 +2222,102 @@ fn pool_hidden(
     Ok(embeddings)
 }
 
-/// Bytes of source text one token covers at most, for bounding how much of a
-/// text the sequence cap can reach.
-const BYTES_PER_TOKEN_CEILING: usize = 3;
-
 /// How [`Embedder::embed_batch`] splits a set of texts into internal batches.
-/// Batches are ordered by byte length: they pad to their longest member, so
-/// grouping similar lengths cuts padded compute, and byte length tracks token
-/// count well enough to order by. A batch holds at most `batch_size` texts
-/// and, counting each at most `max_text_bytes` (what the sequence cap can
-/// reach), at most `max_batch_bytes` of padded input, so batches of long
-/// texts shrink instead of multiplying attention memory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Batches are grouped in ascending length order (minimizing internal padding)
+/// and executed in descending order (heaviest batch first) so CUDA's
+/// `SameAsRequested` BFC arena allocates one peak block and reuses it across
+/// all later smaller batches.
+#[derive(Debug, Clone)]
 pub struct BatchPlan {
     batches: Vec<Vec<usize>>,
     texts: usize,
+    encodings: Option<Vec<tokenizers::Encoding>>,
+}
+
+fn plan_descending_batches(
+    lengths: &[usize],
+    batch_size: usize,
+    max_item_len: usize,
+    max_batch_budget: usize,
+    round_up_multiple_of_8: bool,
+) -> Vec<Vec<usize>> {
+    let batch_size = batch_size.max(1);
+    let mut order: Vec<usize> = (0..lengths.len()).collect();
+    order.sort_by_key(|&i| lengths[i]);
+
+    // Ascending grouping minimizes padding spread within each batch.
+    let mut batches: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() {
+            let rows = end + 1 - start;
+            let raw = lengths[order[end]].min(max_item_len);
+            let longest = if round_up_multiple_of_8 {
+                round_up_8(raw)
+            } else {
+                raw
+            };
+            if rows > batch_size || rows.saturating_mul(longest) > max_batch_budget {
+                break;
+            }
+            end += 1;
+        }
+        let raw_max = lengths[order[end - 1]].min(max_item_len);
+        let seq_len = if round_up_multiple_of_8 {
+            round_up_8(raw_max)
+        } else {
+            raw_max
+        };
+        let footprint = (end - start).saturating_mul(seq_len);
+        batches.push((footprint, seq_len, order[start..end].to_vec()));
+        start = end;
+    }
+    // Execute the largest padded-token footprint first (tie-breaking by longer
+    // sequences, whose O(S^2) attention bias is heavier) rather than merely
+    // reversing, so a small partial remainder at the longest tier never runs
+    // ahead of a full peak batch.
+    batches.sort_by_key(|(footprint, seq_len, _)| std::cmp::Reverse((*footprint, *seq_len)));
+    batches.into_iter().map(|(_, _, batch)| batch).collect()
 }
 
 impl BatchPlan {
+    pub fn empty() -> Self {
+        Self {
+            batches: Vec::new(),
+            texts: 0,
+            encodings: Some(Vec::new()),
+        }
+    }
+
     pub fn new(
         texts: &[&str],
         batch_size: usize,
         max_text_bytes: usize,
         max_batch_bytes: usize,
     ) -> Self {
-        let mut order: Vec<usize> = (0..texts.len()).collect();
-        order.sort_by_key(|&i| texts[i].len());
-
-        // Ascending order makes each candidate the batch's longest member.
-        let mut batches = Vec::new();
-        let mut start = 0;
-        while start < order.len() {
-            let mut end = start + 1;
-            while end < order.len() {
-                let rows = end + 1 - start;
-                let longest = texts[order[end]].len().min(max_text_bytes);
-                if rows > batch_size || rows * longest > max_batch_bytes {
-                    break;
-                }
-                end += 1;
-            }
-            batches.push(order[start..end].to_vec());
-            start = end;
-        }
+        let lengths: Vec<usize> = texts.iter().map(|t| t.len()).collect();
+        let batches =
+            plan_descending_batches(&lengths, batch_size, max_text_bytes, max_batch_bytes, false);
         Self {
             batches,
             texts: texts.len(),
+            encodings: None,
+        }
+    }
+
+    pub fn from_encodings(
+        encodings: Vec<tokenizers::Encoding>,
+        batch_size: usize,
+        max_batch_tokens: usize,
+    ) -> Self {
+        let lengths: Vec<usize> = encodings.iter().map(tokenizers::Encoding::len).collect();
+        let batches =
+            plan_descending_batches(&lengths, batch_size, usize::MAX, max_batch_tokens, true);
+        Self {
+            batches,
+            texts: encodings.len(),
+            encodings: Some(encodings),
         }
     }
 
@@ -2074,6 +2350,48 @@ impl BatchPlan {
             codesage_protocol::work::checkpoint()?;
             let batch_texts: Vec<&str> = batch.iter().map(|&i| texts[i]).collect();
             let embeddings = embed(&batch_texts, stats)?;
+            stats.completed_batches += 1;
+            ensure!(
+                embeddings.len() == batch.len(),
+                "embedder produced {} vectors for {} texts",
+                embeddings.len(),
+                batch.len()
+            );
+            for (&i, embedding) in batch.iter().zip(embeddings) {
+                slots[i] = Some(embedding);
+            }
+        }
+        Ok(slots
+            .into_iter()
+            .map(|v| v.expect("every text belongs to exactly one batch"))
+            .collect())
+    }
+
+    /// Embed every pre-tokenized batch through `embed`, returning vectors in
+    /// input order. Requires a plan built by [`BatchPlanner::plan`] or
+    /// [`BatchPlan::from_encodings`].
+    pub fn run_encoded(
+        &self,
+        stats: &mut EmbedStats,
+        mut embed: impl FnMut(&[&tokenizers::Encoding], &mut EmbedStats) -> Result<Vec<Vec<f32>>>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let encodings = self
+            .encodings
+            .as_deref()
+            .context("batch plan carries no pre-tokenized encodings")?;
+        ensure!(
+            encodings.len() == self.texts,
+            "batch plan covers {} texts, {} encodings are attached",
+            self.texts,
+            encodings.len()
+        );
+        stats.planned_batches += self.batches.len();
+        let mut slots: Vec<Option<Vec<f32>>> = vec![None; self.texts];
+        for batch in &self.batches {
+            codesage_protocol::work::checkpoint()?;
+            let batch_encodings: Vec<&tokenizers::Encoding> =
+                batch.iter().map(|&i| &encodings[i]).collect();
+            let embeddings = embed(&batch_encodings, stats)?;
             stats.completed_batches += 1;
             ensure!(
                 embeddings.len() == batch.len(),
@@ -2271,31 +2589,37 @@ mod tests {
             "the unpinned bypass resolves the name the config gives"
         );
         let minilm = "sentence-transformers/all-MiniLM-L6-v2";
-        assert_eq!(load_repo(minilm, false), minilm);
+        assert_eq!(load_repo(minilm, false), "IA0x00/all-MiniLM-L6-v2-codesage");
+        assert_eq!(load_repo(minilm, true), minilm);
     }
 
     #[test]
     fn cuda_devices_load_the_pinned_cuda_graph_and_others_the_portable_one() {
-        let jina = "jinaai/jina-embeddings-v2-base-code";
-        for device in ["gpu", "cuda", "GPU"] {
-            assert_eq!(load_graph(jina, false, device), "onnx/model_cuda_fp16.onnx");
+        for model in [
+            "jinaai/jina-embeddings-v2-base-code",
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "cross-encoder/ms-marco-MiniLM-L6-v2",
+        ] {
+            for device in ["gpu", "cuda", "GPU"] {
+                assert_eq!(
+                    load_graph(model, false, device),
+                    "onnx/model_cuda_fp16.onnx",
+                    "{model} on {device}"
+                );
+            }
+            for device in ["cpu", "coreml"] {
+                assert_eq!(
+                    load_graph(model, false, device),
+                    ONNX_ARTIFACT,
+                    "{model} on {device}"
+                );
+            }
+            assert_eq!(
+                load_graph(model, true, "gpu"),
+                ONNX_ARTIFACT,
+                "the unpinned bypass knows no derived graphs ({model})"
+            );
         }
-        for device in ["cpu", "coreml"] {
-            assert_eq!(load_graph(jina, false, device), ONNX_ARTIFACT);
-        }
-        assert_eq!(
-            load_graph(jina, true, "gpu"),
-            ONNX_ARTIFACT,
-            "the unpinned bypass knows no derived graphs"
-        );
-        assert_eq!(
-            load_graph("cross-encoder/ms-marco-MiniLM-L6-v2", false, "gpu"),
-            "onnx/model_cuda_fp16.onnx"
-        );
-        assert_eq!(
-            load_graph("sentence-transformers/all-MiniLM-L6-v2", false, "gpu"),
-            ONNX_ARTIFACT
-        );
     }
 
     #[test]
@@ -2345,7 +2669,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             batches,
-            [vec!["a", "bb"], vec!["ccc", "dddd"], vec!["eeeee"]]
+            [vec!["ccc", "dddd"], vec!["eeeee"], vec!["a", "bb"]]
         );
         assert_eq!(out, [vec![3.0], vec![1.0], vec![5.0], vec![2.0], vec![4.0]]);
         assert_eq!((stats.planned_batches, stats.completed_batches), (3, 3));
@@ -2361,9 +2685,9 @@ mod tests {
             Ok(batch.iter().map(|_| vec![0.0]).collect())
         })
         .unwrap();
-        // Short texts fill a batch by count; long ones count at the 30-byte
-        // reach of the cap, so two of them fill the 60-byte budget.
-        assert_eq!(sizes, [4, 2]);
+        // Long texts run first (descending order) capped at 2 by the 60-byte
+        // budget; short texts run next filling a batch of 4 by count.
+        assert_eq!(sizes, [2, 4]);
 
         let mut sizes = Vec::new();
         embed_in_length_order(
@@ -2379,6 +2703,201 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sizes, [1], "a text over the budget still embeds alone");
+    }
+
+    #[test]
+    fn token_batch_planner_rounds_to_eight_and_executes_heaviest_first() {
+        let lengths = [12, 500, 14, 510, 10, 490];
+        let batches = plan_descending_batches(&lengths, 4, usize::MAX, 1024, true);
+        // Ascending groups: [4, 0, 2] (3 * 16 = 48), [5, 1] (2 * 504 = 1008),
+        // [3] (1 * 512 = 512). Sorted by descending padded-token footprint so
+        // the full peak batch runs ahead of a small partial tail remainder.
+        assert_eq!(batches, vec![vec![5, 1], vec![3], vec![4, 0, 2]]);
+        assert_eq!(max_batch_tokens_for(768, 64), 8_192);
+        assert_eq!(max_batch_tokens_for(384, 64), 16_384);
+        assert_eq!(max_batch_tokens_for(768, 10), 1_280);
+        assert_eq!(max_batch_tokens_for(384, 10), 2_560);
+
+        // 17 long chunks with budget 8192 pack into [16 x 504 = 8064] and [1 x 504 = 504];
+        // the full 16-chunk peak batch must execute before the 1-chunk remainder.
+        let long_tier = vec![500; 17];
+        let long_batches = plan_descending_batches(&long_tier, 64, usize::MAX, 8_192, true);
+        assert_eq!(long_batches.len(), 2);
+        assert_eq!(long_batches[0].len(), 16);
+        assert_eq!(long_batches[1].len(), 1);
+    }
+
+    fn test_word_tokenizer() -> Tokenizer {
+        Tokenizer::from_bytes(
+            br#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"a":1,"b":2,"c":3},"unk_token":"[UNK]"},"pre_tokenizer":{"type":"Whitespace"}}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn batch_plan_from_encodings_preserves_order_and_enforces_contracts() {
+        let tok = test_word_tokenizer();
+        let texts = ["a b c", "a", "a b c a b c a b c", "a b"];
+        let encodings = tok.encode_batch(texts.to_vec(), false).unwrap();
+        let plan = BatchPlan::from_encodings(encodings, 2, 16);
+
+        let mut seen_lens = Vec::new();
+        let mut stats = EmbedStats::default();
+        let out = plan
+            .run_encoded(&mut stats, |batch, _| {
+                seen_lens.push(batch.iter().map(|e| e.len()).collect::<Vec<_>>());
+                Ok(batch.iter().map(|e| vec![e.len() as f32]).collect())
+            })
+            .unwrap();
+        assert_eq!(out, vec![vec![3.0], vec![1.0], vec![9.0], vec![2.0]]);
+        assert_eq!(stats.planned_batches, seen_lens.len());
+        assert_eq!(stats.completed_batches, seen_lens.len());
+        // The 9-token encoding (padded to 16) runs before or alongside smaller groups.
+        assert_eq!(seen_lens[0], vec![9]);
+
+        // Mismatched vector count is rejected.
+        let err = plan
+            .run_encoded(&mut EmbedStats::default(), |_, _| Ok(vec![]))
+            .unwrap_err();
+        assert!(err.to_string().contains("produced 0 vectors"));
+
+        // Cancelled WorkControl stops before running any batch.
+        let control = codesage_protocol::work::WorkControl::new(None);
+        control.cancel(codesage_protocol::work::StopReason::ClientCancelled);
+        let _scope = control.enter();
+        let stopped = plan
+            .run_encoded(&mut EmbedStats::default(), |_, _| {
+                panic!("cancelled plan must not invoke embedder")
+            })
+            .unwrap_err();
+        drop(_scope);
+        assert!(
+            stopped
+                .downcast_ref::<codesage_protocol::work::WorkStopped>()
+                .is_some()
+        );
+
+        // A byte-only BatchPlan::new has no encodings and errors on run_encoded.
+        let unencoded = BatchPlan::new(&["x"], 2, 16, 32);
+        let err = unencoded
+            .run_encoded(&mut EmbedStats::default(), |_, _| Ok(vec![vec![1.0]]))
+            .unwrap_err();
+        assert!(err.to_string().contains("no pre-tokenized encodings"));
+    }
+
+    #[test]
+    fn assemble_encoded_batch_pads_to_multiple_of_8_and_guards_empty() {
+        let tok = test_word_tokenizer();
+        let e1 = tok.encode("a b c", false).unwrap();
+        let e2 = tok.encode("a", false).unwrap();
+        let (seq_len, ids, mask, tokens) = assemble_encoded_batch(&[&e1, &e2], 99).unwrap();
+        assert_eq!(seq_len, 8);
+        assert_eq!(tokens, 4);
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 99, 99, 99, 99, 99, 1, 99, 99, 99, 99, 99, 99, 99]
+        );
+        assert_eq!(mask, vec![1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+
+        // Empty encodings (special-tokenless custom tokenizer) must fail before ORT.
+        let empty = tok.encode("", false).unwrap();
+        assert_eq!(empty.len(), 0);
+        let err = assemble_encoded_batch(&[&empty], 0).unwrap_err();
+        assert!(err.to_string().contains("all empty"));
+    }
+
+    #[test]
+    fn pool_hidden_handles_unpadded_mean_cls_and_pre_pooled() {
+        let tok = test_word_tokenizer();
+        let e1 = tok.encode("a b", false).unwrap();
+        let e2 = tok.encode("a", false).unwrap();
+        let seq_len = 8;
+        let dim = 2;
+        // Row 0: token0=(2,0), token1=(0,2), padding=(999,999) -> mean=(1,1) -> norm=(1/sqrt2, 1/sqrt2)
+        // Row 1: token0=(0,4), padding=(999,999) -> mean=(0,4) -> norm=(0,1)
+        let mut hidden = vec![999.0f32; 2 * seq_len * dim];
+        hidden[0] = 2.0;
+        hidden[1] = 0.0;
+        hidden[2] = 0.0;
+        hidden[3] = 2.0;
+        let row1 = seq_len * dim;
+        hidden[row1] = 0.0;
+        hidden[row1 + 1] = 4.0;
+
+        let mean = pool_hidden(
+            &hidden,
+            &[&e1, &e2],
+            seq_len,
+            dim,
+            PoolingStrategy::Mean,
+            false,
+        )
+        .unwrap();
+        assert!((mean[0][0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        assert!((mean[0][1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        assert!((mean[1][0]).abs() < 1e-5);
+        assert!((mean[1][1] - 1.0).abs() < 1e-5);
+
+        let cls = pool_hidden(
+            &hidden,
+            &[&e1, &e2],
+            seq_len,
+            dim,
+            PoolingStrategy::Cls,
+            false,
+        )
+        .unwrap();
+        assert!((cls[0][0] - 1.0).abs() < 1e-5);
+        assert!((cls[1][1] - 1.0).abs() < 1e-5);
+
+        let pre = pool_hidden(
+            &[3.0, 4.0, 0.0, 5.0],
+            &[&e1, &e2],
+            seq_len,
+            dim,
+            PoolingStrategy::Mean,
+            true,
+        )
+        .unwrap();
+        assert!((pre[0][0] - 0.6).abs() < 1e-5);
+        assert!((pre[0][1] - 0.8).abs() < 1e-5);
+        assert!((pre[1][1] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn pinned_pool_key_shares_across_projects_while_unpinned_stays_per_project() {
+        let pinned_a = ModelAuthorization {
+            root: Some(PathBuf::from("/proj-a")),
+            allow_any: false,
+        };
+        let pinned_b = ModelAuthorization {
+            root: Some(PathBuf::from("/proj-b")),
+            allow_any: false,
+        };
+        let unpinned_a = ModelAuthorization {
+            root: Some(PathBuf::from("/proj-a")),
+            allow_any: true,
+        };
+        let unpinned_b = ModelAuthorization {
+            root: Some(PathBuf::from("/proj-b")),
+            allow_any: true,
+        };
+        let model = "jinaai/jina-embeddings-v2-base-code";
+        assert_eq!(
+            pinned_a.pool_key(model).unwrap(),
+            pinned_b.pool_key(model).unwrap(),
+            "pinned allowlisted models must share one resident session across projects"
+        );
+        assert_ne!(
+            unpinned_a.pool_key(model).unwrap(),
+            pinned_a.pool_key(model).unwrap(),
+            "unpinned bypass must never share a pinned session"
+        );
+        assert_ne!(
+            unpinned_a.pool_key(model).unwrap(),
+            unpinned_b.pool_key(model).unwrap(),
+            "unpinned bypasses stay isolated per project root"
+        );
     }
 
     #[test]

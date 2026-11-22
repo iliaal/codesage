@@ -1015,7 +1015,8 @@ fn semantic_reindex_batch_authorized(
         }
     };
     let dim = emb_arc.lock().dim();
-    let mut emb = crate::shared_model::SharedEmbedder(emb_arc);
+    let batch_size = config.embed_config.effective_batch_size().ok();
+    let mut emb = crate::shared_model::SharedEmbedder::new(emb_arc, batch_size);
     let db = match Database::open_for_model(&config.db_path, &config.embed_config.model, dim) {
         Ok(db) => db,
         Err(e) => {
@@ -1788,7 +1789,8 @@ fn run_bulk_incremental_authorized(
     };
     {
         let dim = emb_arc.lock().dim();
-        let mut emb = crate::shared_model::SharedEmbedder(emb_arc);
+        let batch_size = config.embed_config.effective_batch_size().ok();
+        let mut emb = crate::shared_model::SharedEmbedder::new(emb_arc, batch_size);
         let db = match Database::open_for_model(&config.db_path, &config.embed_config.model, dim) {
             Ok(db) => db,
             Err(e) => {

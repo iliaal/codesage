@@ -186,6 +186,11 @@ fn scoped_artifact_authorization_and_policy_identity() {
             approved.pool_key(pinned).unwrap(),
             revoked.pool_key(pinned).unwrap()
         );
+        assert_eq!(
+            denied.pool_key(pinned).unwrap(),
+            revoked.pool_key(pinned).unwrap(),
+            "pinned allowlisted models must share one resident pool key across projects"
+        );
         return;
     }
     let scratch = tempfile::tempdir().unwrap();

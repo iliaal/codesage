@@ -1,5 +1,6 @@
 //! Locking for model sessions the daemon pools by model key across projects.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,7 @@ pub(crate) fn model_lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
 /// Take the pooled model per internal batch and hand it to the next waiter
 /// between batches, so one long embedding shares the model with other
 /// holders instead of keeping it until it finishes.
+#[cfg(test)]
 pub(crate) fn run_plan_fairly<T>(
     model: &Mutex<T>,
     plan: &BatchPlan,
@@ -40,25 +42,65 @@ pub(crate) fn run_plan_fairly<T>(
     })
 }
 
+/// Fair per-batch scheduler for a pre-tokenized [`BatchPlan`], avoiding both
+/// re-tokenization and holding the model lock across tokenization.
+pub(crate) fn run_encoded_plan_fairly(
+    model: &Mutex<Embedder>,
+    plan: &BatchPlan,
+    stats: &mut EmbedStats,
+    lock_wait: &mut Duration,
+) -> Result<Vec<Vec<f32>>> {
+    plan.run_encoded(stats, |batch, stats| {
+        let waiting = Instant::now();
+        let mut guard = model_lock(model)?;
+        *lock_wait += waiting.elapsed();
+        let result = guard.embed_encoded_batch(batch, stats);
+        MutexGuard::unlock_fair(guard);
+        result
+    })
+}
+
 /// A pooled embedder that is locked only while an internal batch runs, so a
-/// watcher pass does not hold it across file reads and database writes.
-pub(crate) struct SharedEmbedder(pub(crate) Arc<Mutex<Embedder>>);
+/// watcher pass does not hold it across file reads, tokenization, and DB writes.
+pub(crate) struct SharedEmbedder {
+    model: Arc<Mutex<Embedder>>,
+    batch_size: Option<NonZeroUsize>,
+}
+
+impl SharedEmbedder {
+    pub(crate) fn new(model: Arc<Mutex<Embedder>>, batch_size: Option<NonZeroUsize>) -> Self {
+        Self { model, batch_size }
+    }
+}
 
 impl TextEmbedder for SharedEmbedder {
     fn bind_fingerprint(&mut self, expected: &SemanticFingerprint) -> Result<()> {
-        TextEmbedder::bind_fingerprint(&mut *self.0.lock(), expected)
+        TextEmbedder::bind_fingerprint(&mut *self.model.lock(), expected)
     }
 
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        embed_shared(
-            &self.0,
-            texts,
-            |embedder, texts| embedder.plan_batches(texts),
-            |embedder, batch, stats| embedder.embed_planned_batch(batch, stats),
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let planner = {
+            let guard = self.model.lock();
+            match self.batch_size {
+                Some(limit) => guard.planner_with_limit(limit),
+                None => guard.planner(),
+            }
+        };
+        let plan = planner.plan(texts)?;
+        let mut lock_wait = Duration::ZERO;
+        run_encoded_plan_fairly(
+            &self.model,
+            &plan,
+            &mut EmbedStats::default(),
+            &mut lock_wait,
         )
     }
 }
 
+#[cfg(test)]
 /// Plan under a brief lock, then embed each batch under its own lock.
 fn embed_shared<T>(
     model: &Mutex<T>,

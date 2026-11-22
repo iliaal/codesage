@@ -94,7 +94,7 @@ struct ModelEntry<T> {
 
 type ModelMap<T> = Mutex<HashMap<String, ModelEntry<T>>>;
 
-use crate::shared_model::{model_lock, run_plan_fairly};
+use crate::shared_model::{model_lock, run_encoded_plan_fairly};
 
 /// Hold the map lock only for lookup; load under the per-key lock to prevent duplicate sessions.
 fn get_or_load_slot<T, F>(map: &ModelMap<T>, key: String, load: F) -> Result<Arc<Mutex<T>>>
@@ -129,6 +129,49 @@ fn get_or_load_authorized_slot<T>(
 ) -> Result<Arc<Mutex<T>>> {
     let policy = codesage_embed::model::ModelAuthorization::current().pool_key(model)?;
     get_or_load_slot(map, format!("{policy}|{}", identity()?), load)
+}
+
+/// Shrink arenas only for idle entries whose pool slot holds the sole
+/// reference, so an active watcher or request never loses its CUDA arena
+/// mid-pass. Drops the map lock before calling `shrink` because GPU calls can
+/// block.
+fn shrink_idle_from_map<T>(
+    map: &ModelMap<T>,
+    idle_after: Duration,
+    mut shrink: impl FnMut(&mut T) -> Result<bool>,
+) -> usize {
+    let candidates: Vec<Arc<Mutex<T>>> = {
+        let guard = map.lock();
+        guard
+            .values()
+            .filter(|entry| entry.last_used.elapsed() >= idle_after)
+            .filter_map(|entry| {
+                let slot = entry.slot.try_lock()?;
+                match slot.as_ref() {
+                    Some(arc) if Arc::strong_count(arc) == 1 => Some(arc.clone()),
+                    _ => None,
+                }
+            })
+            .collect()
+    };
+    let mut shrunk = 0usize;
+    for arc in candidates {
+        let Some(mut model) = arc.try_lock() else {
+            continue;
+        };
+        // Re-check after dropping the map lock: 1 in the pool slot + 1 here.
+        if Arc::strong_count(&arc) > 2 {
+            continue;
+        }
+        match shrink(&mut model) {
+            Ok(true) => shrunk += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "shrinking idle embedder memory arena failed");
+            }
+        }
+    }
+    shrunk
 }
 
 /// Evict idle models only when the pool owns the last reference. Skip busy load
@@ -558,9 +601,12 @@ fn watcher_config_key(state: &ProjectState) -> String {
 }
 
 fn watcher_key(config: &EmbeddingConfig, artifact_identity: &str) -> String {
-    match embedder_pool_key(config, artifact_identity) {
-        Ok(key) => key,
-        Err(e) => format!("invalid-config|{e}"),
+    match (
+        embedder_pool_key(config, artifact_identity),
+        config.effective_batch_size(),
+    ) {
+        (Ok(key), Ok(batch_size)) => format!("{key}|batch:{batch_size}"),
+        (Err(e), _) | (_, Err(e)) => format!("invalid-config|{e}"),
     }
 }
 
@@ -576,15 +622,23 @@ fn cached_artifact_identity(config: &EmbeddingConfig) -> String {
 }
 
 /// Include pooling and artifact digest: the same model name may produce incompatible vectors.
+/// Normalize device spelling and omit `batch_size` so projects sharing one model and
+/// execution provider reuse one resident ONNX session while honoring per-project batch caps.
 fn embedder_pool_key(config: &EmbeddingConfig, artifact_digest: &str) -> Result<String> {
-    let batch_size = config.effective_batch_size()?;
+    config.effective_batch_size()?;
+    codesage_embed::config::validate_device(&config.device)?;
+    let provider = codesage_embed::fingerprint::configured_execution_provider(&config.device);
     Ok(format!(
-        "{}|{}|{}|{:?}|{artifact_digest}",
+        "{}|{provider}|{:?}|{artifact_digest}",
         config.model,
-        config.device,
-        batch_size.get(),
         config.pooling_strategy()
     ))
+}
+
+fn reranker_pool_key(reranker_model: &str, device: &str) -> Result<String> {
+    codesage_embed::config::validate_device(device)?;
+    let provider = codesage_embed::fingerprint::configured_execution_provider(device);
+    Ok(format!("{reranker_model}|{provider}"))
 }
 
 /// Model resolution, download, and session creation failures share one code
@@ -600,6 +654,7 @@ fn model_error(context: &str, error: anyhow::Error) -> anyhow::Error {
 /// them (downloading on a cache miss) exactly as `Embedder::new` is about to.
 fn resolved_embedder_pool_key(config: &EmbeddingConfig) -> Result<String> {
     config.effective_batch_size()?;
+    codesage_embed::config::validate_device(&config.device)?;
     let artifacts = codesage_embed::model::resolve_model_artifacts(&config.model, &config.device)
         .with_context(|| format!("resolving model files for {:?}", config.model))?;
     let digest = codesage_embed::fingerprint::model_artifact_digest(&artifacts)?;
@@ -720,6 +775,19 @@ impl CodeSageServerState {
     pub(crate) fn evict_idle_models(&self, timeout: Duration) -> usize {
         evict_idle_from_map(&self.embedders, timeout)
             + evict_idle_from_map(&self.rerankers, timeout)
+    }
+
+    /// Shrink CUDA/CPU BFC arenas on embedders that finished bulk batches and
+    /// have been idle at least `idle_after`, returning gigabytes of transient
+    /// indexing workspace without unloading the resident session.
+    pub(crate) fn shrink_idle_arenas(&self, idle_after: Duration) -> usize {
+        shrink_idle_from_map(&self.embedders, idle_after, |emb| {
+            if !emb.needs_arena_shrink() {
+                return Ok(false);
+            }
+            emb.shrink_arena()?;
+            Ok(true)
+        })
     }
 
     /// Stop and join watchers within `wait`; timed-out slots stay reserved.
@@ -1049,7 +1117,7 @@ impl CodeSageServer {
         get_or_load_authorized_slot(
             &self.state.rerankers,
             reranker_model,
-            || Ok(format!("{reranker_model}|{device}")),
+            || reranker_pool_key(reranker_model, device),
             || {
                 Reranker::new(reranker_model, device).with_context(|| {
                     format!("loading reranker model '{reranker_model}' on device '{device}'")
@@ -1355,13 +1423,14 @@ impl CodeSageServer {
                     model
                 );
             }
+            let batch_size = config.effective_batch_size()?;
             let embedder_arc = self.get_or_load_embedder(config)?;
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
             let embedder = model_lock(&embedder_arc)?;
             timing.ready = Some(Instant::now());
             let dim = embedder.dim();
             let fingerprint = session_fingerprint(config, &embedder);
-            let plan = embedder.plan_batches(&refs);
+            let planner = embedder.planner_with_limit(batch_size);
             parking_lot::MutexGuard::unlock_fair(embedder);
             let fingerprint = fingerprint?;
             check_expected_fingerprint(
@@ -1369,18 +1438,13 @@ impl CodeSageServer {
                 fingerprint.as_str(),
                 texts.is_empty(),
             )?;
+            let plan = planner.plan(&refs)?;
             // Every batch locks this same `Arc`. Eviction only removes a pool
             // entry, nothing writes a new `Embedder` into an existing slot, and
             // an `Embedder`'s dimension and execution provider never change, so
             // this fingerprint covers every batch.
-            let embeddings = run_plan_fairly(
-                &embedder_arc,
-                &plan,
-                &refs,
-                stats,
-                &mut timing.batch_lock_wait,
-                |embedder, batch, stats| embedder.embed_planned_batch(batch, stats),
-            )?;
+            let embeddings =
+                run_encoded_plan_fairly(&embedder_arc, &plan, stats, &mut timing.batch_lock_wait)?;
             Ok(EmbedTextsResult {
                 model: config.model.clone(),
                 dim,
@@ -1696,6 +1760,11 @@ mod tests {
             );
             let pinned = "sentence-transformers/all-MiniLM-L6-v2";
             let unpinned = lookup(&listed, pinned, 11).unwrap();
+            let unlisted_pinned = lookup(&unlisted, pinned, 33).unwrap();
+            assert!(
+                !Arc::ptr_eq(&unpinned, &unlisted_pinned),
+                "unpinned bypass must not share a pinned session"
+            );
             std::fs::write(&allowlist, "").unwrap();
             assert!(lookup(&listed, MODEL, 99).is_err(), "revoked warm project");
             let verified = lookup(&listed, pinned, 22).unwrap();
@@ -1703,7 +1772,11 @@ mod tests {
                 !Arc::ptr_eq(&unpinned, &verified),
                 "pin policy changed despite identical artifact identity"
             );
-            assert_eq!(*verified.lock(), 22);
+            assert!(
+                Arc::ptr_eq(&verified, &unlisted_pinned),
+                "pinned allowlisted models share one resident session across distinct projects"
+            );
+            assert_eq!(*verified.lock(), 33);
             return;
         }
         let temp = tempfile::tempdir().unwrap();
@@ -1785,6 +1858,64 @@ mod tests {
             .insert("a".into(), loaded_entry(1, Duration::from_secs(10)));
         assert_eq!(evict_idle_from_map(&map, Duration::from_secs(900)), 0);
         assert_eq!(map.lock().len(), 1);
+    }
+
+    #[test]
+    fn shrink_idle_skips_fresh_in_flight_and_locked_entries() {
+        let timeout = Duration::from_secs(30);
+        let map: ModelMap<(bool, usize)> = Mutex::new(HashMap::new());
+
+        let make = |dirty: bool, age: Duration| ModelEntry {
+            slot: Arc::new(Mutex::new(Some(Arc::new(Mutex::new((dirty, 0usize)))))),
+            last_used: Instant::now().checked_sub(age).expect("test clock"),
+        };
+
+        map.lock()
+            .insert("fresh".into(), make(true, Duration::from_secs(5)));
+        map.lock()
+            .insert("idle_clean".into(), make(false, Duration::from_secs(60)));
+        map.lock()
+            .insert("idle_dirty".into(), make(true, Duration::from_secs(60)));
+        // Active watcher / caller clone (strong_count == 2): must not shrink mid-pass!
+        let active = make(true, Duration::from_secs(60));
+        let active_clone = active.slot.lock().as_ref().unwrap().clone();
+        map.lock().insert("active_watcher".into(), active);
+        // Locked model mutex: must be skipped without blocking.
+        let locked_entry = make(true, Duration::from_secs(60));
+        let locked_slot = locked_entry.slot.clone();
+        map.lock().insert("locked_slot".into(), locked_entry);
+        let _held_slot = locked_slot.lock();
+
+        let shrunk = shrink_idle_from_map(&map, timeout, |(dirty, count)| {
+            if !*dirty {
+                return Ok(false);
+            }
+            *dirty = false;
+            *count += 1;
+            Ok(true)
+        });
+
+        assert_eq!(shrunk, 1, "only idle_dirty with strong_count == 1 shrinks");
+        assert_eq!(
+            *map.lock()["idle_dirty"]
+                .slot
+                .lock()
+                .as_ref()
+                .unwrap()
+                .lock(),
+            (false, 1)
+        );
+        assert_eq!(
+            *active_clone.lock(),
+            (true, 0),
+            "active watcher holder must not have its arena shrunk mid-pass"
+        );
+        assert_eq!(
+            *map.lock()["fresh"].slot.lock().as_ref().unwrap().lock(),
+            (true, 0)
+        );
+        drop(_held_slot);
+        drop(active_clone);
     }
 
     fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {
@@ -1885,6 +2016,8 @@ mod tests {
 
     #[test]
     fn embedder_pool_key_separates_pooling_strategies_and_model_bytes() {
+        use std::num::NonZeroUsize;
+
         let mut config = EmbeddingConfig::default();
         let mean = embedder_pool_key(&config, "digest-a").unwrap();
         config.pooling = Some(codesage_embed::config::PoolingStrategy::Cls);
@@ -1899,6 +2032,36 @@ mod tests {
             embedder_pool_key(&config, "digest-b").unwrap(),
             mean,
             "a same-name model whose files changed must not share a session"
+        );
+
+        let gpu = EmbeddingConfig {
+            device: "gpu".into(),
+            batch_size: NonZeroUsize::new(32),
+            ..EmbeddingConfig::default()
+        };
+        let cuda = EmbeddingConfig {
+            device: "CUDA".into(),
+            batch_size: NonZeroUsize::new(64),
+            ..EmbeddingConfig::default()
+        };
+        assert_eq!(
+            embedder_pool_key(&gpu, "digest-a").unwrap(),
+            embedder_pool_key(&cuda, "digest-a").unwrap(),
+            "equivalent device spellings and different batch sizes must share one session"
+        );
+        assert_ne!(
+            watcher_key(&gpu, "digest-a"),
+            watcher_key(&cuda, "digest-a"),
+            "changing batch_size must retire the running watcher even though the pool session is shared"
+        );
+        assert_eq!(
+            reranker_pool_key("cross-encoder/ms-marco-MiniLM-L6-v2", "gpu").unwrap(),
+            reranker_pool_key("cross-encoder/ms-marco-MiniLM-L6-v2", "CUDA").unwrap(),
+            "equivalent reranker device spellings must share one session"
+        );
+        assert!(
+            reranker_pool_key("cross-encoder/ms-marco-MiniLM-L6-v2", "tpu").is_err(),
+            "invalid reranker device must be rejected"
         );
     }
 
@@ -1916,6 +2079,17 @@ mod tests {
             error
                 .to_string()
                 .contains("exceeds max supported batch size")
+        );
+
+        let bad_device = EmbeddingConfig {
+            model: "not-a-real-model".into(),
+            device: "tpu".into(),
+            ..EmbeddingConfig::default()
+        };
+        let error = resolved_embedder_pool_key(&bad_device).unwrap_err();
+        assert!(
+            error.to_string().contains("tpu") || error.to_string().contains("device"),
+            "invalid device must fail before artifact resolution: {error}"
         );
     }
 

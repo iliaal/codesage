@@ -460,36 +460,55 @@ mod unix {
         let state = Arc::new(CodeSageServerState::new());
         let our_uid = unsafe { libc::getuid() };
 
-        // Open client connections prevent daemon idle exit, so evict unused models separately.
+        // Open client connections prevent daemon idle exit, so evict unused models separately
+        // and shrink bulk-indexing arenas once a model has been quiet for 30 s.
         let model_idle = model_idle_timeout();
-        if !model_idle.is_zero() {
-            let state_evict = state.clone();
-            let evict_poll = model_idle
-                .min(Duration::from_secs(60))
-                .max(Duration::from_secs(1));
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(evict_poll);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tick.tick().await;
-                    let s = state_evict.clone();
-                    // An ORT Session drop can block on CUDA teardown; keep it
-                    // off the async worker threads.
-                    let evicted = tokio::task::spawn_blocking(move || {
-                        let n = s.evict_idle_models(model_idle);
-                        if n > 0 {
-                            free_retained_heap();
-                        }
-                        n
-                    })
-                    .await
-                    .unwrap_or(0);
-                    if evicted > 0 {
-                        tracing::info!(evicted, "evicted idle pooled models");
+        let arena_shrink_idle = Duration::from_secs(30);
+        let shrink_after = if model_idle.is_zero() {
+            arena_shrink_idle
+        } else {
+            arena_shrink_idle
+                .min(model_idle / 2)
+                .max(Duration::from_secs(1))
+        };
+        let state_reap = state.clone();
+        let reap_poll = if model_idle.is_zero() {
+            Duration::from_secs(15)
+        } else {
+            model_idle
+                .min(Duration::from_secs(15))
+                .max(Duration::from_secs(1))
+        };
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(reap_poll);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let s = state_reap.clone();
+                // ORT Session drop and CUDA arena shrinkage can block; keep both
+                // off the async worker threads.
+                let (evicted, shrunk) = tokio::task::spawn_blocking(move || {
+                    let evicted = if model_idle.is_zero() {
+                        0
+                    } else {
+                        s.evict_idle_models(model_idle)
+                    };
+                    let shrunk = s.shrink_idle_arenas(shrink_after);
+                    if evicted > 0 || shrunk > 0 {
+                        free_retained_heap();
                     }
+                    (evicted, shrunk)
+                })
+                .await
+                .unwrap_or((0, 0));
+                if evicted > 0 {
+                    tracing::info!(evicted, "evicted idle pooled models");
                 }
-            });
-        }
+                if shrunk > 0 {
+                    tracing::info!(shrunk, "shrank idle embedder memory arenas");
+                }
+            }
+        });
 
         spawn_index_observer_sweep(state.clone(), INDEX_OBSERVER_SWEEP);
 

@@ -1,5 +1,16 @@
 ## [Unreleased]
 
+### Changed
+
+- `jinaai/jina-embeddings-v2-base-code` and `sentence-transformers/all-MiniLM-L6-v2` load updated pinned derived graphs (`IA0x00/jina-embeddings-v2-base-code-codesage`, `IA0x00/all-MiniLM-L6-v2-codesage`): on an RTX 4080 (325 Rust files, 7,663 chunks), full indexing dropped from 30.36 s / 5,317 MiB VRAM to 19.56 s / 1,215 MiB on Jina and 24.43 s / 7,629 MiB to 7.21 s / 885 MiB on MiniLM.
+- `sentence-transformers/all-MiniLM-L6-v2` now emits mean-pooled vectors directly from its pinned derived graphs (configuring `pooling = "cls"` for it is an error); the next `codesage index` re-embeds existing Jina and MiniLM indexes.
+- The MCP daemon releases unused CUDA embedding workspace memory back to the GPU after 30 seconds of idle time without unloading the resident model.
+- `CODESAGE_ALLOW_CPU_FALLBACK=1` loads the verified portable `onnx/model.onnx` graph on CPU when a CUDA-only fused graph fails to initialize without CUDA libraries.
+
+### Fixed
+
+- The MCP daemon shares one resident embedding session across projects using the same allowlisted pinned model, pooling strategy, and execution provider (`gpu`/`cuda` normalized, independent of `[embedding].batch_size`), instead of loading a duplicate model per repository, while keeping per-project unpinned bypasses isolated.
+
 ## [0.54.0] - 2026-11-21
 
 ### Changed

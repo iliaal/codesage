@@ -530,24 +530,33 @@ fn is_fingerprint_refusal(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains(EMBED_TEXTS_FINGERPRINT_MISMATCH)
 }
 
-/// Split `lens` (byte length per text, in order) into daemon batches that
-/// each stay within `max_count` texts and `max_total` bytes, and the indices
-/// of texts over `max_text` bytes, which never go to the daemon at all.
+/// Split `lens` (byte length per text) into daemon batches that each stay
+/// within `max_count` texts and `max_total` bytes, and the indices of texts
+/// over `max_text` bytes, which never go to the daemon at all. Eligible texts
+/// are grouped by descending byte length before slicing so each daemon RPC
+/// receives tightly length-clustered chunks instead of mixed lengths.
 fn plan_embed_batches(
     lens: &[usize],
     max_text: usize,
     max_total: usize,
     max_count: usize,
 ) -> (Vec<Vec<usize>>, Vec<usize>) {
-    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let mut eligible = Vec::with_capacity(lens.len());
     let mut oversize = Vec::new();
-    let mut current: Vec<usize> = Vec::new();
-    let mut current_bytes = 0usize;
     for (i, &len) in lens.iter().enumerate() {
         if len > max_text {
             oversize.push(i);
-            continue;
+        } else {
+            eligible.push(i);
         }
+    }
+    eligible.sort_by(|&a, &b| lens[b].cmp(&lens[a]).then_with(|| a.cmp(&b)));
+
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut current_bytes = 0usize;
+    for i in eligible {
+        let len = lens[i];
         if !current.is_empty() && (current.len() >= max_count || current_bytes + len > max_total) {
             batches.push(std::mem::take(&mut current));
             current_bytes = 0;
@@ -1258,10 +1267,15 @@ pub(crate) mod tests {
             vec![4],
             "the 11-byte text never goes to the daemon"
         );
+        // Eligible indices sorted descending by byte length:
+        // 10-byte [5, 6, 7], 5-byte [0, 1, 2, 3], 1-byte [8].
+        // Batch 1: 10+10=20 <= 24 (adding another 10 would exceed 24).
+        // Batch 2: 10+5+5=20 <= 24 (count cap = 3).
+        // Batch 3: 5+5+1=11 <= 24 (count cap = 3).
         assert_eq!(
             batches,
-            vec![vec![0, 1, 2], vec![3, 5], vec![6, 7, 8]],
-            "count splits after three; bytes split before 5+10+10 would pass 24"
+            vec![vec![5, 6], vec![7, 0, 1], vec![2, 3, 8]],
+            "descending length clustering preserves byte and count caps"
         );
         let (batches, oversize) = plan_embed_batches(&[], 10, 25, 3);
         assert!(batches.is_empty() && oversize.is_empty());

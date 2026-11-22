@@ -17,11 +17,43 @@ pub(crate) fn run_session<T>(
     inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)>,
     read: impl FnOnce(&SessionOutputs<'_>) -> Result<T>,
 ) -> Result<T> {
+    run_session_inner(session, inputs, None, read)
+}
+
+/// [`run_session`] with `memory.enable_memory_arena_shrinkage` set to
+/// `shrink_arenas` (for example `"gpu:0;cpu:0"`) on the run's `RunOptions`,
+/// releasing unused BFC arena blocks back to the device/OS after the run.
+pub(crate) fn run_session_shrinking<T>(
+    session: &mut Session,
+    inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)>,
+    shrink_arenas: &str,
+    read: impl FnOnce(&SessionOutputs<'_>) -> Result<T>,
+) -> Result<T> {
+    run_session_inner(session, inputs, Some(shrink_arenas), read)
+}
+
+fn run_session_inner<T>(
+    session: &mut Session,
+    inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)>,
+    shrink_arenas: Option<&str>,
+    read: impl FnOnce(&SessionOutputs<'_>) -> Result<T>,
+) -> Result<T> {
     let Some(control) = work::current() else {
-        let outputs = session.run(inputs)?;
-        return read(&outputs);
+        return if let Some(arenas) = shrink_arenas {
+            let mut options = RunOptions::new()?;
+            options.set("memory.enable_memory_arena_shrinkage", arenas)?;
+            let outputs = session.run_with_options(inputs, &options)?;
+            read(&outputs)
+        } else {
+            let outputs = session.run(inputs)?;
+            read(&outputs)
+        };
     };
-    let options = Arc::new(RunOptions::new()?);
+    let mut options = RunOptions::new()?;
+    if let Some(arenas) = shrink_arenas {
+        options.set("memory.enable_memory_arena_shrinkage", arenas)?;
+    }
+    let options = Arc::new(options);
     let terminator = Arc::clone(&options);
     let outputs = run_guarded(
         &control,
