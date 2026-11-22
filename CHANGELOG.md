@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.55.0] - 2026-11-22
+
 ### Changed
 
 - `jinaai/jina-embeddings-v2-base-code` and `sentence-transformers/all-MiniLM-L6-v2` load updated pinned derived graphs (`IA0x00/jina-embeddings-v2-base-code-codesage`, `IA0x00/all-MiniLM-L6-v2-codesage`): on an RTX 4080 (325 Rust files, 7,663 chunks), full indexing dropped from 30.36 s / 5,317 MiB VRAM to 19.56 s / 1,215 MiB on Jina and 24.43 s / 7,629 MiB to 7.21 s / 885 MiB on MiniLM.
@@ -1536,5 +1538,7 @@ Initial public release.
 
 [0.53.0]: https://github.com/iliaal/codesage/releases/tag/v0.53.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.54.0...HEAD
 [0.54.0]: https://github.com/iliaal/codesage/releases/tag/v0.54.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.55.0...HEAD
+[0.55.0]: https://github.com/iliaal/codesage/releases/tag/v0.55.0
