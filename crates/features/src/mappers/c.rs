@@ -556,6 +556,9 @@ fn main_function_targets(
             continue;
         }
         let Ok(source) = fs::read(&abs) else { continue };
+        if !may_define_main(&source) {
+            continue;
+        }
         let parser = if lang_for_path(rel) == Language::Cpp {
             &mut cpp_parser
         } else {
@@ -596,6 +599,25 @@ fn main_function_targets(
         });
     }
     Ok(out)
+}
+
+/// Whether `source` can hold the identifier [`file_defines_main`] looks for:
+/// `main` followed by a byte that cannot continue an ASCII identifier, or by
+/// the end of the file. Both grammars lex identifiers by longest match, so a
+/// declarator whose text is exactly `main` always leaves such a byte after it;
+/// a file without one skips the parse and cannot change the result.
+fn may_define_main(source: &[u8]) -> bool {
+    let mut rest = source;
+    while let Some(index) = rest.windows(4).position(|window| window == b"main") {
+        rest = &rest[index + 4..];
+        if !rest
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn file_defines_main(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
@@ -2016,5 +2038,118 @@ mod tests {
             s.entry_path
         );
         assert_eq!(s.entry_path, "Makefile.am");
+    }
+
+    #[test]
+    fn may_define_main_requires_main_before_a_non_identifier_byte() {
+        for source in [
+            "int main(void) {}",
+            "int main (void) {}",
+            "int\nmain\n(void) {}",
+            "int (main)(void) {}",
+            "int main/* c */(void) {}",
+            "main",
+            "domain(",
+            "main$",
+            "mainé",
+        ] {
+            assert!(may_define_main(source.as_bytes()), "{source:?}");
+        }
+        for source in [
+            "",
+            "mai",
+            "int mainx(void) {}",
+            "int main_(void) {}",
+            "int main1(void) {}",
+            "int mainX(void) {}",
+            "remaining maintain domains",
+            "int ma\\\nin(void) {}",
+        ] {
+            assert!(!may_define_main(source.as_bytes()), "{source:?}");
+        }
+    }
+
+    /// Differential for the parse skip in `main_function_targets`: no
+    /// generated source that `file_defines_main` accepts under either grammar
+    /// is rejected by `may_define_main`.
+    #[test]
+    fn may_define_main_never_rejects_a_source_that_defines_main() {
+        const FRAGMENTS: &[&str] = &[
+            "int main(void) { return 0; }\n",
+            "int main (int argc, char **argv) {}\n",
+            "int\nmain\n(void) {}\n",
+            "int (main)(void) {}\n",
+            "int *main(void) { return 0; }\n",
+            "main() {}\n",
+            "int main/* c */(void) {}\n",
+            "auto main() -> int { return 0; }\n",
+            "int main() try { return 0; } catch (...) { return 1; }\n",
+            "extern \"C\" int main(void) { return 0; }\n",
+            "namespace n { int main() { return 0; } }\n",
+            "int S::main() { return 0; }\n",
+            "int ma\\\nin(void) {}\n",
+            "int mainx(void) {}\n",
+            "int main_(void) {}\n",
+            "int main1(void) {}\n",
+            "int _main(void) {}\n",
+            "int domain(void) {}\n",
+            "int main$(void) {}\n",
+            "int mainé(void) {}\n",
+            "int \\u006dain(void) {}\n",
+            "static void remaining(void) {}\n",
+            "/* main */\n",
+            "// the main loop\n",
+            "#define main real_main\n",
+            "\"main\"",
+            "struct s { int main; };\n",
+            "int x = 1;\n",
+            "1main(void) {}\n",
+            "main",
+            "mai",
+            "n(",
+            "n_(",
+            "(void) {}\n",
+            "int ",
+            "{",
+            "}",
+            "(",
+            ")",
+        ];
+        const SEPARATORS: &[&str] = &["", "", " ", "\n", "\t"];
+        let mut c_parser = Parser::new();
+        let mut cpp_parser = Parser::new();
+        c_parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .unwrap();
+        cpp_parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let (mut defined, mut skipped) = (0, 0);
+        for _ in 0..20_000 {
+            let mut source = String::new();
+            for _ in 0..=next(6) {
+                source.push_str(FRAGMENTS[next(FRAGMENTS.len())]);
+                source.push_str(SEPARATORS[next(SEPARATORS.len())]);
+            }
+            let bytes = source.as_bytes();
+            let may = may_define_main(bytes);
+            skipped += usize::from(!may);
+            for parser in [&mut c_parser, &mut cpp_parser] {
+                let tree = parser.parse(bytes, None).unwrap();
+                if file_defines_main(tree.root_node(), bytes) {
+                    defined += 1;
+                    assert!(may, "skipped a source that defines main: {source:?}");
+                }
+            }
+        }
+        assert!(defined > 5_000, "defined={defined}");
+        assert!(skipped > 1_000, "skipped={skipped}");
     }
 }
