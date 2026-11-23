@@ -146,25 +146,94 @@ pub fn cpp_headers_with_context(
         }
     }
     if !cpp_sources.is_empty() {
-        for file in files.iter().filter(|file| file.path.ends_with(".h")) {
-            let header = file.path.as_str();
-            codesage_protocol::work::checkpoint()?;
-            if cpp.contains(header) || reusable.contains_key(header) {
-                continue;
-            }
-            let Some(source) = read_indexable_file(root, Path::new(header))? else {
-                continue;
-            };
-            ensure!(
-                file.content_hash.is_empty() || file.content_hash == source.content_hash,
-                "{header} changed while establishing header routing; retry discovery"
-            );
-            if !crate::parse::c_header_prefers_c(&source.bytes)? {
-                cpp.insert(header.to_owned());
-            }
-        }
+        let candidates: Vec<_> = files
+            .iter()
+            .filter(|file| file.path.ends_with(".h"))
+            .filter(|file| {
+                !cpp.contains(file.path.as_str()) && !reusable.contains_key(file.path.as_str())
+            })
+            .collect();
+        cpp.extend(probe_headers(root, &candidates)?);
     }
     Ok(cpp)
+}
+
+/// The headers among `candidates` whose C parse routes them to C++, in
+/// `candidates` order. Each header is probed independently, so up to
+/// `available_parallelism` scoped workers share the list, largest file first
+/// so one large header does not start last; each worker enters the caller's
+/// work control. Every candidate is probed and results are read back in
+/// `candidates` order, so the first failing header in that order supplies the
+/// error, as in a serial loop.
+fn probe_headers(root: &Path, candidates: &[&FileInfo]) -> Result<Vec<String>> {
+    let probe = |file: &FileInfo| -> Result<bool> {
+        codesage_protocol::work::checkpoint()?;
+        let header = file.path.as_str();
+        let Some(source) = read_indexable_file(root, Path::new(header))? else {
+            return Ok(false);
+        };
+        ensure!(
+            file.content_hash.is_empty() || file.content_hash == source.content_hash,
+            "{header} changed while establishing header routing; retry discovery"
+        );
+        Ok(!crate::parse::c_header_prefers_c(&source.bytes)?)
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(candidates.len());
+    let results: Vec<Result<bool>> = if workers <= 1 {
+        candidates.iter().map(|file| probe(file)).collect()
+    } else {
+        // Scheduling order only; a failed stat just sorts the header last.
+        let mut order: Vec<(u64, usize)> = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                let size = std::fs::metadata(root.join(&file.path)).map_or(0, |meta| meta.len());
+                (size, index)
+            })
+            .collect();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        let next = AtomicUsize::new(0);
+        let control = codesage_protocol::work::current();
+        let mut slots: Vec<Option<Result<bool>>> = Vec::new();
+        slots.resize_with(candidates.len(), || None);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let _scope = control.as_ref().map(|control| control.enter());
+                        let mut done = Vec::new();
+                        while let Some(&(_, index)) =
+                            order.get(next.fetch_add(1, Ordering::Relaxed))
+                        {
+                            done.push((index, probe(candidates[index])));
+                        }
+                        done
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let done = handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                for (index, result) in done {
+                    slots[index] = Some(result);
+                }
+            }
+        });
+        slots
+            .into_iter()
+            .map(|slot| slot.expect("every header index is claimed exactly once"))
+            .collect()
+    };
+    let mut routed = Vec::new();
+    for (file, result) in candidates.iter().zip(results) {
+        if result? {
+            routed.push(file.path.clone());
+        }
+    }
+    Ok(routed)
 }
 
 pub fn is_cpp_evidence(path: &Path) -> bool {
@@ -331,4 +400,110 @@ fn normalize(path: &Path) -> Option<PathBuf> {
         }
     }
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_headers;
+    use codesage_protocol::work::{StopReason, WorkControl, WorkStopped};
+    use codesage_protocol::{FileInfo, Language};
+
+    fn header(root: &std::path::Path, path: &str, body: &str, content_hash: &str) -> FileInfo {
+        std::fs::write(root.join(path), body).unwrap();
+        FileInfo {
+            path: path.to_owned(),
+            language: Language::C,
+            content_hash: content_hash.to_owned(),
+            is_test: false,
+        }
+    }
+
+    #[test]
+    fn probe_workers_see_the_callers_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let files: Vec<_> = (0..8)
+            .map(|n| header(root.path(), &format!("h{n}.h"), "int clean(void);\n", ""))
+            .collect();
+        let candidates: Vec<_> = files.iter().collect();
+        assert!(probe_headers(root.path(), &candidates).unwrap().is_empty());
+
+        let control = WorkControl::new(None);
+        control.cancel(StopReason::ClientCancelled);
+        let _scope = control.enter();
+        let error = probe_headers(root.path(), &candidates).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WorkStopped>().map(|stop| stop.reason),
+            Some(StopReason::ClientCancelled),
+            "{error:#}"
+        );
+    }
+
+    /// Differential against the serial loop this replaced: probing every
+    /// candidate in order with `c_header_prefers_c` must route the same
+    /// headers, over generated C, C++ and ambiguous headers of mixed sizes.
+    #[test]
+    fn parallel_probe_routes_the_same_headers_as_a_serial_probe() {
+        const FRAGMENTS: [&str; 8] = [
+            "int plain(int x);\n",
+            "typedef struct point { int x, y; } point;\n",
+            "class Widget { public: int x; };\n",
+            "namespace ns { int f(); }\n",
+            "template <typename T> T id(T value);\n",
+            "RULE(EQ(A, B))\n{ emit(); }\n",
+            "#define MAX(a, b) ((a) > (b) ? (a) : (b))\n",
+            "extern \"C\" { int c_api(void); }\n",
+        ];
+        let root = tempfile::tempdir().unwrap();
+        let mut state = 0x2545_f491_u32;
+        let files: Vec<_> = (0..240)
+            .map(|n| {
+                let mut body = String::new();
+                for _ in 0..1 + n % 7 {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    body.push_str(
+                        &FRAGMENTS[(state >> 24) as usize % FRAGMENTS.len()].repeat(1 + n % 13),
+                    );
+                }
+                header(root.path(), &format!("h{n}.h"), &body, "")
+            })
+            .collect();
+        let candidates: Vec<_> = files.iter().collect();
+        let serial: Vec<_> = files
+            .iter()
+            .filter(|file| {
+                let bytes = std::fs::read(root.path().join(&file.path)).unwrap();
+                !crate::parse::c_header_prefers_c(&bytes).unwrap()
+            })
+            .map(|file| file.path.clone())
+            .collect();
+        assert!(
+            serial.len() > 20 && serial.len() < files.len() - 20,
+            "{}",
+            serial.len()
+        );
+        assert_eq!(probe_headers(root.path(), &candidates).unwrap(), serial);
+    }
+
+    #[test]
+    fn the_first_failing_candidate_supplies_the_error() {
+        let root = tempfile::tempdir().unwrap();
+        // The second header is larger, so it is probed first.
+        let first = header(root.path(), "first.h", "int a(void);\n", "stale");
+        let second = header(
+            root.path(),
+            "second.h",
+            &"int b(void);\n".repeat(4096),
+            "stale",
+        );
+        let error = probe_headers(root.path(), &[&first, &second]).unwrap_err();
+        assert!(
+            error.to_string().starts_with("first.h changed"),
+            "{error:#}"
+        );
+        let error = probe_headers(root.path(), &[&second, &first]).unwrap_err();
+        assert!(
+            error.to_string().starts_with("second.h changed"),
+            "{error:#}"
+        );
+    }
 }
