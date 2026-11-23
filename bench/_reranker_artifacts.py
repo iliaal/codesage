@@ -37,7 +37,7 @@ def model_pins(source: str) -> list[dict]:
         if revision.startswith('"'):
             pin["revision"] = revision.strip('"')
         else:
-            values = re.findall(rf'(?m)^const {re.escape(revision)}: &str = "([0-9a-f]{{40}})";', source)
+            values = re.findall(rf'(?m)^(?:pub(?:\([a-z]+\))?\s+)?const {re.escape(revision)}: &str = "([0-9a-f]{{40}})";', source)
             if len(values) != 1:
                 raise InvalidRun(f"missing or ambiguous canonical revision {revision}")
             pin["revision"] = values[0]
