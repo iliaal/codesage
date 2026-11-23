@@ -4,6 +4,7 @@
 
 - `CODESAGE_ALLOW_CPU_FALLBACK=1` always reloads the verified portable `onnx/model.onnx` graph on CPU (including when a derived fp16 graph commits on CPU) and fingerprints the graph the session runs rather than the configured CUDA graph.
 - MCP daemon idle arena shrinkage measures the 30-second idle window from inference completion rather than slot lookup, includes single-row 1,024-token batches at the threshold, and disables retries for the session after three consecutive failures with one warning.
+- MCP daemon idle model eviction measures inactivity from inference completion rather than slot lookup, avoiding eviction immediately after a long indexing pass.
 
 ## [0.55.0] - 2026-11-22
 

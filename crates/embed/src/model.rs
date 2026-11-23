@@ -1578,7 +1578,6 @@ pub(crate) struct LoadedSession {
 /// the mapped-libraries guard (only meaningful when CUDA was requested). A
 /// failed check is fatal unless the fallback is allowed, in which case the
 /// session runs on the CPU and the second element says so.
-#[cfg(any(test, all(feature = "cuda", target_os = "linux")))]
 fn effective_execution_provider(
     configured: &'static str,
     cuda_check: Result<()>,
@@ -1591,7 +1590,6 @@ fn effective_execution_provider(
     }
 }
 
-#[cfg(any(test, all(feature = "cuda", target_os = "linux")))]
 struct CudaSessionContext<'a> {
     model: &'a str,
     device: &'a str,
@@ -1613,7 +1611,6 @@ struct CudaSessionContext<'a> {
 ///
 /// When CUDA libraries are absent and `allow_cpu_fallback` is false, surface
 /// the actionable `cuda_check` error even when `commit_result` failed first.
-#[cfg(any(test, all(feature = "cuda", target_os = "linux")))]
 fn resolve_cuda_session<S, A>(
     ctx: CudaSessionContext<'_>,
     commit_result: Result<S>,
@@ -1659,14 +1656,67 @@ fn cpu_fallback_allowed_from_env() -> bool {
     )
 }
 
+struct SessionWiring {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    same_as_requested_arena: bool,
+    #[cfg_attr(not(any(feature = "cuda", target_vendor = "apple")), allow(dead_code))]
+    register_execution_providers: bool,
+    enforce_platform_gates: bool,
+}
+
+struct ArtifactResolution<'a> {
+    model: &'a str,
+    repo: &'a str,
+    revision: Option<&'static str>,
+    graph: &'static str,
+    expectation: SidecarExpectation,
+    pin: Option<&'static ModelPin>,
+    graph_pin: Option<&'static GraphPin>,
+}
+
+type CudaLibsCheck = fn() -> Result<()>;
+
 /// [`load_onnx_session`], also reporting the execution provider the session
 /// initialised on. Pass `same_as_requested_arena = true` only when the caller
 /// pairs CUDA inference with peak-first batching and idle arena shrinkage.
 pub(crate) fn load_onnx_session_with_provider(
     model: &str,
     device: &str,
-    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] same_as_requested_arena: bool,
+    same_as_requested_arena: bool,
 ) -> Result<LoadedSession> {
+    let wiring = SessionWiring {
+        same_as_requested_arena,
+        register_execution_providers: true,
+        enforce_platform_gates: true,
+    };
+    let mut resolve = |req: ArtifactResolution<'_>| -> Result<ModelArtifacts> {
+        let artifacts =
+            resolve_model_artifacts_at(req.repo, req.revision, req.graph, req.expectation)?;
+        if let Some(pin) = req.pin {
+            verify_pinned_model_artifacts(req.model, pin, req.graph_pin, artifacts)
+        } else {
+            Ok(artifacts)
+        }
+    };
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    let cuda_fallback: Option<(CudaLibsCheck, bool)> =
+        Some((require_cuda_libs_mapped, cpu_fallback_allowed_from_env()));
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+    let cuda_fallback: Option<(CudaLibsCheck, bool)> = None;
+
+    load_onnx_session_with_wiring(model, device, wiring, &mut resolve, cuda_fallback)
+}
+
+fn load_onnx_session_with_wiring<FCheck>(
+    model: &str,
+    device: &str,
+    wiring: SessionWiring,
+    resolve_artifacts: &mut impl FnMut(ArtifactResolution<'_>) -> Result<ModelArtifacts>,
+    cuda_fallback: Option<(FCheck, bool)>,
+) -> Result<LoadedSession>
+where
+    FCheck: FnOnce() -> Result<()>,
+{
     let allow_any = allow_any_model_from_env();
     validate_model_allowed(model, allow_any)?;
     let pin = load_pin(model, allow_any);
@@ -1690,7 +1740,7 @@ pub(crate) fn load_onnx_session_with_provider(
 
     crate::config::validate_device(device)?;
     let want_cuda = wants_cuda(device);
-    if want_cuda {
+    if want_cuda && wiring.enforce_platform_gates {
         #[cfg(not(feature = "cuda"))]
         {
             anyhow::bail!(
@@ -1700,23 +1750,21 @@ pub(crate) fn load_onnx_session_with_provider(
     }
 
     let want_coreml = wants_coreml(device);
-    if want_coreml && !cfg!(target_vendor = "apple") {
+    if want_coreml && wiring.enforce_platform_gates && !cfg!(target_vendor = "apple") {
         anyhow::bail!(
             "CoreML requested in .codesage/config.toml but this binary is not running on Apple hardware"
         );
     }
 
-    let artifacts = resolve_model_artifacts_at(
-        load_repo(model, allow_any),
-        pin.map(|pin| pin.revision),
-        load_graph(model, allow_any, device),
-        sidecar_expectation(model, allow_any),
-    )?;
-    let artifacts = if let Some(pin) = pin {
-        verify_pinned_model_artifacts(model, pin, graph_pin(Some(pin), device), artifacts)?
-    } else {
-        artifacts
-    };
+    let artifacts = resolve_artifacts(ArtifactResolution {
+        model,
+        repo: load_repo(model, allow_any),
+        revision: pin.map(|pin| pin.revision),
+        graph: load_graph(model, allow_any, device),
+        expectation: sidecar_expectation(model, allow_any),
+        pin,
+        graph_pin: graph_pin(pin, device),
+    })?;
 
     let mut tokenizer =
         Tokenizer::from_file(&artifacts.tokenizer).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1749,12 +1797,12 @@ pub(crate) fn load_onnx_session_with_provider(
             .map_err(|e| anyhow::anyhow!("setting the graph optimization level: {e}"))?;
     }
 
-    if want_cuda {
+    if want_cuda && wiring.register_execution_providers {
         #[cfg(feature = "cuda")]
         {
             preload_native_libs();
             let mut cuda = ort::ep::CUDA::default();
-            if same_as_requested_arena {
+            if wiring.same_as_requested_arena {
                 // Paired with peak-first batch execution in `BatchPlan`: allocating
                 // the largest batch first lets SameAsRequested split one peak block
                 // across all later smaller batches instead of doubling via power-of-two.
@@ -1767,7 +1815,7 @@ pub(crate) fn load_onnx_session_with_provider(
         }
     }
 
-    if want_coreml {
+    if want_coreml && wiring.register_execution_providers {
         #[cfg(target_vendor = "apple")]
         {
             builder = builder
@@ -1781,8 +1829,10 @@ pub(crate) fn load_onnx_session_with_provider(
 
     // Linux CUDA fallback must load the portable graph and fingerprint as CPU.
     let configured = crate::fingerprint::configured_execution_provider(device);
-    #[cfg(all(feature = "cuda", target_os = "linux"))]
-    let (session, execution_provider, artifacts) = if want_cuda {
+    let (session, execution_provider, artifacts) = if let Some((cuda_check, allow_cpu_fallback)) =
+        cuda_fallback
+        && want_cuda
+    {
         let commit_result = builder
             .commit_from_file(&artifacts.onnx)
             .map_err(anyhow::Error::from);
@@ -1792,23 +1842,21 @@ pub(crate) fn load_onnx_session_with_provider(
                 device,
                 configured,
                 has_cuda_graph: graph_pin(pin, device).is_some(),
-                allow_cpu_fallback: cpu_fallback_allowed_from_env(),
+                allow_cpu_fallback,
             },
             commit_result,
             artifacts,
-            require_cuda_libs_mapped,
+            cuda_check,
             || {
-                let portable_artifacts = resolve_model_artifacts_at(
-                    load_repo(model, allow_any),
-                    pin.map(|pin| pin.revision),
-                    ONNX_ARTIFACT,
-                    sidecar_expectation(model, allow_any),
-                )?;
-                let portable_artifacts = if let Some(pin) = pin {
-                    verify_pinned_model_artifacts(model, pin, None, portable_artifacts)?
-                } else {
-                    portable_artifacts
-                };
+                let portable_artifacts = resolve_artifacts(ArtifactResolution {
+                    model,
+                    repo: load_repo(model, allow_any),
+                    revision: pin.map(|pin| pin.revision),
+                    graph: ONNX_ARTIFACT,
+                    expectation: sidecar_expectation(model, allow_any),
+                    pin,
+                    graph_pin: None,
+                })?;
                 let cpu_session = Session::builder(&ort_environment()?)?
                     .commit_from_file(&portable_artifacts.onnx)?;
                 Ok((cpu_session, portable_artifacts))
@@ -1821,14 +1869,6 @@ pub(crate) fn load_onnx_session_with_provider(
             artifacts,
         )
     };
-    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
-    // CoreML registration errors are fatal, but ORT exposes no post-commit
-    // provider query or mapping check. Attest the configured provider.
-    let (session, execution_provider, artifacts) = (
-        builder.commit_from_file(&artifacts.onnx)?,
-        configured,
-        artifacts,
-    );
 
     let has_token_type_ids = wants_token_type_ids(session.inputs().iter().map(|i| i.name()));
 
@@ -2558,6 +2598,248 @@ fn detect_dim(session: &Session) -> Result<usize> {
     )
 }
 
+/// Test-only ONNX and `Embedder` builders shared with downstream crate unit
+/// tests via the `test-support` Cargo feature (enabled only in dev-dependencies).
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support {
+    use super::*;
+
+    pub const MINILM_DERIVED_REVISION: &str = super::MINILM_DERIVED_REVISION;
+    pub const JINA_CODE_DERIVED_REVISION: &str = super::JINA_CODE_DERIVED_REVISION;
+    pub const TEST_WORD_TOKENIZER_JSON: &str = r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"a":1,"b":2,"c":3},"unk_token":"[UNK]"},"pre_tokenizer":{"type":"Whitespace"}}"#;
+
+    pub fn test_word_tokenizer() -> Tokenizer {
+        Tokenizer::from_bytes(TEST_WORD_TOKENIZER_JSON.as_bytes()).unwrap()
+    }
+
+    fn pb_varint(mut n: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let b = (n & 0x7f) as u8;
+            n >>= 7;
+            if n != 0 {
+                out.push(b | 0x80);
+            } else {
+                out.push(b);
+                return out;
+            }
+        }
+    }
+
+    fn pb_field_varint(num: u64, val: u64) -> Vec<u8> {
+        let mut out = pb_varint(num << 3);
+        out.extend(pb_varint(val));
+        out
+    }
+
+    fn pb_field_bytes(num: u64, data: &[u8]) -> Vec<u8> {
+        let mut out = pb_varint((num << 3) | 2);
+        out.extend(pb_varint(data.len() as u64));
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn onnx_value_info(name: &str, elem_type: u64, dims: &[Vec<u8>]) -> Vec<u8> {
+        let mut shape = Vec::new();
+        for dim in dims {
+            shape.extend(pb_field_bytes(1, dim));
+        }
+        let mut tensor_type = pb_field_varint(1, elem_type);
+        tensor_type.extend(pb_field_bytes(2, &shape));
+        let type_proto = pb_field_bytes(1, &tensor_type);
+        let mut out = pb_field_bytes(1, name.as_bytes());
+        out.extend(pb_field_bytes(2, &type_proto));
+        out
+    }
+
+    fn onnx_attr_int(name: &str, val: i64) -> Vec<u8> {
+        let mut out = pb_field_bytes(1, name.as_bytes());
+        out.extend(pb_field_varint(3, val as u64));
+        out.extend(pb_field_varint(20, 2)); // AttributeProto::INT
+        out
+    }
+
+    fn onnx_attr_ints(name: &str, vals: &[i64]) -> Vec<u8> {
+        let mut out = pb_field_bytes(1, name.as_bytes());
+        for &v in vals {
+            out.extend(pb_field_varint(7, v as u64));
+        }
+        out.extend(pb_field_varint(20, 7)); // AttributeProto::INTS
+        out
+    }
+
+    fn onnx_node(
+        op: &str,
+        domain: &str,
+        inputs: &[&str],
+        outputs: &[&str],
+        attrs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in inputs {
+            out.extend(pb_field_bytes(1, i.as_bytes()));
+        }
+        for o in outputs {
+            out.extend(pb_field_bytes(2, o.as_bytes()));
+        }
+        out.extend(pb_field_bytes(4, op.as_bytes()));
+        if !domain.is_empty() {
+            out.extend(pb_field_bytes(7, domain.as_bytes()));
+        }
+        for attr in attrs {
+            out.extend(pb_field_bytes(5, attr));
+        }
+        out
+    }
+
+    /// Build a tiny valid ONNX embedding graph emitting `[batch, dim]` floats,
+    /// or a CUDA-only op graph when `unsupported_op` is `Some(...)`.
+    pub fn tiny_onnx_bytes(
+        dim: usize,
+        with_token_type_ids: bool,
+        unsupported_op: Option<&str>,
+    ) -> Vec<u8> {
+        const FLOAT: u64 = 1;
+        const INT64: u64 = 7;
+        let dim_batch = pb_field_bytes(2, b"batch");
+        let dim_seq = pb_field_bytes(2, b"seq");
+        let dim_out = pb_field_varint(1, dim as u64);
+
+        let mut nodes = Vec::new();
+        let ids_src = if with_token_type_ids {
+            nodes.push(onnx_node(
+                "Add",
+                "",
+                &["input_ids", "token_type_ids"],
+                &["ids_sum"],
+                &[],
+            ));
+            "ids_sum"
+        } else {
+            "input_ids"
+        };
+        nodes.push(onnx_node(
+            "Cast",
+            "",
+            &[ids_src],
+            &["ids_f"],
+            &[onnx_attr_int("to", FLOAT as i64)],
+        ));
+        nodes.push(onnx_node(
+            "Cast",
+            "",
+            &["attention_mask"],
+            &["mask_f"],
+            &[onnx_attr_int("to", FLOAT as i64)],
+        ));
+        nodes.push(onnx_node("Mul", "", &["ids_f", "mask_f"], &["masked"], &[]));
+        let pooled_in = if let Some(op) = unsupported_op {
+            nodes.push(onnx_node(
+                op,
+                "com.microsoft",
+                &["masked"],
+                &["cuda_only"],
+                &[],
+            ));
+            "cuda_only"
+        } else {
+            "masked"
+        };
+        nodes.push(onnx_node(
+            "ReduceMean",
+            "",
+            &[pooled_in],
+            &["m"],
+            &[onnx_attr_ints("axes", &[1]), onnx_attr_int("keepdims", 1)],
+        ));
+        let concat_inputs = vec!["m"; dim];
+        nodes.push(onnx_node(
+            "Concat",
+            "",
+            &concat_inputs,
+            &["embeddings"],
+            &[onnx_attr_int("axis", 1)],
+        ));
+
+        let mut graph = Vec::new();
+        for node in nodes {
+            graph.extend(pb_field_bytes(1, &node));
+        }
+        let graph_name = format!("tiny_dim{dim}_tti{with_token_type_ids}");
+        graph.extend(pb_field_bytes(2, graph_name.as_bytes()));
+        graph.extend(pb_field_bytes(
+            11,
+            &onnx_value_info("input_ids", INT64, &[dim_batch.clone(), dim_seq.clone()]),
+        ));
+        if with_token_type_ids {
+            graph.extend(pb_field_bytes(
+                11,
+                &onnx_value_info(
+                    "token_type_ids",
+                    INT64,
+                    &[dim_batch.clone(), dim_seq.clone()],
+                ),
+            ));
+        }
+        graph.extend(pb_field_bytes(
+            11,
+            &onnx_value_info("attention_mask", INT64, &[dim_batch.clone(), dim_seq]),
+        ));
+        graph.extend(pb_field_bytes(
+            12,
+            &onnx_value_info("embeddings", FLOAT, &[dim_batch, dim_out]),
+        ));
+
+        let mut opset = pb_field_bytes(1, b"");
+        opset.extend(pb_field_varint(2, 14));
+        let mut model = pb_field_varint(1, 7);
+        model.extend(pb_field_bytes(7, &graph));
+        model.extend(pb_field_bytes(8, &opset));
+        if unsupported_op.is_some() {
+            let mut ms_opset = pb_field_bytes(1, b"com.microsoft");
+            ms_opset.extend(pb_field_varint(2, 1));
+            model.extend(pb_field_bytes(8, &ms_opset));
+        }
+        model
+    }
+
+    pub fn tiny_embedder(
+        artifacts: ModelArtifacts,
+        execution_provider: &'static str,
+        arena_shrink_spec: &'static str,
+        batch_size: usize,
+    ) -> Embedder {
+        let session = Session::builder(&ort_environment().unwrap())
+            .unwrap()
+            .commit_from_file(&artifacts.onnx)
+            .unwrap();
+        let dim = detect_dim(&session).unwrap();
+        let pre_pooled = output_rank(&session) == Some(2);
+        let has_token_type_ids = wants_token_type_ids(session.inputs().iter().map(|i| i.name()));
+        Embedder {
+            session,
+            tokenizer: Arc::new(test_word_tokenizer()),
+            pad_token_id: 0,
+            dim,
+            pooling: PoolingStrategy::Mean,
+            pre_pooled,
+            has_token_type_ids,
+            batch_size: NonZeroUsize::new(batch_size).unwrap(),
+            execution_provider,
+            artifacts,
+            arena_shrink_spec,
+            arena_dirty: false,
+            arena_shrink_failures: 0,
+            last_inference_completed: None,
+        }
+    }
+
+    pub fn set_last_inference_completed(embedder: &mut Embedder, at: Option<Instant>) {
+        embedder.last_inference_completed = at;
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
@@ -2827,13 +3109,6 @@ pub(crate) mod tests {
         assert_eq!(long_batches.len(), 2);
         assert_eq!(long_batches[0].len(), 16);
         assert_eq!(long_batches[1].len(), 1);
-    }
-
-    fn test_word_tokenizer() -> Tokenizer {
-        Tokenizer::from_bytes(
-            br#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"a":1,"b":2,"c":3},"unk_token":"[UNK]"},"pre_tokenizer":{"type":"Whitespace"}}"#,
-        )
-        .unwrap()
     }
 
     #[test]
@@ -4401,197 +4676,9 @@ pub(crate) mod tests {
         );
     }
 
-    // Minimal ONNX ModelProto (IR 7, opset 14) builder for CPU-level ORT tests.
-    fn pb_varint(mut n: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        loop {
-            let b = (n & 0x7f) as u8;
-            n >>= 7;
-            if n != 0 {
-                out.push(b | 0x80);
-            } else {
-                out.push(b);
-                return out;
-            }
-        }
-    }
-
-    fn pb_field_varint(num: u64, val: u64) -> Vec<u8> {
-        let mut out = pb_varint(num << 3);
-        out.extend(pb_varint(val));
-        out
-    }
-
-    fn pb_field_bytes(num: u64, data: &[u8]) -> Vec<u8> {
-        let mut out = pb_varint((num << 3) | 2);
-        out.extend(pb_varint(data.len() as u64));
-        out.extend_from_slice(data);
-        out
-    }
-
-    fn onnx_value_info(name: &str, elem_type: u64, dims: &[Vec<u8>]) -> Vec<u8> {
-        let mut shape = Vec::new();
-        for dim in dims {
-            shape.extend(pb_field_bytes(1, dim));
-        }
-        let mut tensor_type = pb_field_varint(1, elem_type);
-        tensor_type.extend(pb_field_bytes(2, &shape));
-        let type_proto = pb_field_bytes(1, &tensor_type);
-        let mut out = pb_field_bytes(1, name.as_bytes());
-        out.extend(pb_field_bytes(2, &type_proto));
-        out
-    }
-
-    fn onnx_attr_int(name: &str, val: i64) -> Vec<u8> {
-        let mut out = pb_field_bytes(1, name.as_bytes());
-        out.extend(pb_field_varint(3, val as u64));
-        out.extend(pb_field_varint(20, 2)); // AttributeProto::INT
-        out
-    }
-
-    fn onnx_attr_ints(name: &str, vals: &[i64]) -> Vec<u8> {
-        let mut out = pb_field_bytes(1, name.as_bytes());
-        for &v in vals {
-            out.extend(pb_field_varint(7, v as u64));
-        }
-        out.extend(pb_field_varint(20, 7)); // AttributeProto::INTS
-        out
-    }
-
-    fn onnx_node(
-        op: &str,
-        domain: &str,
-        inputs: &[&str],
-        outputs: &[&str],
-        attrs: &[Vec<u8>],
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
-        for i in inputs {
-            out.extend(pb_field_bytes(1, i.as_bytes()));
-        }
-        for o in outputs {
-            out.extend(pb_field_bytes(2, o.as_bytes()));
-        }
-        out.extend(pb_field_bytes(4, op.as_bytes()));
-        if !domain.is_empty() {
-            out.extend(pb_field_bytes(7, domain.as_bytes()));
-        }
-        for attr in attrs {
-            out.extend(pb_field_bytes(5, attr));
-        }
-        out
-    }
-
-    /// Build a tiny valid ONNX embedding graph emitting `[batch, dim]` floats,
-    /// or a CUDA-only op graph when `unsupported_op` is `Some(...)`.
-    fn tiny_onnx_bytes(
-        dim: usize,
-        with_token_type_ids: bool,
-        unsupported_op: Option<&str>,
-    ) -> Vec<u8> {
-        const FLOAT: u64 = 1;
-        const INT64: u64 = 7;
-        let dim_batch = pb_field_bytes(2, b"batch");
-        let dim_seq = pb_field_bytes(2, b"seq");
-        let dim_out = pb_field_varint(1, dim as u64);
-
-        let mut nodes = Vec::new();
-        let ids_src = if with_token_type_ids {
-            nodes.push(onnx_node(
-                "Add",
-                "",
-                &["input_ids", "token_type_ids"],
-                &["ids_sum"],
-                &[],
-            ));
-            "ids_sum"
-        } else {
-            "input_ids"
-        };
-        nodes.push(onnx_node(
-            "Cast",
-            "",
-            &[ids_src],
-            &["ids_f"],
-            &[onnx_attr_int("to", FLOAT as i64)],
-        ));
-        nodes.push(onnx_node(
-            "Cast",
-            "",
-            &["attention_mask"],
-            &["mask_f"],
-            &[onnx_attr_int("to", FLOAT as i64)],
-        ));
-        nodes.push(onnx_node("Mul", "", &["ids_f", "mask_f"], &["masked"], &[]));
-        let pooled_in = if let Some(op) = unsupported_op {
-            nodes.push(onnx_node(
-                op,
-                "com.microsoft",
-                &["masked"],
-                &["cuda_only"],
-                &[],
-            ));
-            "cuda_only"
-        } else {
-            "masked"
-        };
-        nodes.push(onnx_node(
-            "ReduceMean",
-            "",
-            &[pooled_in],
-            &["m"],
-            &[onnx_attr_ints("axes", &[1]), onnx_attr_int("keepdims", 1)],
-        ));
-        let concat_inputs = vec!["m"; dim];
-        nodes.push(onnx_node(
-            "Concat",
-            "",
-            &concat_inputs,
-            &["embeddings"],
-            &[onnx_attr_int("axis", 1)],
-        ));
-
-        let mut graph = Vec::new();
-        for node in nodes {
-            graph.extend(pb_field_bytes(1, &node));
-        }
-        let graph_name = format!("tiny_dim{dim}_tti{with_token_type_ids}");
-        graph.extend(pb_field_bytes(2, graph_name.as_bytes()));
-        graph.extend(pb_field_bytes(
-            11,
-            &onnx_value_info("input_ids", INT64, &[dim_batch.clone(), dim_seq.clone()]),
-        ));
-        if with_token_type_ids {
-            graph.extend(pb_field_bytes(
-                11,
-                &onnx_value_info(
-                    "token_type_ids",
-                    INT64,
-                    &[dim_batch.clone(), dim_seq.clone()],
-                ),
-            ));
-        }
-        graph.extend(pb_field_bytes(
-            11,
-            &onnx_value_info("attention_mask", INT64, &[dim_batch.clone(), dim_seq]),
-        ));
-        graph.extend(pb_field_bytes(
-            12,
-            &onnx_value_info("embeddings", FLOAT, &[dim_batch, dim_out]),
-        ));
-
-        let mut opset = pb_field_bytes(1, b"");
-        opset.extend(pb_field_varint(2, 14));
-        let mut model = pb_field_varint(1, 7);
-        model.extend(pb_field_bytes(7, &graph));
-        model.extend(pb_field_bytes(8, &opset));
-        if unsupported_op.is_some() {
-            let mut ms_opset = pb_field_bytes(1, b"com.microsoft");
-            ms_opset.extend(pb_field_varint(2, 1));
-            model.extend(pb_field_bytes(8, &ms_opset));
-        }
-        model
-    }
+    use super::test_support::{
+        TEST_WORD_TOKENIZER_JSON, test_word_tokenizer, tiny_embedder, tiny_onnx_bytes,
+    };
 
     fn build_test_embedder(
         dir: &Path,
@@ -4602,36 +4689,93 @@ pub(crate) mod tests {
     ) -> Embedder {
         let tokenizer_path = dir.join("tokenizer.json");
         let onnx_path = dir.join(format!("model_tti_{with_token_type_ids}.onnx"));
-        fs::write(&tokenizer_path, b"{\"test\":true}").unwrap();
+        fs::write(&tokenizer_path, TEST_WORD_TOKENIZER_JSON).unwrap();
         fs::write(&onnx_path, tiny_onnx_bytes(4, with_token_type_ids, None)).unwrap();
-        let session = Session::builder(&ort_environment().unwrap())
-            .unwrap()
-            .commit_from_file(&onnx_path)
-            .unwrap();
-        let dim = detect_dim(&session).unwrap();
-        let pre_pooled = output_rank(&session) == Some(2);
-        let has_token_type_ids = wants_token_type_ids(session.inputs().iter().map(|i| i.name()));
-        assert_eq!(has_token_type_ids, with_token_type_ids);
-        Embedder {
-            session,
-            tokenizer: Arc::new(test_word_tokenizer()),
-            pad_token_id: 0,
-            dim,
-            pooling: PoolingStrategy::Mean,
-            pre_pooled,
-            has_token_type_ids,
-            batch_size: NonZeroUsize::new(batch_size).unwrap(),
-            execution_provider,
-            artifacts: ModelArtifacts {
+        let emb = tiny_embedder(
+            ModelArtifacts {
                 tokenizer: tokenizer_path,
                 onnx: onnx_path,
                 onnx_data: None,
                 ort_runtime: None,
             },
+            execution_provider,
             arena_shrink_spec,
-            arena_dirty: false,
-            arena_shrink_failures: 0,
-            last_inference_completed: None,
+            batch_size,
+        );
+        assert_eq!(emb.has_token_type_ids, with_token_type_ids);
+        emb
+    }
+
+    #[test]
+    fn load_onnx_session_wiring_reloads_portable_graph_for_pinned_cuda_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer_path = dir.path().join("tokenizer.json");
+        let portable_onnx = dir.path().join("portable_model.onnx");
+        let minilm_fp16_onnx = dir.path().join("minilm_cuda_fp16.onnx");
+        let jina_cuda_only_onnx = dir.path().join("jina_cuda_fp16.onnx");
+        fs::write(&tokenizer_path, TEST_WORD_TOKENIZER_JSON).unwrap();
+        fs::write(&portable_onnx, tiny_onnx_bytes(4, false, None)).unwrap();
+        fs::write(&minilm_fp16_onnx, tiny_onnx_bytes(2, false, None)).unwrap();
+        fs::write(
+            &jina_cuda_only_onnx,
+            tiny_onnx_bytes(2, false, Some("BiasSplitGelu")),
+        )
+        .unwrap();
+
+        let cases = [
+            ("sentence-transformers/all-MiniLM-L6-v2", &minilm_fp16_onnx),
+            ("jinaai/jina-embeddings-v2-base-code", &jina_cuda_only_onnx),
+        ];
+
+        for (model, cuda_onnx) in cases {
+            let mut requested_graphs = Vec::new();
+            let mut resolve = |req: ArtifactResolution<'_>| -> Result<ModelArtifacts> {
+                requested_graphs.push(req.graph);
+                let onnx = if req.graph == ONNX_ARTIFACT {
+                    portable_onnx.clone()
+                } else {
+                    cuda_onnx.clone()
+                };
+                Ok(ModelArtifacts {
+                    tokenizer: tokenizer_path.clone(),
+                    onnx,
+                    onnx_data: None,
+                    ort_runtime: None,
+                })
+            };
+            let loaded = load_onnx_session_with_wiring(
+                model,
+                "gpu",
+                SessionWiring {
+                    same_as_requested_arena: true,
+                    register_execution_providers: false,
+                    enforce_platform_gates: false,
+                },
+                &mut resolve,
+                Some((
+                    || anyhow::bail!("CUDA runtime libraries are not loaded"),
+                    true,
+                )),
+            )
+            .unwrap();
+            assert_eq!(
+                loaded.execution_provider, "cpu",
+                "{model}: fallback must report cpu provider"
+            );
+            assert_eq!(
+                requested_graphs,
+                vec!["onnx/model_cuda_fp16.onnx", ONNX_ARTIFACT],
+                "{model}: wiring must reload portable onnx/model.onnx after CUDA graph fallback"
+            );
+            assert_eq!(
+                loaded.artifacts.onnx, portable_onnx,
+                "{model}: LoadedSession must retain portable artifacts"
+            );
+            assert_eq!(
+                detect_dim(&loaded.session).unwrap(),
+                4,
+                "{model}: fallback session must run the portable graph (dim=4)"
+            );
         }
     }
 

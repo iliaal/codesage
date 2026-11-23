@@ -193,7 +193,10 @@ fn shrink_idle_from_map_with_hook<T>(
             Ok(true) => shrunk += 1,
             Ok(false) => {}
             Err(error) => {
-                tracing::warn!(%error, "shrinking idle embedder memory arena failed");
+                tracing::warn!(
+                    %error,
+                    "shrinking idle embedder memory arena failed; automatic shrinking is now disabled for this session"
+                );
             }
         }
     }
@@ -2256,6 +2259,181 @@ mod tests {
             "only the final give-up failure should surface to emit one warning"
         );
         assert!(!model.needs_shrink());
+    }
+
+    #[test]
+    fn session_fingerprint_on_cpu_fallback_digests_portable_graph() {
+        const CHILD: &str = "CODESAGE_SESSION_FP_FALLBACK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            use codesage_embed::model::{ModelArtifacts, ort_runtime_dylib, test_support};
+
+            let hf_home = PathBuf::from(std::env::var_os("HF_HOME").unwrap());
+            let ort_runtime = ort_runtime_dylib().unwrap();
+            let fixtures = [
+                (
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "models--IA0x00--all-MiniLM-L6-v2-codesage",
+                    test_support::MINILM_DERIVED_REVISION,
+                ),
+                (
+                    "jinaai/jina-embeddings-v2-base-code",
+                    "models--IA0x00--jina-embeddings-v2-base-code-codesage",
+                    test_support::JINA_CODE_DERIVED_REVISION,
+                ),
+            ];
+
+            for (model, repo_dir, rev) in fixtures {
+                let snap = hf_home
+                    .join("hub")
+                    .join(repo_dir)
+                    .join("snapshots")
+                    .join(rev);
+                std::fs::create_dir_all(snap.join("onnx")).unwrap();
+                let tokenizer = snap.join("tokenizer.json");
+                let portable_onnx = snap.join("onnx/model.onnx");
+                let cuda_onnx = snap.join("onnx/model_cuda_fp16.onnx");
+                std::fs::write(&tokenizer, test_support::TEST_WORD_TOKENIZER_JSON).unwrap();
+                std::fs::write(
+                    &portable_onnx,
+                    test_support::tiny_onnx_bytes(4, false, None),
+                )
+                .unwrap();
+                std::fs::write(&cuda_onnx, test_support::tiny_onnx_bytes(2, false, None)).unwrap();
+
+                let embedder = test_support::tiny_embedder(
+                    ModelArtifacts {
+                        tokenizer,
+                        onnx: portable_onnx,
+                        onnx_data: None,
+                        ort_runtime: ort_runtime.clone(),
+                    },
+                    "cpu",
+                    "gpu:0;cpu:0",
+                    8,
+                );
+                let gpu_config = EmbeddingConfig {
+                    model: model.to_string(),
+                    device: "gpu".to_string(),
+                    ..EmbeddingConfig::default()
+                };
+                let cpu_config = EmbeddingConfig {
+                    device: "cpu".to_string(),
+                    ..gpu_config.clone()
+                };
+
+                let actual = session_fingerprint(&gpu_config, &embedder).unwrap();
+                let native_cpu =
+                    codesage_graph::SemanticFingerprint::compute(&cpu_config, embedder.dim())
+                        .unwrap();
+                let cuda_graph_rebound =
+                    codesage_graph::SemanticFingerprint::compute(&gpu_config, embedder.dim())
+                        .unwrap()
+                        .with_execution_provider("cpu");
+
+                assert_eq!(
+                    actual, native_cpu,
+                    "{model}: MCP session_fingerprint under CPU fallback must digest onnx/model.onnx"
+                );
+                assert_eq!(actual.artifact_digest(), native_cpu.artifact_digest());
+                assert_ne!(
+                    actual, cuda_graph_rebound,
+                    "{model}: MCP session_fingerprint must not digest onnx/model_cuda_fp16.onnx"
+                );
+            }
+            return;
+        }
+
+        let hf_home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mcp::state::tests::session_fingerprint_on_cpu_fallback_digests_portable_graph",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HF_HOME", hf_home.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn shrink_idle_arenas_measures_idle_from_inference_completion() {
+        use codesage_embed::model::{EmbedStats, ModelArtifacts, test_support};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer_path = dir.path().join("tokenizer.json");
+        let onnx_path = dir.path().join("model.onnx");
+        std::fs::write(&tokenizer_path, test_support::TEST_WORD_TOKENIZER_JSON).unwrap();
+        std::fs::write(&onnx_path, test_support::tiny_onnx_bytes(4, false, None)).unwrap();
+        let artifacts = ModelArtifacts {
+            tokenizer: tokenizer_path,
+            onnx: onnx_path,
+            onnx_data: None,
+            ort_runtime: None,
+        };
+
+        let tok = test_support::test_word_tokenizer();
+        let big = tok.encode(vec!["a"; 1024].join(" "), false).unwrap();
+
+        let mut just_inferred = test_support::tiny_embedder(artifacts.clone(), "cuda", "cpu:0", 8);
+        just_inferred
+            .embed_encoded_batch(&[&big], &mut EmbedStats::default())
+            .unwrap();
+        assert!(just_inferred.needs_arena_shrink());
+
+        let mut idle_since_inference = test_support::tiny_embedder(artifacts, "cuda", "cpu:0", 8);
+        idle_since_inference
+            .embed_encoded_batch(&[&big], &mut EmbedStats::default())
+            .unwrap();
+        assert!(idle_since_inference.needs_arena_shrink());
+
+        let now = Instant::now();
+        test_support::set_last_inference_completed(
+            &mut idle_since_inference,
+            Some(now.checked_sub(Duration::from_secs(60)).unwrap()),
+        );
+
+        let state = CodeSageServerState::new();
+        {
+            let mut embedders = state.embedders.lock();
+            // Old lookup (60s ago) + fresh inference completion (~0s ago): must NOT shrink.
+            embedders.insert(
+                "just_inferred".into(),
+                ModelEntry {
+                    slot: Arc::new(Mutex::new(Some(Arc::new(Mutex::new(just_inferred))))),
+                    last_used: now.checked_sub(Duration::from_secs(60)).unwrap(),
+                },
+            );
+            // Recent lookup (5s ago) + old inference completion (60s ago): MUST shrink.
+            embedders.insert(
+                "idle_since_inference".into(),
+                ModelEntry {
+                    slot: Arc::new(Mutex::new(Some(Arc::new(Mutex::new(idle_since_inference))))),
+                    last_used: now.checked_sub(Duration::from_secs(5)).unwrap(),
+                },
+            );
+        }
+
+        let shrunk = state.shrink_idle_arenas(Duration::from_secs(30));
+        assert_eq!(shrunk, 1);
+
+        let embedders = state.embedders.lock();
+        let still_dirty = embedders["just_inferred"].slot.lock();
+        assert!(
+            still_dirty.as_ref().unwrap().lock().needs_arena_shrink(),
+            "shrink_idle_arenas must not shrink a model whose inference just finished"
+        );
+        let cleared = embedders["idle_since_inference"].slot.lock();
+        assert!(
+            !cleared.as_ref().unwrap().lock().needs_arena_shrink(),
+            "shrink_idle_arenas must shrink a model idle for 60s since inference completion"
+        );
     }
 
     fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {

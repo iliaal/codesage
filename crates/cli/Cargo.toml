@@ -45,3 +45,6 @@ hex.workspace = true
 libc = "0.2"
 rustix = { version = "1", features = ["event", "fs", "net", "process"] }
 socket2 = "0.6"
+
+[dev-dependencies]
+codesage-embed = { workspace = true, features = ["test-support"] }

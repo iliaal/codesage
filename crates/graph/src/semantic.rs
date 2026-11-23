@@ -50,7 +50,7 @@ fn verify_session_fingerprint(
     ensure!(
         expected.artifact_digest() == actual_digest,
         "the embedding session loaded artifacts with digest {actual_digest} ({}) but this \
-         pass fingerprints {:?}; re-run once configuration and model files agree",
+         pass fingerprints {:?}; run `codesage index --full` once configuration and model files agree",
         actual_artifacts.onnx.display(),
         expected.artifact_digest()
     );
@@ -1314,8 +1314,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("loaded artifacts with digest"),
-            "mismatched graph digest on the same provider must be rejected: {err}"
+            err.contains("loaded artifacts with digest") && err.contains("codesage index --full"),
+            "mismatched graph digest on the same provider must be rejected with repair: {err}"
         );
     }
 

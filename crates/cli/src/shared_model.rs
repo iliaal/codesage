@@ -129,6 +129,7 @@ mod tests {
         default_batch_size: NonZeroUsize,
         batch_delay: Duration,
         started_tx: Option<mpsc::SyncSender<()>>,
+        wait_for_contender: Option<mpsc::Receiver<()>>,
         /// First token ID of each batch's leading item, paired with batch row count.
         log: Vec<(u32, usize)>,
     }
@@ -141,6 +142,7 @@ mod tests {
                 default_batch_size: NonZeroUsize::new(default_batch_size).unwrap(),
                 batch_delay,
                 started_tx: None,
+                wait_for_contender: None,
                 log: Vec::new(),
             }
         }
@@ -172,6 +174,9 @@ mod tests {
             if let Some(tx) = self.started_tx.take() {
                 let _ = tx.try_send(());
             }
+            if let Some(rx) = self.wait_for_contender.take() {
+                rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
             if !self.batch_delay.is_zero() {
                 std::thread::sleep(self.batch_delay);
             }
@@ -199,8 +204,10 @@ mod tests {
     #[test]
     fn run_encoded_plan_fairly_interleaves_concurrent_callers_and_preserves_order() {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let mut fake = FakeEncodedModel::new(1, Duration::from_millis(35));
+        let (contender_tx, contender_rx) = mpsc::sync_channel(1);
+        let mut fake = FakeEncodedModel::new(1, Duration::from_millis(60));
         fake.started_tx = Some(started_tx);
+        fake.wait_for_contender = Some(contender_rx);
         let tokenizer = Arc::clone(&fake.tokenizer);
         let model = Arc::new(Mutex::new(fake));
 
@@ -226,10 +233,14 @@ mod tests {
                     .unwrap();
             (out, stats, lock_wait)
         });
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
         let second_model = Arc::clone(&model);
         let second = std::thread::spawn(move || {
+            // Wait until `first` holds the lock in batch 1, then signal right
+            // before entering `run_encoded_plan_fairly` so thread-spawn delay
+            // under heavy host load cannot let `first` finish uncontended.
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            contender_tx.send(()).unwrap();
             let mut stats = EmbedStats::default();
             let mut lock_wait = Duration::ZERO;
             let out =
