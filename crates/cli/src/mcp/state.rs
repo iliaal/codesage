@@ -135,32 +135,58 @@ fn get_or_load_authorized_slot<T>(
 /// reference, so an active watcher or request never loses its CUDA arena
 /// mid-pass. Drops the map lock before calling `shrink` because GPU calls can
 /// block.
+#[cfg(test)]
 fn shrink_idle_from_map<T>(
     map: &ModelMap<T>,
     idle_after: Duration,
-    mut shrink: impl FnMut(&mut T) -> Result<bool>,
+    shrink: impl FnMut(&mut T) -> Result<bool>,
 ) -> usize {
-    let candidates: Vec<Arc<Mutex<T>>> = {
+    shrink_idle_from_map_with(map, idle_after, |_| None, shrink)
+}
+
+fn shrink_idle_from_map_with<T>(
+    map: &ModelMap<T>,
+    idle_after: Duration,
+    last_activity: impl FnMut(&T) -> Option<Instant>,
+    shrink: impl FnMut(&mut T) -> Result<bool>,
+) -> usize {
+    shrink_idle_from_map_with_hook(map, idle_after, last_activity, shrink, || {})
+}
+
+fn shrink_idle_from_map_with_hook<T>(
+    map: &ModelMap<T>,
+    idle_after: Duration,
+    mut last_activity: impl FnMut(&T) -> Option<Instant>,
+    mut shrink: impl FnMut(&mut T) -> Result<bool>,
+    between_scan_and_shrink: impl FnOnce(),
+) -> usize {
+    let candidates: Vec<(Arc<Mutex<T>>, Instant)> = {
         let guard = map.lock();
         guard
             .values()
-            .filter(|entry| entry.last_used.elapsed() >= idle_after)
             .filter_map(|entry| {
                 let slot = entry.slot.try_lock()?;
                 match slot.as_ref() {
-                    Some(arc) if Arc::strong_count(arc) == 1 => Some(arc.clone()),
+                    Some(arc) if Arc::strong_count(arc) == 1 => {
+                        Some((arc.clone(), entry.last_used))
+                    }
                     _ => None,
                 }
             })
             .collect()
     };
+    between_scan_and_shrink();
     let mut shrunk = 0usize;
-    for arc in candidates {
+    for (arc, last_used) in candidates {
         let Some(mut model) = arc.try_lock() else {
             continue;
         };
         // Re-check after dropping the map lock: 1 in the pool slot + 1 here.
         if Arc::strong_count(&arc) > 2 {
+            continue;
+        }
+        let idle_since = last_activity(&model).unwrap_or(last_used);
+        if idle_since.elapsed() < idle_after {
             continue;
         }
         match shrink(&mut model) {
@@ -174,9 +200,42 @@ fn shrink_idle_from_map<T>(
     shrunk
 }
 
+/// Run one idle-shrink attempt: return `Ok(true)` on shrink, `Ok(false)` when
+/// clean or transiently failing (logged at debug), and `Err` once repeated
+/// failures disable shrinking so the caller emits a single warning.
+fn run_arena_shrink_step<T>(
+    model: &mut T,
+    needs_shrink: impl FnOnce(&T) -> bool,
+    attempt: impl FnOnce(&mut T) -> Result<()>,
+    is_disabled: impl FnOnce(&T) -> bool,
+) -> Result<bool> {
+    if !needs_shrink(model) {
+        return Ok(false);
+    }
+    match attempt(model) {
+        Ok(()) => Ok(true),
+        Err(error) if is_disabled(model) => Err(error),
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "shrinking idle embedder memory arena failed; will retry"
+            );
+            Ok(false)
+        }
+    }
+}
+
 /// Evict idle models only when the pool owns the last reference. Skip busy load
 /// slots and drop models outside the map lock because CUDA teardown can block.
 fn evict_idle_from_map<T>(map: &ModelMap<T>, timeout: Duration) -> usize {
+    evict_idle_from_map_with(map, timeout, |_| None)
+}
+
+fn evict_idle_from_map_with<T>(
+    map: &ModelMap<T>,
+    timeout: Duration,
+    mut last_activity: impl FnMut(&T) -> Option<Instant>,
+) -> usize {
     let mut taken: Vec<Arc<Mutex<T>>> = Vec::new();
     {
         let mut guard = map.lock();
@@ -189,6 +248,16 @@ fn evict_idle_from_map<T>(map: &ModelMap<T>, timeout: Duration) -> usize {
             };
             match slot_guard.as_ref() {
                 Some(arc) if Arc::strong_count(arc) == 1 => {
+                    let Some(model) = arc.try_lock() else {
+                        return true;
+                    };
+                    if let Some(at) = last_activity(&model)
+                        && at.elapsed() < timeout
+                    {
+                        entry.last_used = entry.last_used.max(at);
+                        return true;
+                    }
+                    drop(model);
                     taken.push(slot_guard.take().expect("just matched Some"));
                     false // drop the now-empty entry from the map
                 }
@@ -661,15 +730,14 @@ fn resolved_embedder_pool_key(config: &EmbeddingConfig) -> Result<String> {
     embedder_pool_key(config, &digest)
 }
 
-/// Include the resident execution provider; artifact digests are cached by pool-key resolution.
+/// Derive the fingerprint from the session's actual loaded artifacts and
+/// execution provider so a CUDA-to-CPU fallback digests the portable graph it
+/// runs rather than the configured CUDA graph.
 fn session_fingerprint(
     config: &EmbeddingConfig,
     embedder: &Embedder,
 ) -> Result<codesage_graph::SemanticFingerprint> {
-    Ok(
-        codesage_graph::SemanticFingerprint::compute(config, embedder.dim())?
-            .with_execution_provider(embedder.execution_provider()),
-    )
+    embedder.fingerprint(config)
 }
 
 /// Keep the final compatibility check, inference, and every retrieval read on one generation.
@@ -773,21 +841,28 @@ impl CodeSageServerState {
     /// Evict unused models without touching in-flight references. Call malloc_trim once
     /// after the sweep, not per model.
     pub(crate) fn evict_idle_models(&self, timeout: Duration) -> usize {
-        evict_idle_from_map(&self.embedders, timeout)
-            + evict_idle_from_map(&self.rerankers, timeout)
+        evict_idle_from_map_with(&self.embedders, timeout, |emb| {
+            emb.last_inference_completed()
+        }) + evict_idle_from_map(&self.rerankers, timeout)
     }
 
     /// Shrink CUDA/CPU BFC arenas on embedders that finished bulk batches and
-    /// have been idle at least `idle_after`, returning gigabytes of transient
-    /// indexing workspace without unloading the resident session.
+    /// have been idle at least `idle_after` since inference completed, returning
+    /// transient indexing workspace without unloading the resident session.
     pub(crate) fn shrink_idle_arenas(&self, idle_after: Duration) -> usize {
-        shrink_idle_from_map(&self.embedders, idle_after, |emb| {
-            if !emb.needs_arena_shrink() {
-                return Ok(false);
-            }
-            emb.shrink_arena()?;
-            Ok(true)
-        })
+        shrink_idle_from_map_with(
+            &self.embedders,
+            idle_after,
+            |emb| emb.last_inference_completed(),
+            |emb| {
+                run_arena_shrink_step(
+                    emb,
+                    Embedder::needs_arena_shrink,
+                    Embedder::shrink_arena,
+                    Embedder::arena_shrink_disabled,
+                )
+            },
+        )
     }
 
     /// Stop and join watchers within `wait`; timed-out slots stay reserved.
@@ -1918,6 +1993,271 @@ mod tests {
         drop(active_clone);
     }
 
+    #[test]
+    fn shrink_idle_skips_busy_model_mutex_without_blocking() {
+        use std::sync::mpsc;
+
+        let timeout = Duration::from_secs(30);
+        let map: Arc<ModelMap<(bool, usize)>> = Arc::new(Mutex::new(HashMap::new()));
+        let slot: ModelSlot<(bool, usize)> =
+            Arc::new(Mutex::new(Some(Arc::new(Mutex::new((true, 0usize))))));
+        map.lock().insert(
+            "busy_model".into(),
+            ModelEntry {
+                slot: Arc::clone(&slot),
+                last_used: Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .expect("test clock"),
+            },
+        );
+
+        let (locked_tx, locked_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let locker_slot = Arc::clone(&slot);
+        let mut locker_handle: Option<std::thread::JoinHandle<()>> = None;
+
+        let map_for_shrink = Arc::clone(&map);
+        let shrink_thread = std::thread::spawn(move || {
+            let shrunk = shrink_idle_from_map_with_hook(
+                &map_for_shrink,
+                timeout,
+                |_| None,
+                |(dirty, count)| {
+                    *dirty = false;
+                    *count += 1;
+                    Ok(true)
+                },
+                || {
+                    // After scan has cloned `arc` (strong_count == 2) and dropped
+                    // the map lock, lock the model mutex without cloning `arc` so
+                    // strong_count stays 2 and only `arc.try_lock()` guards it.
+                    let slot = Arc::clone(&locker_slot);
+                    let tx = locked_tx.clone();
+                    locker_handle = Some(std::thread::spawn(move || {
+                        let slot_guard = slot.lock();
+                        let _model_guard = slot_guard.as_ref().unwrap().lock();
+                        tx.send(()).unwrap();
+                        let _ = release_rx.recv();
+                    }));
+                    locked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                },
+            );
+            let _ = done_tx.send(shrunk);
+            locker_handle
+        });
+
+        let shrunk = done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("shrink_idle must skip a locked model mutex via try_lock without blocking");
+        let _ = release_tx.send(());
+        if let Some(handle) = shrink_thread.join().unwrap() {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(shrunk, 0, "busy model mutex must be skipped");
+        assert_eq!(
+            *slot.lock().as_ref().unwrap().lock(),
+            (true, 0),
+            "shrink closure must not run on a busy model"
+        );
+    }
+
+    #[test]
+    fn shrink_idle_rechecks_in_use_strong_count_after_dropping_map_lock() {
+        let timeout = Duration::from_secs(30);
+        let map: ModelMap<(bool, usize)> = Mutex::new(HashMap::new());
+        let slot: ModelSlot<(bool, usize)> =
+            Arc::new(Mutex::new(Some(Arc::new(Mutex::new((true, 0usize))))));
+        map.lock().insert(
+            "claimed_after_scan".into(),
+            ModelEntry {
+                slot: Arc::clone(&slot),
+                last_used: Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .expect("test clock"),
+            },
+        );
+
+        let mut late_claim: Option<Arc<Mutex<(bool, usize)>>> = None;
+        let shrunk = shrink_idle_from_map_with_hook(
+            &map,
+            timeout,
+            |_| None,
+            |(dirty, count)| {
+                *dirty = false;
+                *count += 1;
+                Ok(true)
+            },
+            || {
+                // Simulate a watcher/caller cloning the Arc after the scan
+                // dropped the map lock, leaving the model mutex unlocked so
+                // `arc.try_lock()` succeeds and only the strong_count > 2
+                // recheck prevents shrinking mid-pass.
+                late_claim = Some(slot.lock().as_ref().unwrap().clone());
+            },
+        );
+
+        assert_eq!(
+            shrunk, 0,
+            "entry claimed after map lock drop must not shrink"
+        );
+        assert_eq!(
+            *late_claim.as_ref().unwrap().lock(),
+            (true, 0),
+            "shrink closure must not run when Arc::strong_count > 2"
+        );
+        drop(late_claim);
+    }
+
+    #[test]
+    fn shrink_idle_measures_from_inference_completion_not_lookup() {
+        let timeout = Duration::from_secs(30);
+        struct TimedModel {
+            dirty: bool,
+            shrinks: usize,
+            last_inference: Option<Instant>,
+        }
+        let map: ModelMap<TimedModel> = Mutex::new(HashMap::new());
+        let now = Instant::now();
+
+        // Lookup was 60s ago (start of a long bulk pass), but inference finished 5s ago:
+        // must NOT shrink yet.
+        map.lock().insert(
+            "long_pass_just_finished".into(),
+            ModelEntry {
+                slot: Arc::new(Mutex::new(Some(Arc::new(Mutex::new(TimedModel {
+                    dirty: true,
+                    shrinks: 0,
+                    last_inference: Some(now.checked_sub(Duration::from_secs(5)).unwrap()),
+                }))))),
+                last_used: now.checked_sub(Duration::from_secs(60)).unwrap(),
+            },
+        );
+
+        // Lookup was 5s ago (e.g., an empty probe), but last inference finished 60s ago:
+        // MUST shrink.
+        map.lock().insert(
+            "probed_recently_idle_since_inference".into(),
+            ModelEntry {
+                slot: Arc::new(Mutex::new(Some(Arc::new(Mutex::new(TimedModel {
+                    dirty: true,
+                    shrinks: 0,
+                    last_inference: Some(now.checked_sub(Duration::from_secs(60)).unwrap()),
+                }))))),
+                last_used: now.checked_sub(Duration::from_secs(5)).unwrap(),
+            },
+        );
+
+        let shrunk = shrink_idle_from_map_with(
+            &map,
+            timeout,
+            |m| m.last_inference,
+            |m| {
+                if !m.dirty {
+                    return Ok(false);
+                }
+                m.dirty = false;
+                m.shrinks += 1;
+                Ok(true)
+            },
+        );
+
+        assert_eq!(shrunk, 1);
+        {
+            let guard = map.lock();
+            let just_finished_slot = guard["long_pass_just_finished"].slot.lock();
+            let just_finished = just_finished_slot.as_ref().unwrap().lock();
+            assert!(
+                just_finished.dirty && just_finished.shrinks == 0,
+                "model whose inference finished 5s ago must not shrink on a 30s idle window"
+            );
+            drop(just_finished);
+            drop(just_finished_slot);
+            let probed_slot = guard["probed_recently_idle_since_inference"].slot.lock();
+            let probed = probed_slot.as_ref().unwrap().lock();
+            assert!(
+                !probed.dirty && probed.shrinks == 1,
+                "model idle for 60s since inference must shrink even after a recent lookup"
+            );
+        }
+
+        // Eviction also respects recent inference completion after a long pass.
+        let evict_map: ModelMap<TimedModel> = Mutex::new(HashMap::new());
+        evict_map.lock().insert(
+            "long_watcher_pass".into(),
+            ModelEntry {
+                slot: Arc::new(Mutex::new(Some(Arc::new(Mutex::new(TimedModel {
+                    dirty: false,
+                    shrinks: 0,
+                    last_inference: Some(now.checked_sub(Duration::from_secs(5)).unwrap()),
+                }))))),
+                last_used: now.checked_sub(Duration::from_secs(1000)).unwrap(),
+            },
+        );
+        assert_eq!(
+            evict_idle_from_map_with(&evict_map, Duration::from_secs(900), |m| m.last_inference),
+            0,
+            "model whose inference finished 5s ago must not be evicted"
+        );
+        assert!(evict_map.lock().contains_key("long_watcher_pass"));
+    }
+
+    #[test]
+    fn shrink_idle_stops_retrying_after_failure_limit_with_one_error() {
+        const LIMIT: u32 = 3;
+        struct FailingModel {
+            dirty: bool,
+            failures: u32,
+            attempts: u32,
+        }
+        impl FailingModel {
+            fn disabled(&self) -> bool {
+                self.failures >= LIMIT
+            }
+            fn needs_shrink(&self) -> bool {
+                self.dirty && !self.disabled()
+            }
+            fn shrink(&mut self) -> Result<()> {
+                self.attempts += 1;
+                self.failures += 1;
+                if self.disabled() {
+                    self.dirty = false;
+                }
+                bail!("simulated ORT shrink failure")
+            }
+        }
+
+        let mut model = FailingModel {
+            dirty: true,
+            failures: 0,
+            attempts: 0,
+        };
+        let mut hard_errors = 0u32;
+        for _ in 0..6 {
+            let step = run_arena_shrink_step(
+                &mut model,
+                FailingModel::needs_shrink,
+                FailingModel::shrink,
+                FailingModel::disabled,
+            );
+            match step {
+                Ok(false) => {}
+                Ok(true) => panic!("failing shrink must not report success"),
+                Err(_) => hard_errors += 1,
+            }
+        }
+        assert_eq!(
+            model.attempts, LIMIT,
+            "shrink must stop retrying after {LIMIT} failures"
+        );
+        assert_eq!(
+            hard_errors, 1,
+            "only the final give-up failure should surface to emit one warning"
+        );
+        assert!(!model.needs_shrink());
+    }
+
     fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("codesage-mcp-test-{}-{}", std::process::id(), name));
@@ -2059,9 +2399,11 @@ mod tests {
             reranker_pool_key("cross-encoder/ms-marco-MiniLM-L6-v2", "CUDA").unwrap(),
             "equivalent reranker device spellings must share one session"
         );
-        assert!(
-            reranker_pool_key("cross-encoder/ms-marco-MiniLM-L6-v2", "tpu").is_err(),
-            "invalid reranker device must be rejected"
+        let bad_reranker =
+            reranker_pool_key("cross-encoder/ms-marco-MiniLM-L6-v2", "tpu").unwrap_err();
+        assert_eq!(
+            bad_reranker.to_string(),
+            "unknown device \"tpu\" in .codesage/config.toml: expected one of \"cpu\", \"gpu\", \"cuda\", \"coreml\""
         );
     }
 
@@ -2087,9 +2429,10 @@ mod tests {
             ..EmbeddingConfig::default()
         };
         let error = resolved_embedder_pool_key(&bad_device).unwrap_err();
-        assert!(
-            error.to_string().contains("tpu") || error.to_string().contains("device"),
-            "invalid device must fail before artifact resolution: {error}"
+        assert_eq!(
+            error.to_string(),
+            "unknown device \"tpu\" in .codesage/config.toml: expected one of \"cpu\", \"gpu\", \"cuda\", \"coreml\"",
+            "invalid device must fail with the exact validate_device message before artifact resolution"
         );
     }
 

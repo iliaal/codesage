@@ -99,9 +99,22 @@ impl SemanticFingerprint {
     /// `codesage_graph::resolve_semantic_fingerprint`, which compares the
     /// stat key first and reads nothing when it matches.
     pub fn compute(config: &EmbeddingConfig, dim: usize) -> Result<Self> {
-        let artifacts = resolve_model_artifacts(&config.model, &config.device)
+        Self::compute_for_provider(config, dim, configured_execution_provider(&config.device))
+    }
+
+    /// Derive the fingerprint for `config` when the session runs on
+    /// `execution_provider` (`"cpu"`, `"cuda"`, or `"coreml"`), resolving and
+    /// digesting the graph that provider actually loads (for example
+    /// `onnx/model.onnx` when a `device = "gpu"` config fell back to `"cpu"`).
+    pub fn compute_for_provider(
+        config: &EmbeddingConfig,
+        dim: usize,
+        execution_provider: &str,
+    ) -> Result<Self> {
+        let artifacts = resolve_model_artifacts(&config.model, execution_provider)
             .with_context(|| format!("resolving model files for {:?}", config.model))?;
-        Self::for_artifacts(config, dim, &artifacts)
+        Ok(Self::for_artifacts(config, dim, &artifacts)?
+            .with_execution_provider(execution_provider))
     }
 
     /// The fingerprint for `config` over an explicit artifact set. Reads
@@ -178,8 +191,11 @@ impl SemanticFingerprint {
     }
 
     /// This fingerprint with its device component replaced by `provider`,
-    /// the execution provider a session actually initialised. Everything
-    /// else (digest, stat key, pipeline) is carried over unchanged.
+    /// keeping the existing artifact digest and stat key unchanged. When a
+    /// provider fallback also loads a different graph (such as CUDA falling
+    /// back to the portable CPU graph), use [`Self::compute_for_provider`] or
+    /// [`crate::model::Embedder::fingerprint`] so the digest covers the graph
+    /// the session actually runs.
     pub fn with_execution_provider(&self, provider: &str) -> Self {
         let mut inputs = self.inputs.clone();
         inputs.execution_provider = provider.to_string();
@@ -721,5 +737,72 @@ mod tests {
             SemanticFingerprint::with_artifact_digest(&other, 384, "d"),
             SemanticFingerprint::with_artifact_digest(&config, 384, "d")
         );
+    }
+
+    #[test]
+    fn compute_for_provider_digests_portable_graph_for_gpu_config_on_cpu_fallback() {
+        let _lock = crate::model::tests::env_lock().unwrap_or_else(|e| e.into_inner());
+        let hf_home = tempfile::tempdir().unwrap();
+        let _hf = crate::model::tests::SavedEnv::set("HF_HOME", hf_home.path().to_str().unwrap());
+
+        let fixtures = [
+            (
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "models--IA0x00--all-MiniLM-L6-v2-codesage",
+                crate::model::MINILM_DERIVED_REVISION,
+                384usize,
+            ),
+            (
+                "jinaai/jina-embeddings-v2-base-code",
+                "models--IA0x00--jina-embeddings-v2-base-code-codesage",
+                crate::model::JINA_CODE_DERIVED_REVISION,
+                768usize,
+            ),
+        ];
+
+        for (model, repo_dir, rev, dim) in fixtures {
+            let snap = hf_home
+                .path()
+                .join("hub")
+                .join(repo_dir)
+                .join("snapshots")
+                .join(rev);
+            std::fs::create_dir_all(snap.join("onnx")).unwrap();
+            std::fs::write(snap.join("tokenizer.json"), b"{\"vocab\":{}}").unwrap();
+            std::fs::write(snap.join("onnx/model.onnx"), b"portable-fp32-graph-bytes").unwrap();
+            std::fs::write(
+                snap.join("onnx/model_cuda_fp16.onnx"),
+                b"cuda-fp16-fused-graph-bytes",
+            )
+            .unwrap();
+
+            let gpu_config = EmbeddingConfig {
+                model: model.to_string(),
+                device: "gpu".to_string(),
+                ..EmbeddingConfig::default()
+            };
+            let cpu_config = EmbeddingConfig {
+                device: "cpu".to_string(),
+                ..gpu_config.clone()
+            };
+
+            let gpu_fp = SemanticFingerprint::compute(&gpu_config, dim).unwrap();
+            let cpu_fp = SemanticFingerprint::compute(&cpu_config, dim).unwrap();
+            let fallback_fp =
+                SemanticFingerprint::compute_for_provider(&gpu_config, dim, "cpu").unwrap();
+
+            assert_eq!(
+                fallback_fp, cpu_fp,
+                "{model}: compute_for_provider(gpu_config, \"cpu\") must digest onnx/model.onnx"
+            );
+            assert_eq!(fallback_fp.artifact_digest(), cpu_fp.artifact_digest());
+            assert_eq!(fallback_fp.execution_provider(), "cpu");
+            assert_ne!(
+                fallback_fp,
+                gpu_fp.with_execution_provider("cpu"),
+                "{model}: with_execution_provider alone retains the CUDA fp16 graph digest"
+            );
+            assert_ne!(fallback_fp.artifact_digest(), gpu_fp.artifact_digest());
+        }
     }
 }

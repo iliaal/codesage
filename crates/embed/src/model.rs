@@ -9,13 +9,13 @@ use std::sync::LazyLock;
 use std::sync::Once;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use hf_hub::{Repo, RepoType};
 use ort::environment::Environment;
 use ort::session::{Session, builder::GraphOptimizationLevel};
-use tokenizers::Tokenizer;
+pub use tokenizers::{Encoding, Tokenizer};
 use wait_timeout::ChildExt;
 
 use crate::config::{EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_coreml, wants_cuda};
@@ -634,11 +634,11 @@ struct GraphPin {
 /// Commit of the derived all-MiniLM-L6-v2 graphs (portable fp32 pooled plus an
 /// ORT-fused fp16 CUDA graph), built from upstream revision
 /// c9745ed1d9f207416be6d2e6f8de32d1f16199bf.
-const MINILM_DERIVED_REVISION: &str = "292b973de823b96bb970cd40b233c8075427110d";
+pub(crate) const MINILM_DERIVED_REVISION: &str = "292b973de823b96bb970cd40b233c8075427110d";
 
 /// Commit of the derived jina-embeddings-v2-base-code graphs, built from
 /// upstream revision 516f4baf13dec4ddddda8631e019b5737c8bc250.
-const JINA_CODE_DERIVED_REVISION: &str = "211266c1a2fdf1191f617611af2cbef9b7a96944";
+pub(crate) const JINA_CODE_DERIVED_REVISION: &str = "211266c1a2fdf1191f617611af2cbef9b7a96944";
 
 /// Commit of the ms-marco-MiniLM-L6-v2 graphs (upstream plus a fused fp16
 /// CUDA graph), built from upstream revision
@@ -1489,45 +1489,41 @@ fn verify_or_refetch_artifact(
 }
 
 /// Verify every pinned artifact, tolerating one locally-corrupted cache file
-/// per artifact via [`verify_with_refetch`]. Returns the verified tokenizer
-/// and model paths (re-downloaded ones when the cache was evicted).
+/// per artifact via [`verify_with_refetch`]. Returns the verified artifacts
+/// (with re-downloaded paths when the cache was evicted).
 fn verify_pinned_model_artifacts(
     model: &str,
     pin: &ModelPin,
     graph: Option<&GraphPin>,
-    tokenizer_path: PathBuf,
-    model_path: PathBuf,
-    onnx_data_path: Option<PathBuf>,
-) -> Result<(PathBuf, PathBuf)> {
-    let tokenizer_path = verify_or_refetch_artifact(
+    mut artifacts: ModelArtifacts,
+) -> Result<ModelArtifacts> {
+    artifacts.tokenizer = verify_or_refetch_artifact(
         model,
         pin.repo,
         pin.revision,
         "tokenizer.json",
-        tokenizer_path,
+        artifacts.tokenizer,
         pin.tokenizer_sha256,
     )?;
     let (graph_file, graph_sha256) =
         graph.map_or((ONNX_ARTIFACT, pin.onnx_sha256), |g| (g.file, g.sha256));
-    let model_path = verify_or_refetch_artifact(
+    artifacts.onnx = verify_or_refetch_artifact(
         model,
         pin.repo,
         pin.revision,
         graph_file,
-        model_path,
+        artifacts.onnx,
         graph_sha256,
     )?;
-    match (pin.onnx_data_sha256, onnx_data_path) {
-        (Some(expected), Some(path)) => {
-            verify_or_refetch_artifact(
-                model,
-                pin.repo,
-                pin.revision,
-                "onnx/model.onnx_data",
-                path,
-                expected,
-            )?;
-        }
+    artifacts.onnx_data = match (pin.onnx_data_sha256, artifacts.onnx_data) {
+        (Some(expected), Some(path)) => Some(verify_or_refetch_artifact(
+            model,
+            pin.repo,
+            pin.revision,
+            "onnx/model.onnx_data",
+            path,
+            expected,
+        )?),
         (Some(_), None) => {
             anyhow::bail!(
                 "pinned model {model:?} requires onnx/model.onnx_data at revision {}, but it was not downloaded",
@@ -1542,9 +1538,9 @@ fn verify_pinned_model_artifacts(
                 path.display()
             );
         }
-        (None, None) => {}
-    }
-    Ok((tokenizer_path, model_path))
+        (None, None) => None,
+    };
+    Ok(artifacts)
 }
 
 /// Whether a model's declared input names include `token_type_ids`, i.e. the
@@ -1565,7 +1561,7 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
 }
 
 /// What [`load_onnx_session_with_provider`] produced, including the
-/// execution provider the session actually runs on.
+/// execution provider the session actually runs on and the artifacts it opened.
 pub(crate) struct LoadedSession {
     pub(crate) session: Session,
     pub(crate) tokenizer: Tokenizer,
@@ -1573,6 +1569,8 @@ pub(crate) struct LoadedSession {
     /// `cpu`, `cuda`, or `coreml`: the provider that succeeded, which under
     /// `CODESAGE_ALLOW_CPU_FALLBACK=1` may differ from the configured one.
     pub(crate) execution_provider: &'static str,
+    /// The verified model artifacts this session actually opened.
+    pub(crate) artifacts: ModelArtifacts,
 }
 
 /// The provider a session runs on after the CUDA-library check. `configured`
@@ -1591,6 +1589,66 @@ fn effective_execution_provider(
         Err(_) if allow_cpu_fallback => Ok(("cpu", true)),
         Err(e) => Err(e),
     }
+}
+
+#[cfg(any(test, all(feature = "cuda", target_os = "linux")))]
+struct CudaSessionContext<'a> {
+    model: &'a str,
+    device: &'a str,
+    configured: &'static str,
+    has_cuda_graph: bool,
+    allow_cpu_fallback: bool,
+}
+
+/// Resolve the final session, execution provider, and loaded artifacts after a
+/// CUDA session-commit attempt.
+///
+/// When CUDA libraries are absent and `allow_cpu_fallback` is true:
+/// - If the initial load targeted a CUDA-specific derived graph (whether
+///   `commit_result` failed on a CUDA-only op such as Jina's `BiasSplitGelu` or
+///   succeeded on CPU such as MiniLM's fp16 graph), drop any initial session
+///   and load the verified portable `onnx/model.onnx` graph on CPU instead.
+/// - Otherwise (the initial load already targeted `onnx/model.onnx`), keep the
+///   committed session on CPU or propagate its commit error.
+///
+/// When CUDA libraries are absent and `allow_cpu_fallback` is false, surface
+/// the actionable `cuda_check` error even when `commit_result` failed first.
+#[cfg(any(test, all(feature = "cuda", target_os = "linux")))]
+fn resolve_cuda_session<S, A>(
+    ctx: CudaSessionContext<'_>,
+    commit_result: Result<S>,
+    initial_artifacts: A,
+    cuda_check: impl FnOnce() -> Result<()>,
+    load_portable_cpu: impl FnOnce() -> Result<(S, A)>,
+) -> Result<(S, &'static str, A)> {
+    let (provider, fell_back) =
+        effective_execution_provider(ctx.configured, cuda_check(), ctx.allow_cpu_fallback)?;
+    if fell_back {
+        if ctx.has_cuda_graph {
+            drop(commit_result);
+            tracing::warn!(
+                model = ctx.model,
+                configured_device = ctx.device,
+                execution_provider = provider,
+                fallback_graph = ONNX_ARTIFACT,
+                "CODESAGE_ALLOW_CPU_FALLBACK: CUDA was requested but its libraries are not \
+                 mapped; loading the verified portable graph on CPU and fingerprinting as a CPU setup"
+            );
+            let (cpu_session, portable_artifacts) = load_portable_cpu()?;
+            return Ok((cpu_session, provider, portable_artifacts));
+        }
+        let session = commit_result?;
+        tracing::warn!(
+            model = ctx.model,
+            configured_device = ctx.device,
+            execution_provider = provider,
+            "CODESAGE_ALLOW_CPU_FALLBACK: CUDA was requested but its libraries are not \
+             mapped; this session runs on the CPU and fingerprints as a CPU setup"
+        );
+        return Ok((session, provider, initial_artifacts));
+    }
+    let session = commit_result?;
+    Ok((session, provider, initial_artifacts))
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -1654,21 +1712,14 @@ pub(crate) fn load_onnx_session_with_provider(
         load_graph(model, allow_any, device),
         sidecar_expectation(model, allow_any),
     )?;
-    let (tokenizer_path, model_path) = if let Some(pin) = pin {
-        verify_pinned_model_artifacts(
-            model,
-            pin,
-            graph_pin(Some(pin), device),
-            artifacts.tokenizer,
-            artifacts.onnx,
-            artifacts.onnx_data,
-        )?
+    let artifacts = if let Some(pin) = pin {
+        verify_pinned_model_artifacts(model, pin, graph_pin(Some(pin), device), artifacts)?
     } else {
-        (artifacts.tokenizer, artifacts.onnx)
+        artifacts
     };
 
     let mut tokenizer =
-        Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Tokenizer::from_file(&artifacts.tokenizer).map_err(|e| anyhow::anyhow!("{e}"))?;
     tokenizer
         .with_truncation(Some(tokenizers::TruncationParams {
             max_length: pin.map_or(MAX_SEQ_LENGTH, |pin| pin.max_seq_length),
@@ -1728,78 +1779,56 @@ pub(crate) fn load_onnx_session_with_provider(
         }
     }
 
-    // Linux CUDA fallback must fingerprint as CPU, never attest CUDA vectors.
+    // Linux CUDA fallback must load the portable graph and fingerprint as CPU.
     let configured = crate::fingerprint::configured_execution_provider(device);
     #[cfg(all(feature = "cuda", target_os = "linux"))]
-    let (session, execution_provider) = match builder.commit_from_file(&model_path) {
-        Ok(session) if want_cuda => {
-            let (provider, fell_back) = effective_execution_provider(
+    let (session, execution_provider, artifacts) = if want_cuda {
+        let commit_result = builder
+            .commit_from_file(&artifacts.onnx)
+            .map_err(anyhow::Error::from);
+        resolve_cuda_session(
+            CudaSessionContext {
+                model,
+                device,
                 configured,
-                require_cuda_libs_mapped(),
-                cpu_fallback_allowed_from_env(),
-            )?;
-            if fell_back {
-                tracing::warn!(
-                    model,
-                    configured_device = device,
-                    execution_provider = provider,
-                    "CODESAGE_ALLOW_CPU_FALLBACK: CUDA was requested but its libraries are not \
-                     mapped; this session runs on the CPU and fingerprints as a CPU setup"
-                );
-            }
-            (session, provider)
-        }
-        Ok(session) => (session, configured),
-        Err(commit_err) if want_cuda => {
-            // CUDA-only fused ops (such as Jina's BiasSplitGelu) fail inside
-            // commit_from_file when ORT silently falls back to CPU because CUDA
-            // libraries are absent. Surface the actionable CUDA setup error, or
-            // load the verified portable CPU graph when fallback is explicitly allowed.
-            let (provider, fell_back) = effective_execution_provider(
-                configured,
-                require_cuda_libs_mapped(),
-                cpu_fallback_allowed_from_env(),
-            )?;
-            if fell_back && graph_pin(pin, device).is_some() {
-                tracing::warn!(
-                    model,
-                    configured_device = device,
-                    execution_provider = provider,
-                    fallback_graph = ONNX_ARTIFACT,
-                    "CODESAGE_ALLOW_CPU_FALLBACK: CUDA was requested but its libraries are not \
-                     mapped; this session runs on the CPU and fingerprints as a CPU setup"
-                );
+                has_cuda_graph: graph_pin(pin, device).is_some(),
+                allow_cpu_fallback: cpu_fallback_allowed_from_env(),
+            },
+            commit_result,
+            artifacts,
+            require_cuda_libs_mapped,
+            || {
                 let portable_artifacts = resolve_model_artifacts_at(
                     load_repo(model, allow_any),
                     pin.map(|pin| pin.revision),
                     ONNX_ARTIFACT,
                     sidecar_expectation(model, allow_any),
                 )?;
-                let (_tok, portable_model_path) = if let Some(pin) = pin {
-                    verify_pinned_model_artifacts(
-                        model,
-                        pin,
-                        None,
-                        portable_artifacts.tokenizer,
-                        portable_artifacts.onnx,
-                        portable_artifacts.onnx_data,
-                    )?
+                let portable_artifacts = if let Some(pin) = pin {
+                    verify_pinned_model_artifacts(model, pin, None, portable_artifacts)?
                 } else {
-                    (portable_artifacts.tokenizer, portable_artifacts.onnx)
+                    portable_artifacts
                 };
                 let cpu_session = Session::builder(&ort_environment()?)?
-                    .commit_from_file(&portable_model_path)?;
-                (cpu_session, provider)
-            } else {
-                return Err(commit_err.into());
-            }
-        }
-        Err(commit_err) => return Err(commit_err.into()),
+                    .commit_from_file(&portable_artifacts.onnx)?;
+                Ok((cpu_session, portable_artifacts))
+            },
+        )?
+    } else {
+        (
+            builder.commit_from_file(&artifacts.onnx)?,
+            configured,
+            artifacts,
+        )
     };
     #[cfg(not(all(feature = "cuda", target_os = "linux")))]
     // CoreML registration errors are fatal, but ORT exposes no post-commit
     // provider query or mapping check. Attest the configured provider.
-    let (session, execution_provider) = (builder.commit_from_file(&model_path)?, configured);
+    let (session, execution_provider, artifacts) = (
+        builder.commit_from_file(&artifacts.onnx)?,
+        configured,
+        artifacts,
+    );
 
     let has_token_type_ids = wants_token_type_ids(session.inputs().iter().map(|i| i.name()));
 
@@ -1808,7 +1837,21 @@ pub(crate) fn load_onnx_session_with_provider(
         tokenizer,
         has_token_type_ids,
         execution_provider,
+        artifacts,
     })
+}
+
+/// Minimum padded token count in a CUDA batch that marks the BFC arena dirty.
+/// Inclusive (`>=`) so a single-row max-length Jina chunk (1x1024) triggers
+/// idle arena shrinkage while ordinary search queries stay below the threshold.
+const ARENA_SHRINK_TOKEN_THRESHOLD: usize = 1024;
+
+/// Stop retrying idle arena shrinkage for this session after this many
+/// consecutive failures so a broken shrink path does not spin every daemon tick.
+const MAX_ARENA_SHRINK_FAILURES: u32 = 3;
+
+fn should_mark_arena_dirty(execution_provider: &str, total_elems: usize) -> bool {
+    execution_provider == "cuda" && total_elems >= ARENA_SHRINK_TOKEN_THRESHOLD
 }
 
 pub struct Embedder {
@@ -1823,8 +1866,15 @@ pub struct Embedder {
     has_token_type_ids: bool,
     batch_size: NonZeroUsize,
     execution_provider: &'static str,
+    artifacts: ModelArtifacts,
+    /// ORT `memory.enable_memory_arena_shrinkage` target list.
+    arena_shrink_spec: &'static str,
     /// True after a large CUDA batch expanded the BFC arena beyond single-query needs.
     arena_dirty: bool,
+    /// Consecutive shrink failures; reaching [`MAX_ARENA_SHRINK_FAILURES`] disables shrinking.
+    arena_shrink_failures: u32,
+    /// Monotonic timestamp when the most recent inference call completed.
+    last_inference_completed: Option<Instant>,
 }
 
 impl Embedder {
@@ -1839,6 +1889,7 @@ impl Embedder {
             mut tokenizer,
             has_token_type_ids,
             execution_provider,
+            artifacts,
         } = load_onnx_session_with_provider(&config.model, &config.device, true)?;
         // Pad directly when assembling tensor buffers so `BatchPlanner` can
         // tokenize once without per-encoding padding allocations and plan on
@@ -1878,7 +1929,11 @@ impl Embedder {
             has_token_type_ids,
             batch_size,
             execution_provider,
+            artifacts,
+            arena_shrink_spec: "gpu:0;cpu:0",
             arena_dirty: false,
+            arena_shrink_failures: 0,
+            last_inference_completed: None,
         })
     }
 
@@ -1892,9 +1947,38 @@ impl Embedder {
         self.execution_provider
     }
 
+    /// The verified model artifacts this session actually opened and runs.
+    pub fn artifacts(&self) -> &ModelArtifacts {
+        &self.artifacts
+    }
+
+    /// The semantic fingerprint of the vectors this session actually produces,
+    /// digesting the graph it loaded and naming its actual execution provider.
+    pub fn fingerprint(
+        &self,
+        config: &EmbeddingConfig,
+    ) -> Result<crate::fingerprint::SemanticFingerprint> {
+        Ok(crate::fingerprint::SemanticFingerprint::for_artifacts(
+            config,
+            self.dim,
+            &self.artifacts,
+        )?
+        .with_execution_provider(self.execution_provider))
+    }
+
+    /// When the most recent inference call on this session completed.
+    pub fn last_inference_completed(&self) -> Option<Instant> {
+        self.last_inference_completed
+    }
+
+    /// Whether repeated shrink failures have disabled automatic arena shrinkage.
+    pub fn arena_shrink_disabled(&self) -> bool {
+        self.arena_shrink_failures >= MAX_ARENA_SHRINK_FAILURES
+    }
+
     /// Whether a large CUDA batch has expanded the device arena since the last shrink.
     pub fn needs_arena_shrink(&self) -> bool {
-        self.execution_provider == "cuda" && self.arena_dirty
+        self.execution_provider == "cuda" && self.arena_dirty && !self.arena_shrink_disabled()
     }
 
     /// Release unused CUDA and CPU BFC arena blocks back to the device and OS
@@ -1923,14 +2007,25 @@ impl Embedder {
                 "attention_mask" => mask_tensor,
             ]
         };
-        crate::run_control::run_session_shrinking(
+        match crate::run_control::run_session_shrinking(
             &mut self.session,
             inputs,
-            "gpu:0;cpu:0",
+            self.arena_shrink_spec,
             |_| Ok(()),
-        )?;
-        self.arena_dirty = false;
-        Ok(())
+        ) {
+            Ok(()) => {
+                self.arena_dirty = false;
+                self.arena_shrink_failures = 0;
+                Ok(())
+            }
+            Err(error) => {
+                self.arena_shrink_failures = self.arena_shrink_failures.saturating_add(1);
+                if self.arena_shrink_disabled() {
+                    self.arena_dirty = false;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Cheap lock-free planner sharing this embedder's tokenizer and batch cap.
@@ -1941,12 +2036,7 @@ impl Embedder {
     /// [`Embedder::planner`] with an explicit per-call `batch_size` cap, so
     /// projects sharing one pooled session still honor their own batch limits.
     pub fn planner_with_limit(&self, batch_size: NonZeroUsize) -> BatchPlanner {
-        let limit = batch_size.get();
-        BatchPlanner {
-            tokenizer: Arc::clone(&self.tokenizer),
-            batch_size: limit,
-            max_batch_tokens: max_batch_tokens_for(self.dim, limit),
-        }
+        BatchPlanner::for_dim(Arc::clone(&self.tokenizer), self.dim, batch_size)
     }
 
     pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -2034,14 +2124,16 @@ impl Embedder {
 
         // Mark dirty before inference so failed or cancelled large CUDA runs
         // still release any arena blocks they allocated once idle.
-        if self.execution_provider == "cuda" && total_elems > 1024 {
+        if should_mark_arena_dirty(self.execution_provider, total_elems) {
             self.arena_dirty = true;
         }
         let (dim, pooling, pre_pooled) = (self.dim, self.pooling, self.pre_pooled);
-        let embeddings = crate::run_control::run_session(&mut self.session, inputs, |outputs| {
+        let result = crate::run_control::run_session(&mut self.session, inputs, |outputs| {
             let (_shape, hidden) = outputs[0].try_extract_tensor::<f32>()?;
             pool_hidden(hidden, encodings, seq_len, dim, pooling, pre_pooled)
-        })?;
+        });
+        self.last_inference_completed = Some(Instant::now());
+        let embeddings = result?;
         stats.tokens += tokens;
         stats.padded_tokens += total_elems;
         Ok(embeddings)
@@ -2097,6 +2189,16 @@ pub struct BatchPlanner {
 }
 
 impl BatchPlanner {
+    /// Construct a planner with the model-scaled token budget for `dim` and `batch_size`.
+    pub fn for_dim(tokenizer: Arc<Tokenizer>, dim: usize, batch_size: NonZeroUsize) -> Self {
+        let limit = batch_size.get();
+        Self {
+            tokenizer,
+            batch_size: limit,
+            max_batch_tokens: max_batch_tokens_for(dim, limit),
+        }
+    }
+
     /// Tokenize `texts` once and group them into length-tight, descending batches.
     pub fn plan(&self, texts: &[&str]) -> Result<BatchPlan> {
         if texts.is_empty() {
@@ -2457,7 +2559,7 @@ fn detect_dim(session: &Session) -> Result<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn embedder_rejects_oversized_batch_before_model_access() {
         use std::num::NonZeroUsize;
@@ -4158,26 +4260,26 @@ mod tests {
 
     /// Serializes the env-seam tests below for `HF_HOME` and `HOME`.
     /// Every test below restores what it touches via [`SavedEnv`].
-    fn env_lock() -> std::sync::LockResult<std::sync::MutexGuard<'static, ()>> {
+    pub(crate) fn env_lock() -> std::sync::LockResult<std::sync::MutexGuard<'static, ()>> {
         static LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
         LOCK.lock()
     }
 
     /// Saves one env var and restores it on drop, so a serial env-seam test
     /// cannot leak into another test if it panics mid-mutation.
-    struct SavedEnv {
+    pub(crate) struct SavedEnv {
         key: &'static str,
         old: Option<std::ffi::OsString>,
     }
 
     impl SavedEnv {
-        fn set(key: &'static str, value: &str) -> Self {
+        pub(crate) fn set(key: &'static str, value: &str) -> Self {
             let old = std::env::var_os(key);
             unsafe { std::env::set_var(key, value) };
             Self { key, old }
         }
 
-        fn remove(key: &'static str) -> Self {
+        pub(crate) fn remove(key: &'static str) -> Self {
             let old = std::env::var_os(key);
             unsafe { std::env::remove_var(key) };
             Self { key, old }
@@ -4296,6 +4398,664 @@ mod tests {
         assert_eq!(
             crate::fingerprint::configured_execution_provider("cpu"),
             "cpu"
+        );
+    }
+
+    // Minimal ONNX ModelProto (IR 7, opset 14) builder for CPU-level ORT tests.
+    fn pb_varint(mut n: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let b = (n & 0x7f) as u8;
+            n >>= 7;
+            if n != 0 {
+                out.push(b | 0x80);
+            } else {
+                out.push(b);
+                return out;
+            }
+        }
+    }
+
+    fn pb_field_varint(num: u64, val: u64) -> Vec<u8> {
+        let mut out = pb_varint(num << 3);
+        out.extend(pb_varint(val));
+        out
+    }
+
+    fn pb_field_bytes(num: u64, data: &[u8]) -> Vec<u8> {
+        let mut out = pb_varint((num << 3) | 2);
+        out.extend(pb_varint(data.len() as u64));
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn onnx_value_info(name: &str, elem_type: u64, dims: &[Vec<u8>]) -> Vec<u8> {
+        let mut shape = Vec::new();
+        for dim in dims {
+            shape.extend(pb_field_bytes(1, dim));
+        }
+        let mut tensor_type = pb_field_varint(1, elem_type);
+        tensor_type.extend(pb_field_bytes(2, &shape));
+        let type_proto = pb_field_bytes(1, &tensor_type);
+        let mut out = pb_field_bytes(1, name.as_bytes());
+        out.extend(pb_field_bytes(2, &type_proto));
+        out
+    }
+
+    fn onnx_attr_int(name: &str, val: i64) -> Vec<u8> {
+        let mut out = pb_field_bytes(1, name.as_bytes());
+        out.extend(pb_field_varint(3, val as u64));
+        out.extend(pb_field_varint(20, 2)); // AttributeProto::INT
+        out
+    }
+
+    fn onnx_attr_ints(name: &str, vals: &[i64]) -> Vec<u8> {
+        let mut out = pb_field_bytes(1, name.as_bytes());
+        for &v in vals {
+            out.extend(pb_field_varint(7, v as u64));
+        }
+        out.extend(pb_field_varint(20, 7)); // AttributeProto::INTS
+        out
+    }
+
+    fn onnx_node(
+        op: &str,
+        domain: &str,
+        inputs: &[&str],
+        outputs: &[&str],
+        attrs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in inputs {
+            out.extend(pb_field_bytes(1, i.as_bytes()));
+        }
+        for o in outputs {
+            out.extend(pb_field_bytes(2, o.as_bytes()));
+        }
+        out.extend(pb_field_bytes(4, op.as_bytes()));
+        if !domain.is_empty() {
+            out.extend(pb_field_bytes(7, domain.as_bytes()));
+        }
+        for attr in attrs {
+            out.extend(pb_field_bytes(5, attr));
+        }
+        out
+    }
+
+    /// Build a tiny valid ONNX embedding graph emitting `[batch, dim]` floats,
+    /// or a CUDA-only op graph when `unsupported_op` is `Some(...)`.
+    fn tiny_onnx_bytes(
+        dim: usize,
+        with_token_type_ids: bool,
+        unsupported_op: Option<&str>,
+    ) -> Vec<u8> {
+        const FLOAT: u64 = 1;
+        const INT64: u64 = 7;
+        let dim_batch = pb_field_bytes(2, b"batch");
+        let dim_seq = pb_field_bytes(2, b"seq");
+        let dim_out = pb_field_varint(1, dim as u64);
+
+        let mut nodes = Vec::new();
+        let ids_src = if with_token_type_ids {
+            nodes.push(onnx_node(
+                "Add",
+                "",
+                &["input_ids", "token_type_ids"],
+                &["ids_sum"],
+                &[],
+            ));
+            "ids_sum"
+        } else {
+            "input_ids"
+        };
+        nodes.push(onnx_node(
+            "Cast",
+            "",
+            &[ids_src],
+            &["ids_f"],
+            &[onnx_attr_int("to", FLOAT as i64)],
+        ));
+        nodes.push(onnx_node(
+            "Cast",
+            "",
+            &["attention_mask"],
+            &["mask_f"],
+            &[onnx_attr_int("to", FLOAT as i64)],
+        ));
+        nodes.push(onnx_node("Mul", "", &["ids_f", "mask_f"], &["masked"], &[]));
+        let pooled_in = if let Some(op) = unsupported_op {
+            nodes.push(onnx_node(
+                op,
+                "com.microsoft",
+                &["masked"],
+                &["cuda_only"],
+                &[],
+            ));
+            "cuda_only"
+        } else {
+            "masked"
+        };
+        nodes.push(onnx_node(
+            "ReduceMean",
+            "",
+            &[pooled_in],
+            &["m"],
+            &[onnx_attr_ints("axes", &[1]), onnx_attr_int("keepdims", 1)],
+        ));
+        let concat_inputs = vec!["m"; dim];
+        nodes.push(onnx_node(
+            "Concat",
+            "",
+            &concat_inputs,
+            &["embeddings"],
+            &[onnx_attr_int("axis", 1)],
+        ));
+
+        let mut graph = Vec::new();
+        for node in nodes {
+            graph.extend(pb_field_bytes(1, &node));
+        }
+        let graph_name = format!("tiny_dim{dim}_tti{with_token_type_ids}");
+        graph.extend(pb_field_bytes(2, graph_name.as_bytes()));
+        graph.extend(pb_field_bytes(
+            11,
+            &onnx_value_info("input_ids", INT64, &[dim_batch.clone(), dim_seq.clone()]),
+        ));
+        if with_token_type_ids {
+            graph.extend(pb_field_bytes(
+                11,
+                &onnx_value_info(
+                    "token_type_ids",
+                    INT64,
+                    &[dim_batch.clone(), dim_seq.clone()],
+                ),
+            ));
+        }
+        graph.extend(pb_field_bytes(
+            11,
+            &onnx_value_info("attention_mask", INT64, &[dim_batch.clone(), dim_seq]),
+        ));
+        graph.extend(pb_field_bytes(
+            12,
+            &onnx_value_info("embeddings", FLOAT, &[dim_batch, dim_out]),
+        ));
+
+        let mut opset = pb_field_bytes(1, b"");
+        opset.extend(pb_field_varint(2, 14));
+        let mut model = pb_field_varint(1, 7);
+        model.extend(pb_field_bytes(7, &graph));
+        model.extend(pb_field_bytes(8, &opset));
+        if unsupported_op.is_some() {
+            let mut ms_opset = pb_field_bytes(1, b"com.microsoft");
+            ms_opset.extend(pb_field_varint(2, 1));
+            model.extend(pb_field_bytes(8, &ms_opset));
+        }
+        model
+    }
+
+    fn build_test_embedder(
+        dir: &Path,
+        execution_provider: &'static str,
+        arena_shrink_spec: &'static str,
+        with_token_type_ids: bool,
+        batch_size: usize,
+    ) -> Embedder {
+        let tokenizer_path = dir.join("tokenizer.json");
+        let onnx_path = dir.join(format!("model_tti_{with_token_type_ids}.onnx"));
+        fs::write(&tokenizer_path, b"{\"test\":true}").unwrap();
+        fs::write(&onnx_path, tiny_onnx_bytes(4, with_token_type_ids, None)).unwrap();
+        let session = Session::builder(&ort_environment().unwrap())
+            .unwrap()
+            .commit_from_file(&onnx_path)
+            .unwrap();
+        let dim = detect_dim(&session).unwrap();
+        let pre_pooled = output_rank(&session) == Some(2);
+        let has_token_type_ids = wants_token_type_ids(session.inputs().iter().map(|i| i.name()));
+        assert_eq!(has_token_type_ids, with_token_type_ids);
+        Embedder {
+            session,
+            tokenizer: Arc::new(test_word_tokenizer()),
+            pad_token_id: 0,
+            dim,
+            pooling: PoolingStrategy::Mean,
+            pre_pooled,
+            has_token_type_ids,
+            batch_size: NonZeroUsize::new(batch_size).unwrap(),
+            execution_provider,
+            artifacts: ModelArtifacts {
+                tokenizer: tokenizer_path,
+                onnx: onnx_path,
+                onnx_data: None,
+                ort_runtime: None,
+            },
+            arena_shrink_spec,
+            arena_dirty: false,
+            arena_shrink_failures: 0,
+            last_inference_completed: None,
+        }
+    }
+
+    #[test]
+    fn embedder_shrink_arena_marks_dirty_at_boundary_and_clears_on_shrink() {
+        assert!(!should_mark_arena_dirty("cuda", 1016));
+        assert!(!should_mark_arena_dirty("cuda", 1023));
+        assert!(should_mark_arena_dirty("cuda", 1024));
+        assert!(should_mark_arena_dirty("cuda", 1025));
+        assert!(!should_mark_arena_dirty("cpu", 1024));
+        assert!(!should_mark_arena_dirty("coreml", 2048));
+
+        let dir = tempfile::tempdir().unwrap();
+        let tok = test_word_tokenizer();
+        let below = tok.encode(vec!["a"; 1016].join(" "), false).unwrap();
+        let exact = tok.encode(vec!["a"; 1024].join(" "), false).unwrap();
+        assert_eq!(below.len(), 1016);
+        assert_eq!(exact.len(), 1024);
+
+        for with_token_type_ids in [false, true] {
+            let mut emb = build_test_embedder(dir.path(), "cuda", "cpu:0", with_token_type_ids, 8);
+            assert!(!emb.needs_arena_shrink());
+            assert!(emb.last_inference_completed().is_none());
+
+            let mut stats = EmbedStats::default();
+            let out = emb.embed_encoded_batch(&[&below], &mut stats).unwrap();
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].len(), 4);
+            assert!(
+                !emb.needs_arena_shrink(),
+                "1016 tokens is below the 1024-token boundary (tti={with_token_type_ids})"
+            );
+            assert!(emb.last_inference_completed().is_some());
+
+            let out = emb.embed_encoded_batch(&[&exact], &mut stats).unwrap();
+            assert_eq!(out.len(), 1);
+            assert!(
+                emb.needs_arena_shrink(),
+                "a single-row 1024-token batch must mark the arena dirty (tti={with_token_type_ids})"
+            );
+
+            emb.shrink_arena().unwrap();
+            assert!(
+                !emb.needs_arena_shrink(),
+                "successful shrink_arena must clear the dirty flag (tti={with_token_type_ids})"
+            );
+            assert!(!emb.arena_shrink_disabled());
+
+            // A later large batch can mark dirty and shrink again.
+            emb.embed_encoded_batch(&[&exact], &mut stats).unwrap();
+            assert!(emb.needs_arena_shrink());
+            emb.shrink_arena().unwrap();
+            assert!(!emb.needs_arena_shrink());
+        }
+
+        // On CPU, even a 1024-token batch never marks the arena dirty and
+        // shrink_arena returns Ok without touching ORT (gpu:0 would fail on CPU).
+        let mut cpu_emb = build_test_embedder(dir.path(), "cpu", "gpu:0;cpu:0", false, 8);
+        cpu_emb
+            .embed_encoded_batch(&[&exact], &mut EmbedStats::default())
+            .unwrap();
+        assert!(!cpu_emb.needs_arena_shrink());
+        cpu_emb.shrink_arena().unwrap();
+    }
+
+    #[test]
+    fn embedder_shrink_arena_gives_up_after_repeated_failures_and_resets_on_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = test_word_tokenizer();
+        let exact = tok.encode(vec!["a"; 1024].join(" "), false).unwrap();
+
+        // Real CPU ORT rejects "gpu:0;cpu:0" with INVALID_ARGUMENT.
+        let mut emb = build_test_embedder(dir.path(), "cuda", "gpu:0;cpu:0", false, 8);
+        emb.embed_encoded_batch(&[&exact], &mut EmbedStats::default())
+            .unwrap();
+        assert!(emb.needs_arena_shrink());
+
+        for attempt in 1..MAX_ARENA_SHRINK_FAILURES {
+            assert!(
+                emb.shrink_arena().is_err(),
+                "attempt {attempt} should surface the ORT shrink error"
+            );
+            assert!(
+                emb.needs_arena_shrink(),
+                "dirty flag stays set while retries remain"
+            );
+            assert!(!emb.arena_shrink_disabled());
+        }
+        assert!(
+            emb.shrink_arena().is_err(),
+            "final failure should still return Err so the caller logs one warning"
+        );
+        assert!(
+            emb.arena_shrink_disabled(),
+            "reaching MAX_ARENA_SHRINK_FAILURES must disable automatic shrinking"
+        );
+        assert!(
+            !emb.needs_arena_shrink(),
+            "disabled session must not request further shrinks"
+        );
+        // Subsequent shrink_arena calls are no-ops even after another large batch.
+        emb.shrink_arena().unwrap();
+        emb.embed_encoded_batch(&[&exact], &mut EmbedStats::default())
+            .unwrap();
+        assert!(!emb.needs_arena_shrink());
+        emb.shrink_arena().unwrap();
+
+        // A transient failure followed by a success resets the failure counter.
+        let mut recovering = build_test_embedder(dir.path(), "cuda", "gpu:0;cpu:0", false, 8);
+        recovering
+            .embed_encoded_batch(&[&exact], &mut EmbedStats::default())
+            .unwrap();
+        assert!(recovering.shrink_arena().is_err());
+        assert_eq!(recovering.arena_shrink_failures, 1);
+        recovering.arena_shrink_spec = "cpu:0";
+        recovering.shrink_arena().unwrap();
+        assert_eq!(recovering.arena_shrink_failures, 0);
+        assert!(!recovering.needs_arena_shrink());
+        assert!(!recovering.arena_shrink_disabled());
+    }
+
+    #[test]
+    fn embedder_planner_with_limit_caps_batches_below_session_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let emb = build_test_embedder(dir.path(), "cpu", "cpu:0", false, 8);
+        let texts = ["a", "b b", "c c c", "a b", "b c a b"];
+
+        let default_plan = emb.planner().plan(&texts).unwrap();
+        assert_eq!(default_plan.len(), 1, "default cap 8 fits all 5 texts");
+
+        let capped_plan = emb
+            .planner_with_limit(NonZeroUsize::new(2).unwrap())
+            .plan(&texts)
+            .unwrap();
+        assert_eq!(capped_plan.len(), 3, "cap 2 splits 5 texts into [2, 2, 1]");
+        let mut batch_sizes = Vec::new();
+        let out = capped_plan
+            .run_encoded(&mut EmbedStats::default(), |batch, _| {
+                batch_sizes.push(batch.len());
+                Ok(batch.iter().map(|e| vec![e.len() as f32]).collect())
+            })
+            .unwrap();
+        assert_eq!(batch_sizes, vec![2, 2, 1]);
+        assert_eq!(
+            out,
+            vec![vec![1.0], vec![2.0], vec![3.0], vec![2.0], vec![4.0]]
+        );
+    }
+
+    #[test]
+    fn cuda_fallback_loads_portable_graph_on_commit_failure_and_minilm_cpu_commit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = dir.path().join("tokenizer.json");
+        let cuda_only_onnx = dir.path().join("jina_cuda_fp16.onnx");
+        let minilm_fp16_onnx = dir.path().join("minilm_cuda_fp16.onnx");
+        let portable_onnx = dir.path().join("portable_model.onnx");
+        fs::write(&tokenizer, b"{}").unwrap();
+        fs::write(
+            &cuda_only_onnx,
+            tiny_onnx_bytes(2, false, Some("BiasSplitGelu")),
+        )
+        .unwrap();
+        fs::write(&minilm_fp16_onnx, tiny_onnx_bytes(2, false, None)).unwrap();
+        fs::write(&portable_onnx, tiny_onnx_bytes(4, false, None)).unwrap();
+
+        let make_artifacts = |onnx: &Path| ModelArtifacts {
+            tokenizer: tokenizer.clone(),
+            onnx: onnx.to_path_buf(),
+            onnx_data: None,
+            ort_runtime: None,
+        };
+        let env = ort_environment().unwrap();
+
+        // 1. Jina-style CUDA-only op fails commit_from_file on CPU: fallback loads portable graph.
+        let jina_commit = Session::builder(&env)
+            .unwrap()
+            .commit_from_file(&cuda_only_onnx)
+            .map_err(anyhow::Error::from);
+        assert!(
+            jina_commit.is_err(),
+            "CUDA-only BiasSplitGelu graph must fail CPU commit_from_file"
+        );
+        let portable_loads = Cell::new(0u32);
+        let (session, provider, loaded) = resolve_cuda_session(
+            CudaSessionContext {
+                model: "jinaai/jina-embeddings-v2-base-code",
+                device: "gpu",
+                configured: "cuda",
+                has_cuda_graph: true,
+                allow_cpu_fallback: true,
+            },
+            jina_commit,
+            make_artifacts(&cuda_only_onnx),
+            || anyhow::bail!("CUDA runtime libraries are not loaded"),
+            || {
+                portable_loads.set(portable_loads.get() + 1);
+                let s = Session::builder(&env)?.commit_from_file(&portable_onnx)?;
+                Ok((s, make_artifacts(&portable_onnx)))
+            },
+        )
+        .unwrap();
+        assert_eq!(provider, "cpu");
+        assert_eq!(portable_loads.get(), 1);
+        assert_eq!(loaded.onnx, portable_onnx);
+        assert_eq!(
+            detect_dim(&session).unwrap(),
+            4,
+            "fallback session must run the portable graph (dim=4)"
+        );
+
+        // 2. MiniLM-style fp16 graph commits on CPU: fallback must drop it and load portable graph.
+        struct DropWatchedSession {
+            session: Session,
+            dropped: Arc<AtomicBool>,
+        }
+        impl Drop for DropWatchedSession {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+        let fp16_dropped = Arc::new(AtomicBool::new(false));
+        let minilm_commit = Session::builder(&env)
+            .unwrap()
+            .commit_from_file(&minilm_fp16_onnx)
+            .map(|session| DropWatchedSession {
+                session,
+                dropped: Arc::clone(&fp16_dropped),
+            })
+            .map_err(anyhow::Error::from);
+        assert!(
+            minilm_commit.is_ok(),
+            "MiniLM fp16 fixture commits on CPU just like upstream MiniLM"
+        );
+        let portable_loads = Cell::new(0u32);
+        let dropped_before_reload = Cell::new(false);
+        let (session, provider, loaded) = resolve_cuda_session(
+            CudaSessionContext {
+                model: "sentence-transformers/all-MiniLM-L6-v2",
+                device: "gpu",
+                configured: "cuda",
+                has_cuda_graph: true,
+                allow_cpu_fallback: true,
+            },
+            minilm_commit,
+            make_artifacts(&minilm_fp16_onnx),
+            || anyhow::bail!("CUDA runtime libraries are not loaded"),
+            || {
+                dropped_before_reload.set(fp16_dropped.load(Ordering::SeqCst));
+                portable_loads.set(portable_loads.get() + 1);
+                let s = Session::builder(&env)?.commit_from_file(&portable_onnx)?;
+                Ok((
+                    DropWatchedSession {
+                        session: s,
+                        dropped: Arc::new(AtomicBool::new(false)),
+                    },
+                    make_artifacts(&portable_onnx),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(provider, "cpu");
+        assert_eq!(portable_loads.get(), 1);
+        assert!(
+            dropped_before_reload.get(),
+            "CPU-committed fp16 session must be dropped before loading the portable graph"
+        );
+        assert_eq!(loaded.onnx, portable_onnx);
+        assert_eq!(
+            detect_dim(&session.session).unwrap(),
+            4,
+            "MiniLM CPU fallback must run the portable graph (dim=4), not the fp16 graph (dim=2)"
+        );
+
+        // 3. Disallowed fallback surfaces the actionable CUDA error in both commit Ok and Err.
+        for commit in [
+            Err(anyhow::anyhow!("BiasSplitGelu unsupported on CPU")),
+            Ok(()),
+        ] {
+            let err = resolve_cuda_session(
+                CudaSessionContext {
+                    model: "jinaai/jina-embeddings-v2-base-code",
+                    device: "gpu",
+                    configured: "cuda",
+                    has_cuda_graph: true,
+                    allow_cpu_fallback: false,
+                },
+                commit,
+                "cuda-graph",
+                || anyhow::bail!("CUDA runtime libraries are not loaded"),
+                || panic!("portable loader must not run when fallback is disabled"),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("CUDA runtime libraries are not loaded"),
+                "expected actionable CUDA check error, got: {err:#}"
+            );
+        }
+
+        // 4. When CUDA libs are mapped, genuine commit errors propagate even with fallback allowed.
+        let err = resolve_cuda_session(
+            CudaSessionContext {
+                model: "jinaai/jina-embeddings-v2-base-code",
+                device: "gpu",
+                configured: "cuda",
+                has_cuda_graph: true,
+                allow_cpu_fallback: true,
+            },
+            Err::<(), _>(anyhow::anyhow!("corrupted protobuf")),
+            "cuda-graph",
+            || Ok(()),
+            || panic!("portable loader must not run when CUDA libraries are present"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("corrupted protobuf"));
+
+        // 5. Without a separate CUDA graph, fallback keeps the committed portable session.
+        let (sess, provider, art) = resolve_cuda_session(
+            CudaSessionContext {
+                model: "custom/unpinned",
+                device: "gpu",
+                configured: "cuda",
+                has_cuda_graph: false,
+                allow_cpu_fallback: true,
+            },
+            Ok("already-portable"),
+            "onnx/model.onnx",
+            || anyhow::bail!("no cuda"),
+            || panic!("single-graph model must not reload"),
+        )
+        .unwrap();
+        assert_eq!(
+            (sess, provider, art),
+            ("already-portable", "cpu", "onnx/model.onnx")
+        );
+    }
+
+    #[test]
+    fn cpu_fallback_embedder_fingerprint_digests_portable_graph_not_cuda_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = dir.path().join("tokenizer.json");
+        let cuda_onnx = dir.path().join("model_cuda_fp16.onnx");
+        let portable_onnx = dir.path().join("model.onnx");
+        fs::write(&tokenizer, b"{}").unwrap();
+        fs::write(&cuda_onnx, tiny_onnx_bytes(2, false, None)).unwrap();
+        fs::write(&portable_onnx, tiny_onnx_bytes(4, false, None)).unwrap();
+
+        let cuda_artifacts = ModelArtifacts {
+            tokenizer: tokenizer.clone(),
+            onnx: cuda_onnx,
+            onnx_data: None,
+            ort_runtime: None,
+        };
+        let portable_artifacts = ModelArtifacts {
+            tokenizer,
+            onnx: portable_onnx.clone(),
+            onnx_data: None,
+            ort_runtime: None,
+        };
+        let session = Session::builder(&ort_environment().unwrap())
+            .unwrap()
+            .commit_from_file(&portable_onnx)
+            .unwrap();
+        let embedder = Embedder {
+            session,
+            tokenizer: Arc::new(test_word_tokenizer()),
+            pad_token_id: 0,
+            dim: 4,
+            pooling: PoolingStrategy::Mean,
+            pre_pooled: true,
+            has_token_type_ids: false,
+            batch_size: NonZeroUsize::new(8).unwrap(),
+            execution_provider: "cpu",
+            artifacts: portable_artifacts.clone(),
+            arena_shrink_spec: "gpu:0;cpu:0",
+            arena_dirty: false,
+            arena_shrink_failures: 0,
+            last_inference_completed: None,
+        };
+
+        let gpu_config = EmbeddingConfig {
+            model: "jinaai/jina-embeddings-v2-base-code".into(),
+            device: "gpu".into(),
+            ..EmbeddingConfig::default()
+        };
+        let cpu_config = EmbeddingConfig {
+            device: "cpu".into(),
+            ..gpu_config.clone()
+        };
+
+        let fallback_fp = embedder.fingerprint(&gpu_config).unwrap();
+        let native_cpu_fp = crate::fingerprint::SemanticFingerprint::for_artifacts(
+            &cpu_config,
+            4,
+            &portable_artifacts,
+        )
+        .unwrap();
+        let stale_cuda_graph_rebound =
+            crate::fingerprint::SemanticFingerprint::for_artifacts(&gpu_config, 4, &cuda_artifacts)
+                .unwrap()
+                .with_execution_provider("cpu");
+
+        assert_eq!(
+            fallback_fp, native_cpu_fp,
+            "CPU fallback session fingerprint must match native CPU over onnx/model.onnx"
+        );
+        assert_eq!(
+            fallback_fp.artifact_digest(),
+            native_cpu_fp.artifact_digest()
+        );
+        assert_eq!(fallback_fp.execution_provider(), "cpu");
+        assert!(
+            !fallback_fp.as_str().contains("cudagemm"),
+            "CPU fallback must not emit CUDA GEMM options: {fallback_fp}"
+        );
+        assert_ne!(
+            fallback_fp, stale_cuda_graph_rebound,
+            "fallback fingerprint must not digest the CUDA fp16 graph"
+        );
+        assert_ne!(
+            fallback_fp.artifact_digest(),
+            stale_cuda_graph_rebound.artifact_digest()
         );
     }
 }

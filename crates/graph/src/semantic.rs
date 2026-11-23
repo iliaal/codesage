@@ -32,18 +32,36 @@ pub trait TextEmbedder {
     }
 }
 
+/// Reject an embedding session whose execution provider or loaded artifact
+/// digest disagrees with the pass's expected fingerprint.
+fn verify_session_fingerprint(
+    expected: &SemanticFingerprint,
+    actual_provider: &str,
+    actual_artifacts: &ModelArtifacts,
+) -> Result<()> {
+    ensure!(
+        expected.execution_provider() == actual_provider,
+        "the embedding session runs on the {actual_provider} execution provider but this pass \
+         fingerprints its vectors as {:?}; set `device` in .codesage/config.toml to the \
+         provider that actually runs, or make the configured one available",
+        expected.execution_provider()
+    );
+    let actual_digest = codesage_embed::fingerprint::model_artifact_digest(actual_artifacts)?;
+    ensure!(
+        expected.artifact_digest() == actual_digest,
+        "the embedding session loaded artifacts with digest {actual_digest} ({}) but this \
+         pass fingerprints {:?}; re-run once configuration and model files agree",
+        actual_artifacts.onnx.display(),
+        expected.artifact_digest()
+    );
+    Ok(())
+}
+
 impl TextEmbedder for Embedder {
-    /// CPU fallback must never be attested as the configured CUDA provider.
+    /// CPU fallback must never be attested as the configured CUDA provider,
+    /// and a session must never attest an artifact digest for another graph.
     fn bind_fingerprint(&mut self, expected: &SemanticFingerprint) -> Result<()> {
-        let actual = self.execution_provider();
-        ensure!(
-            expected.execution_provider() == actual,
-            "the embedding session runs on the {actual} execution provider but this pass \
-             fingerprints its vectors as {:?}; set `device` in .codesage/config.toml to the \
-             provider that actually runs, or make the configured one available",
-            expected.execution_provider()
-        );
-        Ok(())
+        verify_session_fingerprint(expected, self.execution_provider(), self.artifacts())
     }
 
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -1252,6 +1270,52 @@ mod tests {
         assert_eq!(
             db.semantic_fingerprint().unwrap().as_deref(),
             Some(cpu_fp.as_str())
+        );
+    }
+
+    #[test]
+    fn verify_session_fingerprint_rejects_mismatched_graph_even_on_same_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = dir.path().join("tokenizer.json");
+        let portable_onnx = dir.path().join("model.onnx");
+        let cuda_onnx = dir.path().join("model_cuda_fp16.onnx");
+        std::fs::write(&tokenizer, b"{}").unwrap();
+        std::fs::write(&portable_onnx, b"portable-fp32").unwrap();
+        std::fs::write(&cuda_onnx, b"cuda-fp16").unwrap();
+
+        let portable = ModelArtifacts {
+            tokenizer: tokenizer.clone(),
+            onnx: portable_onnx,
+            onnx_data: None,
+            ort_runtime: None,
+        };
+        let cuda = ModelArtifacts {
+            tokenizer,
+            onnx: cuda_onnx,
+            onnx_data: None,
+            ort_runtime: None,
+        };
+        let gpu_config = EmbeddingConfig {
+            device: "gpu".into(),
+            ..EmbeddingConfig::default()
+        };
+        let cpu_config = EmbeddingConfig {
+            device: "cpu".into(),
+            ..gpu_config.clone()
+        };
+        let portable_cpu_fp =
+            SemanticFingerprint::for_artifacts(&cpu_config, 4, &portable).unwrap();
+        let cuda_graph_rebound_cpu = SemanticFingerprint::for_artifacts(&gpu_config, 4, &cuda)
+            .unwrap()
+            .with_execution_provider("cpu");
+
+        verify_session_fingerprint(&portable_cpu_fp, "cpu", &portable).unwrap();
+        let err = verify_session_fingerprint(&cuda_graph_rebound_cpu, "cpu", &portable)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("loaded artifacts with digest"),
+            "mismatched graph digest on the same provider must be rejected: {err}"
         );
     }
 
