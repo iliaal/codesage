@@ -1863,6 +1863,8 @@ where
             },
         )?
     } else {
+        // CoreML registration errors are fatal, but ORT exposes no post-commit
+        // provider query or mapping check. Attest the configured provider.
         (
             builder.commit_from_file(&artifacts.onnx)?,
             configured,

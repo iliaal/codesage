@@ -2289,6 +2289,9 @@ mod tests {
                     .join("snapshots")
                     .join(rev);
                 std::fs::create_dir_all(snap.join("onnx")).unwrap();
+                let refs = hf_home.join("hub").join(repo_dir).join("refs");
+                std::fs::create_dir_all(&refs).unwrap();
+                std::fs::write(refs.join(rev), rev).unwrap();
                 let tokenizer = snap.join("tokenizer.json");
                 let portable_onnx = snap.join("onnx/model.onnx");
                 let cuda_onnx = snap.join("onnx/model_cuda_fp16.onnx");
