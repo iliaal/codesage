@@ -6,6 +6,10 @@
 - MCP daemon idle arena shrinkage measures the 30-second idle window from inference completion rather than slot lookup, includes single-row 1,024-token batches at the threshold, and disables retries for the session after three consecutive failures with one warning.
 - MCP daemon idle model eviction measures inactivity from inference completion rather than slot lookup, avoiding eviction immediately after a long indexing pass.
 
+### Security
+
+- Updated `cookie` to 0.18.3 and `url` to 2.5.9 in the lockfile, clearing RUSTSEC-2026-0594 and RUSTSEC-2026-0592 from `cargo audit`.
+
 ## [0.55.0] - 2026-11-22
 
 ### Changed
