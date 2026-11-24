@@ -2138,6 +2138,91 @@ mod tests {
         );
     }
 
+    /// Each match rule of the `imported_by` symbol arm, and each language,
+    /// ref-kind, and self-path exclusion, with an importer it admits or
+    /// rejects. The expected list was recorded from the single-join query
+    /// this arm replaced.
+    #[test]
+    fn list_file_dependencies_imported_by_applies_each_symbol_match_rule() {
+        use ReferenceKind::{Call, Import, ImportBinding, Include};
+        let db = Database::open_in_memory().unwrap();
+        let file = |path: &str| {
+            let language = match path.rsplit('.').next() {
+                Some("rs") => Language::Rust,
+                Some("c") => Language::C,
+                Some("go") => Language::Go,
+                Some("js") => Language::JavaScript,
+                Some("ts") => Language::TypeScript,
+                Some("py") => Language::Python,
+                _ => Language::Php,
+            };
+            db.upsert_file(&FileInfo {
+                language,
+                ..make_file(path)
+            })
+            .unwrap()
+        };
+        let symbol =
+            |name: &str, qualified: &str, kind| make_qualified_symbol(name, qualified, kind);
+        let target = file("lib/Target.php");
+        db.insert_symbols(
+            target,
+            &[
+                symbol("Widget", "Widget", SymbolKind::Class),
+                symbol("Svc", "App\\Svc", SymbolKind::Class),
+                symbol("helper", "helper", SymbolKind::Function),
+                symbol("UniqueThing", "lib::UniqueThing", SymbolKind::Constant),
+                symbol("SharedName", "lib::SharedName", SymbolKind::Constant),
+            ],
+        )
+        .unwrap();
+        let other = file("other/shared.rs");
+        let shared = symbol("SharedName", "other::SharedName", SymbolKind::Constant);
+        db.insert_symbols(other, &[shared]).unwrap();
+        let importers = [
+            // Qualified-name match.
+            ("in/qualified.rs", "App\\Svc", Import),
+            // PHP leading-backslash match on a global class, case-insensitive.
+            ("in/global.php", "\\WIDGET", Import),
+            ("in/global.php", "Widget", Import),
+            // The backslash rule is PHP-only, class-like-only, and global-only.
+            ("in/global.rs", "\\WIDGET", Import),
+            ("in/function.php", "\\helper", Import),
+            ("in/namespaced.php", "\\App\\Svc", Import),
+            // Short-name match, only while no other file defines the name.
+            ("in/short.c", "UniqueThing", Include),
+            ("in/shared.rs", "SharedName", Import),
+            // Languages and ref kinds the arm excludes, and the target itself.
+            ("in/go.go", "App\\Svc", Import),
+            ("in/app.js", "App\\Svc", Import),
+            ("in/app.ts", "App\\Svc", Import),
+            ("in/app.py", "App\\Svc", Import),
+            ("in/binding.py", "App\\Svc", ImportBinding),
+            ("in/call.rs", "App\\Svc", Call),
+            ("lib/Target.php", "App\\Svc", Import),
+        ];
+        for (line, (path, to_name, kind)) in importers.into_iter().enumerate() {
+            let id = if path == "lib/Target.php" {
+                target
+            } else {
+                file(path)
+            };
+            let reference = Reference {
+                from_file: path.to_string(),
+                line: line as u32 + 1,
+                ..make_reference(to_name, kind)
+            };
+            db.insert_references(id, &[reference]).unwrap();
+        }
+
+        let deps = db.list_file_dependencies("lib/Target.php").unwrap();
+
+        assert_eq!(
+            deps.imported_by,
+            vec!["in/global.php", "in/qualified.rs", "in/short.c"]
+        );
+    }
+
     #[test]
     fn list_file_dependencies_reports_unknown_path() {
         let db = Database::open_in_memory().unwrap();

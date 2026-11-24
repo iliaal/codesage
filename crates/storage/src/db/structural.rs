@@ -1752,6 +1752,12 @@ impl Database {
             }
         }
 
+        // The second arm finds refs that name one of the target file's symbols.
+        // Each of its three match rules is a separate lookup keyed by the
+        // target's symbols, so the planner drives from that file instead of
+        // from every import ref; the final UNION removes duplicate paths.
+        // `instr(r.to_name, '\\') > 0` follows from the PHP rule's equality
+        // and lets it use idx_refs_php_name_nocase.
         let mut imported_by_stmt = self.conn.prepare(
             "SELECT DISTINCT f.path
              FROM refs r JOIN files f ON r.from_file_id = f.id
@@ -1760,34 +1766,44 @@ impl Database {
                AND f.language NOT IN ('javascript', 'typescript', 'python')
                AND f.path <> ?1
              UNION
-             SELECT DISTINCT f_from.path
-             FROM refs r
-             JOIN files f_from ON r.from_file_id = f_from.id
-             JOIN symbols s ON (
-               s.qualified_name = r.to_name
-               OR (
-                 f_from.language = 'php'
-                 AND r.to_name = '\\' || s.qualified_name COLLATE NOCASE
+             SELECT f_from.path
+             FROM (
+               SELECT r.id AS ref_id
+               FROM files f_to
+               JOIN symbols s ON s.file_id = f_to.id
+               JOIN refs r ON r.to_name = s.qualified_name
+               WHERE f_to.path = ?1
+               UNION ALL
+               SELECT r.id
+               FROM files f_to
+               JOIN symbols s ON s.file_id = f_to.id
+               JOIN refs r ON r.to_name = '\\' || s.qualified_name COLLATE NOCASE
+               JOIN files f_from ON r.from_file_id = f_from.id
+               WHERE f_to.path = ?1
+                 AND f_from.language = 'php'
+                 AND instr(r.to_name, '\\') > 0
                  AND instr(s.qualified_name, '\\') = 0
                  AND s.kind IN ('class', 'interface', 'trait', 'enum')
-               )
-               OR (
-                 s.name = r.to_name
+               UNION ALL
+               SELECT r.id
+               FROM files f_to
+               JOIN symbols s ON s.file_id = f_to.id
+               JOIN refs r ON r.to_name = s.name
+               WHERE f_to.path = ?1
                  AND NOT EXISTS (
                    SELECT 1
                    FROM symbols s2
                    WHERE s2.name = r.to_name
                      AND s2.file_id <> s.file_id
                  )
-               )
-             )
-             JOIN files f_to ON s.file_id = f_to.id
-             WHERE f_to.path = ?1
-               AND (r.kind IN ('import', 'include')
+             ) m
+             JOIN refs r ON r.id = m.ref_id
+             JOIN files f_from ON r.from_file_id = f_from.id
+             WHERE (r.kind IN ('import', 'include')
                     OR (r.kind = 'import_binding' AND f_from.language = 'python'))
                AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
                AND f_from.language <> 'python'
-               AND f_from.path <> f_to.path
+               AND f_from.path <> ?1
              ORDER BY 1",
         )?;
         let mut imported_by: Vec<String> = imported_by_stmt
