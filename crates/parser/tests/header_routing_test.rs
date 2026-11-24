@@ -471,3 +471,35 @@ fn header_membership_caps_routing_candidates_and_directories() {
         "{error:#}"
     );
 }
+
+#[test]
+fn headers_routed_by_directory_or_reuse_are_not_probed_again() {
+    use codesage_parser::header::cpp_headers_with_context;
+
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "cpp/app.cpp", "void app() {}\n");
+    write(root.path(), "cpp/local.h", "struct Local { int value; };\n");
+    write(root.path(), "other/clean.h", "int clean(void);\n");
+    let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+    // A stale content hash fails any header the probe reads, so these
+    // calls succeed only if the decided headers are skipped.
+    write(
+        root.path(),
+        "cpp/local.h",
+        "struct Local { long value; };\n",
+    );
+    assert_eq!(
+        cpp_headers_with_context(root.path(), &files, &[]).unwrap(),
+        ["cpp/local.h".to_owned()].into_iter().collect()
+    );
+    write(root.path(), "other/clean.h", "int clean(int);\n");
+    assert_eq!(
+        cpp_headers_with_context(root.path(), &files, &files).unwrap(),
+        ["cpp/local.h".to_owned()].into_iter().collect()
+    );
+    let error = cpp_headers_with_context(root.path(), &files, &[]).unwrap_err();
+    assert!(
+        error.to_string().starts_with("other/clean.h changed"),
+        "{error:#}"
+    );
+}
