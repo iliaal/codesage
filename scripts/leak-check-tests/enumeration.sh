@@ -165,4 +165,19 @@ for mode in staged range all; do
 		fi
 	)
 done
-printf 'PASS: leak-check enumeration, rename, type-change, and blob fixtures\n'
+# Every matching file is reported before the scan fails, and --help shows
+# the exit-status and bypass lines of the header.
+(
+	new_repo multiple-matches
+	printf 'FORBIDDEN_TOKEN\n' >first.txt
+	printf 'FORBIDDEN_TOKEN\n' >second.txt
+	git add first.txt second.txt
+	git commit -qm leak
+	expect_scan 1 'first.txt contains a forbidden pattern' --all
+	if [[ "$scan_output" != *'second.txt contains a forbidden pattern'* ]]; then
+		printf 'FAIL: scan stopped before reporting every match\n%s\n' "$scan_output" >&2
+		exit 1
+	fi
+	expect_scan 0 'Bypass deliberately with: git commit --no-verify' --help
+)
+printf 'PASS: leak-check enumeration, rename, type-change, blob, and multi-match fixtures\n'
