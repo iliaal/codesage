@@ -113,6 +113,55 @@ fn file_import_references_sql() -> String {
     )
 }
 
+/// Files that import `?1`: direct path imports, then refs naming one of its
+/// symbols. Used by `list_file_dependencies`; a plan test pins its shape.
+const IMPORTED_BY_SQL: &str = "SELECT DISTINCT f.path
+             FROM refs r JOIN files f ON r.from_file_id = f.id
+             WHERE r.to_name = ?1
+               AND r.kind IN ('import', 'include')
+               AND f.language NOT IN ('javascript', 'typescript', 'python')
+               AND f.path <> ?1
+             UNION
+             SELECT f_from.path
+             FROM (
+               SELECT r.id AS ref_id
+               FROM files f_to
+               JOIN symbols s ON s.file_id = f_to.id
+               JOIN refs r ON r.to_name = s.qualified_name
+               WHERE f_to.path = ?1
+               UNION ALL
+               SELECT r.id
+               FROM files f_to
+               JOIN symbols s ON s.file_id = f_to.id
+               JOIN refs r ON r.to_name = '\\' || s.qualified_name COLLATE NOCASE
+               JOIN files f_from ON r.from_file_id = f_from.id
+               WHERE f_to.path = ?1
+                 AND f_from.language = 'php'
+                 AND instr(r.to_name, '\\') > 0
+                 AND instr(s.qualified_name, '\\') = 0
+                 AND s.kind IN ('class', 'interface', 'trait', 'enum')
+               UNION ALL
+               SELECT r.id
+               FROM files f_to
+               JOIN symbols s ON s.file_id = f_to.id
+               JOIN refs r ON r.to_name = s.name
+               WHERE f_to.path = ?1
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM symbols s2
+                   WHERE s2.name = r.to_name
+                     AND s2.file_id <> s.file_id
+                 )
+             ) m
+             JOIN refs r ON r.id = m.ref_id
+             JOIN files f_from ON r.from_file_id = f_from.id
+             WHERE (r.kind IN ('import', 'include')
+                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
+               AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
+               AND f_from.language <> 'python'
+               AND f_from.path <> ?1
+             ORDER BY 1";
+
 // `CROSS JOIN` pins the join order: driving from the `files.path` range keeps a
 // directory with no relative imports from scanning every relative import row.
 const PYTHON_RELATIVE_IMPORT_IN_DIRECTORY: &str =
@@ -1758,54 +1807,7 @@ impl Database {
         // from every import ref; the final UNION removes duplicate paths.
         // `instr(r.to_name, '\\') > 0` follows from the PHP rule's equality
         // and lets it use idx_refs_php_name_nocase.
-        let mut imported_by_stmt = self.conn.prepare(
-            "SELECT DISTINCT f.path
-             FROM refs r JOIN files f ON r.from_file_id = f.id
-             WHERE r.to_name = ?1
-               AND r.kind IN ('import', 'include')
-               AND f.language NOT IN ('javascript', 'typescript', 'python')
-               AND f.path <> ?1
-             UNION
-             SELECT f_from.path
-             FROM (
-               SELECT r.id AS ref_id
-               FROM files f_to
-               JOIN symbols s ON s.file_id = f_to.id
-               JOIN refs r ON r.to_name = s.qualified_name
-               WHERE f_to.path = ?1
-               UNION ALL
-               SELECT r.id
-               FROM files f_to
-               JOIN symbols s ON s.file_id = f_to.id
-               JOIN refs r ON r.to_name = '\\' || s.qualified_name COLLATE NOCASE
-               JOIN files f_from ON r.from_file_id = f_from.id
-               WHERE f_to.path = ?1
-                 AND f_from.language = 'php'
-                 AND instr(r.to_name, '\\') > 0
-                 AND instr(s.qualified_name, '\\') = 0
-                 AND s.kind IN ('class', 'interface', 'trait', 'enum')
-               UNION ALL
-               SELECT r.id
-               FROM files f_to
-               JOIN symbols s ON s.file_id = f_to.id
-               JOIN refs r ON r.to_name = s.name
-               WHERE f_to.path = ?1
-                 AND NOT EXISTS (
-                   SELECT 1
-                   FROM symbols s2
-                   WHERE s2.name = r.to_name
-                     AND s2.file_id <> s.file_id
-                 )
-             ) m
-             JOIN refs r ON r.id = m.ref_id
-             JOIN files f_from ON r.from_file_id = f_from.id
-             WHERE (r.kind IN ('import', 'include')
-                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
-               AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
-               AND f_from.language <> 'python'
-               AND f_from.path <> ?1
-             ORDER BY 1",
-        )?;
+        let mut imported_by_stmt = self.conn.prepare(IMPORTED_BY_SQL)?;
         let mut imported_by: Vec<String> = imported_by_stmt
             .query_map(params![file_path], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2414,6 +2416,47 @@ mod tests {
                 "{name}: {plan:?}"
             );
         }
+    }
+
+    #[test]
+    fn imported_by_query_drives_symbol_matches_from_the_target_file() {
+        let db = Database::open_in_memory().unwrap();
+        let mut stmt = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", super::IMPORTED_BY_SQL))
+            .unwrap();
+        let plan = stmt
+            .query_map(["src/a.php"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        // No table is scanned, and every refs lookup is keyed by name or rowid,
+        // never walked per importing file.
+        let tables = ["r", "f", "f_to", "f_from", "s", "s2"];
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN ")
+                && tables.contains(&step.split_whitespace().nth(1).unwrap_or(""))),
+            "{plan:?}"
+        );
+        for step in plan.iter().filter(|step| step.starts_with("SEARCH r ")) {
+            assert!(
+                step.ends_with("(to_name=?)") || step.ends_with("(rowid=?)"),
+                "{plan:?}"
+            );
+        }
+        // Each of the three symbol match rules starts from the target's path.
+        assert_eq!(
+            plan.iter()
+                .filter(|step| step.starts_with("SEARCH f_to ") && step.ends_with("(path=?)"))
+                .count(),
+            3,
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH r USING INDEX idx_refs_php_name_nocase")),
+            "{plan:?}"
+        );
     }
 
     #[test]
