@@ -158,9 +158,20 @@ pub fn cpp_headers_with_context(
     Ok(cpp)
 }
 
+/// Upper bound on header probe workers per call. Each concurrent daemon
+/// overlay refresh spawns its own probe workers, so the per-call count stays
+/// at the `.min(4)` that `verify_membership` uses for its walk.
+const MAX_HEADER_PROBE_WORKERS: usize = 4;
+
+/// Workers for one probe call: the available parallelism, capped at
+/// `MAX_HEADER_PROBE_WORKERS` and at the number of candidates.
+fn probe_worker_count(available: usize, candidates: usize) -> usize {
+    available.min(MAX_HEADER_PROBE_WORKERS).min(candidates)
+}
+
 /// The headers among `candidates` whose C parse routes them to C++, in
 /// `candidates` order. Each header is probed independently, so up to
-/// `available_parallelism` scoped workers share the list, largest file first
+/// `MAX_HEADER_PROBE_WORKERS` scoped workers share the list, largest file first
 /// so one large header does not start last; each worker enters the caller's
 /// work control. Every candidate is probed and results are read back in
 /// `candidates` order, so the first failing header in that order supplies the
@@ -178,9 +189,10 @@ fn probe_headers(root: &Path, candidates: &[&FileInfo]) -> Result<Vec<String>> {
         );
         Ok(!crate::parse::c_header_prefers_c(&source.bytes)?)
     };
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(candidates.len());
+    let workers = probe_worker_count(
+        std::thread::available_parallelism().map_or(1, usize::from),
+        candidates.len(),
+    );
     let results: Vec<Result<bool>> = if workers <= 1 {
         candidates.iter().map(|file| probe(file)).collect()
     } else {
@@ -404,7 +416,7 @@ fn normalize(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::probe_headers;
+    use super::{MAX_HEADER_PROBE_WORKERS, probe_headers, probe_worker_count};
     use codesage_protocol::work::{StopReason, WorkControl, WorkStopped};
     use codesage_protocol::{FileInfo, Language};
 
@@ -415,6 +427,20 @@ mod tests {
             language: Language::C,
             content_hash: content_hash.to_owned(),
             is_test: false,
+        }
+    }
+
+    #[test]
+    fn probe_worker_count_never_exceeds_the_cap() {
+        assert_eq!(MAX_HEADER_PROBE_WORKERS, 4);
+        for available in [1, 2, 4, 5, 8, 64, usize::MAX] {
+            for candidates in [0, 1, 2, 3, 4, 5, 240, usize::MAX] {
+                assert_eq!(
+                    probe_worker_count(available, candidates),
+                    available.min(candidates).min(4),
+                    "available={available} candidates={candidates}"
+                );
+            }
         }
     }
 
