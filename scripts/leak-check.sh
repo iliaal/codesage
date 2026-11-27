@@ -10,7 +10,9 @@
 #   - scripts/leak-patterns.txt (tracked, shared)
 #   - .git/info/leak-patterns.txt (local-only, per-developer)
 #
-# Exits non-zero on the first match (stops the commit / fails the CI job).
+# Reports every file that hits a pattern or the filename policy, then exits 1
+# (stops the commit / fails the CI job). Usage, pattern, enumeration, and read
+# errors exit 2 at once.
 # Bypass deliberately with: git commit --no-verify
 
 set -euo pipefail
@@ -34,7 +36,7 @@ while [ $# -gt 0 ]; do
 		mode="all"
 		;;
 	-h | --help)
-		sed -n '2,12p' "$0" >&2
+		sed -n '2,16p' "$0" >&2
 		exit 0
 		;;
 	*)

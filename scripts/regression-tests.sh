@@ -563,6 +563,7 @@ EOF
 
 test_leak_check_range_uses_range_endpoint
 test_leak_check_invalid_regex_fails_closed
+bash "$repo_root/scripts/leak-check-tests/enumeration.sh"
 test_release_script_updates_changelog_links
 test_check_changelog_terseness
 run_python_suite() {
