@@ -7,6 +7,8 @@ checker="$script_dir/../leak-check.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf -- "$tmp"' EXIT
 real_git="$(command -v git)"
+real_sed="$(command -v sed)"
+base_path="$PATH"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
 
@@ -180,4 +182,68 @@ done
 	fi
 	expect_scan 0 'Bypass deliberately with: git commit --no-verify' --help
 )
-printf 'PASS: leak-check enumeration, rename, type-change, blob, and multi-match fixtures\n'
+# Every error class the header lists exits 2: usage (including a bad --range
+# endpoint and running outside a repository), pattern, and read errors.
+# Enumeration errors are covered above.
+(
+	new_repo usage-errors
+	expect_scan 2 'unknown option: --bogus' --bogus
+	expect_scan 2 '--range needs an argument' --range
+	expect_scan 2 '--range must be A..B' --range HEAD
+	expect_scan 2 '--range endpoint is not a commit: missing-end' --range 'HEAD..missing-end'
+)
+(
+	mkdir "$tmp/not-a-repo"
+	cd "$tmp/not-a-repo"
+	export GIT_CEILING_DIRECTORIES="$tmp"
+	expect_scan 2 'not inside a git work tree' --all
+)
+(
+	new_repo invalid-pattern
+	printf '(\n' >scripts/leak-patterns.txt
+	expect_scan 2 'invalid forbidden pattern regex' --all
+)
+# Wrapped tools fail on demand, so these cases also hold when run as root.
+mkdir "$tmp/sed-bin" "$tmp/show-bin"
+cat >"$tmp/sed-bin/sed" <<'WRAPPER'
+#!/usr/bin/env bash
+case "${!#}" in
+*/leak-patterns.txt)
+	printf 'sed: fixture read failure\n' >&2
+	exit 4
+	;;
+esac
+exec "$REAL_SED" "$@"
+WRAPPER
+cat >"$tmp/show-bin/git" <<'WRAPPER'
+#!/usr/bin/env bash
+if [[ "${1-}" == show ]]; then
+	printf 'fixture read failure\n' >&2
+	exit 73
+fi
+exec "$REAL_GIT" "$@"
+WRAPPER
+chmod +x "$tmp/sed-bin/sed" "$tmp/show-bin/git"
+(
+	new_repo unreadable-pattern
+	printf 'FORBIDDEN_TOKEN\n' >leaking.txt
+	git add leaking.txt
+	git commit -qm leak
+	REAL_SED="$real_sed" PATH="$tmp/sed-bin:$base_path" \
+		expect_scan 2 'cannot read pattern file' --all
+)
+for mode in staged all; do
+	(
+		new_repo "read-error-$mode"
+		printf 'clean\n' >other.txt
+		git add other.txt
+		args=()
+		if [[ "$mode" == all ]]; then
+			git commit -qm other
+			args=(--all)
+		fi
+		REAL_GIT="$real_git" PATH="$tmp/show-bin:$base_path" \
+			expect_scan 2 'failed to read content for' "${args[@]}"
+	)
+done
+printf 'PASS: leak-check enumeration, rename, type-change, blob, multi-match, and exit-code fixtures\n'

@@ -50,11 +50,11 @@ if [[ $CUDA -eq 1 ]]; then
 	cargo clippy --workspace --all-targets --features codesage/cuda -- -D warnings
 fi
 
-step "shellcheck scripts/*.sh"
-shellcheck scripts/*.sh
+step "shellcheck scripts/*.sh scripts/leak-check-tests/*.sh"
+shellcheck scripts/*.sh scripts/leak-check-tests/*.sh
 
-step "shfmt -d scripts/*.sh"
-shfmt -d scripts/*.sh
+step "shfmt -d scripts/*.sh scripts/leak-check-tests/*.sh"
+shfmt -d scripts/*.sh scripts/leak-check-tests/*.sh
 
 if [[ $FAST -eq 0 ]]; then
 	step "cargo test --workspace"
