@@ -2216,6 +2216,47 @@ impl Database {
         Ok(out)
     }
 
+    /// [`Self::reference_counts_for_names`] for a name set too large to bind:
+    /// one pass over every `refs` row instead of indexed lookups per batch.
+    /// A row counts for its `to_name` and for its `to_name_tail` when either
+    /// is in `names`, and each name counts distinct `(from_file_id, line)`
+    /// sites, so a tail equal to its `to_name` adds nothing. Only text values
+    /// match, as in SQL. Every name in `names` is present in the result, at
+    /// zero when nothing references it.
+    pub fn reference_counts_for_name_set(
+        &self,
+        names: &HashSet<String>,
+    ) -> Result<HashMap<String, u32>> {
+        use rusqlite::types::ValueRef;
+        let lookup = |value: ValueRef<'_>| match value {
+            ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|name| names.get(name)),
+            _ => None,
+        };
+        let mut sites: HashSet<(&str, i64, i64)> = HashSet::new();
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT to_name, to_name_tail, from_file_id, line FROM refs")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let file: i64 = row.get(2)?;
+            let line: i64 = row.get(3)?;
+            for column in 0..2 {
+                if let Some(name) = lookup(row.get_ref(column)?) {
+                    sites.insert((name.as_str(), file, line));
+                }
+            }
+        }
+        let mut out: HashMap<String, u32> = names.iter().map(|name| (name.clone(), 0)).collect();
+        for (name, _, _) in sites {
+            if let Some(count) = out.get_mut(name) {
+                *count += 1;
+            }
+        }
+        Ok(out)
+    }
+
     /// Indexed (id, path, language) rows in stable path order.
     pub fn all_files_with_id_and_language(&self) -> Result<Vec<(i64, String, Language)>> {
         let mut stmt = self
