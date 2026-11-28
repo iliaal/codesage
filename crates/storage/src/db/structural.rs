@@ -706,7 +706,7 @@ impl Database {
             .map(serde_json::from_str::<PythonBindingTarget>)
             .transpose()?;
         if let (Some(key), Some(mut memo)) = (key, self.python_memo()) {
-            memo.set_binding(key, &target, json.as_ref().map_or(0, String::capacity));
+            memo.set_binding(key, &target);
         }
         Ok(target)
     }

@@ -13,6 +13,24 @@ pub struct PythonImportSite {
     pub col: u32,
 }
 
+/// Stores each import site as a `[file, to_name, line, col]` array rather than
+/// a `{"file", "to_name", "line", "col"}` object. Every binding in a module
+/// copies the module's visible imports, so these sites dominate
+/// `python_bindings.target`. The derived `Deserialize` already accepts a struct
+/// as a sequence of its fields in declaration order, so this binary and older
+/// ones read both forms; order and duplicates round-trip unchanged.
+fn import_sites_as_arrays<S: serde::Serializer>(
+    sites: &[PythonImportSite],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = serializer.serialize_seq(Some(sites.len()))?;
+    for site in sites {
+        seq.serialize_element(&(&site.file, &site.to_name, site.line, site.col))?;
+    }
+    seq.end()
+}
+
 pub fn is_python_path(path: &str) -> bool {
     path.ends_with(".py") || path.ends_with(".pyi")
 }
@@ -20,7 +38,7 @@ pub fn is_python_path(path: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PythonBindingCapture {
     pub attributes: usize,
-    #[serde(default)]
+    #[serde(default, serialize_with = "import_sites_as_arrays")]
     pub import_sites: Vec<PythonImportSite>,
 }
 
@@ -39,7 +57,7 @@ pub struct PythonBindingTarget {
     pub export_names: Option<Vec<String>>,
     #[serde(default)]
     pub bound: bool,
-    #[serde(default)]
+    #[serde(default, serialize_with = "import_sites_as_arrays")]
     pub import_sites: Vec<PythonImportSite>,
     #[serde(default)]
     pub module_binding: bool,
@@ -405,5 +423,155 @@ mod tests {
             directory_module_names("src/app/api"),
             ["src.app.api", "app.api"]
         );
+    }
+
+    fn site(file: &str, to_name: &str, line: u32, col: u32) -> PythonImportSite {
+        PythonImportSite {
+            file: file.into(),
+            to_name: to_name.into(),
+            line,
+            col,
+        }
+    }
+
+    #[test]
+    fn import_sites_store_as_arrays_and_round_trip_order_and_duplicates() {
+        let sites = vec![
+            site("a.py", "os", 1, 0),
+            site("b.py", "re", 3, 4),
+            site("a.py", "sys", 2, 7),
+            site("a.py", "sys", 2, 7),
+        ];
+        let target = PythonBindingTarget {
+            name: "x".into(),
+            import_sites: sites.clone(),
+            captures: vec![PythonBindingCapture {
+                attributes: 1,
+                import_sites: sites[1..].to_vec(),
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&target).unwrap();
+        assert!(
+            json.contains(r#""import_sites":[["a.py","os",1,0],["b.py","re",3,4],["a.py","sys",2,7],["a.py","sys",2,7]]"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#"{"attributes":1,"import_sites":[["b.py","re",3,4],["a.py","sys",2,7],["a.py","sys",2,7]]}"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<PythonBindingTarget>(&json).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn import_sites_decode_legacy_objects_and_missing_fields() {
+        let legacy = r#"{"module":null,"name":"x","definition_line":null,"import_sites":[{"file":"a.py","to_name":"os","line":1,"col":0},["b.py","re",3,4]],"captures":[{"attributes":2,"import_sites":[{"file":"c.py","to_name":"json","line":5,"col":1}]},{"attributes":3}]}"#;
+        let target: PythonBindingTarget = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            target.import_sites,
+            [site("a.py", "os", 1, 0), site("b.py", "re", 3, 4)]
+        );
+        assert_eq!(
+            target.captures[0].import_sites,
+            [site("c.py", "json", 5, 1)]
+        );
+        assert!(target.captures[1].import_sites.is_empty());
+        let missing: PythonBindingTarget =
+            serde_json::from_str(r#"{"module":null,"name":"x","definition_line":null}"#).unwrap();
+        assert!(missing.import_sites.is_empty());
+    }
+
+    /// Differential against the previous object form: rewrites every stored
+    /// `import_sites` array back to `{"file","to_name","line","col"}` objects,
+    /// and requires both encodings to decode to the same target.
+    #[test]
+    fn array_and_legacy_object_encodings_decode_identically() {
+        fn to_legacy(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map.iter_mut() {
+                        if key == "import_sites" {
+                            let rows = child.as_array_mut().expect("import_sites is an array");
+                            for row in rows.iter_mut() {
+                                let a = row.as_array().expect("site is an array").clone();
+                                assert_eq!(a.len(), 4, "{a:?}");
+                                *row = serde_json::json!({
+                                    "file": a[0], "to_name": a[1], "line": a[2], "col": a[3]
+                                });
+                            }
+                        } else {
+                            to_legacy(child);
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(to_legacy),
+                _ => {}
+            }
+        }
+        let names = [
+            "",
+            "os",
+            "a\"b\\c",
+            "p/\u{e9}\u{4e2d}.py",
+            "x\ny",
+            "\u{1f600}",
+        ];
+        let sites_for = |seed: usize| -> Vec<PythonImportSite> {
+            (0..seed % 5)
+                .map(|n| {
+                    site(
+                        names[(seed + n) % names.len()],
+                        names[(seed * 3 + n) % names.len()],
+                        (seed * 7 + n) as u32,
+                        u32::MAX - (n as u32),
+                    )
+                })
+                .chain((seed.is_multiple_of(3)).then(|| site("dup.py", "dup", 1, 1)))
+                .chain((seed.is_multiple_of(3)).then(|| site("dup.py", "dup", 1, 1)))
+                .collect()
+        };
+        let mut checked = 0;
+        for seed in 0..60usize {
+            let leaf = |n: usize| PythonBindingTarget {
+                name: names[n % names.len()].into(),
+                import_sites: sites_for(seed + n),
+                ..Default::default()
+            };
+            let target = PythonBindingTarget {
+                module: (seed.is_multiple_of(2)).then(|| "m".to_string()),
+                name: names[seed % names.len()].into(),
+                bound: seed.is_multiple_of(4),
+                import_sites: sites_for(seed),
+                captures: (0..seed % 3)
+                    .map(|n| PythonBindingCapture {
+                        attributes: n,
+                        import_sites: sites_for(seed + n + 1),
+                    })
+                    .collect(),
+                fallback: (seed.is_multiple_of(5)).then(|| Box::new(leaf(seed))),
+                namespace: (seed.is_multiple_of(6))
+                    .then(|| vec![("n".to_string(), leaf(1)), ("o".to_string(), leaf(2))]),
+                ..Default::default()
+            };
+            let mut value = serde_json::to_value(&target).unwrap();
+            let stored = serde_json::to_string(&value).unwrap();
+            to_legacy(&mut value);
+            let legacy = serde_json::to_string(&value).unwrap();
+            assert_eq!(
+                serde_json::from_str::<PythonBindingTarget>(&stored).unwrap(),
+                target,
+                "{stored}"
+            );
+            assert_eq!(
+                serde_json::from_str::<PythonBindingTarget>(&legacy).unwrap(),
+                target,
+                "{legacy}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 60);
     }
 }

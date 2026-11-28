@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use codesage_protocol::Symbol;
-use codesage_protocol::python::{PythonBindingTarget, PythonModule};
+use codesage_protocol::python::{
+    PythonBindingCapture, PythonBindingTarget, PythonImportSite, PythonModule,
+};
 
 use super::Database;
 
@@ -108,14 +110,8 @@ impl PythonMemo {
         self.bindings.get(key).cloned()
     }
 
-    /// `json_len` is the stored target's length, a proxy for its decoded size.
-    pub(super) fn set_binding(
-        &mut self,
-        key: BindingKey,
-        target: &Option<PythonBindingTarget>,
-        json_len: usize,
-    ) {
-        let bytes = key_bytes(&key).saturating_add(json_len);
+    pub(super) fn set_binding(&mut self, key: BindingKey, target: &Option<PythonBindingTarget>) {
+        let bytes = key_bytes(&key).saturating_add(target.as_ref().map_or(0, decoded_bytes));
         if admit(&mut self.binding_bytes, Self::MAX_BINDING_BYTES, bytes) {
             self.bindings.insert(key, target.clone());
         }
@@ -164,6 +160,42 @@ fn admit(used: &mut usize, max: usize, bytes: usize) -> bool {
         *used += bytes;
     }
     fits
+}
+
+/// Estimated heap and inline bytes of a decoded target, counted from its
+/// fields rather than from the stored JSON, whose length depends on the
+/// encoding (an import site stored as an array is shorter than as an object).
+fn decoded_bytes(target: &PythonBindingTarget) -> usize {
+    use std::mem::size_of;
+    let strings = |names: &[String]| {
+        names
+            .iter()
+            .map(|name| size_of::<String>() + name.len())
+            .sum::<usize>()
+    };
+    let sites = |sites: &[PythonImportSite]| {
+        sites
+            .iter()
+            .map(|site| size_of::<PythonImportSite>() + site.file.len() + site.to_name.len())
+            .sum::<usize>()
+    };
+    size_of::<PythonBindingTarget>()
+        + target.module.as_ref().map_or(0, String::len)
+        + target.name.len()
+        + target.fallback.as_deref().map_or(0, decoded_bytes)
+        + target.export_names.as_deref().map_or(0, strings)
+        + sites(&target.import_sites)
+        + target
+            .captures
+            .iter()
+            .map(|capture| size_of::<PythonBindingCapture>() + sites(&capture.import_sites))
+            .sum::<usize>()
+        + target.namespace.as_deref().map_or(0, |members| {
+            members
+                .iter()
+                .map(|(name, member)| size_of::<String>() + name.len() + decoded_bytes(member))
+                .sum()
+        })
 }
 
 fn key_bytes(key: &BindingKey) -> usize {
@@ -303,5 +335,177 @@ mod tests {
         assert_eq!(module(&reader).as_deref(), Some("third"));
         drop(outer);
         assert_eq!(module(&reader).as_deref(), Some("fourth"));
+    }
+
+    #[test]
+    fn binding_budget_counts_every_decoded_field() {
+        use codesage_protocol::python::{PythonBindingCapture, PythonImportSite};
+
+        use super::{PythonMemo, decoded_bytes};
+        use std::mem::size_of;
+
+        const LONG: usize = 4096;
+        let long = || "x".repeat(LONG);
+        let site = |file: String, to_name: String| PythonImportSite {
+            file,
+            to_name,
+            line: 1,
+            col: 0,
+        };
+        let empty = PythonBindingTarget::default();
+        let grown: [(&str, PythonBindingTarget); 9] = [
+            (
+                "module",
+                PythonBindingTarget {
+                    module: Some(long()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "name",
+                PythonBindingTarget {
+                    name: long(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "fallback",
+                PythonBindingTarget {
+                    fallback: Some(Box::new(PythonBindingTarget {
+                        name: long(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            ),
+            (
+                "export_names",
+                PythonBindingTarget {
+                    export_names: Some(vec![long()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "import_sites.file",
+                PythonBindingTarget {
+                    import_sites: vec![site(long(), String::new())],
+                    ..Default::default()
+                },
+            ),
+            (
+                "import_sites.to_name",
+                PythonBindingTarget {
+                    import_sites: vec![site(String::new(), long())],
+                    ..Default::default()
+                },
+            ),
+            (
+                "captures",
+                PythonBindingTarget {
+                    captures: vec![PythonBindingCapture {
+                        attributes: 0,
+                        import_sites: vec![site(long(), String::new())],
+                    }],
+                    ..Default::default()
+                },
+            ),
+            (
+                "namespace.name",
+                PythonBindingTarget {
+                    namespace: Some(vec![(long(), PythonBindingTarget::default())]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "namespace.member",
+                PythonBindingTarget {
+                    namespace: Some(vec![(
+                        String::new(),
+                        PythonBindingTarget {
+                            name: long(),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (field, target) in &grown {
+            assert!(
+                decoded_bytes(target) >= decoded_bytes(&empty) + LONG,
+                "{field} is not counted"
+            );
+        }
+        // Each element also costs its inline size, so many empty elements count.
+        const MANY: usize = 1000;
+        let empty_site = || site(String::new(), String::new());
+        let inline: [(&str, PythonBindingTarget, usize); 4] = [
+            (
+                "export_names",
+                PythonBindingTarget {
+                    export_names: Some(vec![String::new(); MANY]),
+                    ..Default::default()
+                },
+                size_of::<String>(),
+            ),
+            (
+                "import_sites",
+                PythonBindingTarget {
+                    import_sites: (0..MANY).map(|_| empty_site()).collect(),
+                    ..Default::default()
+                },
+                size_of::<PythonImportSite>(),
+            ),
+            (
+                "captures",
+                PythonBindingTarget {
+                    captures: vec![
+                        PythonBindingCapture {
+                            attributes: 0,
+                            import_sites: Vec::new(),
+                        };
+                        MANY
+                    ],
+                    ..Default::default()
+                },
+                size_of::<PythonBindingCapture>(),
+            ),
+            (
+                "namespace",
+                PythonBindingTarget {
+                    namespace: Some(vec![(String::new(), PythonBindingTarget::default()); MANY]),
+                    ..Default::default()
+                },
+                size_of::<String>() + size_of::<PythonBindingTarget>(),
+            ),
+        ];
+        for (field, target, each) in &inline {
+            assert!(
+                decoded_bytes(target) >= decoded_bytes(&empty) + MANY * each,
+                "{field} elements are not counted"
+            );
+        }
+        assert!(decoded_bytes(&empty) >= size_of::<PythonBindingTarget>());
+
+        // Admission charges the decoded estimate, so a target larger than the
+        // whole budget is not retained while a small one is.
+        let mut memo = PythonMemo::default();
+        let key = |name: &str| {
+            (
+                "pkg.py".to_string(),
+                "export".to_string(),
+                name.to_string(),
+                0,
+                0,
+            )
+        };
+        let huge = PythonBindingTarget {
+            name: "x".repeat(PythonMemo::MAX_BINDING_BYTES),
+            ..Default::default()
+        };
+        memo.set_binding(key("huge"), &Some(huge));
+        assert!(memo.binding(&key("huge")).is_none());
+        memo.set_binding(key("small"), &Some(empty.clone()));
+        assert_eq!(memo.binding(&key("small")), Some(Some(empty)));
     }
 }

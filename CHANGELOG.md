@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- `codesage index` of Python projects stores each `python_bindings` import site as a `[file, to_name, line, col]` array instead of an object: a full structural index of Django (2,980 files) went from 24.8 s to 19.2 s median (-22.6% time) and the index from 1.53 GB to 1.15 GB. Query output is unchanged; existing indexes and older versions read both forms.
+
 ### Fixed
 
 - `CODESAGE_ALLOW_CPU_FALLBACK=1` always reloads the verified portable `onnx/model.onnx` graph on CPU (including when a derived fp16 graph commits on CPU) and fingerprints the graph the session runs rather than the configured CUDA graph.
