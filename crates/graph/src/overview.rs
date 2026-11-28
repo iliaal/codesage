@@ -15,6 +15,7 @@ use crate::drift::{self, DriftKind};
 
 const ENTRYPOINT_CAP: usize = 15;
 const TOP_RISK_CAP: usize = 10;
+const HOT_SYMBOL_CAP: usize = 10;
 
 pub fn build_project_overview(root: &Path, db: &Database) -> Result<ProjectOverview> {
     build_project_overview_with_options(root, db, false)
@@ -95,36 +96,12 @@ pub fn build_project_overview_with_top_risk(
             (path, test)
         })
         .collect();
-    let names: Vec<_> = symbols
-        .values()
-        .flatten()
-        .map(|s| s.name.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    let mut counts = HashMap::new();
-    for batch in names.chunks(500) {
-        codesage_protocol::work::checkpoint()?;
-        counts.extend(db.reference_counts_for_names(batch)?);
-    }
+    let names: HashSet<String> = symbols.values().flatten().map(|s| s.name.clone()).collect();
+    codesage_protocol::work::checkpoint()?;
+    let counts = db.reference_counts_for_name_set(&names)?;
     let module_map = module_map(root, &files, &symbols, &flags)?;
-    let mut hot: Vec<_> = symbols
-        .iter()
-        .filter(|(path, _)| !flags.get(*path).copied().unwrap_or(false))
-        .flat_map(|(_, rows)| rows.iter())
-        .filter(|s| !s.is_test)
-        .collect();
-    hot.sort_by(|a, b| {
-        counts
-            .get(&b.name)
-            .cmp(&counts.get(&a.name))
-            .then_with(|| a.file_path.cmp(&b.file_path))
-            .then_with(|| a.line_start.cmp(&b.line_start))
-            .then_with(|| a.qualified_name.cmp(&b.qualified_name))
-    });
-    let hot_symbols = hot
+    let hot_symbols = top_hot_symbols(&symbols, &flags, &counts)
         .into_iter()
-        .take(10)
         .map(|s| OverviewHotSymbol {
             handle: s.handle().to_string(),
             fan_in: counts.get(&s.name).copied().unwrap_or(0),
@@ -173,6 +150,39 @@ pub fn build_project_overview_with_top_risk(
         entrypoints,
         hook_health,
     })
+}
+
+/// The [`HOT_SYMBOL_CAP`] non-test symbols outside test files with the
+/// highest reference count, ordered by count (descending), then file path,
+/// line and qualified name. Symbols tied on all four keys share a file and
+/// keep their row order there, as a stable sort would. Each count is looked
+/// up once, and only the selected symbols are sorted.
+fn top_hot_symbols<'a>(
+    symbols: &'a HashMap<String, Vec<Symbol>>,
+    flags: &HashMap<String, bool>,
+    counts: &HashMap<String, u32>,
+) -> Vec<&'a Symbol> {
+    let mut hot: Vec<(Option<u32>, usize, &Symbol)> = symbols
+        .iter()
+        .filter(|(path, _)| !flags.get(*path).copied().unwrap_or(false))
+        .flat_map(|(_, rows)| rows.iter())
+        .filter(|s| !s.is_test)
+        .enumerate()
+        .map(|(order, s)| (counts.get(&s.name).copied(), order, s))
+        .collect();
+    let rank = |a: &(Option<u32>, usize, &Symbol), b: &(Option<u32>, usize, &Symbol)| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.2.file_path.cmp(&b.2.file_path))
+            .then_with(|| a.2.line_start.cmp(&b.2.line_start))
+            .then_with(|| a.2.qualified_name.cmp(&b.2.qualified_name))
+            .then_with(|| a.1.cmp(&b.1))
+    };
+    if hot.len() > HOT_SYMBOL_CAP {
+        hot.select_nth_unstable_by(HOT_SYMBOL_CAP - 1, rank);
+        hot.truncate(HOT_SYMBOL_CAP);
+    }
+    hot.sort_unstable_by(rank);
+    hot.into_iter().map(|(_, _, s)| s).collect()
 }
 
 fn ranked_entrypoints(
@@ -1122,5 +1132,80 @@ mod tests {
             calls.iter().map(|c| c.command.as_str()).collect::<Vec<_>>()
         );
         assert!(calls.is_empty(), "fresh history and index need no recovery");
+    }
+
+    /// The stable full sort `top_hot_symbols` replaced, kept as the oracle.
+    fn hot_by_full_sort<'a>(
+        symbols: &'a HashMap<String, Vec<Symbol>>,
+        flags: &HashMap<String, bool>,
+        counts: &HashMap<String, u32>,
+    ) -> Vec<&'a Symbol> {
+        let mut hot: Vec<_> = symbols
+            .iter()
+            .filter(|(path, _)| !flags.get(*path).copied().unwrap_or(false))
+            .flat_map(|(_, rows)| rows.iter())
+            .filter(|s| !s.is_test)
+            .collect();
+        hot.sort_by(|a, b| {
+            counts
+                .get(&b.name)
+                .cmp(&counts.get(&a.name))
+                .then_with(|| a.file_path.cmp(&b.file_path))
+                .then_with(|| a.line_start.cmp(&b.line_start))
+                .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+        });
+        hot.into_iter().take(HOT_SYMBOL_CAP).collect()
+    }
+
+    #[test]
+    fn top_hot_symbols_match_a_stable_full_sort() {
+        let mut state: u64 = 0x0b5e_55ed;
+        let mut next = |n: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % n
+        };
+        let pool = ["a", "b", "c", "d", ""];
+        for round in 0..400 {
+            let mut symbols: HashMap<String, Vec<Symbol>> = HashMap::new();
+            let mut flags = HashMap::new();
+            for file in 0..1 + next(4) {
+                let path = format!("src/f{file}.rs");
+                flags.insert(path.clone(), next(5) == 0);
+                // Few names, lines and qualified names, so whole-key ties occur.
+                let rows = (0..next(12))
+                    .map(|_| Symbol {
+                        name: pool[next(pool.len())].to_string(),
+                        qualified_name: pool[next(pool.len())].to_string(),
+                        kind: codesage_protocol::SymbolKind::Function,
+                        file_path: path.clone(),
+                        line_start: 1 + next(3) as u32,
+                        line_end: 9,
+                        col_start: 0,
+                        col_end: 0,
+                        rationale: vec![],
+                        visibility: None,
+                        is_test: next(6) == 0,
+                        signature: None,
+                        overloaded: next(2) == 0,
+                    })
+                    .collect();
+                symbols.insert(path, rows);
+            }
+            let mut counts: HashMap<String, u32> = HashMap::new();
+            for name in pool {
+                // A quarter of the names have no count at all (`None` sorts last).
+                if next(4) != 0 {
+                    counts.insert(name.to_string(), next(3) as u32);
+                }
+            }
+            let got = top_hot_symbols(&symbols, &flags, &counts);
+            let want = hot_by_full_sort(&symbols, &flags, &counts);
+            assert_eq!(got.len(), want.len(), "round {round}");
+            for (g, w) in got.iter().zip(&want) {
+                assert!(std::ptr::eq(*g, *w), "round {round}: {g:?} != {w:?}");
+            }
+        }
     }
 }
