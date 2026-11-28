@@ -47,8 +47,14 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-repo_root="$(git rev-parse --show-toplevel)"
-git_dir="$(git rev-parse --git-dir)"
+repo_root="$(git rev-parse --show-toplevel)" || {
+	echo "leak-check: not inside a git work tree" >&2
+	exit 2
+}
+git_dir="$(git rev-parse --git-dir)" || {
+	echo "leak-check: cannot locate the git directory" >&2
+	exit 2
+}
 case "$git_dir" in
 /*) ;;
 *) git_dir="$repo_root/$git_dir" ;;
@@ -62,20 +68,24 @@ local_patterns="$git_dir/info/leak-patterns.txt"
 FILENAME_BLOCK_RE='(^|/)\.env$|(^|/)\.env\..+|(^|/)\.secret$|(^|/)\.secrets$|(^|/)\.secrets/|\.pem$|\.p12$|\.pfx$|(^|/)id_(rsa|dsa|ecdsa|ed25519)$|(^|/)id_(rsa|dsa|ecdsa|ed25519)\.|(^|/)credentials\.json$|(^|/)service-account.*\.json$'
 FILENAME_ALLOW_RE='(^|/)\.env\.(example|template|sample)$|(^|/)id_(rsa|dsa|ecdsa|ed25519)\.pub$'
 
+# An unreadable pattern file must fail closed, not scan with fewer patterns.
 collect_patterns() {
-	local file="$1"
+	local file="$1" contents
 	[ -f "$file" ] || return 0
-	sed -E 's/[[:space:]]*#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' "$file" |
-		grep -v '^$' || true
+	if ! contents="$(sed -E 's/[[:space:]]*#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' "$file")"; then
+		echo "leak-check: cannot read pattern file $file" >&2
+		return 2
+	fi
+	printf '%s\n' "$contents" | grep -v '^$' || true
 }
 
 patterns="$(
 	{
-		collect_patterns "$shared_patterns"
-		collect_patterns "$local_patterns"
+		collect_patterns "$shared_patterns" &&
+			collect_patterns "$local_patterns"
 	} |
 		paste -sd '|' -
-)"
+)" || exit 2
 
 if [ -z "$patterns" ]; then
 	exit 0
@@ -101,7 +111,10 @@ range)
 		echo "leak-check: --range must be A..B or A...B (got: $range)" >&2
 		exit 2
 	fi
-	content_ref="$(git rev-parse --verify "${range_tip}^{commit}")"
+	content_ref="$(git rev-parse --quiet --verify "${range_tip}^{commit}")" || {
+		echo "leak-check: --range endpoint is not a commit: $range_tip" >&2
+		exit 2
+	}
 	;;
 all)
 	content_ref="HEAD"
