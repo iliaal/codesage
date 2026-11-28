@@ -2,7 +2,7 @@
 
 ### Changed
 
-- `codesage index` of Python projects writes each import site in `python_bindings` rows as a `[file, to_name, line, col]` array instead of an object, so a full structural index of Django (2,980 files, `--no-semantic`) went from 24.8 s to 19.2 s median (-22.6% time, 9 interleaved runs) and the index from 1.53 GB to 1.15 GB. Query output is unchanged, and older versions and existing indexes read both forms.
+- `codesage index` of Python projects stores each `python_bindings` import site as a `[file, to_name, line, col]` array instead of an object: a full structural index of Django (2,980 files) went from 24.8 s to 19.2 s median (-22.6% time) and the index from 1.53 GB to 1.15 GB. Query output is unchanged; existing indexes and older versions read both forms.
 
 ### Fixed
 
