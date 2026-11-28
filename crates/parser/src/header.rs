@@ -158,10 +158,13 @@ pub fn cpp_headers_with_context(
     Ok(cpp)
 }
 
+/// Upper bound on the walker threads `verify_membership` starts per call.
+const MAX_MEMBERSHIP_WALK_THREADS: usize = 4;
+
 /// Upper bound on header probe workers per call. Each concurrent daemon
 /// overlay refresh spawns its own probe workers, so the per-call count stays
-/// at the `.min(4)` that `verify_membership` uses for its walk.
-const MAX_HEADER_PROBE_WORKERS: usize = 4;
+/// at the `MAX_MEMBERSHIP_WALK_THREADS` cap `verify_membership` uses.
+const MAX_HEADER_PROBE_WORKERS: usize = MAX_MEMBERSHIP_WALK_THREADS;
 
 /// Workers for one probe call: the available parallelism, capped at
 /// `MAX_HEADER_PROBE_WORKERS` and at the number of candidates.
@@ -293,7 +296,7 @@ pub fn verify_membership(root: &Path, files: &[FileInfo], excludes: &[String]) -
     walk.threads(
         std::thread::available_parallelism()
             .map_or(1, usize::from)
-            .min(4),
+            .min(MAX_MEMBERSHIP_WALK_THREADS),
     )
     .hidden(true)
     .git_ignore(true)
@@ -437,7 +440,7 @@ mod tests {
             for candidates in [0, 1, 2, 3, 4, 5, 240, usize::MAX] {
                 assert_eq!(
                     probe_worker_count(available, candidates),
-                    available.min(candidates).min(4),
+                    available.min(candidates).min(MAX_HEADER_PROBE_WORKERS),
                     "available={available} candidates={candidates}"
                 );
             }
