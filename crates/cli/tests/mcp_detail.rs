@@ -118,6 +118,26 @@ fn command(root: &Path, binary: &str, args: &[&str]) {
     );
 }
 
+fn assert_reference_budget(result: &Value, tokens: usize, exceeded: bool) {
+    assert_eq!(result["cost"]["budget_tokens"], tokens);
+    assert_eq!(result.to_string().len() > tokens * 4, exceeded);
+    if exceeded {
+        assert_eq!(result["cost"]["budget_exceeded"], true);
+    } else {
+        assert!(result["cost"].get("budget_exceeded").is_none());
+    }
+}
+
+fn reference_budget_recovery(result: &Value, legacy: bool) -> &Value {
+    if legacy {
+        assert_eq!(result["_meta"]["truncated"], true);
+        &result["_meta"]
+    } else {
+        assert_eq!(result["completeness"]["kind"], "truncated");
+        &result["completeness"]["recover"]
+    }
+}
+
 fn fixture(root: &Path) {
     std::fs::create_dir_all(root.join("src")).unwrap();
     let source = format!(
@@ -229,6 +249,353 @@ fn compact_hundred_reference_response_is_under_four_kib_and_recovers_all_rows() 
         recovery["arguments"].clone(),
     );
     assert_eq!(recovered["results"], standard["results"]);
+}
+
+#[test]
+fn capped_mcp_references_keep_production_callers_first() {
+    let root = tempfile::tempdir().unwrap();
+    let anchor_calls = "    anchor();\n".repeat(120);
+    let test_calls = "    test_only_anchor();\n".repeat(120);
+    let mixed_calls = "    mixed_anchor();\n".repeat(20);
+    std::fs::write(
+        root.path().join("lib.rs"),
+        format!(
+            "pub fn anchor() {{}}\npub fn test_only_anchor() {{}}\n\
+             pub fn mixed_anchor() {{}}\npub fn small_anchor() {{}}\n\
+             #[test]\nfn first_test() {{\n{anchor_calls}{test_calls}{mixed_calls}small_anchor();\n}}\n\
+             pub fn first_product() {{ mixed_anchor(); small_anchor(); }}\n\
+             #[test]\nfn second_test() {{\n{anchor_calls}{test_calls}{mixed_calls}small_anchor();\n}}\n\
+             pub fn second_product() {{ anchor(); mixed_anchor(); small_anchor(); }}\n"
+        ),
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_codesage");
+    command(root.path(), binary, &["init"]);
+    command(root.path(), binary, &["index", "--no-semantic"]);
+
+    let cli_rows = |name: &str| {
+        let output = Command::new(binary)
+            .current_dir(root.path())
+            .args(["find-references", name, "--kind", "call", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        result["results"].as_array().unwrap().clone()
+    };
+    let anchor = cli_rows("anchor");
+    assert_eq!(anchor.len(), 241);
+    assert!(anchor[..240].iter().all(|row| row["is_test"] == true));
+    assert_eq!(anchor[240]["from_symbol"], "second_product");
+
+    let mixed = cli_rows("mixed_anchor");
+    assert_eq!(mixed.len(), 42);
+    assert_eq!(mixed[0]["from_symbol"], "first_test");
+    assert_eq!(mixed[20]["from_symbol"], "first_product");
+    assert_eq!(mixed[21]["from_symbol"], "second_test");
+    assert_eq!(mixed[41]["from_symbol"], "second_product");
+
+    let tests = cli_rows("test_only_anchor");
+    assert_eq!(tests.len(), 240);
+    assert!(tests.iter().all(|row| row["is_test"] == true));
+    let small = cli_rows("small_anchor");
+    assert_eq!(small.len(), 4);
+    assert_eq!(small[0]["from_symbol"], "first_test");
+
+    for legacy in [false, true] {
+        let mut server = Server::start_mode(legacy);
+        for (args, original, production, budget) in [
+            (json!({"name":"anchor","kind":"call"}), &anchor, 1, 462),
+            (
+                json!({"name":"anchor","kind":"call","detail":"standard","budget_tokens":8000}),
+                &anchor,
+                1,
+                8000,
+            ),
+            (
+                json!({"name":"mixed_anchor","kind":"call","detail":"standard","budget_tokens":800}),
+                &mixed,
+                2,
+                800,
+            ),
+        ] {
+            let result = server.call(root.path(), "find_references", args.clone());
+            assert_reference_budget(&result, budget, false);
+            let rows = result["results"].as_array().unwrap();
+            assert!(
+                rows.len() > production && rows.len() < original.len(),
+                "{args}: {result}"
+            );
+            let (product, tests): (Vec<_>, Vec<_>) = original
+                .iter()
+                .cloned()
+                .partition(|row| row["is_test"] != true);
+            assert_eq!(product.len(), production);
+            let expected: Vec<_> = product.into_iter().chain(tests).take(rows.len()).collect();
+            assert_eq!(rows, &expected, "{args}");
+            let recovery = reference_budget_recovery(&result, legacy);
+            if let Some(trimmed) = recovery.pointer("/trimmed/0") {
+                assert_eq!(trimmed["field"], "/results");
+                assert_eq!(trimmed["omitted"], original.len() - rows.len(), "{args}");
+                assert_eq!(trimmed["returned"], rows.len());
+            } else {
+                let total = if legacy { "total_results" } else { "total" };
+                assert_eq!(recovery[total], original.len(), "{args}");
+                assert_eq!(recovery["returned"], rows.len());
+            }
+        }
+
+        let test_only = server.call(
+            root.path(),
+            "find_references",
+            json!({"name":"test_only_anchor","kind":"call"}),
+        );
+        let rows = test_only["results"].as_array().unwrap();
+        assert!(!rows.is_empty() && rows.len() < tests.len());
+        assert_eq!(rows, &tests[..rows.len()]);
+
+        let uncapped = server.call(
+            root.path(),
+            "find_references",
+            json!({"name":"small_anchor","kind":"call","detail":"standard","budget_tokens":8000}),
+        );
+        assert_eq!(uncapped["results"], json!(small));
+    }
+}
+
+fn full_reference_fixture(root: &Path) {
+    let mut source = String::from("pub fn anchor() {}\n");
+    for (attribute, name, comment) in [
+        ("#[test]\n", "first_test", "a".repeat(2600)),
+        ("", "first_product", "short".to_owned()),
+        ("#[test]\n", "second_test", "b".repeat(2000)),
+        ("", "second_product", "c".repeat(2300)),
+        ("#[test]\n", "third_test", "d".repeat(2100)),
+    ] {
+        source.push_str(&format!(
+            "{attribute}fn {name}() {{\n   anchor(); // {comment}\n}}\n"
+        ));
+    }
+    std::fs::write(root.join("lib.rs"), source).unwrap();
+    let binary = env!("CARGO_BIN_EXE_codesage");
+    command(root, binary, &["init"]);
+    command(root, binary, &["index", "--no-semantic"]);
+}
+
+fn call_full_references(server: &mut Server, root: &Path, budget: usize) -> Value {
+    server.call(
+        root,
+        "find_references",
+        json!({"name":"anchor","kind":"call","detail":"full","budget_tokens":budget}),
+    )
+}
+
+fn assert_shortened_reference_snippets(
+    result: &Value,
+    recovery: &Value,
+    original: &[Value],
+) -> usize {
+    let rows = result["results"].as_array().unwrap();
+    let mut shortened = Vec::new();
+    for (index, (row, original)) in rows.iter().zip(original).enumerate() {
+        let mut unchanged = original.clone();
+        let original_snippet = original["snippet"].as_str().unwrap();
+        let snippet = row["snippet"].as_str().unwrap();
+        if let Some(prefix) = snippet.strip_suffix("\n…[truncated by MCP budget]") {
+            assert!(original_snippet.starts_with(prefix));
+            assert!(prefix.len() < original_snippet.len());
+            unchanged["snippet"] = json!(snippet);
+            shortened.push(json!(format!("/results/{index}/snippet")));
+        }
+        assert_eq!(row, &unchanged);
+    }
+    if shortened.is_empty() {
+        assert!(recovery.get("shortened").is_none(), "{recovery}");
+    } else {
+        assert_eq!(recovery["shortened"], json!(shortened), "{recovery}");
+    }
+    shortened.len()
+}
+
+#[test]
+fn full_reference_budget_shortening_keeps_original_row_order() {
+    let root = tempfile::tempdir().unwrap();
+    full_reference_fixture(root.path());
+    for legacy in [false, true] {
+        let mut server = Server::start_mode(legacy);
+        let original = call_full_references(&mut server, root.path(), 8000);
+        let original = original["results"].as_array().unwrap();
+        assert_eq!(original.len(), 5);
+        assert_eq!(original[0]["from_symbol"], "first_test");
+        assert_eq!(original[1]["from_symbol"], "first_product");
+
+        let result = call_full_references(&mut server, root.path(), 1600);
+        assert_reference_budget(&result, 1600, false);
+        let recovery = reference_budget_recovery(&result, legacy);
+        assert_eq!(result["results"].as_array().unwrap().len(), original.len());
+        assert_eq!(recovery["trimmed"], json!([]));
+        assert!(assert_shortened_reference_snippets(&result, recovery, original) > 0);
+    }
+}
+
+#[test]
+fn early_reference_budget_leaves_room_to_shorten_full_snippets() {
+    let root = tempfile::tempdir().unwrap();
+    let comment = "a".repeat(33_000);
+    std::fs::write(
+        root.path().join("lib.rs"),
+        format!(
+            "fn anchor() {{}}\n\
+             #[test]\nfn test_one() {{ anchor(); }}\n\
+             #[test]\nfn test_two() {{ anchor(); }}\n\
+             #[test]\nfn test_three() {{ anchor(); }}\n\n\n\
+             fn production() {{\n    anchor(); // {comment}\n}}\n"
+        ),
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_codesage");
+    command(root.path(), binary, &["init"]);
+    command(root.path(), binary, &["index", "--no-semantic"]);
+
+    for legacy in [false, true] {
+        let mut server = Server::start_mode(legacy);
+        let original = server.call(
+            root.path(),
+            "find_references",
+            json!({"name":"anchor","kind":"call","detail":"standard","budget_tokens":8000}),
+        );
+        let original = original["results"].as_array().unwrap();
+        assert_eq!(original.len(), 4);
+        assert_eq!(original[0]["from_symbol"], "test_one");
+        assert_eq!(original[3]["from_symbol"], "production");
+        let stats = server.call(root.path(), "daemon_stats", json!({"recent":5}));
+        assert_eq!(stats["tools"]["find_references"]["executions"], 2);
+
+        let result = call_full_references(&mut server, root.path(), 8000);
+        assert_reference_budget(&result, 8000, false);
+        let rows = result["results"].as_array().unwrap();
+        assert_eq!(rows.len(), original.len());
+        for (row, expected) in rows.iter().zip(original) {
+            let mut facts = row.as_object().unwrap().clone();
+            facts.remove("snippet").unwrap();
+            assert_eq!(facts.remove("snippet_source").unwrap(), "working_tree");
+            assert_eq!(&facts, expected.as_object().unwrap());
+        }
+        let snippet = rows[3]["snippet"].as_str().unwrap();
+        assert!(snippet.starts_with("    anchor(); // aaa"));
+        assert!(snippet.ends_with("\n…[truncated by MCP budget]"));
+        assert!(snippet.len() < comment.len());
+        let recovery = reference_budget_recovery(&result, legacy);
+        assert_eq!(recovery["trimmed"], json!([]));
+        assert_eq!(recovery["shortened"], json!(["/results/3/snippet"]));
+        let stats = server.call(root.path(), "daemon_stats", json!({"recent":5}));
+        assert_eq!(stats["tools"]["find_references"]["requests"], 2);
+        assert_eq!(stats["tools"]["find_references"]["executions"], 5);
+        let request = &stats["recent_requests"][0];
+        let execution = &stats["recent_executions"][0];
+        assert_eq!(request["tool"], "find_references");
+        assert_eq!(request["outcome"], "success");
+        assert_eq!(request["execution_id"], execution["id"]);
+        assert_eq!(
+            execution["project"],
+            json!(root.path().canonicalize().unwrap())
+        );
+        assert_eq!(execution["work_class"], "interactive");
+        assert_eq!(execution["outcome"], "success");
+        assert_eq!(stats["work"]["requests"], 0);
+        assert_eq!(stats["work"]["running"], json!([0, 0, 0]));
+    }
+}
+
+#[test]
+fn full_reference_budget_caps_many_repeated_escaped_snippets() {
+    let root = tempfile::tempdir().unwrap();
+    let calls = "anchor(); ".repeat(32);
+    let comment = "\"quoted\" \\\t雪".repeat(3500);
+    let long_line = format!("    {calls}// {comment}");
+    std::fs::write(
+        root.path().join("lib.rs"),
+        format!(
+            "fn anchor() {{}}\n#[test]\nfn test_callers() {{\n{long_line}\n}}\n\
+             fn production() {{ anchor(); }}\n"
+        ),
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_codesage");
+    command(root.path(), binary, &["init"]);
+    command(root.path(), binary, &["index", "--no-semantic"]);
+
+    let mut server = Server::start();
+    let original = server.call(
+        root.path(),
+        "find_references",
+        json!({"name":"anchor","kind":"call","detail":"standard","budget_tokens":8000}),
+    );
+    let original = original["results"].as_array().unwrap();
+    assert_eq!(original.len(), 33);
+    assert!(original[..32].iter().all(|row| row["is_test"] == true));
+    assert_eq!(original[32]["from_symbol"], "production");
+
+    let result = call_full_references(&mut server, root.path(), 8000);
+    assert_reference_budget(&result, 8000, false);
+    let rows = result["results"].as_array().unwrap();
+    assert_eq!(rows.len(), original.len());
+    for (row, expected) in rows.iter().zip(original) {
+        let mut facts = row.as_object().unwrap().clone();
+        let snippet = facts.remove("snippet").unwrap();
+        assert_eq!(facts.remove("snippet_source").unwrap(), "working_tree");
+        assert_eq!(&facts, expected.as_object().unwrap());
+        if row["is_test"] == true {
+            let prefix = snippet
+                .as_str()
+                .unwrap()
+                .strip_suffix("\n…[truncated by MCP budget]")
+                .unwrap();
+            assert!(long_line.starts_with(prefix));
+            assert!(prefix.contains("\t雪"));
+        } else {
+            assert_eq!(snippet, "fn production() { anchor(); }");
+        }
+    }
+    let recovery = reference_budget_recovery(&result, false);
+    assert_eq!(recovery["trimmed"], json!([]));
+    let mut paths: Vec<_> = (0..32)
+        .map(|index| format!("/results/{index}/snippet"))
+        .collect();
+    paths.sort();
+    assert_eq!(recovery["shortened"], json!(paths));
+}
+
+#[test]
+fn full_reference_budget_trim_identifies_retained_shortened_snippets() {
+    let root = tempfile::tempdir().unwrap();
+    full_reference_fixture(root.path());
+    for legacy in [false, true] {
+        let mut server = Server::start_mode(legacy);
+        let original = call_full_references(&mut server, root.path(), 8000);
+        let mut original = original["results"].as_array().unwrap().clone();
+        assert_eq!(original.len(), 5);
+        original.sort_by_key(|row| row["is_test"] == true);
+
+        for (budget, exceeded) in [(600, false), (256, true)] {
+            let result = call_full_references(&mut server, root.path(), budget);
+            assert_reference_budget(&result, budget, exceeded);
+            let rows = result["results"].as_array().unwrap();
+            let recovery = reference_budget_recovery(&result, legacy);
+            assert_eq!(
+                recovery["trimmed"],
+                json!([{"field":"/results", "returned":rows.len(), "omitted":original.len() - rows.len()}])
+            );
+            let shortened = assert_shortened_reference_snippets(&result, recovery, &original);
+            if exceeded {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(shortened, 0);
+            } else {
+                assert!((3..5).contains(&rows.len()));
+                assert!(shortened > 0);
+            }
+        }
+    }
 }
 
 #[test]

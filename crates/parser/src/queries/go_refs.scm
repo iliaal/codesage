@@ -1,5 +1,5 @@
 ; Pattern 0: import path
-(import_spec path: (interpreted_string_literal) @ref)
+(import_spec path: [(interpreted_string_literal) (raw_string_literal)] @ref)
 
 ; Pattern 1: function call (simple name)
 (call_expression function: (identifier) @ref)

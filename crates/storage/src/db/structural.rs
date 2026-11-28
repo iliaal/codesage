@@ -62,6 +62,10 @@ fn enumerate_file_import_pairs_sql() -> String {
               FROM symbols s2
               WHERE s2.name = r.to_name
                 AND s2.file_id <> s.file_id
+                AND NOT (
+                  (s2.kind = 'method' OR (s2.kind = 'function' AND s2.name <> s2.qualified_name))
+                  AND EXISTS (SELECT 1 FROM files f2 WHERE f2.id = s2.file_id AND f2.language = 'c')
+                )
             )
           )
         )
@@ -71,6 +75,9 @@ fn enumerate_file_import_pairs_sql() -> String {
                OR (r.kind = 'import_binding' AND f_from.language = 'python'))
           AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
           AND f_from.language <> 'python'
+          AND NOT (f_to.language = 'c' AND (
+            s.kind = 'method' OR (s.kind = 'function' AND r.to_name <> s.qualified_name)
+          ))
           AND f_from.path <> f_to.path
         GROUP BY f_from.path, f_to.path
     "#
@@ -89,7 +96,7 @@ fn path_import_refs_sql() -> String {
         "SELECT f.path, r.to_name, MIN(r.lazy)
          FROM refs r JOIN files f ON r.from_file_id = f.id
          WHERE r.kind IN {IMPORT_EDGE_KINDS_SQL}
-           AND ((r.kind = 'import' AND f.language IN ('javascript', 'typescript'))
+           AND ((r.kind = 'import' AND f.language IN ('javascript', 'typescript', 'go'))
                 OR (r.kind = 'include' AND f.language IN ('c', 'cpp')))
          GROUP BY f.path, r.to_name"
     )
@@ -119,7 +126,7 @@ const IMPORTED_BY_SQL: &str = "SELECT DISTINCT f.path
              FROM refs r JOIN files f ON r.from_file_id = f.id
              WHERE r.to_name = ?1
                AND r.kind IN ('import', 'include')
-               AND f.language NOT IN ('javascript', 'typescript', 'python')
+               AND f.language NOT IN ('javascript', 'typescript', 'python', 'go')
                AND f.path <> ?1
              UNION
              SELECT f_from.path
@@ -129,6 +136,7 @@ const IMPORTED_BY_SQL: &str = "SELECT DISTINCT f.path
                JOIN symbols s ON s.file_id = f_to.id
                JOIN refs r ON r.to_name = s.qualified_name
                WHERE f_to.path = ?1
+                 AND NOT (s.kind = 'method' AND f_to.language = 'c')
                UNION ALL
                SELECT r.id
                FROM files f_to
@@ -146,11 +154,18 @@ const IMPORTED_BY_SQL: &str = "SELECT DISTINCT f.path
                JOIN symbols s ON s.file_id = f_to.id
                JOIN refs r ON r.to_name = s.name
                WHERE f_to.path = ?1
+                 AND NOT (f_to.language = 'c' AND (
+                   s.kind = 'method' OR (s.kind = 'function' AND s.name <> s.qualified_name)
+                 ))
                  AND NOT EXISTS (
                    SELECT 1
                    FROM symbols s2
                    WHERE s2.name = r.to_name
                      AND s2.file_id <> s.file_id
+                     AND NOT (
+                       (s2.kind = 'method' OR (s2.kind = 'function' AND s2.name <> s2.qualified_name))
+                       AND EXISTS (SELECT 1 FROM files f2 WHERE f2.id = s2.file_id AND f2.language = 'c')
+                     )
                  )
              ) m
              JOIN refs r ON r.id = m.ref_id
@@ -860,6 +875,10 @@ impl Database {
     pub fn symbol_exists(&self, name: &str) -> Result<bool> {
         let sql = if name.contains('\\') || name.contains('.') || name.contains("::") {
             "SELECT 1 FROM symbols WHERE qualified_name = ?1 LIMIT 1"
+        } else if name.starts_with("zflf_") {
+            "SELECT 1 FROM symbols s JOIN files f ON s.file_id = f.id
+             WHERE s.name = ?1 OR (s.qualified_name = ?1 AND s.kind = 'function' AND f.language = 'c')
+             LIMIT 1"
         } else {
             "SELECT 1 FROM symbols WHERE name = ?1 LIMIT 1"
         };
@@ -872,13 +891,15 @@ impl Database {
     }
 
     /// Definitions named `name`: by qualified name when `name` is qualified,
-    /// otherwise by bare name. A PHP-shaped qualified name (one containing
-    /// a backslash) matches case-insensitively, as PHP resolves it.
+    /// otherwise by bare name or exact native ABI name. A PHP-shaped
+    /// qualified name (one containing a backslash) matches case-insensitively.
     pub fn find_symbols(&self, name: &str, kind: Option<SymbolKind>) -> Result<Vec<Symbol>> {
         let condition = if name.contains('\\') {
             "s.qualified_name = ?1 COLLATE NOCASE"
         } else if name.contains('.') || name.contains("::") {
             "s.qualified_name = ?1"
+        } else if name.starts_with("zflf_") {
+            "s.name = ?1 OR (s.qualified_name = ?1 AND s.kind = 'function' AND f.language = 'c')"
         } else {
             "s.name = ?1"
         };
@@ -1622,6 +1643,10 @@ impl Database {
                   FROM symbols s2
                   WHERE s2.name = r.to_name
                     AND s2.file_id <> s.file_id
+                    AND NOT (
+                      (s2.kind = 'method' OR (s2.kind = 'function' AND s2.name <> s2.qualified_name))
+                      AND EXISTS (SELECT 1 FROM files f2 WHERE f2.id = s2.file_id AND f2.language = 'c')
+                    )
                 )
               )
             )
@@ -1631,6 +1656,9 @@ impl Database {
               AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
               AND f_from.language <> 'python'
               AND f_from.path = ?1
+              AND NOT (f_to.language = 'c' AND (
+                s.kind = 'method' OR (s.kind = 'function' AND r.to_name <> s.qualified_name)
+              ))
               AND f_from.path <> f_to.path
         "#;
         let mut stmt = self.conn.prepare(sql)?;
@@ -1662,6 +1690,10 @@ impl Database {
                   FROM symbols s2
                   WHERE s2.name = r.to_name
                     AND s2.file_id <> s.file_id
+                    AND NOT (
+                      (s2.kind = 'method' OR (s2.kind = 'function' AND s2.name <> s2.qualified_name))
+                      AND EXISTS (SELECT 1 FROM files f2 WHERE f2.id = s2.file_id AND f2.language = 'c')
+                    )
                 )
               )
             )
@@ -1671,6 +1703,9 @@ impl Database {
               AND NOT (r.kind = 'import' AND f_from.language IN ('go', 'javascript', 'typescript'))
               AND f_from.language <> 'python'
               AND f_to.path = ?1
+              AND NOT (f_to.language = 'c' AND (
+                s.kind = 'method' OR (s.kind = 'function' AND r.to_name <> s.qualified_name)
+              ))
               AND f_from.path <> f_to.path
         "#;
         let mut stmt = self.conn.prepare(sql)?;
@@ -1688,9 +1723,9 @@ impl Database {
         Ok(rows)
     }
 
-    /// `(from_path, specifier, lazy_only)` for JavaScript/TypeScript `import`
-    /// and C/C++ `include` directives, grouped per importer and specifier.
-    /// These name a file rather than a symbol, so the refs x symbols join in
+    /// `(from_path, specifier, lazy_only)` for JavaScript/TypeScript and Go
+    /// imports and C/C++ includes, grouped per importer and specifier.
+    /// These name files or packages, so the refs x symbols join in
     /// [`Self::enumerate_file_import_pairs`] never sees them; the graph crate
     /// resolves them against the indexed file set. `lazy_only` is true when
     /// every directive spelling that specifier in that file is lazy.
@@ -1704,6 +1739,16 @@ impl Database {
             ))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn has_go_package_imports(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM files f CROSS JOIN refs r ON r.from_file_id = f.id
+             WHERE f.language = 'go' AND r.kind = 'import')",
+            )?
+            .query_row([], |row| row.get(0))?)
     }
 
     /// Unresolved (from_path, to_name) import/include pairs for bulk resolution.

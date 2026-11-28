@@ -1,10 +1,17 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use codesage_parser::{parse::parse_file_tolerant, source::read_indexable_file};
+use codesage_parser::{
+    parse::parse_file_tolerant,
+    references::{
+        RustStdMacroShadows, is_rust_std_expression_macro, rust_macro_arguments_can_bind,
+    },
+    source::{IndexableSource, read_indexable_file},
+};
 use codesage_protocol::{Language, Reference, Symbol, SymbolKind, Visibility};
 use codesage_storage::Database;
 use tree_sitter::Node;
@@ -12,6 +19,68 @@ use tree_sitter::Node;
 use super::RustImportEvidence;
 
 const RESOLUTION_BUDGET: Duration = Duration::from_secs(2);
+const RESOLUTION_READS: usize = 64;
+const RESOLUTION_BYTES: usize = 8 * 1024 * 1024;
+
+struct TypeSource {
+    tree: tree_sitter::Tree,
+    bytes: Vec<u8>,
+    line_offsets: Vec<usize>,
+    macro_shadows: OnceLock<RustStdMacroShadows>,
+}
+
+#[derive(Clone)]
+enum TypeManifest {
+    Parsed(Arc<toml::Value>),
+    Missing,
+    Unavailable,
+}
+
+enum TypeBinding<'tree> {
+    Missing,
+    Unknown,
+    Nominal,
+    Local,
+    Extern(String),
+    Import {
+        path: String,
+        declaration: Node<'tree>,
+        glob: GlobCompetition<'tree>,
+    },
+}
+
+enum GlobCompetition<'tree> {
+    None,
+    Unknown,
+    Import {
+        path: String,
+        declaration: Node<'tree>,
+    },
+}
+
+struct TypeCall<'tree> {
+    site: Node<'tree>,
+    macro_root: Option<String>,
+}
+
+struct TypeRoots<'a> {
+    caller: &'a str,
+    is_test: bool,
+    sources: &'a [(&'a str, Arc<TypeSource>)],
+}
+
+struct ExternalTypePath {
+    crate_name: String,
+    tail: String,
+    absolute: bool,
+    explicit: bool,
+}
+
+impl ExternalTypePath {
+    fn same_item_path(&self, other: &Self) -> bool {
+        self.crate_name == other.crate_name && self.tail == other.tail
+    }
+}
 
 #[derive(Default)]
 struct Surface {
@@ -75,6 +144,14 @@ pub(super) struct ExternalCrates {
     caller_std_macros: HashMap<String, Arc<HashSet<String>>>,
     spelling_masks: HashMap<String, Arc<HashMap<String, u16>>>,
     resolved: HashMap<(String, String), Option<Vec<Symbol>>>,
+    type_sources: HashMap<String, Option<Arc<TypeSource>>>,
+    type_manifests: HashMap<PathBuf, TypeManifest>,
+    type_reads: usize,
+    type_bytes: usize,
+    type_elapsed: Duration,
+    type_deadline: Option<Instant>,
+    type_capped: bool,
+    indexed_thread_local: Option<bool>,
     reads: usize,
     bytes: usize,
     elapsed: Duration,
@@ -138,13 +215,23 @@ impl ExternalCrates {
         {
             return Ok(None);
         }
-        let mut ancestor = Path::new(&package);
+        Ok(self
+            .registry_dependency(&package, &manifest, name, is_test)
+            .map(|package| (package, partial)))
+    }
+
+    fn registry_dependency(
+        &mut self,
+        package: &str,
+        manifest: &toml::Value,
+        name: &str,
+        is_test: bool,
+    ) -> Option<String> {
+        let mut ancestor = Path::new(package);
         loop {
             for suffix in ["Cargo.toml", ".cargo/config.toml", ".cargo/config"] {
                 let path = ancestor.join(suffix);
-                let Some(path) = path.to_str() else {
-                    return Ok(None);
-                };
+                let path = path.to_str()?;
                 let config = self.manifest(path);
                 if config.as_ref().is_some_and(|config| {
                     config.get("patch").is_some()
@@ -152,7 +239,7 @@ impl ExternalCrates {
                         || config.get("paths").is_some()
                 }) || config.is_none() && !self.missing.contains(path)
                 {
-                    return Ok(None);
+                    return None;
                 }
             }
             let Some(parent) = ancestor.parent() else {
@@ -176,32 +263,23 @@ impl ExternalCrates {
                 }
                 let mut dependency = value.clone();
                 if dependency.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
-                    let mut ancestor = Path::new(&package);
+                    let mut ancestor = Path::new(package);
                     loop {
-                        let Some(path) = ancestor.join("Cargo.toml").to_str().map(str::to_string)
-                        else {
-                            return Ok(None);
-                        };
-                        if let Some(manifest) = self.manifest(&path)
+                        let path = ancestor.join("Cargo.toml");
+                        let path = path.to_str()?;
+                        if let Some(manifest) = self.manifest(path)
                             && let Some(workspace) = manifest.get("workspace")
                         {
-                            let Some(inherited) =
-                                workspace.get("dependencies").and_then(|deps| deps.get(key))
-                            else {
-                                return Ok(None);
-                            };
+                            let inherited = workspace.get("dependencies")?.get(key)?;
                             dependency = inherited.clone();
                             break;
                         }
-                        if self.manifests.get(&path).is_some_and(Option::is_none)
-                            && !self.missing.contains(&path)
+                        if self.manifests.get(path).is_some_and(Option::is_none)
+                            && !self.missing.contains(path)
                         {
-                            return Ok(None);
+                            return None;
                         }
-                        let Some(parent) = ancestor.parent() else {
-                            return Ok(None);
-                        };
-                        ancestor = parent;
+                        ancestor = ancestor.parent()?;
                     }
                 }
                 if dependency.get("path").is_some()
@@ -211,7 +289,7 @@ impl ExternalCrates {
                         || dependency.get("version").is_some()
                         || dependency.get("git").is_some())
                 {
-                    return Ok(None);
+                    return None;
                 }
                 matches.push(
                     dependency
@@ -224,10 +302,10 @@ impl ExternalCrates {
         }
         matches.sort();
         matches.dedup();
-        Ok(match matches.as_slice() {
-            [package] => Some((package.clone(), partial)),
+        match matches.as_slice() {
+            [package] => Some(package.clone()),
             _ => None,
-        })
+        }
     }
 
     pub(super) fn import_file(&mut self, db: &Database, row: &Reference) -> Result<Option<String>> {
@@ -333,12 +411,510 @@ impl ExternalCrates {
             caller_std_macros: HashMap::new(),
             spelling_masks: HashMap::new(),
             resolved: HashMap::new(),
+            type_sources: HashMap::new(),
+            type_manifests: HashMap::new(),
+            type_reads: 0,
+            type_bytes: 0,
+            type_elapsed: Duration::ZERO,
+            type_deadline: None,
+            type_capped: false,
+            indexed_thread_local: None,
             reads: 0,
             bytes: 0,
             elapsed: Duration::ZERO,
             deadline: None,
             capped: false,
         }
+    }
+
+    pub(super) fn capped(&self) -> bool {
+        self.capped || self.type_capped
+    }
+
+    pub(super) fn unrelated_type_method(
+        &mut self,
+        db: &Database,
+        row: &Reference,
+        receiver: &str,
+        recorded_receiver: bool,
+        target: &Symbol,
+    ) -> Result<bool> {
+        // Import rows retain the original path. A same-file method already
+        // needs this source, and a cached surface can prove other aliases.
+        if !recorded_receiver
+            && row.from_file != target.file_path
+            && !self
+                .sources
+                .get(&(row.from_file.clone(), true))
+                .and_then(Option::as_ref)
+                .is_some_and(|surface| {
+                    surface.uses.iter().any(|binding| binding.name == receiver)
+                        || surface.shadowed.contains(receiver)
+                })
+        {
+            return Ok(false);
+        }
+        let Some(roots) = self.caller_roots.get(&row.from_file).cloned() else {
+            return Ok(false);
+        };
+        let start = Instant::now();
+        self.type_deadline = Some(start + RESOLUTION_BUDGET.saturating_sub(self.type_elapsed));
+        let result = self.unrelated_type_method_inner(db, row, receiver, target, &roots);
+        self.type_elapsed += start.elapsed();
+        self.type_deadline = None;
+        self.type_capped |= self.type_elapsed > RESOLUTION_BUDGET;
+        result
+    }
+
+    fn unrelated_type_method_inner(
+        &mut self,
+        db: &Database,
+        row: &Reference,
+        receiver: &str,
+        target: &Symbol,
+        roots: &[String],
+    ) -> Result<bool> {
+        if self.type_elapsed >= RESOLUTION_BUDGET {
+            self.type_capped = true;
+            return Ok(false);
+        }
+        let Some(caller) = self.type_source(db, &row.from_file)? else {
+            return Ok(false);
+        };
+        let Some(offset) = source_offset(&caller, row.line, row.col) else {
+            return Ok(false);
+        };
+        let Some(call) = caller
+            .tree
+            .root_node()
+            .descendant_for_byte_range(offset, offset)
+        else {
+            return Ok(false);
+        };
+        if ancestors(call).any(|item| has_rewriting_attrs(item, &caller.bytes)) {
+            return Ok(false);
+        }
+        let mut root_sources = Vec::new();
+        for root in roots {
+            let Some(source) = self.type_source(db, root)? else {
+                return Ok(false);
+            };
+            root_sources.push((root.as_str(), source));
+        }
+        let roots = TypeRoots {
+            caller: &row.from_file,
+            is_test: row.is_test,
+            sources: &root_sources,
+        };
+        let project_macros = self.caller_std_macros(db, &row.from_file)?;
+        let root_macro_use = root_sources.iter().any(|(_, root)| {
+            let tree = root.tree.root_node();
+            tree.named_children(&mut tree.walk())
+                .any(|item| attribute_has_name(item, "macro_use", &root.bytes))
+        });
+        let thread_local_shadowed = self.indexed_thread_local(db)? || root_macro_use;
+        let mut scope = TypeScope {
+            source: &caller,
+            project_macros: &project_macros,
+            thread_local_shadowed,
+            qualified_macro: None,
+        };
+        let Some(call) = scope.call_site(call, offset, &row.to_name, root_macro_use) else {
+            return Ok(false);
+        };
+        if let Some(macro_root) = call.macro_root {
+            // A macro's path resolves before anything it expands.
+            scope.qualified_macro = Some(call.site.id());
+            if self
+                .external_type_path(db, &scope, &roots, call.site, macro_root, true)?
+                .is_none()
+            {
+                return Ok(false);
+            }
+        }
+        let TypeBinding::Import {
+            path,
+            declaration,
+            glob,
+        } = scope.binding(call.site, receiver, 4)?
+        else {
+            return Ok(false);
+        };
+        // A use alias may only bind a value or macro. A block import in
+        // either namespace can coexist with the outer type of the same name.
+        let leaf = last_segment(&path);
+        if leaf != receiver
+            && !leaf
+                .trim_start_matches("r#")
+                .starts_with(char::is_uppercase)
+            || !path.trim_start_matches("::").contains("::")
+        {
+            return Ok(false);
+        }
+        let Some(imported) =
+            self.external_type_path(db, &scope, &roots, declaration, path, false)?
+        else {
+            return Ok(false);
+        };
+        let competing_glob = match glob {
+            GlobCompetition::None => false,
+            GlobCompetition::Unknown => true,
+            GlobCompetition::Import { path, declaration } => self
+                .external_type_path(db, &scope, &roots, declaration, path, false)?
+                .is_none_or(|globbed| !imported.same_item_path(&globbed)),
+        };
+        let competing_block =
+            if let Some(block) = declaration.parent().filter(|item| item.kind() == "block") {
+                !matches!(scope.binding(block, receiver, 4)?, TypeBinding::Missing)
+            } else {
+                false
+            };
+        if competing_glob || competing_block {
+            let mut witnessed = false;
+            for annotation in qualified_type_annotations(call.site) {
+                let path = rust_use_path(annotation, &caller.bytes);
+                if self
+                    .external_type_path(db, &scope, &roots, annotation, path.into_owned(), false)?
+                    .is_some_and(|annotated| imported.same_item_path(&annotated))
+                {
+                    witnessed = true;
+                    break;
+                }
+            }
+            if !witnessed {
+                return Ok(false);
+            }
+        }
+
+        let Some(definition) = self.type_source(db, &target.file_path)? else {
+            return Ok(false);
+        };
+        let Some(implementation) = source_at(&definition, target.line_start, target.col_start)
+            .and_then(|item| ancestors(item).find(|item| item.kind() == "impl_item"))
+        else {
+            return Ok(false);
+        };
+        if ancestors(implementation).any(|item| has_rewriting_attrs(item, &definition.bytes)) {
+            return Ok(false);
+        }
+        if implementation.child_by_field_name("trait").is_none() {
+            return Ok(true);
+        }
+        if row.from_file != target.file_path
+            && let Some(trait_name) =
+                directly_declared_impl_trait(implementation, &definition.bytes)
+            && scope.trait_is_out_of_scope(call.site, declaration, trait_name)?
+            && !root_sources.iter().any(|(_, source)| {
+                let tree = source.tree.root_node();
+                tree.named_children(&mut tree.walk())
+                    .any(|item| attribute_has_name(item, "prelude_import", &source.bytes))
+            })
+        {
+            return Ok(true);
+        }
+        let project_macros = self.caller_std_macros(db, &target.file_path)?;
+        let scope = TypeScope {
+            source: &definition,
+            project_macros: &project_macros,
+            thread_local_shadowed: true,
+            qualified_macro: None,
+        };
+        let Some(impl_type) = implementation.child_by_field_name("type") else {
+            return Ok(false);
+        };
+        match scope.binding(impl_type, receiver, 4)? {
+            TypeBinding::Nominal => Ok(true),
+            TypeBinding::Import {
+                path, declaration, ..
+            } => self.local_crate_nominal(db, &target.file_path, &path, declaration),
+            _ => Ok(false),
+        }
+    }
+
+    fn external_type_path(
+        &mut self,
+        db: &Database,
+        scope: &TypeScope<'_>,
+        roots: &TypeRoots<'_>,
+        site: Node<'_>,
+        path: String,
+        standard_only: bool,
+    ) -> Result<Option<ExternalTypePath>> {
+        let Some(path) = scope.import_root(site, path, roots, |name| {
+            standard_crate(name)
+                || self
+                    .type_package(roots.caller)
+                    .is_none_or(|(_, manifest)| package_names_extern_crate(&manifest, name))
+        })?
+        else {
+            return Ok(None);
+        };
+        let name = path.crate_name.as_str();
+        let builtin = standard_crate(name);
+        if standard_only && !builtin {
+            return Ok(None);
+        }
+        // Rust 2015 use paths start in the crate root instead of the extern prelude.
+        if builtin && !self.type_modern_edition(roots.caller, name) {
+            return Ok(None);
+        }
+        for (root, source) in roots.sources {
+            let tree = source.tree.root_node();
+            let project_macros = self.caller_std_macros(db, root)?;
+            let root_scope = TypeScope {
+                source,
+                project_macros: &project_macros,
+                thread_local_shadowed: scope.thread_local_shadowed,
+                qualified_macro: scope.qualified_macro,
+            };
+            if builtin && name == "alloc" && !path.explicit {
+                return Ok(None);
+            }
+            if tree.named_children(&mut tree.walk()).any(|item| {
+                if root_scope.macro_may_bind(item) {
+                    return true;
+                }
+                if path.explicit {
+                    return false;
+                }
+                if (!path.absolute || item.kind() == "extern_crate_declaration")
+                    && declared_type_binding(item)
+                        .is_some_and(|alias| text(alias, &source.bytes) == name)
+                {
+                    return true;
+                }
+                if item.kind() == "inner_attribute_item" {
+                    return name == "std" && attribute_has_name(item, "no_std", &source.bytes)
+                        || attribute_has_name(item, "no_implicit_prelude", &source.bytes);
+                }
+                let Some(argument) = item
+                    .child_by_field_name("argument")
+                    .filter(|_| !path.absolute && item.kind() == "use_declaration")
+                else {
+                    return false;
+                };
+                let mut bindings = Vec::new();
+                use_bindings(argument, &source.bytes, false, &mut bindings);
+                bindings.iter().any(|binding| binding.name == name)
+            }) {
+                return Ok(None);
+            }
+        }
+        if builtin {
+            return Ok(Some(path));
+        }
+        let Some((package, manifest)) = self.package(roots.caller) else {
+            return Ok(None);
+        };
+        let external = self.supported_caller(roots.caller, &package, &manifest)
+            && self.modern_edition(&package, &manifest)
+            && manifest
+                .get("package")
+                .and_then(|p| p.get("workspace"))
+                .is_none()
+            && self
+                .registry_dependency(&package, &manifest, name, roots.is_test)
+                .is_some();
+        Ok(external.then_some(path))
+    }
+
+    fn local_crate_nominal(
+        &mut self,
+        db: &Database,
+        file: &str,
+        path: &str,
+        declaration: Node<'_>,
+    ) -> Result<bool> {
+        let symbols = if let Some(path) = path.strip_prefix("crate::") {
+            let Some(roots) = self.caller_roots.get(file).cloned() else {
+                return Ok(false);
+            };
+            let [root] = roots.as_slice() else {
+                return Ok(false);
+            };
+            self.export(db, root, root, path, Reach::Internal, &mut HashSet::new())?
+        } else if (path.starts_with("self::") || path.starts_with("super::"))
+            && matches!(self.contexts.get(file).map(Vec::as_slice), Some([_]))
+            && module_scope(declaration).is_some_and(|scope| scope.kind() == "source_file")
+        {
+            self.crate_path(db, file, path, false)?.unwrap_or_default()
+        } else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            symbols.as_slice(),
+            [nominal] if matches!(nominal.kind, SymbolKind::Struct | SymbolKind::Enum)
+        ))
+    }
+
+    fn indexed_thread_local(&mut self, db: &Database) -> Result<bool> {
+        if let Some(shadowed) = self.indexed_thread_local {
+            return Ok(shadowed);
+        }
+        let shadowed = db
+            .find_symbols("thread_local", Some(SymbolKind::Macro))?
+            .iter()
+            .any(|symbol| symbol.file_path.ends_with(".rs"));
+        self.indexed_thread_local = Some(shadowed);
+        Ok(shadowed)
+    }
+
+    fn type_source(&mut self, db: &Database, file: &str) -> Result<Option<Arc<TypeSource>>> {
+        if let Some(source) = self.type_sources.get(file) {
+            return Ok(source.clone());
+        }
+        let source = match db.overlay_source(file)? {
+            Some(content) => content
+                .filter(|content| self.reserve_type_read() && self.charge_type_bytes(content.len()))
+                .map(overlay_source),
+            None => self.read_type_evidence(Path::new(file)).ok().flatten(),
+        };
+        let source =
+            match source {
+                Some(source)
+                    if db.get_file_hash(file)?.as_deref() == Some(source.content_hash.as_str()) =>
+                {
+                    let parsed = parse_file_tolerant(&source.bytes, Language::Rust)?;
+                    (!parsed.degraded).then(|| {
+                        let line_offsets =
+                            std::iter::once(0)
+                                .chain(source.bytes.iter().enumerate().filter_map(
+                                    |(index, byte)| (*byte == b'\n').then_some(index + 1),
+                                ))
+                                .collect();
+                        Arc::new(TypeSource {
+                            tree: parsed.tree,
+                            bytes: source.bytes,
+                            line_offsets,
+                            macro_shadows: OnceLock::new(),
+                        })
+                    })
+                }
+                _ => None,
+            };
+        self.type_sources.insert(file.to_string(), source.clone());
+        Ok(source)
+    }
+
+    fn reserve_type_read(&mut self) -> bool {
+        if self.type_reads >= RESOLUTION_READS
+            || self.type_bytes >= RESOLUTION_BYTES
+            || self.type_deadline.is_some_and(|end| Instant::now() >= end)
+        {
+            self.type_capped = true;
+            return false;
+        }
+        self.type_reads += 1;
+        true
+    }
+
+    fn charge_type_bytes(&mut self, bytes: usize) -> bool {
+        self.type_bytes += bytes;
+        if self.type_bytes > RESOLUTION_BYTES {
+            self.type_capped = true;
+            return false;
+        }
+        true
+    }
+
+    fn read_type_evidence(&mut self, path: &Path) -> Result<Option<IndexableSource>> {
+        if !self.reserve_type_read() {
+            return Ok(None);
+        }
+        let Some(root) = &self.root else {
+            return Ok(None);
+        };
+        let source = read_indexable_file(root, path)?;
+        Ok(source.filter(|source| self.charge_type_bytes(source.bytes.len())))
+    }
+
+    fn type_manifest(&mut self, path: &Path) -> TypeManifest {
+        if let Some(manifest) = self.type_manifests.get(path) {
+            return manifest.clone();
+        }
+        // A failed read in the export walk may mean that walk ran out of
+        // budget. Only reuse evidence known to be present or absent.
+        let manifest = if path.to_str().is_some_and(|key| self.missing.contains(key)) {
+            TypeManifest::Missing
+        } else if let Some(Some(value)) = path.to_str().and_then(|key| self.manifests.get(key)) {
+            TypeManifest::Parsed(value.clone())
+        } else {
+            match self.read_type_evidence(path) {
+                Ok(Some(source)) => std::str::from_utf8(&source.bytes)
+                    .ok()
+                    .and_then(|text| toml::from_str(text).ok())
+                    .map_or(TypeManifest::Unavailable, |value| {
+                        TypeManifest::Parsed(Arc::new(value))
+                    }),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    TypeManifest::Missing
+                }
+                _ => TypeManifest::Unavailable,
+            }
+        };
+        self.type_manifests.insert(path.into(), manifest.clone());
+        manifest
+    }
+
+    fn type_package<'a>(&mut self, caller: &'a str) -> Option<(&'a Path, Arc<toml::Value>)> {
+        let mut package = Path::new(caller).parent()?;
+        loop {
+            match self.type_manifest(&package.join("Cargo.toml")) {
+                TypeManifest::Parsed(manifest) => {
+                    return manifest
+                        .get("package")
+                        .is_some()
+                        .then_some((package, manifest));
+                }
+                TypeManifest::Unavailable => return None,
+                TypeManifest::Missing => {}
+            }
+            package = package.parent()?;
+        }
+    }
+
+    fn type_modern_edition(&mut self, caller: &str, builtin: &str) -> bool {
+        let Some((package, manifest)) = self.type_package(caller) else {
+            return false;
+        };
+        let Some(manifest_package) = manifest.get("package") else {
+            return false;
+        };
+        if package_names_extern_crate(&manifest, builtin) {
+            return false;
+        }
+        let edition = manifest_package.get("edition");
+        if is_modern_edition(edition) {
+            return true;
+        }
+        if edition
+            .and_then(|edition| edition.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            != Some(true)
+            || manifest_package.get("workspace").is_some()
+        {
+            return false;
+        }
+        for ancestor in package.ancestors() {
+            match self.type_manifest(&ancestor.join("Cargo.toml")) {
+                TypeManifest::Parsed(manifest) => {
+                    if let Some(workspace) = manifest.get("workspace") {
+                        return is_modern_edition(
+                            workspace
+                                .get("package")
+                                .and_then(|package| package.get("edition")),
+                        );
+                    }
+                }
+                TypeManifest::Unavailable => return false,
+                TypeManifest::Missing => {}
+            }
+        }
+        false
     }
 
     pub(super) fn resolve(
@@ -634,8 +1210,8 @@ impl ExternalCrates {
 
     fn read(&mut self, path: &str) -> Option<codesage_parser::source::IndexableSource> {
         if self.capped
-            || self.reads >= 64
-            || self.bytes >= 8 * 1024 * 1024
+            || self.reads >= RESOLUTION_READS
+            || self.bytes >= RESOLUTION_BYTES
             || self
                 .deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
@@ -657,7 +1233,7 @@ impl ExternalCrates {
             }
         };
         self.bytes += source.bytes.len();
-        if self.bytes > 8 * 1024 * 1024 {
+        if self.bytes > RESOLUTION_BYTES {
             self.capped = true;
             return None;
         }
@@ -747,10 +1323,7 @@ impl ExternalCrates {
         let edition = manifest
             .get("package")
             .and_then(|package| package.get("edition"));
-        if edition
-            .and_then(toml::Value::as_str)
-            .is_some_and(|edition| matches!(edition, "2018" | "2021" | "2024"))
-        {
+        if is_modern_edition(edition) {
             return true;
         }
         if edition
@@ -900,10 +1473,7 @@ impl ExternalCrates {
         // An overlaid file reads as the overlay holds it, so a request-local
         // view of other content still matches its own indexed hash.
         let source = match db.overlay_source(file)? {
-            Some(content) => content.map(|content| codesage_parser::source::IndexableSource {
-                content_hash: codesage_parser::discover::content_hash(content.as_bytes()),
-                bytes: content.into_bytes(),
-            }),
+            Some(content) => content.map(overlay_source),
             None => self.read(file),
         };
         Ok(match source {
@@ -1253,6 +1823,557 @@ fn last_segment(path: &str) -> &str {
     path.rsplit("::").next().unwrap_or(path)
 }
 
+fn ancestors(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+    std::iter::successors(Some(node), Node::parent)
+}
+
+fn source_at(source: &TypeSource, line: u32, column: u32) -> Option<Node<'_>> {
+    let offset = source_offset(source, line, column)?;
+    source
+        .tree
+        .root_node()
+        .descendant_for_byte_range(offset, offset)
+}
+
+fn source_offset(source: &TypeSource, line: u32, column: u32) -> Option<usize> {
+    let row = line.checked_sub(1)? as usize;
+    let start = *source.line_offsets.get(row)?;
+    let end = source
+        .line_offsets
+        .get(row + 1)
+        .map_or(source.bytes.len(), |offset| offset - 1);
+    let line = source.bytes.get(start..end)?;
+    let column = if line.is_ascii() {
+        column as usize
+    } else {
+        std::str::from_utf8(line)
+            .ok()?
+            .char_indices()
+            .nth(column as usize)?
+            .0
+    };
+    if column > line.len() {
+        return None;
+    }
+    Some(start + column)
+}
+
+fn overlay_source(content: String) -> IndexableSource {
+    IndexableSource {
+        content_hash: codesage_parser::discover::content_hash(content.as_bytes()),
+        bytes: content.into_bytes(),
+    }
+}
+
+fn is_modern_edition(edition: Option<&toml::Value>) -> bool {
+    edition
+        .and_then(toml::Value::as_str)
+        .is_some_and(|edition| matches!(edition, "2018" | "2021" | "2024"))
+}
+
+fn has_dependency_name(manifest: &toml::Value, name: &str) -> bool {
+    ["dependencies", "dev-dependencies", "build-dependencies"]
+        .iter()
+        .filter_map(|key| manifest.get(key).and_then(toml::Value::as_table))
+        .any(|dependencies| {
+            dependencies
+                .keys()
+                .any(|key| key == name || key.contains('-') && key.replace('-', "_") == name)
+        })
+}
+
+fn package_names_extern_crate(manifest: &toml::Value, name: &str) -> bool {
+    let library_name = manifest
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .or_else(|| manifest.get("package")?.get("name"))
+        .and_then(toml::Value::as_str);
+    library_name.is_some_and(|library| library == name || library.replace('-', "_") == name)
+        || has_dependency_name(manifest, name)
+        || manifest
+            .get("target")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|targets| {
+                targets
+                    .values()
+                    .any(|target| has_dependency_name(target, name))
+            })
+}
+
+fn standard_crate(name: &str) -> bool {
+    matches!(name, "std" | "core" | "alloc")
+}
+
+fn extern_name<'a>(item: Node<'_>, name: &str, bytes: &'a [u8]) -> Option<&'a str> {
+    if item.kind() != "extern_crate_declaration"
+        || !declared_binding(item).is_some_and(|visible| text(visible, bytes) == name)
+        || item_attributes(item).any(|attr| conditional_or_rewriting(attr, bytes))
+    {
+        return None;
+    }
+    item.child_by_field_name("name")
+        .map(|original| text(original, bytes))
+}
+
+fn qualified_type_annotations(site: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+    ancestors(site)
+        .flat_map(|node| {
+            [
+                node.child_by_field_name("type"),
+                node.child_by_field_name("return_type"),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .filter(|node| node.kind() == "scoped_type_identifier")
+        .take(8)
+}
+
+fn directly_declared_impl_trait<'a>(implementation: Node<'_>, bytes: &'a [u8]) -> Option<&'a str> {
+    let name = implementation
+        .child_by_field_name("trait")
+        .filter(|node| node.kind() == "type_identifier")
+        .map(|node| text(node, bytes))?;
+    let module = implementation
+        .parent()
+        .filter(|node| is_module_scope(*node))?;
+    let mut cursor = module.walk();
+    let mut found = module.named_children(&mut cursor).filter(|node| {
+        node.kind() == "trait_item"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|node| text(node, bytes) == name)
+    });
+    let declaration = found.next()?;
+    (found.next().is_none()
+        && !item_attributes(declaration).any(|attr| conditional_or_rewriting(attr, bytes)))
+    .then_some(name)
+}
+
+struct TypeScope<'a> {
+    source: &'a TypeSource,
+    project_macros: &'a HashSet<String>,
+    thread_local_shadowed: bool,
+    qualified_macro: Option<usize>,
+}
+
+impl TypeScope<'_> {
+    fn shadows(&self) -> &RustStdMacroShadows {
+        self.source.macro_shadows.get_or_init(|| {
+            let mut shadows =
+                RustStdMacroShadows::scan(self.source.tree.root_node(), &self.source.bytes);
+            shadows.extend(self.project_macros.iter().cloned());
+            shadows
+        })
+    }
+
+    fn call_site<'tree>(
+        &self,
+        node: Node<'tree>,
+        offset: usize,
+        spelling: &str,
+        root_macro_use: bool,
+    ) -> Option<TypeCall<'tree>> {
+        let bytes = &self.source.bytes;
+        for parent in ancestors(node) {
+            if parent.kind() == "call_expression" {
+                let function = parent.child_by_field_name("function")?;
+                return (rust_use_path(function, bytes) == spelling).then_some(TypeCall {
+                    site: function,
+                    macro_root: None,
+                });
+            }
+            if parent.kind() != "macro_invocation" {
+                continue;
+            }
+            let name = parent.child_by_field_name("macro")?;
+            let shadows = self.shadows();
+            if !is_rust_std_expression_macro(parent, bytes, shadows)
+                || rust_macro_arguments_can_bind(parent, bytes, shadows)
+            {
+                return None;
+            }
+            let macro_root = match name.kind() {
+                "identifier" if !root_macro_use => None,
+                "scoped_identifier" => {
+                    let path = rust_use_path(name, bytes);
+                    let (root, _) = path.rsplit_once("::")?;
+                    Some(root.to_owned())
+                }
+                _ => return None,
+            };
+            // Extraction reparses transparent expressions inside token trees.
+            // The source hash and the indexed byte position identify this call.
+            let suffix = std::str::from_utf8(bytes.get(offset..parent.end_byte())?).ok()?;
+            return suffix
+                .strip_prefix(spelling)
+                .is_some_and(|suffix| suffix.trim_start().starts_with('('))
+                .then_some(TypeCall {
+                    site: parent,
+                    macro_root,
+                });
+        }
+        None
+    }
+
+    fn import_root(
+        &self,
+        mut site: Node<'_>,
+        mut path: String,
+        roots: &TypeRoots<'_>,
+        mut prelude_crate: impl FnMut(&str) -> bool,
+    ) -> Result<Option<ExternalTypePath>> {
+        let mut requires_crate_alias = false;
+        for _ in 0..=4 {
+            let absolute = path.starts_with("::");
+            let unrooted = path.trim_start_matches("::");
+            let (name, tail) = unrooted.split_once("::").unwrap_or((unrooted, ""));
+            if matches!(name, "" | "self" | "super" | "crate") {
+                return Ok(None);
+            }
+            if !absolute {
+                match self.binding(site, name, 4)? {
+                    TypeBinding::Import {
+                        path: import,
+                        declaration,
+                        glob,
+                    } => {
+                        // A value-only alias can coexist with a module in
+                        // an enclosing scope or a crate in the extern prelude.
+                        if let Some(block) =
+                            declaration.parent().filter(|item| item.kind() == "block")
+                            && !matches!(self.binding(block, name, 4)?, TypeBinding::Missing)
+                        {
+                            requires_crate_alias = true;
+                        }
+                        requires_crate_alias |= !matches!(glob, GlobCompetition::None)
+                            || prelude_crate(name)
+                            || roots.sources.iter().any(|(_, source)| {
+                                let tree = source.tree.root_node();
+                                tree.named_children(&mut tree.walk()).any(|item| {
+                                    item.kind() == "extern_crate_declaration"
+                                        && declared_binding(item)
+                                            .is_some_and(|ident| text(ident, &source.bytes) == name)
+                                })
+                            });
+                        if requires_crate_alias && import.trim_start_matches("::").contains("::") {
+                            return Ok(None);
+                        }
+                        path = if tail.is_empty() {
+                            import
+                        } else {
+                            format!("{import}::{tail}")
+                        };
+                        site = declaration;
+                        continue;
+                    }
+                    TypeBinding::Extern(original) => {
+                        return Ok((original != "self").then(|| ExternalTypePath {
+                            crate_name: original,
+                            tail: tail.to_owned(),
+                            absolute,
+                            explicit: true,
+                        }));
+                    }
+                    TypeBinding::Missing => {}
+                    _ => return Ok(None),
+                }
+            }
+            let mut explicit = roots.sources.iter().map(|(_, source)| {
+                let tree = source.tree.root_node();
+                tree.named_children(&mut tree.walk())
+                    .find_map(|item| extern_name(item, name, &source.bytes))
+            });
+            if let Some(Some(original)) = explicit.next()
+                && explicit.all(|other| other == Some(original))
+            {
+                return Ok((original != "self").then(|| ExternalTypePath {
+                    crate_name: original.to_owned(),
+                    tail: tail.to_owned(),
+                    absolute,
+                    explicit: true,
+                }));
+            }
+            return Ok(Some(ExternalTypePath {
+                crate_name: name.to_owned(),
+                tail: tail.to_owned(),
+                absolute,
+                explicit: false,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn trait_is_out_of_scope(
+        &self,
+        site: Node<'_>,
+        receiver_import: Node<'_>,
+        trait_name: &str,
+    ) -> Result<bool> {
+        if !matches!(self.binding(site, trait_name, 4)?, TypeBinding::Missing) {
+            return Ok(false);
+        }
+        let Some(argument) = receiver_import.child_by_field_name("argument") else {
+            return Ok(false);
+        };
+        let mut bindings = Vec::new();
+        use_bindings(argument, &self.source.bytes, false, &mut bindings);
+        if bindings.len() != 1 || contains_use_wildcard(argument) {
+            return Ok(false);
+        }
+        // A renamed, anonymous, or re-exported trait may be brought into
+        // scope without a binding for the spelling used in its declaration.
+        for scope in ancestors(site).skip(1) {
+            let module = is_module_scope(scope);
+            if (module || scope.kind() == "block")
+                && scope.named_children(&mut scope.walk()).any(|item| {
+                    item.kind() == "use_declaration" && item.id() != receiver_import.id()
+                })
+            {
+                return Ok(false);
+            }
+            if module {
+                break;
+            }
+        }
+        Ok(true)
+    }
+
+    fn macro_may_bind(&self, item: Node<'_>) -> bool {
+        let invocation = match item.kind() {
+            "macro_invocation" => item,
+            "expression_statement" => match item.named_child(0) {
+                Some(expression) if expression.kind() == "macro_invocation" => expression,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        if self.qualified_macro == Some(invocation.id()) {
+            return false;
+        }
+        let bytes = &self.source.bytes;
+        let Some(path) = invocation.child_by_field_name("macro") else {
+            return true;
+        };
+        if path.kind() != "identifier" {
+            return true;
+        }
+        if text(path, bytes) == "thread_local" {
+            // The prelude macro emits value-namespace statics. Attributes
+            // forwarded to those statics or a shadowing macro can emit items.
+            return self.thread_local_shadowed
+                || thread_local_may_be_shadowed(invocation, bytes)
+                || invocation
+                    .named_children(&mut invocation.walk())
+                    .any(|node| {
+                        node.kind() == "token_tree"
+                            && node
+                                .children(&mut node.walk())
+                                .any(|token| token.kind() == "#")
+                    });
+        }
+        if !codesage_parser::references::rust_std_expression_macro_names()
+            .contains(&text(path, bytes))
+        {
+            return true;
+        }
+        !is_rust_std_expression_macro(invocation, bytes, self.shadows())
+    }
+
+    fn binding<'tree>(
+        &self,
+        node: Node<'tree>,
+        name: &str,
+        remaining: usize,
+    ) -> Result<TypeBinding<'tree>> {
+        let bytes = &self.source.bytes;
+        for scope in ancestors(node).skip(1) {
+            codesage_protocol::work::checkpoint()?;
+            if scope
+                .child_by_field_name("type_parameters")
+                .is_some_and(|params| {
+                    params.named_children(&mut params.walk()).any(|param| {
+                        declared_type_binding(param).is_some_and(|ident| text(ident, bytes) == name)
+                    })
+                })
+            {
+                return Ok(TypeBinding::Local);
+            }
+            let module = is_module_scope(scope);
+            if !module && scope.kind() != "block" {
+                continue;
+            }
+            let mut matching = None;
+            let mut glob = false;
+            let mut parent_glob = false;
+            for item in scope.named_children(&mut scope.walk()) {
+                if self.macro_may_bind(item)
+                    || item.kind() == "attribute_item"
+                        && attribute_can_rewrite(text(item, bytes))
+                        && !is_lint_attribute(text(item, bytes))
+                {
+                    return Ok(TypeBinding::Unknown);
+                }
+                if item.kind() != "use_declaration" {
+                    if declared_type_binding(item).is_some_and(|ident| text(ident, bytes) == name) {
+                        return Ok(
+                            if item_attributes(item)
+                                .any(|attr| conditional_or_rewriting(attr, bytes))
+                            {
+                                TypeBinding::Unknown
+                            } else if matches!(
+                                item.kind(),
+                                "struct_item" | "enum_item" | "union_item"
+                            ) {
+                                TypeBinding::Nominal
+                            } else if let Some(original) = extern_name(item, name, bytes) {
+                                TypeBinding::Extern(original.to_owned())
+                            } else {
+                                TypeBinding::Local
+                            },
+                        );
+                    }
+                    continue;
+                }
+                let Some(argument) = item.child_by_field_name("argument") else {
+                    return Ok(TypeBinding::Unknown);
+                };
+                if argument.kind() == "use_wildcard"
+                    && rust_use_path(argument, bytes) == "super::*"
+                    && !item_attributes(item).any(|attr| conditional_or_rewriting(attr, bytes))
+                {
+                    parent_glob = true;
+                } else {
+                    glob |= contains_use_wildcard(argument);
+                }
+                let mut bindings = Vec::new();
+                use_bindings(argument, bytes, false, &mut bindings);
+                for binding in bindings.into_iter().filter(|binding| binding.name == name) {
+                    if matching.is_some()
+                        || item_attributes(item).any(|attr| conditional_or_rewriting(attr, bytes))
+                    {
+                        return Ok(TypeBinding::Unknown);
+                    }
+                    matching = Some((binding.path, item));
+                }
+            }
+            let glob_binding = if glob {
+                TypeBinding::Unknown
+            } else if parent_glob {
+                match module_scope(scope).and_then(|scope| scope.parent()) {
+                    Some(enclosing) if remaining > 0 => {
+                        self.binding(enclosing, name, remaining - 1)?
+                    }
+                    _ => TypeBinding::Unknown,
+                }
+            } else {
+                TypeBinding::Missing
+            };
+            if let Some((path, declaration)) = matching {
+                // An explicit use only overrides a glob in the namespaces
+                // that the imported item actually binds.
+                let glob = match glob_binding {
+                    TypeBinding::Missing => GlobCompetition::None,
+                    TypeBinding::Import {
+                        path,
+                        declaration,
+                        glob: GlobCompetition::None,
+                    } => GlobCompetition::Import { path, declaration },
+                    _ => GlobCompetition::Unknown,
+                };
+                return Ok(TypeBinding::Import {
+                    path,
+                    declaration,
+                    glob,
+                });
+            }
+            if !matches!(glob_binding, TypeBinding::Missing) {
+                return Ok(glob_binding);
+            }
+            if module {
+                break;
+            }
+        }
+        Ok(TypeBinding::Missing)
+    }
+}
+
+fn thread_local_may_be_shadowed(invocation: Node<'_>, bytes: &[u8]) -> bool {
+    ancestors(invocation)
+        .filter(|scope| matches!(scope.kind(), "block" | "source_file" | "declaration_list"))
+        .any(|scope| {
+            scope.named_children(&mut scope.walk()).any(|item| {
+                if attribute_has_name(item, "macro_use", bytes)
+                    || item.kind() == "macro_definition"
+                        && declared_binding(item)
+                            .is_some_and(|name| text(name, bytes) == "thread_local")
+                {
+                    return true;
+                }
+                let Some(argument) = item
+                    .child_by_field_name("argument")
+                    .filter(|_| item.kind() == "use_declaration")
+                else {
+                    return false;
+                };
+                let path = text(argument, bytes);
+                if path.contains('*') && path != "super::*" {
+                    return true;
+                }
+                let mut bindings = Vec::new();
+                use_bindings(argument, bytes, false, &mut bindings);
+                bindings
+                    .iter()
+                    .any(|binding| binding.name == "thread_local")
+            })
+        })
+}
+
+fn item_attributes(item: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+    std::iter::successors(item.prev_named_sibling(), Node::prev_named_sibling)
+        .take_while(|item| item.kind() == "attribute_item" || item.kind().ends_with("comment"))
+        .filter(|item| item.kind() == "attribute_item")
+}
+
+fn attribute_name<'a>(item: Node<'_>, bytes: &'a [u8]) -> &'a str {
+    item.named_child(0)
+        .filter(|attribute| attribute.kind() == "attribute")
+        .and_then(|attribute| attribute.named_child(0))
+        .map_or("", |name| text(name, bytes))
+}
+
+fn conditional_or_rewriting(attribute: Node<'_>, bytes: &[u8]) -> bool {
+    matches!(attribute_name(attribute, bytes), "cfg" | "cfg_attr")
+        || attribute_can_rewrite(text(attribute, bytes))
+}
+
+fn has_rewriting_attrs(item: Node<'_>, bytes: &[u8]) -> bool {
+    item_attributes(item).any(|attr| {
+        attribute_can_rewrite(text(attr, bytes)) && !is_lint_attribute(text(attr, bytes))
+    })
+}
+
+fn attribute_has_name(item: Node<'_>, name: &str, bytes: &[u8]) -> bool {
+    if !matches!(item.kind(), "attribute_item" | "inner_attribute_item") {
+        return false;
+    }
+    if attribute_name(item, bytes) == name {
+        return true;
+    }
+    if attribute_name(item, bytes) != "cfg_attr" {
+        return false;
+    }
+    let Some(arguments) = item
+        .named_child(0)
+        .and_then(|attribute| attribute.child_by_field_name("arguments"))
+    else {
+        return false;
+    };
+    text(arguments, bytes)
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .any(|token| token == name)
+}
+
 pub(super) fn project_root(db: &Database) -> Option<PathBuf> {
     crate::constructor_imports::project_root(db).map(Path::to_path_buf)
 }
@@ -1564,6 +2685,24 @@ fn declared_binding(item: Node<'_>) -> Option<Node<'_>> {
     declared_binding_of(item, item.kind())
 }
 
+fn declared_type_binding(item: Node<'_>) -> Option<Node<'_>> {
+    let kind = item.kind();
+    matches!(
+        kind,
+        "associated_type"
+            | "enum_item"
+            | "extern_crate_declaration"
+            | "mod_item"
+            | "struct_item"
+            | "trait_item"
+            | "type_item"
+            | "type_parameter"
+            | "union_item"
+    )
+    .then(|| declared_binding_of(item, kind))
+    .flatten()
+}
+
 /// [`declared_binding`] for a caller that already holds `item.kind()`.
 fn declared_binding_of<'tree>(item: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
     if kind == "extern_crate_declaration" {
@@ -1673,16 +2812,19 @@ fn relative_glob_bindings(glob: Node<'_>, root: Node<'_>, bytes: &[u8]) -> Optio
 
 fn module_scope(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
-        if node.kind() == "source_file"
-            || node.kind() == "declaration_list"
-                && node
-                    .parent()
-                    .is_some_and(|parent| parent.kind() == "mod_item")
-        {
+        if is_module_scope(node) {
             return Some(node);
         }
         node = node.parent()?;
     }
+}
+
+fn is_module_scope(node: Node<'_>) -> bool {
+    node.kind() == "source_file"
+        || node.kind() == "declaration_list"
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "mod_item")
 }
 
 fn import_declaration<'a>(root: Node<'a>, row: &Reference) -> Option<Node<'a>> {
@@ -1838,7 +2980,7 @@ fn use_bindings(node: Node<'_>, bytes: &[u8], public: bool, out: &mut Vec<Use>) 
                     node.child_by_field_name("path"),
                     node.child_by_field_name("list"),
                 ) {
-                    pending.push((list, format!("{prefix}{}::", text(path, bytes))));
+                    pending.push((list, format!("{prefix}{}::", rust_use_path(path, bytes))));
                 }
             }
             "use_as_clause" => {
@@ -1846,7 +2988,7 @@ fn use_bindings(node: Node<'_>, bytes: &[u8], public: bool, out: &mut Vec<Use>) 
                     node.child_by_field_name("path"),
                     node.child_by_field_name("alias"),
                 ) {
-                    let path = format!("{prefix}{}", text(path, bytes));
+                    let path = format!("{prefix}{}", rust_use_path(path, bytes));
                     out.push(Use {
                         name: text(alias, bytes).into(),
                         path: path.strip_suffix("::self").unwrap_or(&path).to_string(),
@@ -1855,7 +2997,7 @@ fn use_bindings(node: Node<'_>, bytes: &[u8], public: bool, out: &mut Vec<Use>) 
                 }
             }
             "identifier" | "scoped_identifier" | "self" => {
-                let path = format!("{prefix}{}", text(node, bytes));
+                let path = format!("{prefix}{}", rust_use_path(node, bytes));
                 let path = path.strip_suffix("::self").unwrap_or(&path).to_string();
                 out.push(Use {
                     name: path.rsplit("::").next().unwrap_or_default().into(),
@@ -1866,6 +3008,42 @@ fn use_bindings(node: Node<'_>, bytes: &[u8], public: bool, out: &mut Vec<Use>) 
             _ => {}
         }
     }
+}
+
+fn rust_use_path<'a>(node: Node<'_>, bytes: &'a [u8]) -> Cow<'a, str> {
+    let raw = text(node, bytes);
+    if !raw.bytes().any(|b| b.is_ascii_whitespace() || b == b'/') {
+        return Cow::Borrowed(raw);
+    }
+    let mut path = String::new();
+    let mut stack = vec![node];
+    while let Some(segment) = stack.pop() {
+        match segment.kind() {
+            "scoped_identifier" | "scoped_type_identifier" | "use_wildcard" => {
+                let children: Vec<_> = segment.children(&mut segment.walk()).collect();
+                stack.extend(children.into_iter().rev());
+            }
+            "identifier" | "type_identifier" | "self" | "super" | "crate" | "::" | "*" => {
+                path.push_str(text(segment, bytes));
+            }
+            "line_comment" | "block_comment" => {}
+            _ => return Cow::Borrowed(raw),
+        }
+    }
+    Cow::Owned(path)
+}
+
+fn contains_use_wildcard(argument: Node<'_>) -> bool {
+    let mut pending = vec![argument];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "use_wildcard" {
+            return true;
+        }
+        if matches!(node.kind(), "use_list" | "scoped_use_list") {
+            pending.extend(node.named_children(&mut node.walk()));
+        }
+    }
+    false
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use codesage_storage::db::ImportPairs;
 use codesage_protocol::ReferenceKind;
 
 use crate::bundle::{JsAliases, resolved_path_import_candidates};
+use crate::go_modules::GoFileHeaders;
 
 /// Every cross-file import pair, partitioned by whether any load-time
 /// directive joins it. Pairs are sorted.
@@ -27,8 +28,26 @@ pub fn file_import_pairs(db: &Database) -> Result<ImportPairs> {
     if !path_refs.is_empty() {
         let files: HashSet<String> = db.all_file_paths()?.into_iter().collect();
         let aliases = JsAliases::load(db)?;
+        let go_modules = if path_refs.iter().any(|(from, _, _)| from.ends_with(".go")) {
+            crate::go_modules::GoModules::load(db, files.iter().map(String::as_str))?
+        } else {
+            crate::go_modules::GoModules::default()
+        };
+        let mut go_headers = GoFileHeaders::default();
         for (from, spec, lazy_only) in path_refs {
             codesage_protocol::work::checkpoint()?;
+            if from.ends_with(".go") {
+                let targets = go_modules.targets(&from, &spec);
+                if !targets.is_empty() && !go_headers.excludes(db, &from)? {
+                    for to in targets {
+                        codesage_protocol::work::checkpoint()?;
+                        if !go_headers.excludes(db, to)? {
+                            pairs.add(from.clone(), to.clone(), lazy_only);
+                        }
+                    }
+                }
+                continue;
+            }
             let spec = aliases.effective(ReferenceKind::Import, &spec, &from)?;
             if let Some(to) = loaded_target(&spec, &from, &files) {
                 pairs.add(from, to, lazy_only);

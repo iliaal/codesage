@@ -2046,6 +2046,11 @@ fn import_cycle_components(db: &Database) -> Result<Arc<ImportCycles>> {
     else {
         return Ok(Arc::new(ImportCycles::load(db)?));
     };
+    // Package edges also depend on live go.mod boundaries, outside SQLite's
+    // structural cache token.
+    if db.has_go_package_imports()? {
+        return Ok(Arc::new(ImportCycles::load(db)?));
+    }
     if let Some((_, cached)) = IMPORT_CYCLE_CACHE
         .lock()
         .expect("import cycle cache lock poisoned")

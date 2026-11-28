@@ -10,6 +10,7 @@ pub mod drift;
 pub mod edit_check;
 mod git;
 mod git_history;
+mod go_modules;
 pub mod hook_health;
 mod impact;
 mod import_graph;

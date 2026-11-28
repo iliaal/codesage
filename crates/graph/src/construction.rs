@@ -175,7 +175,7 @@ fn is_instance_constructor(symbol: &Symbol) -> Result<bool> {
             .any(|child| matches!(child.kind(), "static" | "get" | "set" | "async" | "*")))
 }
 
-/// Rows that may reference `symbol`: those spelled with its name, those
+/// Rows that may reference `symbol`: those spelled with its source name, those
 /// spelled with a Rust `use` alias of it (`modules` loads the module context
 /// only when an import of the name exists), and for a constructor, the rows
 /// instantiating its owner.
@@ -184,7 +184,8 @@ pub(crate) fn references_for_symbol(
     symbol: &Symbol,
     modules: &mut dyn FnMut() -> Result<Arc<crate::rust_modules::RustModules>>,
 ) -> Result<Vec<Reference>> {
-    let mut rows = db.find_references(&symbol.name, None)?;
+    let name = crate::bundle::c_abi_function_name(db, symbol)?.unwrap_or(&symbol.name);
+    let mut rows = db.find_references(name, None)?;
     if symbol.file_path.ends_with(".rs") && rust_imports_name(&rows, &symbol.name) {
         let aliased = modules()?.alias_references(db, &symbol.name, &rows)?;
         rows.extend(aliased);

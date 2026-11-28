@@ -130,6 +130,7 @@ pub(crate) struct WalkCache {
     python_references: PythonReferences,
     import_matches: HashMap<String, Arc<Vec<usize>>>,
     rust_modules: Option<Arc<crate::rust_modules::RustModules>>,
+    go_calls: crate::go_modules::GoCalls,
     constructors: crate::construction::Constructors,
     /// Candidates per (caller file, spelling, kind), charged to
     /// `MAX_REFERENCE_BYTES` like `resolutions`.
@@ -336,6 +337,7 @@ impl WalkCache {
             .as_ref()
             .is_some_and(|modules| modules.capped())
             || self.constructors.capped()
+            || self.go_calls.capped()
     }
 
     pub(crate) fn resolve_symbols(
@@ -380,6 +382,21 @@ impl WalkCache {
         db: &Database,
         row: &Reference,
     ) -> Result<Vec<Symbol>> {
+        self.resolve_reference_within(db, row, None)
+    }
+
+    fn resolve_reference_within(
+        &mut self,
+        db: &Database,
+        row: &Reference,
+        target: Option<&DefinitionKey>,
+    ) -> Result<Vec<Symbol>> {
+        if let Some(mut resolved) = self.go_package_resolution(db, row)?.into_targets() {
+            if let Some(target) = target {
+                resolved.retain(|candidate| symbol_identity_key(candidate) == *target);
+            }
+            return Ok(resolved);
+        }
         let mut resolved = match self.python_reference(db, row)? {
             Some(resolved) => resolved,
             None => {
@@ -417,8 +434,39 @@ impl WalkCache {
                 }
             }
         };
+        self.go_calls
+            .retain_fallback_targets(db, row, &mut resolved)?;
         self.constructors.append_targets(db, row, &mut resolved)?;
+        if let Some(target) = target {
+            resolved.retain(|candidate| symbol_identity_key(candidate) == *target);
+        }
+        if row.kind == ReferenceKind::Call
+            && row.from_file.ends_with(".rs")
+            && row.to_name.contains("::")
+            && !resolved.is_empty()
+        {
+            let modules = self.rust_modules(db)?;
+            let mut kept = Vec::with_capacity(resolved.len());
+            for candidate in resolved {
+                if !modules.unrelated_external_type_method(db, row, &candidate)? {
+                    kept.push(candidate);
+                }
+            }
+            resolved = kept;
+        }
         Ok(resolved)
+    }
+
+    pub(crate) fn go_package_resolution(
+        &mut self,
+        db: &Database,
+        row: &Reference,
+    ) -> Result<crate::go_modules::GoResolution> {
+        self.go_calls.resolve(db, row)
+    }
+
+    pub(crate) fn go_context_capped(&self) -> bool {
+        self.go_calls.capped()
     }
 
     fn python_reference(&mut self, db: &Database, row: &Reference) -> Result<Option<Vec<Symbol>>> {
@@ -622,6 +670,10 @@ pub(crate) struct FileImports {
     /// Rows of [`FileImportShape::JsPath`] by the project path their
     /// specifier joins to, ascending.
     js_targets: HashMap<String, Vec<usize>>,
+    go_targets: HashMap<String, Vec<usize>>,
+    go_modules: Option<Arc<crate::go_modules::GoModules>>,
+    go_excluded: HashSet<String>,
+    go_headers_capped: bool,
     /// Files each Python row loads, by row index and filled on first use; empty
     /// when no row is Python. Every frontier file tests every Python row, so
     /// indexing by row avoids building and hashing an import-site key per row
@@ -650,6 +702,8 @@ enum FileImportShape {
     /// A JavaScript/TypeScript relative specifier, or an alias stored with
     /// its relative form; listed in `js_targets` by its joined path.
     JsPath,
+    /// A Go import indexed by its package directory in `go_targets`.
+    GoPackage,
     /// The path matcher rejects this row for every target file.
     NoFile,
 }
@@ -661,6 +715,10 @@ impl FileImports {
         let mut c_family = false;
         let mut shapes = Vec::with_capacity(rows.len());
         let mut js_targets: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut go_targets: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut go_modules = None;
+        let mut go_headers = crate::go_modules::GoFileHeaders::default();
+        let mut go_excluded = HashSet::new();
         let mut path_rows = 0usize;
         for (index, row) in rows.iter().enumerate() {
             c_family |= matches!(
@@ -672,6 +730,37 @@ impl FileImports {
             shapes.push(
                 if codesage_protocol::python::is_python_path(&row.from_file) {
                     FileImportShape::Python
+                } else if row.from_file.ends_with(".go") && row.kind == ReferenceKind::Import {
+                    if go_modules.is_none() {
+                        let files = db.all_file_paths()?;
+                        go_modules = Some(Arc::new(crate::go_modules::GoModules::load(
+                            db,
+                            files.iter().map(String::as_str),
+                        )?));
+                    }
+                    let targets = go_modules
+                        .as_ref()
+                        .expect("Go modules loaded")
+                        .targets(&row.from_file, spec);
+                    if let Some(dir) = targets
+                        .first()
+                        .and_then(|file| crate::go_modules::package_dir(file))
+                        && !go_headers.excludes(db, &row.from_file)?
+                    {
+                        let sites = go_targets.entry(dir.to_owned()).or_default();
+                        if sites.is_empty() {
+                            for target in targets {
+                                codesage_protocol::work::checkpoint()?;
+                                if go_headers.excludes(db, target)? {
+                                    go_excluded.insert(target.clone());
+                                }
+                            }
+                        }
+                        sites.push(index);
+                        FileImportShape::GoPackage
+                    } else {
+                        FileImportShape::NoFile
+                    }
                 } else if crate::bundle::is_js_importer(&row.from_file)
                     && (spec.starts_with("./") || spec.starts_with("../"))
                 {
@@ -715,14 +804,26 @@ impl FileImports {
             rows,
             shapes,
             js_targets,
+            go_targets,
+            go_modules,
+            go_excluded,
+            go_headers_capped: go_headers.capped,
             c_family,
         })
     }
 
     /// The rows `file` may match, ascending: every row of `matchable` and
-    /// the `JsPath` rows whose specifier loads `file`. No other row can.
+    /// the indexed JavaScript and Go rows whose specifier loads `file`.
     fn rows_to_match(&self, file: &str) -> Vec<usize> {
-        let loading = self.js_rows_loading(file);
+        let mut loading = self.js_rows_loading(file);
+        if !file.ends_with("_test.go")
+            && !self.go_excluded.contains(file)
+            && let Some(rows) =
+                crate::go_modules::package_dir(file).and_then(|dir| self.go_targets.get(dir))
+        {
+            loading.extend_from_slice(rows);
+            loading.sort_unstable();
+        }
         let mut rows = Vec::with_capacity(self.matchable.len() + loading.len());
         let (mut a, mut b) = (0, 0);
         while a < self.matchable.len() && b < loading.len() {
@@ -1024,6 +1125,11 @@ pub(crate) fn impact_analysis_walk_shared(
     } else {
         Arc::new(FileImports::load(db)?)
     };
+    if let Some(modules) = &file_imports.go_modules
+        && let Some(cache) = cache.as_deref_mut()
+    {
+        cache.go_calls.use_modules(modules);
+    }
     let indexed = if file_imports.c_family {
         cache
             .as_deref_mut()
@@ -1207,7 +1313,9 @@ pub(crate) fn impact_analysis_walk_shared(
                                 rust_modules_loaded,
                                 &indexed,
                             ),
-                        FileImportShape::Python | FileImportShape::JsPath => false,
+                        FileImportShape::Python
+                        | FileImportShape::JsPath
+                        | FileImportShape::GoPackage => false,
                     }
                 {
                     continue;
@@ -1366,7 +1474,9 @@ pub(crate) fn impact_analysis_walk_shared(
     });
     Ok(WalkOutcome {
         entries,
-        capped: frontier_capped || cache.as_ref().is_some_and(|cache| cache.context_capped()),
+        capped: frontier_capped
+            || file_imports.go_headers_capped
+            || cache.as_ref().is_some_and(|cache| cache.context_capped()),
         edge_counts,
         seed_count,
         type_checking_edges,
@@ -1565,12 +1675,15 @@ fn resolve_references_to_symbol(
     let identity = symbol_identity_key(sym);
     for r in raw {
         codesage_protocol::work::checkpoint()?;
+        if !crate::go_modules::selector_may_target(&r, sym) {
+            continue;
+        }
         if needs_reference_resolution(&r) {
             let resolved = shared
                 .as_deref_mut()
                 .unwrap_or(&mut local)
-                .resolve_reference(db, &r)?;
-            if resolved.iter().any(|s| symbol_identity_key(s) == identity) {
+                .resolve_reference_within(db, &r, Some(&identity))?;
+            if !resolved.is_empty() {
                 out.push(r);
             }
             continue;
@@ -1595,6 +1708,7 @@ fn resolve_references_to_symbol(
 
 pub(crate) fn needs_reference_resolution(row: &Reference) -> bool {
     codesage_protocol::python::is_python_path(&row.from_file)
+        || crate::go_modules::selector_call(row)
         || row.kind == ReferenceKind::Instantiation
         || (row.from_file.ends_with(".rs")
             && matches!(row.kind, ReferenceKind::Call | ReferenceKind::MacroCall))
@@ -2024,6 +2138,7 @@ mod tests {
                 .filter(|&index| match imports.shapes[index] {
                     FileImportShape::NoFile => false,
                     FileImportShape::JsPath => loading.binary_search(&index).is_ok(),
+                    FileImportShape::GoPackage => false,
                     FileImportShape::Python | FileImportShape::PathMatched(_) => true,
                 })
                 .collect();

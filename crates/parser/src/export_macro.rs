@@ -48,7 +48,8 @@ const MAX_MACRO_RUN: usize = 8;
 /// Declaration-head scan window, template arguments included.
 const MAX_HEAD_TOKENS: usize = 64;
 
-const C_MACROS: [&[u8]; 4] = [b"PHPAPI", b"ZEND_COLD", b"ZEND_FASTCALL", b"ZEND_NORETURN"];
+pub(crate) const C_MACROS: [&[u8]; 4] =
+    [b"PHPAPI", b"ZEND_COLD", b"ZEND_FASTCALL", b"ZEND_NORETURN"];
 
 const C_QUALIFIERS: [&[u8]; 15] = [
     b"const",
@@ -524,6 +525,7 @@ pub(crate) struct Lexer<'a> {
     src: &'a [u8],
     i: usize,
     line_start: bool,
+    spliced_line_comments: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -532,6 +534,14 @@ impl<'a> Lexer<'a> {
             src,
             i: 0,
             line_start: true,
+            spliced_line_comments: false,
+        }
+    }
+
+    pub(crate) fn with_spliced_line_comments(src: &'a [u8]) -> Self {
+        Self {
+            spliced_line_comments: true,
+            ..Self::new(src)
         }
     }
 }
@@ -555,7 +565,11 @@ impl Iterator for Lexer<'_> {
             }
             let start = i;
             if b == b'/' && src.get(i + 1) == Some(&b'/') {
-                i = skip_line(src, i);
+                i = if self.spliced_line_comments {
+                    skip_spliced_comment(src, i)
+                } else {
+                    skip_line(src, i)
+                };
                 continue;
             }
             if b == b'/' && src.get(i + 1) == Some(&b'*') {

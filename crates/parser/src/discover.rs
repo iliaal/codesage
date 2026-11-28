@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc;
+use std::time::Instant;
 
 use anyhow::Result;
 use codesage_protocol::stat_cache::{CachedFileHash, FileStat};
@@ -70,24 +71,7 @@ pub fn discover_files_report_with_context(
         Some(build_exclude_set(exclude_patterns)?)
     };
 
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder.hidden(true).git_ignore(true);
-    if let Some(excludes_for_filter) = excludes.clone() {
-        let root_for_filter = root.to_path_buf();
-        builder.filter_entry(move |entry| {
-            let path = entry.path();
-            let Ok(rel) = path.strip_prefix(&root_for_filter) else {
-                return true;
-            };
-            if rel.as_os_str().is_empty() {
-                return true;
-            }
-            let rel_path = rel.to_string_lossy();
-            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
-            !exclude_matches_path(&excludes_for_filter, &rel_path, is_dir)
-        });
-    }
-    let walker = builder.build_parallel();
+    let walker = discover_walker(root, excludes.clone()).build_parallel();
 
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let (tx, rx) = mpsc::channel::<FileInfo>();
@@ -220,6 +204,57 @@ pub fn discover_files_report_with_context(
         hashes_reused,
         bytes_hashed,
     })
+}
+
+fn discover_walker(root: &Path, excludes: Option<GlobSet>) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder.hidden(true).git_ignore(true);
+    if let Some(excludes) = excludes {
+        let root = root.to_path_buf();
+        builder.filter_entry(move |entry| {
+            let Ok(rel) = entry.path().strip_prefix(&root) else {
+                return true;
+            };
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            rel.as_os_str().is_empty()
+                || !exclude_matches_path(&excludes, &rel.to_string_lossy(), is_dir)
+        });
+    }
+    builder
+}
+
+/// Find shallow Go manifests through discovery's ignore rules without parsing or
+/// hashing other files. An incomplete walk cannot establish the closest root.
+pub fn discover_go_manifests(
+    root: &Path,
+    excludes: &GlobSet,
+    max_parent_depth: usize,
+    deadline: Option<Instant>,
+) -> Result<Option<Vec<String>>> {
+    const MAX_ENTRIES: usize = 16_384;
+    const MAX_MANIFESTS: usize = 128;
+    let mut builder = discover_walker(root, Some(excludes.clone()));
+    builder.max_depth(Some(max_parent_depth.saturating_add(1)));
+    let mut paths = Vec::new();
+    for (i, entry) in builder.build().enumerate() {
+        codesage_protocol::work::checkpoint()?;
+        if i == MAX_ENTRIES || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(None);
+        }
+        let Ok(entry) = entry else {
+            return Ok(None);
+        };
+        if entry.file_name() == "go.mod"
+            && entry.file_type().is_some_and(|kind| kind.is_file())
+            && let Some(path) = project_relative_path(root, entry.path())
+        {
+            if paths.len() == MAX_MANIFESTS {
+                return Ok(None);
+            }
+            paths.push(path);
+        }
+    }
+    Ok(Some(paths))
 }
 
 fn now_ns() -> Option<i64> {

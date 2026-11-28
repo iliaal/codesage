@@ -1411,7 +1411,16 @@ fn tree_references(
 
         let ref_node = p.node;
         let raw = crate::parse::node_text_lossy(&ref_node, source);
-        let stripped = strip_surrounding_quotes(&raw);
+        let go_path;
+        let stripped = if language == Language::Go && kind == ReferenceKind::Import {
+            let Some(path) = crate::go_imports::decode_import_path(&raw) else {
+                continue;
+            };
+            go_path = path;
+            go_path.as_ref()
+        } else {
+            strip_surrounding_quotes(&raw)
+        };
         if stripped.is_empty() {
             continue;
         }
@@ -1429,6 +1438,11 @@ fn tree_references(
         // Grouped-import leaves are captured bare; prepend the enclosing base
         // path so the stored name resolves the same way a flat import does.
         let to_name = match language {
+            Language::Go
+                if kind == ReferenceKind::Call && ref_node.kind() == "selector_expression" =>
+            {
+                simple_go_selector(ref_node, source).unwrap_or_else(|| stripped.to_string())
+            }
             Language::Rust if p.pattern == 13 => {
                 if rust_module_has_path_attribute(ref_node.parent(), source) {
                     continue;
@@ -1581,6 +1595,28 @@ fn rust_module_has_path_attribute(node: Option<tree_sitter::Node<'_>>, source: &
         previous = attribute.prev_named_sibling();
     }
     false
+}
+
+fn simple_go_selector(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let (operand, field) = simple_go_selector_parts(node)?;
+    let operand = operand.utf8_text(source).ok()?;
+    let field = field.utf8_text(source).ok()?;
+    Some(format!("{operand}.{field}"))
+}
+
+pub fn simple_go_selector_parts(
+    node: tree_sitter::Node<'_>,
+) -> Option<(tree_sitter::Node<'_>, tree_sitter::Node<'_>)> {
+    if node.kind() != "selector_expression" {
+        return None;
+    }
+    let operand = node
+        .child_by_field_name("operand")
+        .filter(|node| node.kind() == "identifier" && !node.is_missing())?;
+    let field = node
+        .child_by_field_name("field")
+        .filter(|node| node.kind() == "field_identifier" && !node.is_missing())?;
+    Some((operand, field))
 }
 
 fn rust_path_assignment(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {

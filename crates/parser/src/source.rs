@@ -18,18 +18,64 @@ pub fn read_indexable_file(root: &Path, relative: &Path) -> Result<Option<Indexa
     read_indexable_file_with(root, relative, || {}, || {})
 }
 
+/// Take the same race-checked snapshot under a smaller consumer byte limit.
+pub fn read_indexable_file_bounded(
+    root: &Path,
+    relative: &Path,
+    max_bytes: u64,
+) -> Result<Option<IndexableSource>> {
+    read_indexable_file_with_limit(root, relative, max_bytes, || {}, || {})
+}
+
+/// Read a prefix from the same race-checked indexable descriptor.
+pub fn read_indexable_file_prefix(
+    root: &Path,
+    relative: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    let Some(file) = IndexableFile::open(root, relative)? else {
+        return Ok(None);
+    };
+    let len = file.before.len().min(max_bytes as u64);
+    let mut bytes = Vec::new();
+    (&file.file).take(len).read_to_end(&mut bytes)?;
+    file.verify()?;
+    ensure!(
+        bytes.len() as u64 == len,
+        "indexable file prefix length differs from its source snapshot"
+    );
+    Ok(Some(bytes))
+}
+
 fn read_indexable_file_with(
     root: &Path,
     relative: &Path,
+    before_open: impl FnMut(),
+    before_read: impl FnMut(),
+) -> Result<Option<IndexableSource>> {
+    read_indexable_file_with_limit(
+        root,
+        relative,
+        MAX_INDEXABLE_FILE_BYTES,
+        before_open,
+        before_read,
+    )
+}
+
+fn read_indexable_file_with_limit(
+    root: &Path,
+    relative: &Path,
+    max_bytes: u64,
     mut before_open: impl FnMut(),
     mut before_read: impl FnMut(),
 ) -> Result<Option<IndexableSource>> {
+    let max_bytes = max_bytes.min(MAX_INDEXABLE_FILE_BYTES);
     for attempt in 0..3 {
         let result = (|| {
             let Some(file) = IndexableFile::open_with(root, relative, &mut before_open)? else {
                 return Ok(None);
             };
-            file.read_with(&mut before_read)
+            file.read_with_limit(max_bytes, &mut before_read)
         })();
         if attempt < 2
             && result.as_ref().err().is_some_and(|e: &anyhow::Error| {
@@ -106,12 +152,21 @@ impl IndexableFile {
     }
 
     fn read_with(self, before_read: impl FnOnce()) -> Result<Option<IndexableSource>> {
+        self.read_with_limit(MAX_INDEXABLE_FILE_BYTES, before_read)
+    }
+
+    fn read_with_limit(
+        self,
+        max_bytes: u64,
+        before_read: impl FnOnce(),
+    ) -> Result<Option<IndexableSource>> {
+        if self.before.len() > max_bytes {
+            return Ok(None);
+        }
         before_read();
         let mut bytes = Vec::new();
-        (&self.file)
-            .take(MAX_INDEXABLE_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_INDEXABLE_FILE_BYTES {
+        (&self.file).take(max_bytes + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max_bytes {
             return Ok(None);
         }
         self.verify()?;
@@ -266,6 +321,19 @@ mod tests {
     }
 
     #[test]
+    fn indexable_reader_prefix_preserves_bytes_and_stops_before_the_body() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"package main\nfn body() {}\n";
+        std::fs::write(root.path().join("main.go"), bytes).unwrap();
+        let prefix = read_indexable_file_prefix(root.path(), Path::new("main.go"), 13)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix, b"package main\n");
+        symlink("main.go", root.path().join("alias.go")).unwrap();
+        assert!(read_indexable_file_prefix(root.path(), Path::new("alias.go"), 13).is_err());
+    }
+
+    #[test]
     fn indexable_reader_preserves_an_authorized_root_alias() {
         let root = tempfile::tempdir().unwrap();
         let aliases = tempfile::tempdir().unwrap();
@@ -341,6 +409,29 @@ mod tests {
         assert!(!pending);
         assert_eq!(source.bytes, b"fn after() {}\n");
         assert_eq!(source.content_hash, content_hash(b"fn after() {}\n"));
+    }
+
+    #[test]
+    fn indexable_reader_respects_a_smaller_limit_after_a_file_grows() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("go.mod");
+        std::fs::write(&path, b"module ex\n").unwrap();
+        let file = IndexableFile::open(root.path(), Path::new("go.mod"))
+            .unwrap()
+            .unwrap();
+        let mut position = file.file.try_clone().unwrap();
+        let source = file
+            .read_with_limit(32, || {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(1024)
+                    .unwrap();
+            })
+            .unwrap();
+        assert!(source.is_none());
+        assert_eq!(position.stream_position().unwrap(), 33);
     }
 
     #[test]

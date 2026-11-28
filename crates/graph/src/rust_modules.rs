@@ -41,6 +41,7 @@ const MAX_ALIAS_NAMES: usize = 32;
 #[derive(Default)]
 pub(crate) struct RustModules {
     modules: HashMap<String, Vec<Module>>,
+    import_candidates: HashMap<String, HashSet<String>>,
     declared: HashSet<String>,
     capped: bool,
     scopes: Mutex<HashMap<String, Vec<Symbol>>>,
@@ -143,7 +144,7 @@ impl RustModules {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
-                .is_some_and(|external| external.capped)
+                .is_some_and(|external| external.capped())
     }
 
     /// Files whose argument-derived rows a `macro_rules!` in their own crate
@@ -194,6 +195,36 @@ impl RustModules {
         external
             .get_or_insert_with(|| external::ExternalCrates::new(db, &self.modules))
             .resolve(db, caller, spelling)
+    }
+
+    pub(crate) fn unrelated_external_type_method(
+        &self,
+        db: &Database,
+        row: &Reference,
+        target: &Symbol,
+    ) -> Result<bool> {
+        if row.kind != ReferenceKind::Call
+            || target.kind != SymbolKind::Method
+            || row.to_name != target.qualified_name
+        {
+            return Ok(false);
+        }
+        let Some(imports) = self.import_candidates.get(&row.from_file) else {
+            return Ok(false);
+        };
+        let Some((receiver, member)) = row.to_name.split_once("::") else {
+            return Ok(false);
+        };
+        if member.contains("::") {
+            return Ok(false);
+        }
+        let mut external = self
+            .external
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        external
+            .get_or_insert_with(|| external::ExternalCrates::new(db, &self.modules))
+            .unrelated_type_method(db, row, receiver, imports.contains(receiver), target)
     }
 
     pub(crate) fn qualified_target(
@@ -349,11 +380,27 @@ impl RustModules {
             .filter(|file| file.ends_with(".rs"))
             .collect();
         let mut declarations: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut result = Self::default();
         for (file, name) in imports {
-            if files.contains(file)
-                && let Some(name) = name.strip_prefix("./")
-            {
+            if !files.contains(file) {
+                continue;
+            }
+            if let Some(name) = name.strip_prefix("./") {
                 declarations.entry(file).or_default().push(name);
+            } else if let Some((root, _)) = name.trim_start_matches("::").split_once("::")
+                && !matches!(root, "crate" | "self" | "super")
+            {
+                result
+                    .import_candidates
+                    .entry(file.clone())
+                    .or_default()
+                    .insert(
+                        name.trim_end()
+                            .rsplit(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '#')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
             }
         }
         let roots: BTreeMap<_, _> = files
@@ -385,7 +432,6 @@ impl RustModules {
             .copied()
             .filter(|file| parents[file] == 0)
             .collect();
-        let mut result = Self::default();
         let mut total = 0;
         while let Some(root) = root_queue.pop_front() {
             if !result.declared.contains(root) {

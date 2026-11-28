@@ -3,6 +3,7 @@ pub mod discover;
 mod export_macro;
 pub mod extract;
 pub mod fingerprint;
+pub mod go_imports;
 pub mod header;
 mod macro_invocation;
 pub mod parse;

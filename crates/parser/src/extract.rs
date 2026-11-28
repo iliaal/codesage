@@ -342,6 +342,16 @@ pub fn extract_symbols(
 
         let qualified_name = if language == Language::Cpp {
             cpp_qualified_name(&name, &captured_name, kind, &def_node, source)
+        } else if language == Language::C
+            && kind == SymbolKind::Method
+            && let Some(class) = c_php_method_class(def_node, name_node, source)
+        {
+            format!("{class}::{name}")
+        } else if language == Language::C
+            && kind == SymbolKind::Function
+            && let Some(arity) = c_php_frameless_arity(def_node, name_node, source)
+        {
+            format!("zflf_{name}_{arity}")
         } else {
             let namespace = match language {
                 Language::Php => find_php_namespace_for_node(&def_node, &root, source),
@@ -446,13 +456,28 @@ pub(crate) fn is_recovered_statement(
         name,
         "if" | "else" | "while" | "for" | "switch" | "do" | "return" | "case" | "sizeof" | "goto"
     ) {
-        return true;
+        return language != Language::C
+            || (kind != SymbolKind::Method
+                && !(def.kind() == "function_definition"
+                    && def
+                        .child_by_field_name("type")
+                        .and_then(|ty| ty.utf8_text(source).ok())
+                        == Some("ZEND_FRAMELESS_FUNCTION")
+                    && def
+                        .child_by_field_name("declarator")
+                        .is_some_and(|d| d.kind() == "parenthesized_declarator")));
     }
     if def.kind() != "function_definition" {
         return false;
     }
     let def_type = def.child_by_field_name("type");
     if def_type.is_some_and(|ty| ty.utf8_text(source) == Ok("else")) {
+        return true;
+    }
+    if language == Language::C
+        && def_type.is_some_and(|ty| ty.utf8_text(source) == Ok("ZEND_HASH_FILL_PACKED"))
+        && c_zend_hash_fill_wrapper(*def, source)
+    {
         return true;
     }
     if def_type.is_some_and(|ty| is_macro_invocation_type(ty, source)) && in_function_body(def) {
@@ -587,7 +612,15 @@ pub(crate) fn definition_capture<'tree>(
     source: &[u8],
 ) -> Option<(Node<'tree>, SymbolKind)> {
     if language == Language::C {
-        return Some((c_macro_head_name(definition, source).unwrap_or(name), kind));
+        let name = c_macro_head_name(definition, source).unwrap_or(name);
+        let kind = if kind == SymbolKind::Function
+            && c_php_method_class(definition, name, source).is_some()
+        {
+            SymbolKind::Method
+        } else {
+            kind
+        };
+        return Some((name, kind));
     }
     if language != Language::Cpp {
         return Some((name, kind));
@@ -629,6 +662,139 @@ pub(crate) fn definition_capture<'tree>(
         .then_some((name, kind)),
         _ => Some((name, kind)),
     }
+}
+
+fn c_php_method_class<'s>(
+    definition: Node<'_>,
+    name: Node<'_>,
+    source: &'s [u8],
+) -> Option<&'s str> {
+    use crate::{export_macro::Kind, macro_invocation::php_tokens};
+
+    if name.parent()?.kind() != "parenthesized_declarator" {
+        return None;
+    }
+    let ty = definition.child_by_field_name("type")?;
+    if definition.kind() != "function_definition"
+        || !matches!(ty.utf8_text(source), Ok("PHP_METHOD" | "ZEND_METHOD"))
+    {
+        return None;
+    }
+    let prefix = source.get(ty.end_byte()..name.start_byte())?;
+    let mut tokens = php_tokens(prefix);
+    let (open, class, comma) = (tokens.next()?, tokens.next()?, tokens.next()?);
+    if open.kind == Kind::Punct(b'(')
+        && class.kind == Kind::Ident
+        && comma.kind == Kind::Punct(b',')
+        && tokens.next().is_none()
+    {
+        std::str::from_utf8(&prefix[class.start..class.end]).ok()
+    } else {
+        None
+    }
+}
+
+fn c_php_native_function(definition: Node<'_>, source: &[u8]) -> bool {
+    let Some(decl) = definition
+        .child_by_field_name("declarator")
+        .filter(|decl| decl.kind() == "parenthesized_declarator")
+    else {
+        return false;
+    };
+    let Some(name) = decl
+        .named_children(&mut decl.walk())
+        .find(|node| node.kind() == "identifier")
+    else {
+        return false;
+    };
+    c_php_method_class(definition, name, source).is_some()
+        || c_php_frameless_arity(definition, name, source).is_some()
+}
+
+fn c_php_frameless_arity<'s>(
+    definition: Node<'_>,
+    name: Node<'_>,
+    source: &'s [u8],
+) -> Option<&'s str> {
+    use crate::{export_macro::Kind, macro_invocation::php_tokens};
+
+    let decl = definition.child_by_field_name("declarator")?;
+    let ty = definition.child_by_field_name("type")?;
+    if definition.kind() != "function_definition"
+        || decl.kind() != "parenthesized_declarator"
+        || name.parent() != Some(decl)
+        || ty.utf8_text(source) != Ok("ZEND_FRAMELESS_FUNCTION")
+    {
+        return None;
+    }
+    let prefix = source.get(ty.end_byte()..name.start_byte())?;
+    let suffix = source.get(name.end_byte()..decl.end_byte())?;
+    let mut before = php_tokens(prefix);
+    let mut after = php_tokens(suffix);
+    let (open, comma, arity, close) = (before.next()?, after.next()?, after.next()?, after.next()?);
+    let arity = &suffix[arity.start..arity.end];
+    if open.kind != Kind::Punct(b'(')
+        || comma.kind != Kind::Punct(b',')
+        || close.kind != Kind::Punct(b')')
+        || before.next().is_some()
+        || after.next().is_some()
+        || !arity.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    std::str::from_utf8(arity).ok()
+}
+
+fn c_zend_hash_fill_wrapper(definition: Node<'_>, source: &[u8]) -> bool {
+    use crate::{
+        export_macro::Kind,
+        macro_invocation::{directive_parts, php_tokens},
+    };
+
+    let Some(decl) = definition
+        .child_by_field_name("declarator")
+        .filter(|decl| decl.kind() == "parenthesized_declarator")
+    else {
+        return false;
+    };
+    if !decl
+        .named_children(&mut decl.walk())
+        .any(|node| node.kind() == "identifier")
+    {
+        return false;
+    }
+    let Some(tail) = source.get(definition.end_byte()..) else {
+        return false;
+    };
+    let mut tokens = php_tokens(tail);
+    // The closing macro must be the next statement, optionally inside a
+    // literally true first preprocessor arm.
+    let Some(end) = tokens.by_ref().find(|token| {
+        if token.kind != Kind::Directive {
+            return true;
+        }
+        let (keyword, condition) = directive_parts(&tail[token.start..token.end]);
+        let mut parts = php_tokens(condition);
+        keyword != b"if"
+            || !parts
+                .next()
+                .is_some_and(|part| &condition[part.start..part.end] == b"1")
+            || parts.next().is_some()
+    }) else {
+        return false;
+    };
+    if &tail[end.start..end.end] != b"ZEND_HASH_FILL_END"
+        || !b"();".iter().all(|&delimiter| {
+            tokens
+                .next()
+                .is_some_and(|t| t.kind == Kind::Punct(delimiter))
+        })
+    {
+        return false;
+    }
+    std::iter::successors(definition.parent(), Node::parent)
+        .filter(|node| node.kind() == "function_definition")
+        .any(|owner| c_php_native_function(owner, source))
 }
 
 /// `ZEND_API ZEND_INI_MH(OnUpdate) {`: a C definition with no return type, or

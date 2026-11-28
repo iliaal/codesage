@@ -356,15 +356,17 @@ fn render_with_budget<T: serde::Serialize>(
             }
             if let Some(options) = options {
                 super::detail::project(&mut value, options.detail);
-                if options.detail == codesage_protocol::DescribeDetail::Full
-                    && let Some(request) = &request
-                {
-                    super::detail::add_snippets(&mut value, &request.project);
-                }
             }
-            let capped = cap_to_budget_with(value, kind, budget_chars);
+            if kind != "find_references"
+                && options.is_some_and(|options| {
+                    options.detail == codesage_protocol::DescribeDetail::Full
+                })
+                && let Some(request) = &request
+            {
+                super::detail::add_snippets(&mut value, &request.project);
+            }
             // MCP requires a structured-content object; normalize arrays regardless of budget.
-            let structured = match capped {
+            let structured = match cap_to_budget_with(value, kind, budget_chars) {
                 serde_json::Value::Array(items) => serde_json::json!({ "results": items }),
                 other => other,
             };
@@ -657,6 +659,10 @@ pub(super) fn annotate_test_override(mut result: CallToolResult, active: bool) -
 /// Prefer trimming elsewhere; if unavoidable, disclose dropped identities.
 const PROTECTED_TRUNCATION_KEYS: &[&str] = &["files", "clustered_directories"];
 
+pub(super) fn reference_is_test(row: &serde_json::Value) -> bool {
+    row["is_test"] == true
+}
+
 /// Best-effort path/name identifier for a truncated array element, used to
 /// populate `_meta.dropped_files`.
 fn element_identifier(item: &serde_json::Value) -> Option<String> {
@@ -731,12 +737,17 @@ fn cap_to_budget_with(
                 if protected && meta.is_some() {
                     break;
                 }
-                let Some(serde_json::Value::Array(items)) = map.remove(&key) else {
+                let Some(serde_json::Value::Array(mut items)) = map.remove(&key) else {
                     break;
                 };
                 let total = items.len();
                 let other_chars = current_len.saturating_sub(key_len);
                 let remaining = budget_chars.saturating_sub(other_chars);
+                let reference_results = kind == "find_references" && key == "results";
+                // The prefix cap charges rows without the array brackets and commas.
+                if reference_results && key_len.saturating_sub(total + 1) > remaining {
+                    items.sort_by_key(reference_is_test);
+                }
                 // Prefix truncation lets original positions identify the dropped tail.
                 let identifiers: Vec<Option<String>> = if protected {
                     items.iter().map(element_identifier).collect()
@@ -747,6 +758,9 @@ fn cap_to_budget_with(
                 let returned = kept.len();
                 map.insert(key.clone(), serde_json::Value::Array(kept));
                 trimmed.push(key.clone());
+                if reference_results && returned == total && nested.is_none() {
+                    continue;
+                }
                 if let Some(nested) = nested {
                     also_truncated.push(nested.label(&key));
                     nested_dropped.extend(nested.dropped_named);
@@ -1398,6 +1412,32 @@ mod tests {
         assert_eq!(obj["results"].as_array().unwrap().len(), returned);
         let hint = meta["hint"].as_str().unwrap();
         assert!(!hint.contains("offset"), "{hint}");
+    }
+
+    #[test]
+    fn early_reference_budget_discloses_only_actual_row_reduction() {
+        let production = json!({"from_file": "src.rs"});
+        let mut original = json!({
+            "results": [{"from_file": "tests.rs", "is_test": true}, production],
+            "note": "",
+        });
+        original["note"] = json!(fat_string(
+            MCP_BUDGET_CHARS + 1 - original.to_string().len()
+        ));
+        assert_eq!(original.to_string().len(), MCP_BUDGET_CHARS + 1);
+
+        let intact = cap_to_budget_with(original.clone(), "find_references", MCP_BUDGET_CHARS);
+        assert!(
+            intact == original,
+            "expected unchanged rows with no truncation metadata, got {:?}",
+            intact.get("_meta")
+        );
+
+        let trimmed = cap_to_budget_with(original, "find_references", MCP_BUDGET_CHARS - 4);
+        assert_eq!(trimmed["results"], json!([production]));
+        assert_eq!(trimmed["_meta"]["truncated"], true);
+        assert_eq!(trimmed["_meta"]["total_results"], 2);
+        assert_eq!(trimmed["_meta"]["returned"], 1);
     }
 
     #[test]

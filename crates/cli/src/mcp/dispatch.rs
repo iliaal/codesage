@@ -66,6 +66,11 @@ pub(super) struct ToolRequest {
 
 struct CancelOnDrop(WorkControl);
 
+struct FullReferenceFinish {
+    started: Instant,
+    notes: Vec<String>,
+}
+
 #[derive(Debug)]
 struct NeedsAnalysis;
 
@@ -808,25 +813,39 @@ impl CodeSageServer {
             let arguments = request.arguments.clone().unwrap_or_default();
             let mut result = render_mcp_error(&tool, Some(&arguments), error);
             normalize_error(&mut result, &tool, Some(&arguments), None);
-            return Ok(CallToolResponse::Complete(
-                super::detail::finish_with_notes(
-                    result,
-                    &tool,
-                    &arguments,
-                    started.elapsed(),
-                    super::render::MCP_BUDGET_CHARS,
-                    self.state.envelope_enabled,
-                    &notes,
-                ),
-            ));
+            return Ok(CallToolResponse::Complete(super::detail::finish_response(
+                result,
+                &tool,
+                &arguments,
+                started.elapsed(),
+                super::render::MCP_BUDGET_CHARS,
+                self.state.envelope_enabled,
+                super::detail::FinishContext {
+                    notes: &notes,
+                    project: None,
+                },
+            )));
         }
         let tool = request.name.to_string();
         let arguments = request.arguments.clone().unwrap_or_default();
+        let finish_reference = tool == "find_references"
+            && super::detail::Options::parse(&tool, &arguments)
+                .is_ok_and(|options| options.detail == codesage_protocol::DescribeDetail::Full);
+        let full_reference_finish = finish_reference.then(|| FullReferenceFinish {
+            started,
+            notes: notes.clone(),
+        });
         let ticket = (tool != "daemon_stats")
             .then(|| Arc::new(self.state.diagnostics.begin_request(&tool, None)));
         let resolved_project = std::sync::OnceLock::new();
         let result = self
-            .dispatch_tool_inner(request, context, ticket.clone(), &resolved_project)
+            .dispatch_tool_inner(
+                request,
+                context,
+                ticket.clone(),
+                &resolved_project,
+                full_reference_finish,
+            )
             .await;
         let resolved_project = resolved_project.into_inner();
         let response = match result {
@@ -851,15 +870,22 @@ impl CodeSageServer {
             } else {
                 super::render::MCP_BUDGET_CHARS
             };
-            let response = super::detail::finish_with_notes(
-                response,
-                &tool,
-                &arguments,
-                started.elapsed(),
-                cap,
-                server.state.envelope_enabled,
-                &notes,
-            );
+            let response = if finish_reference && response.is_error != Some(true) {
+                response
+            } else {
+                super::detail::finish_response(
+                    response,
+                    &tool,
+                    &arguments,
+                    started.elapsed(),
+                    cap,
+                    server.state.envelope_enabled,
+                    super::detail::FinishContext {
+                        notes: &notes,
+                        project: None,
+                    },
+                )
+            };
             if let Some(project) = resolved_project {
                 server.ledger.record(&project, &tool, &arguments, &response);
             }
@@ -883,6 +909,7 @@ impl CodeSageServer {
         context: RequestContext<RoleServer>,
         ticket: Option<Arc<RequestTicket>>,
         resolved_project: &std::sync::OnceLock<PathBuf>,
+        full_reference_finish: Option<FullReferenceFinish>,
     ) -> Result<CallToolResponse, ErrorData> {
         let arguments: Arc<Map<String, Value>> =
             Arc::new(request.arguments.clone().unwrap_or_default());
@@ -960,6 +987,7 @@ impl CodeSageServer {
         let request_control = control.clone();
         let request_ticket = ticket.clone();
         let request_arguments = arguments.clone();
+        let finish_reference = full_reference_finish.is_some();
         let operation = async {
             let project = if let Some(raw_project) = raw_project {
                 let preflight = Arc::new(ToolRequest {
@@ -1024,13 +1052,48 @@ impl CodeSageServer {
                 class,
                 arguments: request_arguments,
             });
-            CURRENT_REQUEST
+            let result = CURRENT_REQUEST
                 .scope(
-                    scope,
+                    scope.clone(),
                     self.tool_router
                         .call(ToolCallContext::new(self, request, context.clone())),
                 )
-                .await
+                .await;
+            match (full_reference_finish, result) {
+                (Some(finish), Ok(CallToolResponse::Complete(response)))
+                    if response.is_error != Some(true) =>
+                {
+                    let request = scope.clone();
+                    let response = self
+                        .controlled_blocking(scope, move |server| {
+                            let elapsed = finish.started.elapsed();
+                            let response = server.annotate_envelope(
+                                response,
+                                &request.tool,
+                                &request.arguments,
+                                elapsed,
+                            );
+                            super::detail::finish_response(
+                                response,
+                                &request.tool,
+                                &request.arguments,
+                                finish.started.elapsed(),
+                                super::render::MCP_BUDGET_CHARS,
+                                server.state.envelope_enabled,
+                                super::detail::FinishContext {
+                                    notes: &finish.notes,
+                                    project: request
+                                        .project
+                                        .is_absolute()
+                                        .then_some(&request.project),
+                                },
+                            )
+                        })
+                        .await;
+                    Ok(response.into())
+                }
+                (_, result) => result,
+            }
         };
         tokio::select! {
             result = operation => {
@@ -1039,6 +1102,9 @@ impl CodeSageServer {
                 }
                 let mut result = result;
                 if let Ok(CallToolResponse::Complete(response)) = &mut result {
+                    if finish_reference && response.is_error != Some(true) {
+                        return result;
+                    }
                     normalize_error(response, &tool_name, Some(&arguments), Some(&ticket));
                 }
                 result = self

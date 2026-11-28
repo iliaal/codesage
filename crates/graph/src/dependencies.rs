@@ -7,6 +7,7 @@ use codesage_protocol::{
 };
 use codesage_storage::Database;
 
+use crate::go_modules::{GoFileHeaders, GoModules};
 use crate::rust_modules::{RustImportEvidence, RustModules};
 use codesage_storage::db::PythonPackageProbes;
 
@@ -16,7 +17,9 @@ pub(crate) fn resolve_outgoing(
     modules: &RustModules,
     indexed: &HashSet<String>,
     probes: &PythonPackageProbes,
+    go: (&GoModules, &mut GoFileHeaders),
 ) -> Result<()> {
+    let (go, go_headers) = go;
     let raw = RawDependencyImports {
         imports: std::mem::take(&mut entry.imports),
         test_imports: std::mem::take(&mut entry.test_imports),
@@ -30,6 +33,13 @@ pub(crate) fn resolve_outgoing(
     };
     let mut packages: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
     let js_paths = crate::bundle::JsAliases::load(db)?;
+    let mut indexed = IndexedFiles {
+        paths: indexed,
+        python_probes: probes,
+        js_paths: &js_paths,
+        go,
+        go_headers,
+    };
     for name in raw.imports.iter().chain(&raw.test_imports) {
         let mut exclusively_self = true;
         for is_test in [false, true] {
@@ -52,19 +62,8 @@ pub(crate) fn resolve_outgoing(
             let mut unresolved_sites = Vec::new();
             let mut ambiguous = false;
             for row in &sites {
-                let (files, uncertain) = resolve_site(
-                    db,
-                    row,
-                    modules,
-                    &IndexedFiles {
-                        paths: indexed,
-                        python_probes: probes,
-                        js_paths: &js_paths,
-                    },
-                    &symbols,
-                    &rows,
-                    &evidence,
-                )?;
+                let (files, uncertain) =
+                    resolve_site(db, row, modules, &mut indexed, &symbols, &rows, &evidence)?;
                 if files.is_empty() {
                     unresolved_sites.push(*row);
                 }
@@ -112,7 +111,11 @@ pub(crate) fn resolve_outgoing(
                     target: name.clone(),
                     is_test,
                     candidates: targets.into_iter().filter_map(file_handle).collect(),
-                    reason: if ambiguous {
+                    reason: if go.capped && entry.file_path.ends_with(".go") {
+                        "Go module discovery could not establish the governing manifest"
+                    } else if indexed.go_headers.capped && entry.file_path.ends_with(".go") {
+                        "Go package file headers could not all be checked"
+                    } else if ambiguous {
                         "multiple indexed files match an import site; ambiguous candidates are not dependency edges"
                     } else if has_proven {
                         "some import sites remain unresolved; proven file dependencies are retained"
@@ -169,13 +172,15 @@ struct IndexedFiles<'a> {
     paths: &'a HashSet<String>,
     python_probes: &'a PythonPackageProbes,
     js_paths: &'a crate::bundle::JsAliases<'a>,
+    go: &'a GoModules,
+    go_headers: &'a mut GoFileHeaders,
 }
 
 fn resolve_site(
     db: &Database,
     row: &Reference,
     modules: &RustModules,
-    indexed: &IndexedFiles<'_>,
+    indexed: &mut IndexedFiles<'_>,
     symbols: &[Symbol],
     rows: &[Reference],
     evidence: &RustImportEvidence,
@@ -187,6 +192,18 @@ fn resolve_site(
             indexed.paths,
             indexed.python_probes,
         )?);
+        return Ok((files, false));
+    }
+    if row.from_file.ends_with(".go") && row.kind == ReferenceKind::Import {
+        let targets = indexed.go.targets(&row.from_file, &row.to_name);
+        if !targets.is_empty() && !indexed.go_headers.excludes(db, &row.from_file)? {
+            for target in targets {
+                codesage_protocol::work::checkpoint()?;
+                if !indexed.go_headers.excludes(db, target)? {
+                    files.insert(target.clone());
+                }
+            }
+        }
         return Ok((files, false));
     }
     if row.from_file.ends_with(".rs") {

@@ -86,10 +86,10 @@ pub fn find_references_with_budget(
     // Rows are keyed on how call sites spell the name. A spelling that is
     // itself a definition's name or qualified name (or matched nothing) is
     // queried as written, so a qualified input keeps its narrower rows; a
-    // `sym:` handle or other grammar form is queried by the bare names of the
-    // definitions it resolved to, as the union those rows already are. The
+    // `sym:` handle or other grammar form is queried by the definitions'
+    // source spellings, including native ABI names where they differ. The
     // disclosure (`definition_count`, `ambiguous`, `note`, `to`) then covers
-    // every definition behind those bare names, not only the ones the input
+    // every definition behind those spellings, not only the ones the input
     // resolved to; `target` alone keeps the input's own resolution.
     let spelling = req.symbol_name.trim();
     let as_written = definitions.is_empty()
@@ -108,7 +108,13 @@ pub fn find_references_with_budget(
         }
         rows
     } else {
-        let names = distinct_sorted(definitions.iter().map(|s| s.name.as_str()));
+        let names = definitions
+            .iter()
+            .map(|symbol| {
+                Ok(crate::bundle::c_abi_function_name(db, symbol)?.unwrap_or(&symbol.name))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let names = distinct_sorted(names.into_iter());
         let mut rows = Vec::new();
         let mut named = Vec::new();
         for name in names {
@@ -339,7 +345,9 @@ fn attach_handles(
         _ => None,
     };
     let mut resolved: HashMap<(String, String, ReferenceKind), Option<String>> = HashMap::new();
+    let mut rust_calls = HashMap::new();
     let mut resolved_pairs = HashSet::new();
+    let mut go_calls = crate::go_modules::GoCalls::with_deadline(deadline);
     for (index, row) in rows.iter_mut().enumerate() {
         codesage_protocol::work::checkpoint()?;
         if redirectable.get(index) == Some(&false) {
@@ -370,36 +378,106 @@ fn attach_handles(
         if crate::bundle::is_package_import(row.kind, &row.from_file, &row.to_name) {
             continue;
         }
+        let rust_qualified_call = row.kind == ReferenceKind::Call
+            && row.from_file.ends_with(".rs")
+            && row.to_name.contains("::");
         // Trivially same-file: the sole definition, spelled as it is defined.
         if let Some(only) = sole_definition
             && only.file_path == row.from_file
+            && !crate::go_modules::selector_call(row)
             && !(row.from_file.ends_with(".rs")
                 && caches
                     .modules(db)?
                     .macro_shadowed(db, &row.from_file, &row.to_name)?)
             && spelling_names(&row.to_name, only)
-            && crate::bundle::reference_kind_admits(&row.from_file, Some(row.kind), only)
+            && crate::bundle::reference_definition_admits(
+                db,
+                &row.from_file,
+                &row.to_name,
+                Some(row.kind),
+                only,
+            )?
         {
+            if rust_qualified_call {
+                let modules = caches.modules(db)?;
+                let unrelated = modules.unrelated_external_type_method(db, row, only)?;
+                capped |= modules.capped();
+                if unrelated {
+                    continue;
+                }
+            }
             row.to = Some(only.handle().to_string());
             continue;
         }
         let pair = (row.from_file.clone(), row.to_name.clone());
-        let key = (row.from_file.clone(), row.to_name.clone(), row.kind);
-        if let Some(cached) = resolved.get(&key) {
-            row.to = cached.clone();
-            continue;
-        }
         if !resolved_pairs.contains(&pair) && resolved_pairs.len() >= MAX_TO_RESOLUTION_PAIRS {
             capped = true;
             continue;
         }
         let from_file = row.from_file.as_str();
+        if rust_qualified_call {
+            let modules = caches.modules(db)?;
+            let candidates = match rust_calls.entry(pair.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let candidates = resolve_callee_definitions_with_modules(
+                        db,
+                        from_file,
+                        &row.to_name,
+                        &mut || caches.imports(from_file),
+                        &modules,
+                        Some(row.kind),
+                    )?;
+                    entry.insert((candidates.len() <= MAX_TARGET_CANDIDATES).then_some(candidates))
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            };
+            resolved_pairs.insert(pair);
+            let Some(candidates) = candidates else {
+                capped = true;
+                continue;
+            };
+            let mut only = None;
+            for candidate in candidates {
+                if modules.unrelated_external_type_method(db, row, candidate)? {
+                    continue;
+                }
+                if only.replace(candidate).is_some() {
+                    only = None;
+                    break;
+                }
+            }
+            if let Some(candidate) = only
+                && caches.has_evidence(from_file, &row.to_name, candidate)?
+            {
+                row.to = Some(candidate.handle().to_string());
+            }
+            capped |= modules.capped();
+            continue;
+        }
+        if crate::go_modules::selector_call(row) {
+            let definitions = go_calls.resolve(db, row)?.into_targets();
+            capped |= go_calls.capped();
+            if let Some(definitions) = definitions {
+                let handle = match definitions.as_slice() {
+                    [only] => Some(only.handle().to_string()),
+                    _ => None,
+                };
+                row.to = handle;
+                resolved_pairs.insert(pair);
+                continue;
+            }
+        }
+        let key = (row.from_file.clone(), row.to_name.clone(), row.kind);
+        if let Some(cached) = resolved.get(&key) {
+            row.to = cached.clone();
+            continue;
+        }
         let modules = if from_file.ends_with(".rs") {
             caches.modules(db)?
         } else {
             Arc::new(crate::rust_modules::RustModules::default())
         };
-        let candidates = resolve_callee_definitions_with_modules(
+        let mut candidates = resolve_callee_definitions_with_modules(
             db,
             from_file,
             &row.to_name,
@@ -407,6 +485,8 @@ fn attach_handles(
             &modules,
             Some(row.kind),
         )?;
+        go_calls.retain_fallback_targets(db, row, &mut candidates)?;
+        capped |= go_calls.capped();
         capped |= modules.capped();
         let handle = match candidates.as_slice() {
             [only] if caches.has_evidence(from_file, &row.to_name, only)? => {
@@ -561,6 +641,9 @@ fn redirectable_rows(
             if codesage_protocol::python::is_python_path(&row.from_file) {
                 return true;
             }
+            if crate::go_modules::selector_call(row) {
+                return true;
+            }
             if !rust_call(row) {
                 return false;
             }
@@ -672,6 +755,9 @@ impl<'a> EvidenceCaches<'a> {
             return Ok(true);
         }
         if candidate.file_path == caller_file {
+            return Ok(true);
+        }
+        if crate::bundle::c_abi_function_name(self.db, candidate)? == Some(spelling) {
             return Ok(true);
         }
         let imports = self.imports(caller_file)?;
@@ -820,6 +906,12 @@ pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec
         })
         .collect::<Result<Vec<_>>>()?;
     let modules = crate::rust_modules::RustModules::from_imports(db, &pairs)?;
+    let go = if file_paths.iter().any(|path| path.ends_with(".go")) {
+        crate::go_modules::GoModules::load(db, indexed.iter().map(String::as_str))?
+    } else {
+        crate::go_modules::GoModules::default()
+    };
+    let mut go_headers = crate::go_modules::GoFileHeaders::default();
     let mut symbol_imports: HashMap<String, HashSet<String>> = HashMap::new();
     let mut symbols: HashMap<String, Vec<Symbol>> = HashMap::new();
     for row in all_refs
@@ -827,7 +919,19 @@ pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec
         .filter(|row| row.kind == ReferenceKind::Import && is_c_family(&row.from_file))
     {
         if !symbols.contains_key(&row.to_name) {
-            symbols.insert(row.to_name.clone(), db.find_symbols(&row.to_name, None)?);
+            let mut candidates = Vec::new();
+            for symbol in db.find_symbols(&row.to_name, None)? {
+                if crate::bundle::reference_definition_admits(
+                    db,
+                    &row.from_file,
+                    &row.to_name,
+                    Some(row.kind),
+                    &symbol,
+                )? {
+                    candidates.push(symbol);
+                }
+            }
+            symbols.insert(row.to_name.clone(), candidates);
         }
         let candidates = &symbols[&row.to_name];
         for candidate in candidates {
@@ -849,8 +953,23 @@ pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec
     for file_path in file_paths {
         let mut entry = db.list_file_dependencies(file_path)?;
         if entry.found {
-            crate::dependencies::resolve_outgoing(db, &mut entry, &modules, &indexed, &probes)?;
-            resolve_path_imported_by(&mut entry, &pairs, &modules, &indexed, &symbol_imports);
+            crate::dependencies::resolve_outgoing(
+                db,
+                &mut entry,
+                &modules,
+                &indexed,
+                &probes,
+                (&go, &mut go_headers),
+            )?;
+            resolve_path_imported_by(
+                db,
+                &mut entry,
+                &pairs,
+                &modules,
+                &indexed,
+                &symbol_imports,
+                (&go, &mut go_headers),
+            )?;
             if let Some(note) = modules.note(&entry.file_path, &entry.imported_by) {
                 entry.note = Some(match entry.note.take() {
                     Some(existing) => format!("{existing} {note}"),
@@ -865,12 +984,18 @@ pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec
 
 /// Resolve path imports that cannot join against symbol names in SQL.
 fn resolve_path_imported_by(
+    db: &Database,
     entry: &mut DependencyEntry,
     all_refs: &[(String, String)],
     modules: &crate::rust_modules::RustModules,
     indexed: &HashSet<String>,
     symbol_imports: &HashMap<String, HashSet<String>>,
-) {
+    go: (
+        &crate::go_modules::GoModules,
+        &mut crate::go_modules::GoFileHeaders,
+    ),
+) -> Result<()> {
+    let (go, go_headers) = go;
     entry.imported_by.retain(|path| !is_c_family(path));
     if let Some(importers) = symbol_imports.get(&entry.file_path) {
         entry.imported_by.extend(
@@ -889,18 +1014,28 @@ fn resolve_path_imported_by(
         if known.contains(from_path) {
             continue;
         }
-        if import_ref_targets_file_with_indexed(
-            to_name,
-            from_path,
-            &entry.file_path,
-            modules,
-            indexed,
-        ) {
+        let loads = if from_path.ends_with(".go") {
+            go.targets(from_path, to_name)
+                .binary_search(&entry.file_path)
+                .is_ok()
+                && !go_headers.excludes(db, &entry.file_path)?
+                && !go_headers.excludes(db, from_path)?
+        } else {
+            import_ref_targets_file_with_indexed(
+                to_name,
+                from_path,
+                &entry.file_path,
+                modules,
+                indexed,
+            )
+        };
+        if loads {
             known.insert(from_path.clone());
             entry.imported_by.push(from_path.clone());
         }
     }
     entry.imported_by.sort();
+    Ok(())
 }
 
 #[cfg(test)]

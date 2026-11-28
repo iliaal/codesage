@@ -1,7 +1,18 @@
 ## [Unreleased]
 
+### Added
+
+- `dependencies`, `trace`, and `impact` resolve imports and package-qualified calls within the same Go module.
+
+### Changed
+
+- MCP `find_references` lists production references before test references when its response budget omits rows.
+
 ### Fixed
 
+- C indexing recognizes `PHP_METHOD`, `ZEND_METHOD`, and `ZEND_FRAMELESS_FUNCTION` definitions and attributes body calls to them. Reindex to pick up the new definitions.
+- File discovery and the watcher honor Git ignore rules after malformed UTF-8 lines and preserve escaped trailing spaces.
+- Rust calls through explicit standard-library or external type imports no longer appear as callers of unrelated local methods.
 - `CODESAGE_ALLOW_CPU_FALLBACK=1` always reloads the verified portable `onnx/model.onnx` graph on CPU (including when a derived fp16 graph commits on CPU) and fingerprints the graph the session runs rather than the configured CUDA graph.
 - MCP daemon idle arena shrinkage measures the 30-second idle window from inference completion rather than slot lookup, includes single-row 1,024-token batches at the threshold, and disables retries for the session after three consecutive failures with one warning.
 - MCP daemon idle model eviction measures inactivity from inference completion rather than slot lookup, avoiding eviction immediately after a long indexing pass.

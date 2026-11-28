@@ -25,8 +25,9 @@
 //! `PHP_FUNCTION(f)\n{`) is never changed, and neither is a declaration whose
 //! head is a single all-caps function name (`static zend_long SEED(void)`).
 
-use crate::export_macro::{Kind, Lexer, Token};
+use crate::export_macro::{C_MACROS, Kind, Lexer, Token};
 use anyhow::Result;
+use std::ops::Range;
 
 /// Tokens between cancellation checks.
 const CHECK_EVERY: usize = 4096;
@@ -67,11 +68,7 @@ impl Repairs {
     pub(crate) fn apply(&self, source: &[u8]) -> Vec<u8> {
         let mut blanked = source.to_vec();
         for &(start, end) in &self.blanks {
-            for byte in &mut blanked[start..end] {
-                if *byte != b'\n' && *byte != b'\r' {
-                    *byte = b' ';
-                }
-            }
+            blank(&mut blanked[start..end]);
         }
         let mut out = Vec::with_capacity(blanked.len() + self.insertions.len());
         let mut copied = 0;
@@ -83,6 +80,36 @@ impl Repairs {
         out.extend_from_slice(&blanked[copied..]);
         out
     }
+}
+
+fn blank(bytes: &mut [u8]) {
+    for byte in bytes {
+        if *byte != b'\n' && *byte != b'\r' {
+            *byte = b' ';
+        }
+    }
+}
+
+struct PhpFunctionHead {
+    blank: Range<usize>,
+    name: Range<usize>,
+    decorators: Vec<(Range<usize>, &'static [u8])>,
+    start: usize,
+    body_start: usize,
+    directive_gap: Option<Range<usize>>,
+    body_alternative: Option<PhpBodyAlternative>,
+}
+
+struct PhpBodyAlternative {
+    brace: usize,
+    group_end: usize,
+}
+
+#[derive(Default)]
+struct PhpPreparation {
+    heads: Vec<PhpFunctionHead>,
+    clauses: Vec<(Range<usize>, &'static [u8])>,
+    try_close: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -101,6 +128,8 @@ struct Frame {
     /// First token of the current declaration or statement.
     start: usize,
     parens: Vec<usize>,
+    in_php_body: bool,
+    php_try: bool,
 }
 
 const STATEMENT_KEYS: [&[u8]; 14] = [
@@ -227,15 +256,80 @@ const PRIMITIVE_KEYS: [&[u8]; 16] = [
 
 /// Lexically locate the repairs described in the module documentation.
 pub(crate) fn find(source: &[u8]) -> Result<Repairs> {
-    let tokens: Vec<Token> = Lexer::new(source).collect();
+    scan(source, source, None)
+}
+
+pub(crate) fn prepare_php_function_heads(
+    source: &[u8],
+    original: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    if !source.iter().enumerate().any(|(i, byte)| match byte {
+        b'P' => source[i..].starts_with(b"PHP_METHOD"),
+        b'Z' => {
+            source[i..].starts_with(b"ZEND_METHOD")
+                || source[i..].starts_with(b"ZEND_FRAMELESS_FUNCTION")
+        }
+        _ => false,
+    }) {
+        return Ok(None);
+    }
+    let mut php = PhpPreparation::default();
+    scan(source, original, Some(&mut php))?;
+    if php.heads.is_empty() {
+        return Ok(None);
+    }
+    let mut prepared = source.to_vec();
+    for head in php.heads {
+        let raw_head = &source[head.start..head.body_start];
+        for token in Lexer::with_spliced_line_comments(raw_head)
+            .filter(|token| c_line_splice(raw_head, *token))
+        {
+            prepared[head.start + token.start] = b' ';
+        }
+        blank(&mut prepared[head.blank]);
+        // The PHP method name can be a C keyword, such as FFI::sizeof.
+        prepared[head.name].fill(b'x');
+        for (range, replacement) in head.decorators {
+            let prefix = &mut prepared[range];
+            prefix.fill(b' ');
+            prefix[..replacement.len()].copy_from_slice(replacement);
+        }
+        if let Some(gap) = head.directive_gap {
+            blank(&mut prepared[gap]);
+        }
+        if let Some(alternative) = head.body_alternative {
+            blank(&mut prepared[head.body_start + 1..alternative.group_end]);
+        }
+    }
+    for (span, clause) in php.clauses {
+        let bytes = &mut prepared[span];
+        bytes.fill(b' ');
+        bytes[..clause.len()].copy_from_slice(clause);
+    }
+    Ok(Some(prepared))
+}
+
+fn scan(source: &[u8], original: &[u8], mut php: Option<&mut PhpPreparation>) -> Result<Repairs> {
+    let tokens: Vec<Token> = if php.is_some() {
+        php_tokens(source).collect()
+    } else {
+        Lexer::new(source).collect()
+    };
     let mut scan = Scan {
         tokens: &tokens,
         source,
-        defines: function_like_defines(&tokens, source),
+        original,
+        defines: if php.is_none() {
+            function_like_defines(&tokens, source)
+        } else {
+            Vec::new()
+        },
         frames: vec![Frame {
             scope: Scope::Declarations,
             start: 0,
             parens: Vec::new(),
+            in_php_body: false,
+            php_try: false,
         }],
         conditionals: Vec::new(),
         suspended: None,
@@ -248,7 +342,7 @@ pub(crate) fn find(source: &[u8]) -> Result<Repairs> {
         if i.is_multiple_of(CHECK_EVERY) {
             codesage_protocol::work::checkpoint()?;
         }
-        i = scan.step(i);
+        i = scan.step(i, php.as_deref_mut());
     }
     Ok(scan.repairs)
 }
@@ -268,6 +362,7 @@ struct Conditional {
 struct Scan<'a> {
     tokens: &'a [Token],
     source: &'a [u8],
+    original: &'a [u8],
     defines: Vec<&'a [u8]>,
     frames: Vec<Frame>,
     conditionals: Vec<Conditional>,
@@ -283,9 +378,12 @@ struct Scan<'a> {
 }
 
 impl<'a> Scan<'a> {
-    fn step(&mut self, i: usize) -> usize {
+    fn step(&mut self, i: usize, php: Option<&mut PhpPreparation>) -> usize {
         let t = self.tokens[i];
         if t.kind == Kind::Directive {
+            if let Some(php) = php {
+                php.try_close = None;
+            }
             self.conditional(self.text(i));
             return i + 1;
         }
@@ -298,21 +396,44 @@ impl<'a> Scan<'a> {
                 frame.parens.pop();
             }
             Kind::Punct(b'{') => {
+                let in_php_body = frame.in_php_body
+                    || php
+                        .as_ref()
+                        .and_then(|p| p.heads.last())
+                        .is_some_and(|head| {
+                            head.body_start == t.start
+                                || head
+                                    .body_alternative
+                                    .as_ref()
+                                    .is_some_and(|alternative| alternative.brace == t.start)
+                        });
                 let scope = if frame.parens.is_empty() {
                     self.classify_brace(i)
                 } else {
                     Scope::Other
                 };
+                let php_try = in_php_body
+                    && self
+                        .prev
+                        .zip(php.as_ref().and_then(|p| p.clauses.last()))
+                        .is_some_and(|(prev, (span, _))| {
+                            self.tokens[prev].start == span.start && self.text(prev) == b"zend_try"
+                        });
                 self.frames.push(Frame {
                     scope,
                     start: i + 1,
                     parens: Vec::new(),
+                    in_php_body,
+                    php_try,
                 });
                 self.boundary = true;
             }
             Kind::Punct(b'}') => {
-                if self.frames.len() > 1 {
-                    self.frames.pop();
+                if self.frames.len() > 1
+                    && self.frames.pop().is_some_and(|frame| frame.php_try)
+                    && let Some(php) = php
+                {
+                    php.try_close = Some(i);
                 }
                 let frame = self.frames.last_mut().expect("file frame");
                 if frame.parens.is_empty() {
@@ -335,16 +456,20 @@ impl<'a> Scan<'a> {
                 }
             }
             Kind::Ident if frame.parens.is_empty() && !self.repairs_suspended() => {
-                let scope = self.frames.last().expect("file frame").scope;
-                let next = match scope {
-                    Scope::Declarations => self
-                        .semicolonless_declaration(i, at_start)
-                        .or_else(|| (!at_start).then(|| self.annotation(i)).flatten()),
-                    Scope::Statements => self.semicolonless_statement(i, at_start),
-                    Scope::Other => None,
-                };
-                if let Some(next) = next {
-                    return next;
+                if let Some(php) = php {
+                    self.prepare_php_token(i, at_start, php);
+                } else {
+                    let scope = self.frames.last().expect("file frame").scope;
+                    let next = match scope {
+                        Scope::Declarations => self
+                            .semicolonless_declaration(i, at_start)
+                            .or_else(|| (!at_start).then(|| self.annotation(i)).flatten()),
+                        Scope::Statements => self.semicolonless_statement(i, at_start),
+                        Scope::Other => None,
+                    };
+                    if let Some(next) = next {
+                        return next;
+                    }
                 }
             }
             _ => {}
@@ -353,15 +478,187 @@ impl<'a> Scan<'a> {
         i + 1
     }
 
+    fn prepare_php_token(&self, i: usize, at_start: bool, php: &mut PhpPreparation) {
+        if self.frames.len() == 1 {
+            if let Some(head) = self.php_function_head(i, at_start) {
+                php.heads.push(head);
+            }
+        } else if self.frames.last().is_some_and(|frame| frame.in_php_body)
+            && self.kind(i + 1) == Some(Kind::Punct(b'{'))
+        {
+            // These paired macros open and close hidden braces. Without the
+            // preprocessor, the C grammar can close the enclosing function early.
+            let clause: &[u8] = match self.text(i) {
+                b"zend_try" if at_start || self.follows_if_condition() => b"if (1)",
+                b"zend_catch"
+                    if at_start && php.try_close.is_some() && self.prev == php.try_close =>
+                {
+                    b"else"
+                }
+                _ => return,
+            };
+            php.clauses
+                .push((self.tokens[i].start..self.tokens[i].end, clause));
+        }
+    }
+
+    fn follows_if_condition(&self) -> bool {
+        self.prev
+            .filter(|&prev| self.kind(prev) == Some(Kind::Punct(b')')))
+            .and_then(|close| matching_open(self.tokens, close))
+            .and_then(|open| open.checked_sub(1))
+            .is_some_and(|keyword| self.is_ident(keyword, &[b"if"]))
+    }
+
+    fn php_function_head(&self, i: usize, at_start: bool) -> Option<PhpFunctionHead> {
+        let method = match self.text(i) {
+            b"PHP_METHOD" | b"ZEND_METHOD" => true,
+            b"ZEND_FRAMELESS_FUNCTION" => false,
+            _ => return None,
+        };
+        let [head, open, first, comma, second, close, ..] = self.tokens.get(i..)? else {
+            return None;
+        };
+        if open.kind != Kind::Punct(b'(')
+            || first.kind != Kind::Ident
+            || comma.kind != Kind::Punct(b',')
+            || close.kind != Kind::Punct(b')')
+        {
+            return None;
+        }
+        let follows_invocation = self.at_line_start(i)
+            && self.prev.is_some_and(|prev| {
+                self.kind(prev) == Some(Kind::Punct(b')'))
+                    && self.line_break_between(self.tokens[prev].end, self.tokens[i].start)
+                    && !self.closes_declarator_parameters(prev)
+            });
+        let mut decorators: Vec<(Range<usize>, &'static [u8])> = Vec::new();
+        let mut head_start = head.start;
+        if !at_start && !follows_invocation {
+            let mut static_seen = false;
+            let mut seen_decorators = [false; C_MACROS.len()];
+            let first = (self.frames[0].start..i)
+                .find(|index| self.tokens[*index].kind != Kind::Directive)?;
+            head_start = self.tokens[first].start;
+            // The generic C pass may already have rewritten a decorator as
+            // extern. Validate and replace its full span in the original.
+            let prefix = self.original.get(head_start..head.start)?;
+            for token in php_tokens(prefix).filter(|token| token.kind != Kind::Directive) {
+                let word = &prefix[token.start..token.end];
+                if word == b"static" && !static_seen {
+                    static_seen = true;
+                    continue;
+                }
+                let known = C_MACROS.iter().position(|&decorator| word == decorator)?;
+                if std::mem::replace(&mut seen_decorators[known], true) {
+                    return None;
+                }
+                decorators.push((head_start + token.start..head_start + token.end, b""));
+            }
+            // Anchor the definition at its leading decorator without
+            // adding a conflicting linkage specifier when static is present.
+            if let Some((_, replacement)) = decorators
+                .first_mut()
+                .filter(|(range, _)| range.start == head_start)
+            {
+                *replacement = if static_seen { b"inline" } else { b"extern" };
+            }
+        }
+        let (blank, name) = if method && second.kind == Kind::Ident {
+            (first.start..comma.end, second.start..second.end)
+        } else if !method && self.text(i + 4).iter().all(u8::is_ascii_digit) {
+            (comma.start..second.end, first.start..first.end)
+        } else {
+            return None;
+        };
+        let (body_index, body_alternative) = if let Some(open) = self.php_body_start(i + 6) {
+            (open, None)
+        } else {
+            let (open, alternative) = self.php_alternative_body(i + 6)?;
+            (open, Some(alternative))
+        };
+        let body_start = self.tokens[body_index].start;
+        Some(PhpFunctionHead {
+            blank,
+            name,
+            start: head_start,
+            decorators,
+            body_start,
+            directive_gap: (body_index != i + 6).then_some(close.end..body_start),
+            body_alternative,
+        })
+    }
+
+    /// A gap may contain whole conditional groups without any source tokens.
+    fn php_body_start(&self, mut i: usize) -> Option<usize> {
+        let mut else_seen = Vec::new();
+        while self.kind(i) == Some(Kind::Directive) {
+            let (keyword, _) = directive_parts(self.text(i));
+            match keyword {
+                b"if" | b"ifdef" | b"ifndef" => else_seen.push(false),
+                b"elif" | b"elifdef" | b"elifndef" if else_seen.last() == Some(&false) => {}
+                b"else" if else_seen.last() == Some(&false) => *else_seen.last_mut()? = true,
+                b"endif" => {
+                    else_seen.pop()?;
+                }
+                _ => return None,
+            }
+            i += 1;
+        }
+        (else_seen.is_empty() && self.kind(i) == Some(Kind::Punct(b'{'))).then_some(i)
+    }
+
+    /// Both arms must contain only an opening brace.
+    fn php_alternative_body(&self, i: usize) -> Option<(usize, PhpBodyAlternative)> {
+        let [open_if, first, open_else, second, close_if] = self.tokens.get(i..i + 5)? else {
+            return None;
+        };
+        if [open_if, open_else, close_if]
+            .into_iter()
+            .any(|directive| directive.kind != Kind::Directive)
+            || [first, second]
+                .into_iter()
+                .any(|brace| brace.kind != Kind::Punct(b'{'))
+        {
+            return None;
+        }
+        let (keyword, condition) = directive_parts(self.text(i));
+        let mut condition_tokens = php_tokens(condition);
+        let term = condition_tokens.next()?;
+        if !matches!(keyword, b"if" | b"ifdef" | b"ifndef")
+            || [(i + 2, &b"else"[..]), (i + 4, &b"endif"[..])]
+                .into_iter()
+                .any(|(index, expected)| {
+                    let (keyword, rest) = directive_parts(self.text(index));
+                    keyword != expected || php_tokens(rest).next().is_some()
+                })
+        {
+            return None;
+        }
+        let first_is_dead = keyword == b"if"
+            && &condition[term.start..term.end] == b"0"
+            && condition_tokens.next().is_none();
+        let (body_index, other) = if first_is_dead {
+            (i + 3, first)
+        } else {
+            (i + 1, second)
+        };
+        Some((
+            body_index,
+            PhpBodyAlternative {
+                brace: other.start,
+                group_end: close_if.end,
+            },
+        ))
+    }
+
     /// Brace tracking follows the first arm of each `#if` group: every other
     /// arm starts from the frames at the `#if`, and the group ends with the
     /// frames the first arm left. Arms that each open a function head
     /// (`#ifdef A` / `int f(void) {` / `#else` / `int f(int x) {`) would
     /// otherwise count one brace per arm.
     fn conditional(&mut self, directive: &[u8]) {
-        let rest = trim_blanks(&directive[1..]);
-        let length = rest.iter().take_while(|b| b.is_ascii_alphabetic()).count();
-        let (keyword, condition) = rest.split_at(length);
+        let (keyword, condition) = directive_parts(directive);
         let literal_zero = condition_is_literal_zero(condition);
         match keyword {
             b"if" | b"ifdef" | b"ifndef" => self.conditionals.push(Conditional {
@@ -824,6 +1121,21 @@ fn trim_blanks(text: &[u8]) -> &[u8] {
         .take_while(|b| matches!(b, b' ' | b'\t'))
         .count();
     &text[skip..]
+}
+
+pub(crate) fn directive_parts(directive: &[u8]) -> (&[u8], &[u8]) {
+    let rest = trim_blanks(&directive[1..]);
+    let length = rest.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+    rest.split_at(length)
+}
+
+pub(crate) fn php_tokens(source: &[u8]) -> impl Iterator<Item = Token> {
+    Lexer::with_spliced_line_comments(source).filter(|token| !c_line_splice(source, *token))
+}
+
+fn c_line_splice(source: &[u8], token: Token) -> bool {
+    token.kind == Kind::Punct(b'\\')
+        && matches!(&source[token.end..], [b'\n', ..] | [b'\r', b'\n', ..])
 }
 
 /// `FOO`, `Z_PARAM_LONG`, `_ASSERT`: uppercase letters, digits, and

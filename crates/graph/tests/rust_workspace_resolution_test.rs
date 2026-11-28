@@ -58,6 +58,990 @@ fn reaches(db: &Database, from: &str, to: &str) -> bool {
 }
 
 #[test]
+fn external_type_imports_do_not_bind_to_local_methods() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n[dependencies]\nregistry = '1'\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod options; mod std_call; mod registry_call; mod local_call; mod shadowed;",
+        ),
+        (
+            "src/options.rs",
+            "pub struct Options;\nimpl Options { pub fn new() {} }\n",
+        ),
+        (
+            "src/std_call.rs",
+            "use ::std::fs::{OpenOptions as Options};\nfn from_std() { Options::new(); }\nmod inner {\nuse super::*;\nuse std::fs::OpenOptions as Options;\nfn explicit_over_glob() { Options::new(); }\n}",
+        ),
+        (
+            "src/registry_call.rs",
+            "use registry::Options;\nfn from_registry() { Options::new(); }\n",
+        ),
+        (
+            "src/local_call.rs",
+            "use crate::options::Options;\nfn from_local() { Options::new(); }\n",
+        ),
+        (
+            "src/shadowed.rs",
+            "use std::fs::OpenOptions as Options;\nfn from_outer() { Options::new(); }\nmod inner {\nuse crate::options::Options;\nfn from_nested() { Options::new(); }\n}\nmod globbed {\nuse super::*;\nfn from_glob() { Options::new(); }\n}\n",
+        ),
+    ]);
+    let target = "sym:src/options.rs#Options::new";
+    let references = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "Options::new".into(),
+            kind: Some(codesage_protocol::ReferenceKind::Call),
+        },
+    )
+    .unwrap();
+    let bindings: std::collections::BTreeMap<_, _> = references
+        .results
+        .iter()
+        .map(|row| (row.from_symbol.as_deref().unwrap(), row.to.as_deref()))
+        .collect();
+    assert_eq!(
+        bindings,
+        [
+            ("explicit_over_glob", None),
+            ("from_glob", None),
+            ("from_local", Some(target)),
+            ("from_registry", None),
+            ("from_nested", Some(target)),
+            ("from_outer", None),
+            ("from_std", None),
+        ]
+        .into()
+    );
+
+    let impact = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: target.into(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        impact
+            .iter()
+            .map(|row| row.file_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["src/local_call.rs", "src/shadowed.rs"].into()
+    );
+    assert!(reaches(&db, "from_local", target));
+    assert!(reaches(&db, "from_nested", target));
+    assert!(!reaches(&db, "from_outer", target));
+    assert!(!reaches(&db, "from_glob", target));
+    assert!(!reaches(&db, "explicit_over_glob", target));
+    assert!(!reaches(&db, "from_std", target));
+    assert!(!reaches(&db, "from_registry", target));
+}
+
+#[test]
+fn external_type_calls_keep_local_extension_methods() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod extension; mod nominal; mod caller; mod nominal_impl;",
+        ),
+        (
+            "src/extension.rs",
+            "use std::fs::OpenOptions;\npub trait Extra { fn local(); }\nimpl Extra for OpenOptions { fn local() {} }",
+        ),
+        (
+            "src/nominal.rs",
+            "pub struct OpenOptions;\nimpl OpenOptions { pub fn local() {} }",
+        ),
+        (
+            "src/nominal_impl.rs",
+            "use crate::nominal::OpenOptions;\ntrait Local { fn local(); }\nimpl Local for OpenOptions { fn local() {} }",
+        ),
+        (
+            "src/caller.rs",
+            "use std::fs::OpenOptions;\nuse crate::extension::Extra;\nfn extension_call() { OpenOptions::local(); }",
+        ),
+    ]);
+    assert!(reaches(
+        &db,
+        "extension_call",
+        "sym:src/extension.rs#OpenOptions::local"
+    ));
+    assert!(!reaches(
+        &db,
+        "extension_call",
+        "sym:src/nominal.rs#OpenOptions::local"
+    ));
+    assert!(!reaches(
+        &db,
+        "extension_call",
+        "sym:src/nominal_impl.rs#OpenOptions::local"
+    ));
+}
+
+#[test]
+fn relatively_imported_local_nominals_do_not_extend_external_types() {
+    for (root, nominal_file, implementation, local) in [
+        (
+            "mod nominal; mod decoy; mod caller; mod local;",
+            "src/nominal.rs",
+            "use super::nominal::OpenOptions;",
+            "use crate::nominal::OpenOptions;",
+        ),
+        (
+            "mod decoy; mod caller; mod local;",
+            "src/decoy/nominal.rs",
+            "pub mod nominal; use self::nominal::OpenOptions;",
+            "use crate::decoy::nominal::OpenOptions;",
+        ),
+    ] {
+        let implementation = format!(
+            "{implementation}\npub trait Decoy {{ fn new() -> u8; }}\nimpl Decoy for OpenOptions {{ fn new() -> u8 {{ 1 }} }}"
+        );
+        let local = format!(
+            "{local}\nuse crate::decoy::Decoy;\nfn from_local() -> u8 {{ OpenOptions::new() }}"
+        );
+        let (_dir, db) = indexed(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+            ),
+            ("src/lib.rs", root),
+            (nominal_file, "pub struct OpenOptions;"),
+            ("src/decoy.rs", &implementation),
+            ("src/local.rs", &local),
+            (
+                "src/caller.rs",
+                "use std::fs::OpenOptions;\nuse crate::decoy::Decoy;\nfn from_std() -> OpenOptions { OpenOptions::new() }",
+            ),
+        ]);
+        let target = "sym:src/decoy.rs#OpenOptions::new";
+        assert!(!reaches(&db, "from_std", target));
+        assert!(reaches(&db, "from_local", target));
+        let references = find_references(
+            &db,
+            &FindReferencesRequest {
+                symbol_name: "OpenOptions::new".into(),
+                kind: Some(codesage_protocol::ReferenceKind::Call),
+            },
+        )
+        .unwrap();
+        let bindings: std::collections::BTreeMap<_, _> = references
+            .results
+            .iter()
+            .map(|row| (row.from_symbol.as_deref().unwrap(), row.to.as_deref()))
+            .collect();
+        assert_eq!(
+            bindings,
+            [("from_local", Some(target)), ("from_std", None)].into()
+        );
+        let impact = impact_analysis(
+            &db,
+            &ImpactRequest {
+                target: ImpactTarget::Symbol {
+                    name: target.into(),
+                },
+                depth: 1,
+                source_only: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(impact.len(), 1);
+        assert_eq!(impact[0].file_path, "src/local.rs");
+    }
+}
+
+#[test]
+fn relative_reexports_can_reach_an_external_extension_receiver() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        ("src/lib.rs", "mod facade; mod extension; mod caller;"),
+        ("src/facade.rs", "pub use ::std::fs::OpenOptions;"),
+        (
+            "src/extension.rs",
+            "use super::facade::OpenOptions;\nmod facade;\npub trait Extra { fn outer() -> u8; }\nimpl Extra for OpenOptions { fn outer() -> u8 { 1 } }\nmod nested {\n    mod facade { pub use ::std::fs::OpenOptions; }\n    use self::facade::OpenOptions;\n    pub trait InlineExtra { fn inner() -> u8; }\n    impl InlineExtra for OpenOptions { fn inner() -> u8 { 2 } }\n}\npub use nested::InlineExtra;",
+        ),
+        ("src/extension/facade.rs", "pub struct OpenOptions;"),
+        (
+            "src/caller.rs",
+            "use std::fs::OpenOptions;\nuse crate::extension::{Extra, InlineExtra};\nfn from_outer() -> u8 { OpenOptions::outer() }\nfn from_inline() -> u8 { OpenOptions::inner() }",
+        ),
+    ]);
+    for (caller, method) in [("from_outer", "outer"), ("from_inline", "inner")] {
+        let target = format!("sym:src/extension.rs#OpenOptions::{method}");
+        assert!(reaches(&db, caller, &target));
+    }
+}
+
+#[test]
+fn a_blanket_impl_can_extend_an_external_type() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        ("src/lib.rs", "mod extension; mod caller;"),
+        (
+            "src/extension.rs",
+            "pub struct OpenOptions;\npub trait Extra { fn project_extra() -> u8; }\nimpl<OpenOptions> Extra for OpenOptions { fn project_extra() -> u8 { 1 } }",
+        ),
+        (
+            "src/caller.rs",
+            "use std::fs::OpenOptions;\nuse crate::extension::Extra;\nfn extension_call() -> u8 { OpenOptions::project_extra() }",
+        ),
+    ]);
+    let target = "sym:src/extension.rs#OpenOptions::project_extra";
+    assert!(reaches(&db, "extension_call", target));
+}
+
+#[test]
+fn a_crate_root_extern_alias_does_not_hide_its_own_methods() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        (
+            "src/lib.rs",
+            "extern crate self as std;\npub mod fs; mod caller;",
+        ),
+        (
+            "src/fs.rs",
+            "pub struct OpenOptions;\nimpl OpenOptions { pub fn new() {} }",
+        ),
+        (
+            "src/caller.rs",
+            "use std::fs::OpenOptions;\nfn aliased_self() { OpenOptions::new(); }",
+        ),
+    ]);
+    assert!(reaches(
+        &db,
+        "aliased_self",
+        "sym:src/fs.rs#OpenOptions::new"
+    ));
+}
+
+#[test]
+fn a_local_type_alias_can_extend_an_external_type() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        ("src/lib.rs", "mod extension; mod caller;"),
+        (
+            "src/extension.rs",
+            "#[cfg(any())]\nstruct OpenOptions;\ntype OpenOptions = std::fs::OpenOptions;\npub trait Extra { fn local(); }\nimpl Extra for OpenOptions { fn local() {} }",
+        ),
+        (
+            "src/caller.rs",
+            "use std::fs::OpenOptions;\nuse crate::extension::Extra;\nfn extension_call() { OpenOptions::local(); }",
+        ),
+    ]);
+    assert!(reaches(
+        &db,
+        "extension_call",
+        "sym:src/extension.rs#OpenOptions::local"
+    ));
+}
+
+#[test]
+fn same_file_nominal_methods_do_not_override_external_imports() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        (
+            "src/lib.rs",
+            "use std::fs::OpenOptions as Options;\nfn foreign() { Options::new(); }\nmod internal { pub struct Options; impl Options { pub fn new() {} } fn local() { Options::new(); }}",
+        ),
+    ]);
+    let references = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "Options::new".into(),
+            kind: Some(codesage_protocol::ReferenceKind::Call),
+        },
+    )
+    .unwrap();
+    assert!(
+        references
+            .results
+            .iter()
+            .any(|row| row.from_symbol.as_deref() == Some("foreign") && row.to.is_none())
+    );
+    assert!(
+        references
+            .results
+            .iter()
+            .any(|row| row.from_symbol.as_deref() == Some("local")
+                && row.to.as_deref() == Some("sym:src/lib.rs#Options::new"))
+    );
+}
+
+#[test]
+fn a_sibling_macro_can_change_a_type_binding_in_its_block() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        (
+            "src/lib.rs",
+            "use std::fs::OpenOptions;\nmod options;\nmacro_rules! import_local { ($ty:ident) => { use crate::options::$ty; }; }\nfn local() { import_local!(OpenOptions); OpenOptions::new(); }\nfn external() { OpenOptions::new(); }",
+        ),
+        (
+            "src/options.rs",
+            "pub struct OpenOptions;\nimpl OpenOptions { pub fn new() {} }",
+        ),
+    ]);
+    let target = "sym:src/options.rs#OpenOptions::new";
+    assert!(reaches(&db, "local", target));
+    assert!(!reaches(&db, "external", target));
+    let impact = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: target.into(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(impact.len(), 1);
+    assert_eq!(impact[0].reasons.len(), 1);
+    assert_eq!(impact[0].reasons[0].line, 4);
+}
+
+#[test]
+fn a_disabled_block_import_does_not_override_the_active_local_type() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod options;\nuse crate::options::OpenOptions;\nfn local() { #[ cfg(any()) ] use std::fs::OpenOptions; OpenOptions::new(); }",
+        ),
+        (
+            "src/options.rs",
+            "pub struct OpenOptions;\nimpl OpenOptions { pub fn new() {} }",
+        ),
+    ]);
+    assert!(reaches(&db, "local", "sym:src/options.rs#OpenOptions::new"));
+}
+
+#[test]
+fn absolute_type_imports_follow_the_callers_edition() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = ['old', 'modern']\n[workspace.package]\nedition = '2024'\n",
+        ),
+        (
+            "old/Cargo.toml",
+            "[package]\nname = 'old'\nversion = '0.0.0'\nedition = '2015'\n",
+        ),
+        (
+            "old/src/lib.rs",
+            "#![ no_std ]\nmod custom { pub mod std { pub mod fs { pub struct OpenOptions; impl OpenOptions { pub fn old() {} } } } }\npub use custom::*;\nuse ::std::fs::OpenOptions;\npub fn local() { OpenOptions::old(); }",
+        ),
+        (
+            "modern/Cargo.toml",
+            "[package]\nname = 'modern'\nversion = '0.0.0'\nedition.workspace = true\n",
+        ),
+        (
+            "modern/src/lib.rs",
+            "pub mod std { pub mod fs { pub struct OpenOptions; impl OpenOptions { pub fn new() {} } } }\nuse ::std::fs::OpenOptions;\npub fn external() { OpenOptions::new(); }",
+        ),
+    ]);
+    assert!(reaches(&db, "local", "sym:old/src/lib.rs#OpenOptions::old"));
+    assert!(!reaches(
+        &db,
+        "external",
+        "sym:modern/src/lib.rs#OpenOptions::new"
+    ));
+}
+
+#[test]
+fn bare_imports_in_rust_2015_can_reach_a_reexport_at_the_crate_root() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2015'\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod caller;\nmod custom { pub mod core { pub mod cell { pub struct Cell; impl Cell { pub fn project_new() {} } } } }\npub use custom::*;",
+        ),
+        (
+            "src/caller.rs",
+            "use core::cell::Cell;\npub fn local() { Cell::project_new(); }",
+        ),
+    ]);
+    assert!(reaches(&db, "local", "sym:src/lib.rs#Cell::project_new"));
+}
+
+#[test]
+fn external_core_and_explicit_alloc_types_stay_external_in_a_no_std_crate() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        (
+            "src/lib.rs",
+            "#![no_std]\nextern crate alloc;\nmod nominal; mod calls;",
+        ),
+        (
+            "src/nominal.rs",
+            "pub struct Cell;\nimpl Cell { pub fn new() {} }\npub struct Vec;\nimpl Vec { pub fn new() {} }",
+        ),
+        (
+            "src/calls.rs",
+            "use core::cell::Cell;\nuse alloc::vec::Vec;\npub fn core_call() { let _ = Cell::new(1); }\npub fn alloc_call() { let _: Vec<u8> = Vec::new(); }",
+        ),
+    ]);
+    assert!(!reaches(&db, "core_call", "sym:src/nominal.rs#Cell::new"));
+    assert!(!reaches(&db, "alloc_call", "sym:src/nominal.rs#Vec::new"));
+}
+
+#[test]
+fn spaced_imports_and_transparent_macro_calls_keep_per_site_type_proof() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        ("src/lib.rs", "mod nominal; mod calls;"),
+        (
+            "src/nominal.rs",
+            "pub struct OpenOptions;\nimpl OpenOptions { pub fn new() -> u8 { 0 } }",
+        ),
+        (
+            "src/calls.rs",
+            "use std /* path comment */:: fs :: /* terminal comment */ OpenOptions;\nfn direct() { let _ = OpenOptions::new(); }\nfn transparent() { let _ = format!(\"{:?}\", OpenOptions::new()); }\nfn changed_scope() { let _ = format!(\"{:?}\", { use crate::nominal::OpenOptions; OpenOptions::new() }); }",
+        ),
+    ]);
+    let target = "sym:src/nominal.rs#OpenOptions::new";
+    assert!(!reaches(&db, "direct", target));
+    assert!(!reaches(&db, "transparent", target));
+    assert!(reaches(&db, "changed_scope", target));
+    let references = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "OpenOptions::new".into(),
+            kind: Some(codesage_protocol::ReferenceKind::Call),
+        },
+    )
+    .unwrap();
+    let bindings: std::collections::BTreeMap<_, _> = references
+        .results
+        .iter()
+        .map(|row| (row.from_symbol.as_deref().unwrap(), row.to.as_deref()))
+        .collect();
+    assert_eq!(
+        bindings,
+        [
+            ("changed_scope", Some(target)),
+            ("direct", None),
+            ("transparent", None),
+        ]
+        .into()
+    );
+    let impact = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: target.into(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(impact.len(), 1);
+    assert_eq!(impact[0].reasons.len(), 1);
+    assert_eq!(impact[0].reasons[0].line, 4);
+}
+
+#[test]
+fn imported_values_can_share_a_name_with_the_local_type() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        ("src/lib.rs", "mod options; mod calls; mod foreign;"),
+        (
+            "src/options.rs",
+            "pub struct Options {}\nimpl Options { pub fn new() -> std::fs::OpenOptions { std::fs::OpenOptions::new() } }",
+        ),
+        (
+            "src/calls.rs",
+            "use crate::options::Options;\nfn local() { use std::mem::drop as Options; let _ = Options::new(); Options(1); }\nfn constant_alias() { use std::f32::consts::PI as Options; let _: std::fs::OpenOptions = Options::new(); let _ = Options; }",
+        ),
+        (
+            "src/foreign.rs",
+            "use std::fs::OpenOptions as Options;\nfn external() { let _ = Options::new(); }",
+        ),
+    ]);
+    let target = "sym:src/options.rs#Options::new";
+    assert!(reaches(&db, "local", target));
+    assert!(reaches(&db, "constant_alias", target));
+    assert!(!reaches(&db, "external", target));
+    let references = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "Options::new".into(),
+            kind: Some(codesage_protocol::ReferenceKind::Call),
+        },
+    )
+    .unwrap();
+    let bindings: std::collections::BTreeMap<_, _> = references
+        .results
+        .iter()
+        .map(|row| (row.from_symbol.as_deref().unwrap(), row.to.as_deref()))
+        .collect();
+    assert_eq!(
+        bindings,
+        [
+            ("constant_alias", Some(target)),
+            ("external", None),
+            ("local", Some(target)),
+        ]
+        .into()
+    );
+}
+
+#[test]
+fn explicit_external_type_annotations_prove_block_imports_shadow_the_outer_type() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        ("src/lib.rs", "mod options; mod calls;"),
+        (
+            "src/options.rs",
+            "pub struct OpenOptions;\nimpl OpenOptions { pub fn new() {} }\npub struct Options;\nimpl Options { pub fn new() {} }",
+        ),
+        (
+            "src/calls.rs",
+            "use crate::options::{OpenOptions, Options};\nuse std::fs as files;\nfn direct() {\n    OpenOptions::new();\n    { use std::fs::OpenOptions; let _: std::fs::OpenOptions = OpenOptions::new(); }\n}\nfn renamed() {\n    Options::new();\n    { use files::OpenOptions as Options; let _: ::std::fs::OpenOptions = Options::new(); }\n}\nfn unwitnessed() { use files::OpenOptions as Options; let _ = Options::new(); }\nfn direct_only() { use std::fs::OpenOptions; let _: std::fs::OpenOptions = OpenOptions::new(); }\nfn renamed_only() { use files::OpenOptions as Options; let _: ::std::fs::OpenOptions = Options::new(); }",
+        ),
+    ]);
+    for (name, expected) in [
+        ("OpenOptions::new", vec![(4, true), (5, false), (12, false)]),
+        (
+            "Options::new",
+            vec![(8, true), (9, false), (11, true), (13, false)],
+        ),
+    ] {
+        let target = format!("sym:src/options.rs#{name}");
+        let references = find_references(
+            &db,
+            &FindReferencesRequest {
+                symbol_name: name.into(),
+                kind: Some(codesage_protocol::ReferenceKind::Call),
+            },
+        )
+        .unwrap();
+        let mut bindings: Vec<_> = references
+            .results
+            .iter()
+            .map(|row| (row.line, row.to.as_deref() == Some(target.as_str())))
+            .collect();
+        bindings.sort_unstable();
+        assert_eq!(bindings, expected);
+        let impact = impact_analysis(
+            &db,
+            &ImpactRequest {
+                target: ImpactTarget::Symbol { name: target },
+                depth: 1,
+                source_only: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(impact.len(), 1);
+        let mut lines: Vec<_> = impact[0].reasons.iter().map(|reason| reason.line).collect();
+        lines.sort_unstable();
+        assert_eq!(
+            lines,
+            expected
+                .into_iter()
+                .filter_map(|(line, bound)| bound.then_some(line))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(!reaches(
+        &db,
+        "direct_only",
+        "sym:src/options.rs#OpenOptions::new"
+    ));
+    assert!(!reaches(
+        &db,
+        "renamed_only",
+        "sym:src/options.rs#Options::new"
+    ));
+    assert!(reaches(
+        &db,
+        "unwitnessed",
+        "sym:src/options.rs#Options::new"
+    ));
+}
+
+#[test]
+fn an_unavailable_trait_does_not_add_a_method_to_an_imported_type() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        ("src/lib.rs", "mod decoy; mod caller;"),
+        (
+            "src/decoy.rs",
+            "use std::process::Command as OpenOptions;\npub trait Decoy { fn new(); }\nimpl Decoy for OpenOptions { fn new() {} }",
+        ),
+        (
+            "src/caller.rs",
+            "use std::fs::OpenOptions;\nfn call() { let _ = OpenOptions::new(); }",
+        ),
+    ]);
+    let target = "sym:src/decoy.rs#OpenOptions::new";
+    assert!(!reaches(&db, "call", target));
+    let references = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "OpenOptions::new".into(),
+            kind: Some(codesage_protocol::ReferenceKind::Call),
+        },
+    )
+    .unwrap();
+    assert_eq!(references.results.len(), 1);
+    assert!(references.results[0].to.is_none());
+}
+
+#[test]
+fn an_imported_extension_trait_can_apply_through_standard_reexports() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        (
+            "src/lib.rs",
+            "extern crate alloc;\nmod extension; mod caller; mod anonymous;",
+        ),
+        (
+            "src/extension.rs",
+            "use alloc::ffi::CString;\npub trait Extra { fn project_new() -> u8; }\nimpl Extra for CString { fn project_new() -> u8 { 1 } }",
+        ),
+        (
+            "src/caller.rs",
+            "use std::ffi::CString;\nuse crate::extension::Extra;\nfn named() -> u8 { CString::project_new() }",
+        ),
+        (
+            "src/anonymous.rs",
+            "use std::ffi::CString;\nuse crate::extension::Extra as _;\nfn anonymous() -> u8 { CString::project_new() }",
+        ),
+    ]);
+    let target = "sym:src/extension.rs#CString::project_new";
+    assert!(reaches(&db, "named", target));
+    assert!(reaches(&db, "anonymous", target));
+}
+
+#[test]
+fn explicit_external_crate_aliases_do_not_bind_to_local_methods() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        (
+            "src/lib.rs",
+            "extern crate std as global_std;\nmod aliases; mod global; mod local; mod options;",
+        ),
+        (
+            "src/options.rs",
+            "pub struct OpenOptions;\nimpl OpenOptions { pub fn new() {} }",
+        ),
+        (
+            "src/aliases.rs",
+            "use std as library;\nuse library as system;\nuse system::fs::OpenOptions;\nfn through_use() { let _ = OpenOptions::new(); }",
+        ),
+        (
+            "src/global.rs",
+            "use global_std::fs::OpenOptions;\nfn through_extern() { let _ = OpenOptions::new(); }",
+        ),
+        (
+            "src/local.rs",
+            "use crate::options as module;\nuse module::OpenOptions;\nfn through_local() { OpenOptions::new(); }",
+        ),
+    ]);
+    let target = "sym:src/options.rs#OpenOptions::new";
+    assert!(!reaches(&db, "through_use", target));
+    assert!(!reaches(&db, "through_extern", target));
+    assert!(reaches(&db, "through_local", target));
+}
+
+#[test]
+fn value_aliases_do_not_replace_an_outer_module_in_import_paths() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod local;\npub fn real() { use std::f64::consts::PI as local; use local::OpenOptions; OpenOptions::new(); let _ = local; }\npub fn crate_alias() { use std as local; use local::fs::OpenOptions; let _ = OpenOptions::new(); }\npub fn module_alias() { use std::fs as external_fs; use external_fs::OpenOptions; let _ = OpenOptions::new(); }",
+        ),
+        (
+            "src/local.rs",
+            "pub struct OpenOptions;\nimpl OpenOptions { pub fn new() {} }",
+        ),
+    ]);
+    let target = "sym:src/local.rs#OpenOptions::new";
+    assert!(reaches(&db, "real", target));
+    assert!(!reaches(&db, "crate_alias", target));
+    assert!(!reaches(&db, "module_alias", target));
+    let references = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "OpenOptions::new".into(),
+            kind: Some(codesage_protocol::ReferenceKind::Call),
+        },
+    )
+    .unwrap();
+    let bindings: std::collections::BTreeMap<_, _> = references
+        .results
+        .iter()
+        .map(|row| (row.from_symbol.as_deref().unwrap(), row.to.as_deref()))
+        .collect();
+    assert_eq!(
+        bindings,
+        [
+            ("crate_alias", None),
+            ("module_alias", None),
+            ("real", Some(target)),
+        ]
+        .into()
+    );
+    let impact = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: target.into(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(impact.len(), 1);
+    assert_eq!(impact[0].file_path, "src/lib.rs");
+    assert_eq!(impact[0].reasons.len(), 1);
+    assert_eq!(impact[0].reasons[0].line, 2);
+}
+
+#[test]
+fn value_imports_do_not_replace_globbed_types_or_module_prefixes() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod exports; mod prefix; mod receiver; mod blocks;",
+        ),
+        (
+            "src/exports.rs",
+            "pub mod local { pub struct OpenOptions {} impl OpenOptions { pub fn new() {} } }\npub use local::OpenOptions;",
+        ),
+        (
+            "src/prefix.rs",
+            "use crate::exports::*;\nuse ::std::f64::consts::PI as local;\nuse local::OpenOptions;\nfn prefix() { OpenOptions::new(); let _ = local; }",
+        ),
+        (
+            "src/receiver.rs",
+            "use crate::exports::*;\nuse ::std::f64::consts::PI as OpenOptions;\nfn receiver() { OpenOptions::new(); let _ = OpenOptions; }",
+        ),
+        (
+            "src/blocks.rs",
+            "fn block_prefix() { use crate::exports::*; use ::std::f64::consts::PI as local; use local::OpenOptions; OpenOptions::new(); let _ = local; }\nfn block_receiver() { use crate::exports::*; use ::std::f64::consts::PI as OpenOptions; OpenOptions::new(); let _ = OpenOptions; }\nfn crate_alias() { use crate::exports::*; use ::std as local; use local::fs::OpenOptions; let _: ::std::fs::OpenOptions = OpenOptions::new(); }\nfn explicit_type() { use crate::exports::*; use ::std::fs::OpenOptions; let _: ::std::fs::OpenOptions = OpenOptions::new(); }",
+        ),
+    ]);
+    let target = "sym:src/exports.rs#OpenOptions::new";
+    for caller in ["prefix", "receiver", "block_prefix", "block_receiver"] {
+        assert!(reaches(&db, caller, target), "{caller}");
+    }
+    for caller in ["crate_alias", "explicit_type"] {
+        assert!(!reaches(&db, caller, target), "{caller}");
+    }
+    let references = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "OpenOptions::new".into(),
+            kind: Some(codesage_protocol::ReferenceKind::Call),
+        },
+    )
+    .unwrap();
+    let bindings: std::collections::BTreeMap<_, _> = references
+        .results
+        .iter()
+        .map(|row| (row.from_symbol.as_deref().unwrap(), row.to.as_deref()))
+        .collect();
+    assert_eq!(
+        bindings,
+        [
+            ("block_prefix", Some(target)),
+            ("block_receiver", Some(target)),
+            ("crate_alias", None),
+            ("explicit_type", None),
+            ("prefix", Some(target)),
+            ("receiver", Some(target)),
+        ]
+        .into()
+    );
+    let impact = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: target.into(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        impact
+            .iter()
+            .flat_map(|entry| entry
+                .reasons
+                .iter()
+                .map(|reason| (entry.file_path.as_str(), reason.line)))
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            ("src/blocks.rs", 1),
+            ("src/blocks.rs", 2),
+            ("src/prefix.rs", 4),
+            ("src/receiver.rs", 3),
+        ]
+        .into()
+    );
+}
+
+#[test]
+fn a_value_function_does_not_shadow_an_imported_type() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        ("src/lib.rs", "mod options; mod caller;"),
+        (
+            "src/options.rs",
+            "pub struct OpenOptions;\nimpl OpenOptions { pub fn new() {} }",
+        ),
+        (
+            "src/caller.rs",
+            "use std::fs::OpenOptions;\nfn OpenOptions() {}\nfn call() { let _ = OpenOptions::new(); OpenOptions(); }",
+        ),
+    ]);
+    assert!(!reaches(&db, "call", "sym:src/options.rs#OpenOptions::new"));
+    assert!(reaches(&db, "call", "sym:src/caller.rs#OpenOptions"));
+    for (spelling, target) in [
+        ("OpenOptions::new", None),
+        ("OpenOptions", Some("sym:src/caller.rs#OpenOptions")),
+    ] {
+        let references = find_references(
+            &db,
+            &FindReferencesRequest {
+                symbol_name: spelling.into(),
+                kind: Some(codesage_protocol::ReferenceKind::Call),
+            },
+        )
+        .unwrap();
+        assert_eq!(references.results.len(), 1);
+        assert_eq!(references.results[0].to.as_deref(), target);
+    }
+}
+
+#[test]
+fn qualified_std_expression_macros_require_a_standard_crate_binding() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n",
+        ),
+        ("src/lib.rs", "mod options; mod calls; mod custom;"),
+        (
+            "src/options.rs",
+            "pub struct OpenOptions;\nimpl OpenOptions { pub fn new() {} }",
+        ),
+        (
+            "src/custom.rs",
+            "macro_rules! format { ($msg:literal, $ty:ident::$method:ident()) => {{ use crate::options::$ty; $ty::$method() }}; }\npub(crate) use format;",
+        ),
+        (
+            "src/calls.rs",
+            "use ::std::fs::OpenOptions;\nfn standard() -> String { std::format!(\"{:?}\", OpenOptions::new()) }\nfn custom() { use crate::custom as std; std::format!(\"{:?}\", OpenOptions::new()); }",
+        ),
+    ]);
+    let target = "sym:src/options.rs#OpenOptions::new";
+    assert!(!reaches(&db, "standard", target));
+    assert!(reaches(&db, "custom", target));
+}
+
+#[test]
+fn registry_dev_dependencies_are_external_from_integration_tests() {
+    let (_dir, db) = indexed(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = 'app'\nversion = '0.0.0'\nedition = '2024'\n[dev-dependencies]\nregistry = '1'\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub struct Options;\nimpl Options { pub fn new() {} }",
+        ),
+        (
+            "tests/check.rs",
+            "use registry::Options;\n#[test]\nfn integration() { Options::new(); }",
+        ),
+    ]);
+    let target = "sym:src/lib.rs#Options::new";
+    assert!(!reaches(&db, "integration", target));
+    let references = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "Options::new".into(),
+            kind: Some(codesage_protocol::ReferenceKind::Call),
+        },
+    )
+    .unwrap();
+    assert_eq!(references.results.len(), 1);
+    assert!(references.results[0].to.is_none());
+}
+
+#[test]
 fn workspace_public_reexport_resolves_in_references_impact_trace_and_risk() {
     let (_dir, db) = workspace(
         "use codesage_graph::{search_page};\nfn main() {\ncodesage_graph::search_page();\nsearch_page();\n}\n",

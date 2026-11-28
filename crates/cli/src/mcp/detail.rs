@@ -1,3 +1,5 @@
+use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
 use std::time::Duration;
 
 use codesage_protocol::DescribeDetail as Detail;
@@ -256,13 +258,34 @@ pub(super) fn adapt_output_schema(value: &mut Value) {
     }
 }
 
-pub(super) fn add_snippets(value: &mut Value, root: &std::path::Path) {
+fn read_source(root: &Path, path: &str) -> Option<String> {
     use std::io::Read;
-    fn visit(
-        value: &mut Value,
-        root: &std::path::Path,
-        files: &mut std::collections::HashMap<String, Option<String>>,
-    ) {
+    let file = super::render::confined_project_path(root, path)?;
+    if !std::fs::metadata(&file).ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(file)
+        .ok()?
+        .take(1_048_577)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= 1_048_576)
+        .then(|| String::from_utf8(bytes).ok())
+        .flatten()
+}
+
+fn source_snippet(source: &str, line: usize) -> String {
+    source
+        .lines()
+        .skip(line - 1)
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(super) fn add_snippets(value: &mut Value, root: &Path) {
+    fn visit(value: &mut Value, root: &Path, files: &mut HashMap<String, Option<String>>) {
         match value {
             Value::Object(map) => {
                 let path = ["file_path", "from_file", "path", "file"]
@@ -279,28 +302,11 @@ pub(super) fn add_snippets(value: &mut Value, root: &std::path::Path) {
                     && let (Some(path), Some(line)) = (path, line)
                     && (files.contains_key(&path) || files.len() < 20)
                 {
-                    let source = files.entry(path.clone()).or_insert_with(|| {
-                        let file = super::render::confined_project_path(root, &path)?;
-                        if !std::fs::metadata(&file).ok()?.is_file() {
-                            return None;
-                        }
-                        let mut bytes = Vec::new();
-                        std::fs::File::open(file)
-                            .ok()?
-                            .take(1_048_577)
-                            .read_to_end(&mut bytes)
-                            .ok()?;
-                        (bytes.len() <= 1_048_576)
-                            .then(|| String::from_utf8(bytes).ok())
-                            .flatten()
-                    });
+                    let source = files
+                        .entry(path.clone())
+                        .or_insert_with(|| read_source(root, &path));
                     if let Some(source) = source {
-                        let snippet = source
-                            .lines()
-                            .skip(line - 1)
-                            .take(3)
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        let snippet = source_snippet(source, line);
                         if !snippet.is_empty() {
                             map.insert("snippet".into(), json!(snippet));
                             map.insert("snippet_source".into(), json!("working_tree"));
@@ -320,7 +326,56 @@ pub(super) fn add_snippets(value: &mut Value, root: &std::path::Path) {
             _ => {}
         }
     }
-    visit(value, root, &mut std::collections::HashMap::new());
+    visit(value, root, &mut HashMap::new());
+}
+
+fn add_reference_snippets(value: &mut Value, root: &Path, budget: usize) -> BTreeSet<String> {
+    let mut files = HashMap::new();
+    let mut snippets = HashMap::new();
+    let mut shortened = BTreeSet::new();
+    let Some(rows) = value.get_mut("results").and_then(Value::as_array_mut) else {
+        return shortened;
+    };
+    for (index, row) in rows.iter_mut().enumerate() {
+        let Some(path) = row.get("from_file").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(line) = row
+            .get("line")
+            .and_then(Value::as_u64)
+            .and_then(|line| usize::try_from(line).ok())
+            .filter(|line| *line > 0)
+        else {
+            continue;
+        };
+        if files.len() >= 20 && !files.contains_key(path) {
+            continue;
+        }
+        let Some(source) = files
+            .entry(path.to_owned())
+            .or_insert_with(|| read_source(root, path))
+        else {
+            continue;
+        };
+        let (snippet, reduced) = snippets.entry((path.to_owned(), line)).or_insert_with(|| {
+            let mut snippet = source_snippet(source, line);
+            let mut reduced = false;
+            // A snippet larger than the entire budget must shrink before it can fit.
+            while snippet.len() > 256 && encoded_source_bytes(&snippet) > budget {
+                snippet = halve_source(&snippet);
+                reduced = true;
+            }
+            (snippet, reduced)
+        });
+        if !snippet.is_empty() {
+            row["snippet"] = json!(snippet);
+            row["snippet_source"] = json!("working_tree");
+            if *reduced {
+                shortened.insert(format!("/results/{index}/snippet"));
+            }
+        }
+    }
+    shortened
 }
 
 #[cfg(test)]
@@ -332,20 +387,33 @@ pub(super) fn finish(
     cap: usize,
     envelope_enabled: bool,
 ) -> CallToolResult {
-    finish_with_notes(result, tool, arguments, elapsed, cap, envelope_enabled, &[])
+    finish_response(
+        result,
+        tool,
+        arguments,
+        elapsed,
+        cap,
+        envelope_enabled,
+        FinishContext::default(),
+    )
 }
 
-/// [`finish`], recording `notes` (deprecation notices) under `cost.notes`
-/// before the byte count is taken.
-pub(super) fn finish_with_notes(
+#[derive(Default)]
+pub(super) struct FinishContext<'a> {
+    pub notes: &'a [String],
+    pub project: Option<&'a Path>,
+}
+
+pub(super) fn finish_response(
     mut result: CallToolResult,
     tool: &str,
     arguments: &Map<String, Value>,
     elapsed: Duration,
     cap: usize,
     envelope_enabled: bool,
-    notes: &[String],
+    context: FinishContext<'_>,
 ) -> CallToolResult {
+    let FinishContext { notes, project } = context;
     let rendering = std::time::Instant::now();
     let options = Options::parse(tool, arguments).unwrap_or(Options {
         detail: default_detail(tool),
@@ -395,8 +463,24 @@ pub(super) fn finish_with_notes(
     let retry = (serde_json::to_vec(&retry_arguments).map_or(usize::MAX, |value| value.len())
         <= 1024)
         .then(|| json!({"tool":tool,"arguments":retry_arguments}));
+    // Reference snippets only enter the final payload, after the initial envelope.
+    let shortened = if tool == "find_references"
+        && options.detail == Detail::Full
+        && let Some(root) = project
+    {
+        add_reference_snippets(value, root, budget)
+    } else {
+        BTreeSet::new()
+    };
     stamp_cost(value, options, elapsed, Some(budget), notes);
-    trim_to_budget(value, budget, retry.as_ref(), envelope_enabled);
+    trim_to_budget(
+        value,
+        budget,
+        retry.as_ref(),
+        envelope_enabled,
+        tool,
+        shortened,
+    );
     stamp_cost(
         value,
         options,
@@ -440,10 +524,85 @@ fn stamp_cost(
     }
 }
 
-fn trim_to_budget(value: &mut Value, budget: usize, retry: Option<&Value>, envelope_enabled: bool) {
+fn prioritize_reference_rows(rows: &mut Vec<Value>, shortened: &mut BTreeSet<String>) {
+    if shortened.is_empty() {
+        rows.sort_by_key(super::render::reference_is_test);
+        return;
+    }
+
+    // Shortened snippet pointers must follow their rows to their ranked indices.
+    let mut ranked: Vec<_> = rows.drain(..).enumerate().collect();
+    ranked.sort_by_key(|(_, row)| super::render::reference_is_test(row));
+    let mut positions = vec![0; ranked.len()];
+    for (new, (old, row)) in ranked.into_iter().enumerate() {
+        positions[old] = new;
+        rows.push(row);
+    }
+    *shortened = std::mem::take(shortened)
+        .into_iter()
+        .map(|path| {
+            if let Some((index, field)) = path
+                .strip_prefix("/results/")
+                .and_then(|path| path.split_once('/'))
+                && let Ok(index) = index.parse::<usize>()
+                && let Some(position) = positions.get(index)
+            {
+                format!("/results/{position}/{field}")
+            } else {
+                path
+            }
+        })
+        .collect();
+}
+
+fn halve_source(text: &str) -> String {
+    let end = text.floor_char_boundary(text.len() / 2);
+    format!("{}\n…[truncated by MCP budget]", &text[..end])
+}
+
+fn encoded_source_bytes(text: &str) -> usize {
+    serde_json::to_vec(text)
+        .expect("source text serializes")
+        .len()
+}
+
+fn shorten_sources(
+    value: &mut Value,
+    mut path: String,
+    shortened: &mut BTreeSet<String>,
+    mut excess: Option<usize>,
+) {
+    loop {
+        let source = value.pointer_mut(&path).expect("selected source");
+        let text = source.as_str().expect("selected source text");
+        let replacement = halve_source(text);
+        if let Some(remaining) = &mut excess {
+            let saved = encoded_source_bytes(text) - encoded_source_bytes(&replacement);
+            *remaining = remaining.saturating_sub(saved);
+        }
+        *source = Value::String(replacement);
+        shortened.insert(path);
+        if excess.is_none_or(|remaining| remaining == 0) {
+            break;
+        }
+        let Some(next) = largest_source(value, "") else {
+            break;
+        };
+        path = next;
+    }
+}
+
+fn trim_to_budget(
+    value: &mut Value,
+    budget: usize,
+    retry: Option<&Value>,
+    envelope_enabled: bool,
+    tool: &str,
+    mut shortened: BTreeSet<String>,
+) {
     let mut removed = std::collections::BTreeMap::<String, usize>::new();
     let mut omitted_handles = std::collections::BTreeMap::<String, Vec<Value>>::new();
-    let mut shortened = std::collections::BTreeSet::<String>::new();
+    let mut needs_disclosure = !shortened.is_empty();
     let prior = value.get("completeness").cloned();
     let legacy_meta = value
         .get("_meta")
@@ -453,28 +612,26 @@ fn trim_to_budget(value: &mut Value, budget: usize, retry: Option<&Value>, envel
         .as_ref()
         .map(legacy_array_counts)
         .unwrap_or_default();
-    while value.to_string().len() > budget {
-        if let Some(path) = largest_source(value, "") {
-            let text = value
-                .pointer(&path)
-                .and_then(Value::as_str)
-                .expect("selected source")
-                .to_owned();
-            let mut end = text.len() / 2;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            *value.pointer_mut(&path).expect("selected source") =
-                json!(format!("{}\n…[truncated by MCP budget]", &text[..end]));
-            shortened.insert(path);
-        } else {
-            let Some(path) = largest_rows(value, "") else {
+    loop {
+        let excess = value.to_string().len().saturating_sub(budget);
+        if excess == 0 {
+            if !needs_disclosure {
                 break;
-            };
+            }
+        } else if let Some(path) = largest_source(value, "") {
+            // References can share long snippets. Account for each changed JSON string
+            // while batching reductions, then check the refreshed disclosure and payload.
+            let batch_excess = (tool == "find_references").then_some(excess);
+            shorten_sources(value, path, &mut shortened, batch_excess);
+        } else if let Some(path) = largest_rows(value, "") {
             let rows = value
                 .pointer_mut(&path)
                 .and_then(Value::as_array_mut)
                 .expect("selected array");
+            let reference_rows = tool == "find_references" && path == "/results";
+            if reference_rows && !removed.contains_key(&path) {
+                prioritize_reference_rows(rows, &mut shortened);
+            }
             if !envelope_enabled
                 && !legacy_counts
                     .iter()
@@ -489,6 +646,10 @@ fn trim_to_budget(value: &mut Value, budget: usize, retry: Option<&Value>, envel
                 legacy_counts.push((label, path.clone(), rows.len()));
             }
             let dropped = rows.pop().expect("selected nonempty array");
+            if reference_rows && !shortened.is_empty() {
+                let dropped_prefix = format!("/results/{}/", rows.len());
+                shortened.retain(|path| !path.starts_with(&dropped_prefix));
+            }
             if protected_rows(&path) {
                 let identity = ["handle", "file_path", "file", "path", "directory", "name"]
                     .iter()
@@ -503,7 +664,10 @@ fn trim_to_budget(value: &mut Value, budget: usize, retry: Option<&Value>, envel
                 }
             }
             *removed.entry(path).or_default() += 1;
+        } else if !needs_disclosure {
+            break;
         }
+        needs_disclosure = false;
         if let Some(meta) = &legacy_meta {
             let mut meta = meta.clone();
             for (index, (label, path, total)) in legacy_counts.iter().enumerate() {
@@ -931,7 +1095,7 @@ mod tests {
             "completeness":{"kind":"partial","recover":{"reason":"lexical_lookup_failed"}}
         });
         project(&mut value, Detail::Compact);
-        trim_to_budget(&mut value, 1500, None, true);
+        trim_to_budget(&mut value, 1500, None, true, "bundle", BTreeSet::new());
         assert!(value.to_string().len() <= 1500);
         assert_eq!(value["next"], next);
         assert_eq!(value["lexical_fallback_reason"], "lexical_lookup_failed");
@@ -994,7 +1158,7 @@ mod tests {
             "_meta":{"truncated":true,"field":"files","returned":6,"total_results":10,"dropped_files":["src/6.rs","src/7.rs","src/8.rs","src/9.rs"]},
             "completeness":{"kind":"truncated","recover":{"returned":6,"total":10,"arguments":{"offset":16}}}
         });
-        trim_to_budget(&mut value, 1700, None, true);
+        trim_to_budget(&mut value, 1700, None, true, "search", BTreeSet::new());
         let returned = value["files"].as_array().unwrap().len();
         assert!(returned > 0 && returned < 6);
         assert_eq!(value["_meta"]["returned"], returned);
@@ -1032,7 +1196,7 @@ mod tests {
             "measurements":measurements,
             "results":[{"handle":"sym:src/lib.rs#one"},{"handle":"sym:src/lib.rs#two"}]
         });
-        trim_to_budget(&mut value, 1, None, true);
+        trim_to_budget(&mut value, 1, None, true, "describe", BTreeSet::new());
         assert_eq!(value["measurements"], measurements);
         assert_eq!(value["results"].as_array().unwrap().len(), 1);
         assert_eq!(
@@ -1057,7 +1221,14 @@ mod tests {
         });
         let retry =
             json!({"tool":"describe","arguments":{"target":"file:src/lib.rs","detail":"standard"}});
-        trim_to_budget(&mut value, 1, Some(&retry), false);
+        trim_to_budget(
+            &mut value,
+            1,
+            Some(&retry),
+            false,
+            "bundle",
+            BTreeSet::new(),
+        );
         assert!(value.get("completeness").is_none());
         assert_eq!(value["_meta"]["recover"], retry);
         assert_eq!(value["_meta"]["returned"], 1);

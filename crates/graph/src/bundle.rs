@@ -927,14 +927,22 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
     }
     // Gate before any strategy runs: a candidate the caller cannot name must
     // not resurface through a looser tier (lone-candidate return, case fold,
-    // import evidence). The lone-candidate shortcut keys on the pre-gate
+    // import evidence). The lone-candidate shortcut keys on the pre-visibility
     // count, so a homonym set the gate thins to one survivor still owes the
     // same import evidence as the full set did.
+    let caller_language =
+        codesage_parser::detect::detect_language(std::path::Path::new(caller_file));
+    let admits = |symbol: &Symbol| -> Result<bool> {
+        Ok(language_admits(caller_file, caller_language, symbol)
+            && reference_definition_admits(db, caller_file, to_name, kind, symbol)?)
+    };
     let named = find_named(to_name)?;
-    let mut all_candidates: Vec<&Symbol> = named
-        .iter()
-        .filter(|symbol| reference_kind_admits(caller_file, kind, symbol))
-        .collect();
+    let mut all_candidates = Vec::new();
+    for symbol in named.iter() {
+        if admits(symbol)? {
+            all_candidates.push(symbol);
+        }
+    }
     let mut module_qualified = false;
     let tail_named;
     if caller_file.ends_with(".rs")
@@ -942,10 +950,12 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
         && let Some((_, tail)) = to_name.rsplit_once("::")
     {
         tail_named = find_named(tail)?;
-        let tail_candidates: Vec<&Symbol> = tail_named
-            .iter()
-            .filter(|symbol| reference_kind_admits(caller_file, kind, symbol))
-            .collect();
+        let mut tail_candidates = Vec::new();
+        for symbol in tail_named.iter() {
+            if admits(symbol)? {
+                tail_candidates.push(symbol);
+            }
+        }
         let mut seen = HashSet::new();
         let mut ambiguous = HashSet::new();
         for symbol in &tail_candidates {
@@ -964,12 +974,6 @@ pub(crate) fn resolve_callee_definitions_with_lookup(
         }
         module_qualified = true;
     }
-    let caller_language =
-        codesage_parser::detect::detect_language(std::path::Path::new(caller_file));
-    all_candidates.retain(|symbol| {
-        language_admits(caller_file, caller_language, symbol)
-            && reference_kind_admits(caller_file, kind, symbol)
-    });
     let total_candidates = all_candidates.len();
     let mut php_bound = Vec::new();
     if caller_language == Some(Language::Php) && !to_name.contains('\\') {
@@ -1226,6 +1230,45 @@ pub(crate) fn reference_kind_admits(
     }
 }
 
+pub(crate) fn reference_definition_admits(
+    db: &Database,
+    caller_file: &str,
+    spelling: &str,
+    kind: Option<ReferenceKind>,
+    symbol: &Symbol,
+) -> Result<bool> {
+    if !reference_kind_admits(caller_file, kind, symbol) {
+        return Ok(false);
+    }
+    if symbol.kind == SymbolKind::Method && is_c_definition(db, symbol)? {
+        // A C extension macro's qualified display name identifies its body,
+        // while a C++ method in a shared header names a real lexical target.
+        return Ok(false);
+    }
+    Ok(c_abi_function_name(db, symbol)?.is_none_or(|name| spelling == name))
+}
+
+pub(crate) fn c_abi_function_name<'a>(
+    db: &Database,
+    symbol: &'a Symbol,
+) -> Result<Option<&'a str>> {
+    if symbol.kind == SymbolKind::Function
+        && symbol.name != symbol.qualified_name
+        && is_c_definition(db, symbol)?
+    {
+        return Ok(Some(&symbol.qualified_name));
+    }
+    Ok(None)
+}
+
+fn is_c_definition(db: &Database, symbol: &Symbol) -> Result<bool> {
+    Ok(
+        codesage_parser::detect::detect_language(std::path::Path::new(&symbol.file_path))
+            == Some(Language::C)
+            && db.file_language_matches(&symbol.file_path, Language::C)?,
+    )
+}
+
 fn language_admits(caller_file: &str, caller: Option<Language>, symbol: &Symbol) -> bool {
     let Some(caller) = caller else { return true };
     let Some(target) =
@@ -1324,8 +1367,7 @@ fn rust_module_subtree(def_file: &str) -> Option<String> {
 
 /// A Go `import` names a package path (`"errors"`, `"C"`, `"example.com/m/util"`),
 /// never a symbol, so it must not bind to a project symbol that happens to
-/// share the spelling. Package paths name directories, which the file-level
-/// path matcher does not resolve, so these rows carry no symbol or file edge.
+/// share the spelling. The Go package resolver supplies file edges separately.
 /// A Go `import` or a bare JavaScript/TypeScript module specifier
 /// (`'debounce'`, `'lodash/fp'`) names a package, never a project symbol.
 pub(crate) fn is_package_import(kind: ReferenceKind, from_file: &str, to_name: &str) -> bool {

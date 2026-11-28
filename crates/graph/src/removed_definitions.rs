@@ -24,6 +24,7 @@ use codesage_protocol::{
 use codesage_storage::Database;
 
 use crate::drift::{git_output, git_output_with_stdin};
+use crate::go_modules::GoResolution;
 use crate::impact::{WalkCache, symbol_identity_key};
 use crate::index::{ParsedFile, parse_source};
 
@@ -390,6 +391,9 @@ pub(crate) fn check(
     }
 
     let mut notes = gaps.notes();
+    if before_cache.go_context_capped() || after_cache.go_context_capped() || caches.unverified_go {
+        notes.push("Removed-definition check could not verify some Go package selectors".into());
+    }
     if let Some(cause) = stop {
         notes.push(format!(
             "Removed-definition callers resolved for {} of {} removed definition(s): {cause} stopped the rest; counts are lower bounds",
@@ -418,8 +422,8 @@ pub(crate) fn check(
 /// nothing after it, in a caller file that still spells the name; the flag
 /// says whether it held the definition by import, qualified, or same-file
 /// evidence. An evidenced row survives on a target it already resolved to,
-/// a target in a file the caller imports, or any Python target (Python
-/// resolution follows each binding, re-exports included). A row held by
+/// a target in a file the caller imports, or a resolved Python binding or
+/// Go package selector whose definition can move between files. A row held by
 /// name alone survives on any target.
 fn broken_caller(
     root: &Path,
@@ -438,6 +442,14 @@ fn broken_caller(
         return Ok(None);
     }
     let evidenced = before.1.binding_evidence(before.0, row, symbol)?;
+    match after.1.go_package_resolution(after.0, row)? {
+        GoResolution::Proven(survivors) => return Ok(survivors.is_empty().then_some(evidenced)),
+        GoResolution::Unknown => {
+            caches.unverified_go = true;
+            return Ok(None);
+        }
+        GoResolution::Unrelated => {}
+    }
     let Some(survivors) = after.1.reference_target_symbols(after.0, row)? else {
         return Ok(None);
     };
@@ -458,6 +470,7 @@ fn broken_caller(
 struct CallerCaches {
     sources: HashMap<String, Option<String>>,
     after_imports: HashMap<String, HashSet<String>>,
+    unverified_go: bool,
 }
 
 /// Files `caller` imports in `db`'s view.
@@ -1467,6 +1480,48 @@ mod tests {
         let objection = removed(&db, root.path(), &["crates/core/src/work.rs"]).expect("fires");
         assert_eq!(objection.severity, ReviewSeverity::High);
         assert_eq!(objection.files, ["crates/app/src/lib.rs"], "{objection:?}");
+    }
+
+    #[test]
+    fn go_selector_survives_a_move_within_its_imported_package() {
+        let (root, path) = repo(&[
+            ("go.mod", "module example.com/m\ngo 1.23\n"),
+            ("pkg/a.go", "package pkg\nfunc Join() int { return 1 }\n"),
+            ("pkg/b.go", "package pkg\n"),
+            (
+                "caller.go",
+                "package m\nimport \"example.com/m/pkg\"\nfunc Use() int { return pkg.Join() }\n",
+            ),
+        ]);
+        let db = Database::open_read_only(&path).unwrap();
+        write(root.path(), "pkg/a.go", "package pkg\n");
+        write(
+            root.path(),
+            "pkg/b.go",
+            "package pkg\nfunc Join() int { return 1 }\n",
+        );
+        assert!(removed(&db, root.path(), &["pkg/a.go", "pkg/b.go"]).is_none());
+
+        write(root.path(), "pkg/b.go", "package pkg\n");
+        let objection = removed(&db, root.path(), &["pkg/a.go", "pkg/b.go"])
+            .expect("deleting the package member breaks the unchanged caller");
+        assert_eq!(objection.files, ["caller.go"], "{objection:?}");
+
+        let large = format!(
+            "package pkg\n/*{}*/\nfunc Join() int {{ return 1 }}\n",
+            "x".repeat(8 * 1024 * 1024)
+        );
+        write(root.path(), "pkg/b.go", &large);
+        let outcome = check(root.path(), &db, &["pkg/a.go".into(), "pkg/b.go".into()]).unwrap();
+        assert!(outcome.objection.is_none());
+        assert!(
+            outcome
+                .notes
+                .iter()
+                .any(|note| note.contains("could not verify some Go package selectors")),
+            "{:?}",
+            outcome.notes
+        );
     }
 
     #[test]

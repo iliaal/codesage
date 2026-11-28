@@ -545,6 +545,10 @@ pub struct IndexableFilter {
 }
 
 impl IndexableFilter {
+    pub(crate) fn excludes(&self) -> &GlobSet {
+        &self.excludes
+    }
+
     /// [`DEFAULT_EXCLUDE_PATTERNS`] plus `.codesage/config.toml`'s
     /// `[index] exclude_patterns`. A missing, unreadable, or malformed config
     /// adds no patterns, which keeps the unverifiable case on the side that

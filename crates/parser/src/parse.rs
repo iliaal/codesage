@@ -131,7 +131,11 @@ pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTr
     codesage_protocol::work::checkpoint()?;
     let mut parser = Parser::new();
     parser.set_language(&ts_language(language))?;
-    let prepared = prepare_c_family(source, language)?;
+    let mut prepared = prepare_c_family(source, language)?;
+    if language == Language::C {
+        let input = prepared.as_deref().unwrap_or(source);
+        prepared = crate::macro_invocation::prepare_php_function_heads(input, source)?.or(prepared);
+    }
     let input = prepared.as_deref().unwrap_or(source);
     let mut tree = parse_with_control(&mut parser, input)?;
     if matches!(language, Language::C | Language::Cpp) {
@@ -504,6 +508,25 @@ mod header_quality_tests {
         ] {
             assert!(c_header_prefers_c(source.as_bytes()).unwrap(), "{source}");
         }
+    }
+
+    #[test]
+    fn php_macro_heads_do_not_bias_ambiguous_header_routing() {
+        for source in [
+            "PHP_METHOD(A, B) { helper(); }\n",
+            "static PHP_METHOD(A, B) { helper(); }\n",
+            "ZEND_FRAMELESS_FUNCTION(name, 2) { helper(); }\n",
+            "typedef int value_t;\nPHP_METHOD(A, B) { helper(); }\n",
+        ] {
+            assert!(!c_header_prefers_c(source.as_bytes()).unwrap(), "{source}");
+            assert!(
+                !parse_file_tolerant(source.as_bytes(), Language::C)
+                    .unwrap()
+                    .degraded,
+                "{source}"
+            );
+        }
+        assert!(c_header_prefers_c(b"typedef int value_t;\n").unwrap());
     }
 
     #[test]

@@ -119,6 +119,51 @@ fn respects_gitignore() {
 }
 
 #[test]
+fn discovery_and_watch_filter_keep_rules_after_invalid_utf8() {
+    assert_gitignore_filters(
+        b"before.py\n\xff\xfe\nafter.py\n",
+        &[("before.py", false), ("after.py", false), ("kept.py", true)],
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn discovery_and_watch_filter_preserve_escaped_trailing_spaces() {
+    assert_gitignore_filters(
+        b"spaced\\   \ninterior\\ space.py\n",
+        &[
+            ("spaced /inside.py", false),
+            ("spaced/inside.py", true),
+            ("interior space.py", false),
+        ],
+    );
+}
+
+fn assert_gitignore_filters(patterns: &[u8], paths: &[(&str, bool)]) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join(".gitignore"), patterns).unwrap();
+    for (path, _) in paths {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, "def item(): pass\n").unwrap();
+    }
+
+    let files = discover_files_with_excludes(root, &[]).unwrap();
+    let filter = WatchFilter::new(root, &[]).unwrap();
+    for &(path, included) in paths {
+        let discovered = files.iter().any(|file| file.path == path);
+        let watched = !filter.is_ignored(&root.join(path), false);
+        assert_eq!(
+            (discovered, watched),
+            (included, included),
+            "discovery and watcher admission for {path}"
+        );
+    }
+}
+
+#[test]
 fn watch_filter_respects_nested_gitignore_like_discovery() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
