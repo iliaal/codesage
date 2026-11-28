@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.56.0] - 2026-11-28
+
 ### Added
 
 - `dependencies`, `trace`, and `impact` resolve imports and package-qualified calls within the same Go module.
@@ -1561,5 +1563,7 @@ Initial public release.
 
 [0.54.0]: https://github.com/iliaal/codesage/releases/tag/v0.54.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.55.0...HEAD
 [0.55.0]: https://github.com/iliaal/codesage/releases/tag/v0.55.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.56.0...HEAD
+[0.56.0]: https://github.com/iliaal/codesage/releases/tag/v0.56.0
